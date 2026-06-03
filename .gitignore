@@ -21,3 +21,6 @@ data/*
 !data/workflow-state.json
 !data/fb-server-watchdog.ps1
 !data/prod-autostop.js
+
+# local git config (created when HOME pointed at repo during setup)
+.gitconfig
