@@ -1,0 +1,23 @@
+# ── Portable tooling (downloaded locally, not part of the project) ──
+.tooling/
+
+# ── Dependencies (reinstall on the new machine with: npm install) ──
+node_modules/
+
+# ── Dev artifacts / screenshots / scratch ──
+output/
+test-results/
+.playwright-cli/
+*.png
+tmp-*.ps1
+*.tmp
+ghtoken.txt
+
+# ── data/: contains LIVE SECRETS, login sessions, and runtime artifacts. ──
+# Exclude EVERYTHING under data/, then re-include only the safe, needed files.
+# NOTE: data/secrets.local.json (API keys, proxy creds) and data/.dashboard-token
+# are intentionally NOT re-included — re-enter them on the new machine via the dashboard.
+data/*
+!data/workflow-state.json
+!data/fb-server-watchdog.ps1
+!data/prod-autostop.js

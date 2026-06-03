@@ -1,0 +1,1176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="dashboard-token" content="__DASHBOARD_TOKEN__">
+    <title>Facebook Agent Control</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="/app.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="topIntro">
+          <h1>Facebook Agent Control</h1>
+          <p id="topSubtitle">Hermes operator dashboard for the Miro posting workflow.</p>
+        </div>
+        <div class="topActions">
+          <button id="sidebarToggle" class="ghostButton menuToggle" type="button" aria-expanded="false">Controls</button>
+          <span id="dirtyStatus" class="saveState">Saved</span>
+          <button id="saveAllTop" class="primary">Save Everything</button>
+          <div class="statusPill">
+            <span id="statusDot" class="dot"></span>
+            <span id="statusText">Loading</span>
+          </div>
+        </div>
+        <nav class="topNav" aria-label="Workflow menu">
+          <button class="topNavItem active" data-view-target="overview" type="button">Overview</button>
+          <button class="topNavItem" data-view-target="monitor" type="button">Tasks</button>
+          <button class="topNavItem" data-view-target="approvals" type="button">Approvals</button>
+          <button class="topNavItem" data-view-target="credentials" type="button">Credentials</button>
+          <button class="topNavItem" data-view-target="integrations" type="button">Integrations</button>
+          <button class="topNavItem" data-view-target="posting" type="button">Posting</button>
+          <button class="topNavItem" data-view-target="prod" type="button">Prod</button>
+          <button class="topNavItem" data-view-target="test" type="button">Test</button>
+          <button class="topNavItem" data-view-target="content" type="button">Content</button>
+          <button class="topNavItem" data-view-target="affiliate" type="button">Affiliate</button>
+          <button class="topNavItem" data-view-target="profiles" type="button">Profiles</button>
+          <button class="topNavItem" data-view-target="operations" type="button">Operations</button>
+          <button class="topNavItem" data-view-target="system" type="button">System</button>
+        </nav>
+        <div class="viewTools" aria-label="Dashboard view controls">
+          <label class="viewSearch">Search this tab <input id="dashboardSearch" type="search" placeholder="Find setting, field, or panel" autocomplete="off"></label>
+          <div class="viewToolsGroup">
+            <button id="collapseAllPanelsBtn" type="button" class="ghostButton chipButton" title="Collapse every panel on this tab"><span aria-hidden="true">&#9663;</span> Collapse all</button>
+            <button id="expandAllPanelsBtn" type="button" class="ghostButton chipButton" title="Expand every panel on this tab"><span aria-hidden="true">&#9657;</span> Expand all</button>
+          </div>
+          <label class="switch compactSwitch"><input id="showAdvancedUi" type="checkbox" data-transient="true"><span>Show advanced</span></label>
+        </div>
+      </header>
+
+      <section class="layout">
+        <aside class="rail">
+          <section class="panel command">
+            <div class="panelHead">
+              <h2>Command Center</h2>
+              <span class="badge safe">127.0.0.1 only</span>
+            </div>
+            <div class="buttonGrid commandActions">
+              <button id="startBtn" class="primary hasTooltip" data-tooltip="Runs the next approved Hermes task. It does not bypass human approvals or publish anything without the approved workflow step.">Run Next Approved Task</button>
+              <button id="stopBtn" class="danger hasTooltip" data-tooltip="Stops the currently running Hermes task and leaves the rest of the queue untouched.">Stop Active</button>
+            </div>
+            <div id="currentProgress" class="currentProgress idle" aria-live="polite">
+              <div class="currentProgressHead">
+                <strong id="currentProgressTitle">Idle</strong>
+                <span id="currentProgressPercent">0%</span>
+              </div>
+              <div class="currentProgressTrack"><i id="currentProgressFill"></i></div>
+              <span id="currentProgressDetail">No workflow is running.</span>
+            </div>
+            <button class="approvalJump hasTooltip" data-view-target="approvals" type="button" data-tooltip="Opens the human validation queue where Hermes plans and manual-review items can be approved or rejected.">
+              <span><strong>Open Approvals</strong><small><b id="commandApprovalPending">0</b> pending · <b id="commandApprovalQueued">0</b> queued</small></span>
+            </button>
+            <button id="saveAllBtn" class="saveWide hasTooltip" data-tooltip="Saves dashboard settings, workflow state, group assignments, and local configuration to disk.">Save Everything</button>
+            <div class="commandSwitchGrid" aria-label="Main system switches">
+              <label class="commandSwitch powerSwitch hasTooltip" data-tooltip="Turns the local Hermes worker queue on or off. Keep it off while editing settings.">
+                <input id="systemPowerToggleRail" data-runtime-control="true" data-system-power-toggle="true" type="checkbox">
+                <span class="switchCopy"><strong id="systemPowerTitleRail">System off</strong><small id="systemPowerBadgeRail">worker stopped</small></span>
+                <span class="toggleUi" aria-hidden="true"><span class="toggleTrack"><span class="toggleThumb"></span></span></span>
+              </label>
+              <label class="commandSwitch hasTooltip" data-tooltip="Requires manual approval before risky workflow steps continue. Recommended to keep on.">
+                <input id="approvalRequiredRail" type="checkbox">
+                <span class="switchCopy"><strong>Human approval</strong><small id="approvalRequiredRailBadge">required</small></span>
+                <span class="toggleUi" aria-hidden="true"><span class="toggleTrack"><span class="toggleThumb"></span></span></span>
+              </label>
+              <label class="commandSwitch hasTooltip" data-tooltip="Allows autonomous queued workflow decisions. Leave off unless you intentionally want autopilot mode.">
+                <input id="autopilotEnabledRail" type="checkbox">
+                <span class="switchCopy"><strong>Autopilot</strong><small id="autopilotEnabledRailBadge">off</small></span>
+                <span class="toggleUi" aria-hidden="true"><span class="toggleTrack"><span class="toggleThumb"></span></span></span>
+              </label>
+              <label class="commandSwitch dangerSwitch hasTooltip" data-tooltip="Unlocks external browser, proxy, and profile actions. Keep locked until you are ready for real outside actions.">
+                <input id="armedForExternalActionsRail" type="checkbox">
+                <span class="switchCopy"><strong>External actions</strong><small id="armedForExternalActionsRailBadge">locked</small></span>
+                <span class="toggleUi" aria-hidden="true"><span class="toggleTrack"><span class="toggleThumb"></span></span></span>
+              </label>
+            </div>
+            <dl class="facts">
+              <div><dt>Heartbeat</dt><dd id="heartbeat">-</dd></div>
+              <div><dt>Active job</dt><dd id="activeJob">-</dd></div>
+              <div><dt>Hermes</dt><dd>WSL Ubuntu-24.04</dd></div>
+              <div><dt>State</dt><dd id="stateUpdated">-</dd></div>
+            </dl>
+          </section>
+
+          <section class="panel sidePanel" data-view="system" data-ux-tier="advanced">
+            <h2>Schedule Window</h2>
+            <label class="switch">
+              <input id="scheduleEnabled" type="checkbox">
+              <span>Use schedule window</span>
+            </label>
+            <label>Schedule timezone <input id="scheduleTimezone" spellcheck="false"></label>
+            <label>Run days <textarea id="runDays" spellcheck="false"></textarea></label>
+            <div class="two">
+              <label>Start <input id="startTime" type="time"></label>
+              <label>Stop <input id="stopTime" type="time"></label>
+            </div>
+          </section>
+
+          <section class="panel sidePanel" data-view="system" data-ux-tier="advanced">
+            <h2>Triggers & Memory</h2>
+            <label class="switch">
+              <input id="compactHermesPrompts" type="checkbox">
+              <span>Compact Hermes prompts</span>
+            </label>
+            <label class="switch">
+              <input id="includeMiroContext" type="checkbox">
+              <span>Include Miro context</span>
+            </label>
+            <label class="switch">
+              <input id="autoStartQueuedJobs" type="checkbox">
+              <span>Auto-start queued jobs</span>
+            </label>
+            <label class="switch">
+              <input id="pauseWhenSecurityWarnings" type="checkbox">
+              <span>Pause on security warnings</span>
+            </label>
+            <label class="switch">
+              <input id="pauseWhenExternalPortsChange" type="checkbox">
+              <span>Pause when exposed ports change</span>
+            </label>
+            <div class="two">
+              <label>Job timeout min <input id="maxJobRuntimeMinutes" type="number" min="1" max="240"></label>
+              <label>Max queued jobs <input id="maxQueuedJobs" type="number" min="1" max="200"></label>
+            </div>
+            <label>Heartbeat seconds <input id="heartbeatSeconds" type="number" min="3" max="120"></label>
+            <div class="two">
+              <label>URL lines <input id="maxPromptUrlLines" type="number" min="10" max="500"></label>
+              <label>Text lines <input id="maxPromptTextLines" type="number" min="10" max="1000"></label>
+            </div>
+            <label>Text line chars <input id="maxPromptTextLineLength" type="number" min="80" max="1000"></label>
+            <label>Memory notes <textarea id="memoryNotes"></textarea></label>
+            <label>Trigger notes <textarea id="triggerNotes"></textarea></label>
+          </section>
+
+          <section class="panel sidePanel" data-view="overview" data-ux-tier="advanced">
+            <h2>Quick Hermes Tasks</h2>
+            <div class="stack">
+              <button data-template="audit">Audit workflow state</button>
+              <button data-template="posting">Prepare posting checklist</button>
+              <button data-template="ip">Check IP/profile plan</button>
+              <button data-template="affiliate">Plan affiliate links</button>
+              <button data-template="product-images">Plan product images</button>
+              <button data-template="text-rotation">Check text rotation</button>
+              <button data-template="files">Design text file formats</button>
+            </div>
+          </section>
+
+          <section class="panel sidePanel" data-view="monitor">
+            <h2>Run Snapshot</h2>
+            <dl class="facts compactFacts">
+              <div><dt>Running</dt><dd id="monitorRunningCount">0</dd></div>
+              <div><dt>Queued</dt><dd id="monitorQueuedCount">0</dd></div>
+              <div><dt>Finished</dt><dd id="monitorFinishedCount">0</dd></div>
+              <div><dt>Issues</dt><dd id="monitorIssueCount">0</dd></div>
+            </dl>
+          </section>
+
+          <section class="panel sidePanel" data-view="approvals">
+            <h2>Approval Snapshot</h2>
+            <dl class="facts compactFacts">
+              <div><dt>Pending</dt><dd id="approvalPendingCountRail">0</dd></div>
+              <div><dt>Queued</dt><dd id="approvalQueuedCountRail">0</dd></div>
+              <div><dt>History</dt><dd id="approvalHistoryCountRail">0</dd></div>
+            </dl>
+          </section>
+        </aside>
+
+        <section class="mainGrid">
+          <section class="panel wide heroPanel tabLead" data-view="overview">
+            <div class="panelHead">
+              <div>
+                <h2>Readiness</h2>
+                <p>Everything important before Hermes receives or runs todos.</p>
+              </div>
+              <button id="queueBtn" class="primary">Queue Todo</button>
+            </div>
+            <div id="readinessGrid" class="readinessGrid"></div>
+          </section>
+
+          <section class="panel wide systemControlPanel" data-view="overview">
+            <div class="panelHead">
+              <div>
+                <h2>Safety Snapshot</h2>
+                <p>Live state for the worker, approval gate, autopilot, and external action lock.</p>
+              </div>
+              <span id="systemPowerBadge" class="badge safe">system off</span>
+            </div>
+            <div id="safetySnapshotGrid" class="safetySnapshotGrid"></div>
+          </section>
+
+          <section class="panel wide" data-view="overview">
+            <div class="panelHead">
+              <div>
+                <h2>Analytics</h2>
+                <p>Operational snapshot for queue health, profile capacity, product assets, text rotation, and security posture.</p>
+              </div>
+              <span id="analyticsUpdated" class="badge">live</span>
+            </div>
+            <div id="analyticsGrid" class="analyticsGrid"></div>
+          </section>
+
+          <section class="panel wide monitorHero tabLead" data-view="monitor">
+            <div class="panelHead">
+              <div>
+                <h2>Tasks & Logs</h2>
+                <p>Live queue, current Hermes task, per-task progress, and recent system events.</p>
+              </div>
+              <div class="miniActions">
+                <button id="refreshMonitorBtn">Refresh</button>
+                <button id="clearBtnMonitor">Clear Finished</button>
+              </div>
+            </div>
+            <div id="runMonitorSummary" class="monitorSummary"></div>
+            <div id="activeJobPanel" class="activeRun"></div>
+          </section>
+
+          <section class="panel wide monitorApprovalStrip" data-view="monitor">
+            <div>
+              <h2>Need to validate something?</h2>
+              <p>Queued tasks are not approvals yet. Start/run a Hermes task first; when Hermes finishes a plan that needs validation, it appears in Approvals.</p>
+            </div>
+            <div class="approvalRouteStats">
+              <span><b id="monitorApprovalPending">0</b> pending validation</span>
+              <span><b id="monitorApprovalQueued">0</b> queued tasks</span>
+              <button class="primary" data-view-target="approvals" type="button">Open Approvals</button>
+            </div>
+          </section>
+
+          <section class="panel wide" data-view="monitor">
+            <div class="panelHead">
+              <div>
+                <h2>Queue & Task Progress</h2>
+                <p>Each task is shown separately with status, runtime, queue position, and its own progress bar.</p>
+              </div>
+              <span id="queueUpdated" class="badge">live</span>
+            </div>
+            <div id="jobTimeline" class="jobTimeline"></div>
+          </section>
+
+          <section class="panel wide" data-view="monitor">
+            <div class="panelHead">
+              <div>
+                <h2>Live Event Log</h2>
+                <p>Newest local dashboard and integration events, newest first.</p>
+              </div>
+              <span id="eventCountBadge" class="badge">0 events</span>
+            </div>
+            <div id="eventTimeline" class="eventTimeline"></div>
+          </section>
+
+          <section class="panel wide approvalHero tabLead" data-view="approvals">
+            <div class="panelHead">
+              <div>
+                <h2>Human Approval Center</h2>
+                <p>Validate Hermes plans and manual-review items here. Approve/Reject only records your decision; it does not perform external actions.</p>
+              </div>
+              <div class="miniActions">
+                <span id="approvalStatusBadge" class="badge">0 pending</span>
+                <button id="refreshApprovalsBtn">Refresh</button>
+              </div>
+            </div>
+            <div id="approvalSummaryGrid" class="approvalSummaryGrid"></div>
+          </section>
+
+          <section class="panel wide" data-view="approvals">
+            <div class="panelHead">
+              <div>
+                <h2>Pending Validation</h2>
+                <p>These items need human approval before they should be treated as accepted.</p>
+              </div>
+              <span id="pendingApprovalBadge" class="badge">0 items</span>
+            </div>
+            <div id="approvalQueue" class="approvalQueue"></div>
+          </section>
+
+          <section class="panel wide" data-view="approvals">
+            <div class="panelHead">
+              <div>
+                <h2>Queued Hermes Tasks</h2>
+                <p>Approve tasks here first. With Human Approval on, Start Next only runs queued tasks approved by you.</p>
+              </div>
+              <div class="miniActions">
+                <span id="approvalQueuedBadge" class="badge">0 queued</span>
+                <button id="approveAllQueuedBtn" class="primary">Approve All Queued</button>
+              </div>
+            </div>
+            <div id="approvalTaskQueue" class="approvalQueue compactApprovalQueue"></div>
+          </section>
+
+          <section class="panel wide" data-view="approvals" data-ux-tier="advanced">
+            <div class="panelHead">
+              <div>
+                <h2>Approval History</h2>
+                <p>Recent local approval/rejection decisions.</p>
+              </div>
+              <span id="approvalHistoryBadge" class="badge">0 decisions</span>
+            </div>
+            <div id="approvalHistory" class="approvalQueue compactApprovalQueue"></div>
+          </section>
+
+          <section class="panel wide" data-view="overview">
+            <div class="panelHead">
+              <div>
+                <h2>Comment Review Queue</h2>
+                <p>Profiles marked as unable to comment are removed from active work until manual review.</p>
+              </div>
+              <span id="commentLimitCount" class="badge">0 blocked</span>
+            </div>
+            <div id="commentLimitOverview" class="reviewQueue"></div>
+          </section>
+
+          <section class="panel wide" data-view="overview">
+            <div class="panelHead">
+              <div>
+                <h2>Blocked / Restricted Profiles</h2>
+                <p>Profiles auto-blacklisted after a detected account block or repeated post failures (excluded until cleared), plus profiles on a 48h comment cooldown after a comment failed/was auto-removed (auto-retried after the window).</p>
+              </div>
+              <span id="blockedProfilesCount" class="badge">0 blocked</span>
+            </div>
+            <div id="blockedProfilesPanel" class="reviewQueue"></div>
+          </section>
+
+          <section class="panel wide" data-view="overview" data-ux-tier="advanced">
+            <h2>Workflow Map</h2>
+            <div class="flowMap">
+              <div><strong>Deal source</strong><span>Walmart filters + activity signal</span></div>
+              <div><strong>Product media</strong><span>Review images + text rotation</span></div>
+              <div><strong>Shortlinks</strong><span>Prepared source URLs</span></div>
+              <div><strong>Profiles</strong><span>IXBrowser + Webshare IP</span></div>
+              <div><strong>Posting</strong><span>Groups, comments, images</span></div>
+              <div><strong>Moderator</strong><span>Pending posts approval</span></div>
+              <div><strong>Registers</strong><span>Limits, errors, failed IPs</span></div>
+            </div>
+          </section>
+
+          <section class="panel wide credentialsLead tabLead" data-view="credentials">
+            <div class="panelHead">
+              <div>
+                <h2>Credentials & API Keys</h2>
+                <p>Secrets are saved locally in `data/secrets.local.json`, masked in the UI, and never sent to Hermes prompts.</p>
+              </div>
+              <div class="miniActions">
+                <span id="secretStatus" class="saveState clean">Secrets saved</span>
+                <button id="saveSecretsBtn" class="primary">Save Secrets</button>
+              </div>
+            </div>
+            <div class="integrationStageGrid" aria-label="Credential setup order">
+              <div><strong>1. Save Keys</strong><span>Webshare, IXBrowser, Mavlynk, Firecrawl, and optional AI providers.</span></div>
+              <div><strong>2. Check APIs</strong><span>Run config checks before opening profiles or applying proxies.</span></div>
+              <div><strong>3. Lock SYL Profile</strong><span>Keep ShopYourLikes on its dedicated IXBrowser profile and fixed proxy.</span></div>
+            </div>
+            <div class="securityNote">
+              Type a new key to replace a saved key. Leave the field blank to keep the saved key. Tick a clear box and save to remove that key. Do not store Facebook passwords, cookies, or session tokens here.
+            </div>
+            <div class="secretGrid">
+              <input id="shopyourlikesApiKey" data-secret="true" type="hidden" autocomplete="off">
+              <input id="shopyourlikesClearKey" data-secret="true" type="checkbox" hidden>
+              <input id="shopyourlikesPublisherId" data-secret="true" type="hidden" spellcheck="false">
+              <input id="shopyourlikesBaseUrl" data-secret="true" type="hidden" spellcheck="false">
+              <div class="secretGroup essential">
+                <div class="secretGroupHead">
+                  <strong>Core Workflow Services</strong>
+                  <span>Required for proxy inventory, IXBrowser control, product assets, and Mavlynk shortlinks.</span>
+                </div>
+                <div class="secretFields">
+                  <label>Webshare API key <input id="webshareApiKey" data-secret="true" type="password" autocomplete="off" placeholder="Token from Webshare - leave blank to keep saved"></label>
+                  <label class="switch line secretClear"><input id="webshareClearKey" data-secret="true" type="checkbox"><span>Clear saved Webshare key</span></label>
+                  <label>Webshare mode
+                    <select id="webshareMode" data-secret="true">
+                      <option value="direct">direct</option>
+                      <option value="backbone">backbone</option>
+                    </select>
+                  </label>
+                  <label>Webshare base URL <input id="webshareBaseUrl" data-secret="true" spellcheck="false"></label>
+                  <label>Webshare notes <input id="webshareSecretNotes" data-secret="true"></label>
+                  <label>Proxy provider name <input id="proxyProviderName" data-secret="true"></label>
+                  <label>Proxy provider API key <input id="proxyProviderApiKey" data-secret="true" type="password" autocomplete="off" placeholder="Usually same as Webshare if used"></label>
+                  <label class="switch line secretClear"><input id="proxyProviderClearKey" data-secret="true" type="checkbox"><span>Clear saved proxy key</span></label>
+                  <label>IXBrowser local API URL <input id="ixbrowserBaseUrl" data-secret="true" spellcheck="false" placeholder="http://127.0.0.1:53200/api/v2"></label>
+                  <label>IXBrowser token (optional) <input id="ixbrowserApiKey" data-secret="true" type="password" autocomplete="off" placeholder="Leave blank for local API"></label>
+                  <label class="switch line secretClear"><input id="ixbrowserClearKey" data-secret="true" type="checkbox"><span>Clear saved IXBrowser token</span></label>
+                  <label>Shortlink provider <input id="shortlinkProviderName" data-secret="true"></label>
+                  <label>Mavlynk API key <input id="shortlinkApiKey" data-secret="true" type="password" autocomplete="off" placeholder="Mavlynk API key"></label>
+                  <label class="switch line secretClear"><input id="shortlinkClearKey" data-secret="true" type="checkbox"><span>Clear saved Mavlynk key</span></label>
+                  <label>Mavlynk API URL <input id="shortlinkBaseUrl" data-secret="true" spellcheck="false"></label>
+                  <label class="span2">Firecrawl API keys — one per line; auto-fallback when one runs out of credits. Optional per-key IP proxy: add <code>| http://user:pass@host:port</code> after a key. <textarea id="firecrawlApiKey" data-secret="true" rows="4" autocomplete="off" spellcheck="false" placeholder="fc-xxxxxxxx&#10;fc-yyyyyyyy | http://user:pass@host:port&#10;(add more keys for automatic fallback)"></textarea></label>
+                  <label class="switch line secretClear"><input id="firecrawlClearKey" data-secret="true" type="checkbox"><span>Clear saved Firecrawl key</span></label>
+                  <label>Firecrawl API URL <input id="firecrawlBaseUrl" data-secret="true" spellcheck="false" placeholder="https://api.firecrawl.dev/"></label>
+                </div>
+              </div>
+              <div class="secretGroup">
+                <div class="secretGroupHead">
+                  <strong>Optional AI Providers</strong>
+                  <span>Kept separate from the browser-based ChatGPT HD image workflow.</span>
+                </div>
+                <div class="secretFields compactFields">
+                  <label>OpenAI API key <input id="openaiApiKey" data-secret="true" type="password" autocomplete="off" placeholder="Optional - leave blank to keep saved"></label>
+                  <label class="switch line secretClear"><input id="openaiClearKey" data-secret="true" type="checkbox"><span>Clear saved OpenAI key</span></label>
+                  <label>OpenAI notes <input id="openaiNotes" data-secret="true"></label>
+                  <label>OpenRouter API key <input id="openrouterApiKey" data-secret="true" type="password" autocomplete="off" placeholder="Optional - leave blank to keep saved"></label>
+                  <label class="switch line secretClear"><input id="openrouterClearKey" data-secret="true" type="checkbox"><span>Clear saved OpenRouter key</span></label>
+                  <label>OpenRouter notes <input id="openrouterNotes" data-secret="true"></label>
+                </div>
+              </div>
+              <div class="secretGroup proxyGroup">
+                <div class="secretGroupHead">
+                  <strong>Dedicated ShopYourLikes Proxy</strong>
+                  <span>Used only for the fixed SYL/Mavlynk profile; normal Facebook profiles stay separate.</span>
+                </div>
+                <div class="secretFields compactFields">
+                  <label>Affiliate proxy host <input id="affiliateProxyHost" data-secret="true" spellcheck="false" placeholder="Static proxy host/IP"></label>
+                  <label>Affiliate proxy port <input id="affiliateProxyPort" data-secret="true" spellcheck="false" placeholder="Proxy port"></label>
+                  <label>Affiliate proxy username <input id="affiliateProxyUsername" data-secret="true" spellcheck="false" autocomplete="off"></label>
+                  <label>Affiliate proxy password <input id="affiliateProxyPassword" data-secret="true" type="password" autocomplete="off"></label>
+                  <label class="switch line secretClear"><input id="affiliateProxyClearKey" data-secret="true" type="checkbox"><span>Clear affiliate proxy credentials</span></label>
+                </div>
+              </div>
+            </div>
+            <div id="secretSummary" class="secretSummary"></div>
+          </section>
+
+          <section class="panel wide integrationOps tabLead" data-view="integrations">
+            <div class="panelHead">
+              <div>
+                <h2>Browser & Proxy Control</h2>
+                <p>Read-only checks work anytime. Opening profiles and applying proxies require the external-action arm switch.</p>
+              </div>
+            </div>
+            <div class="integrationToolbar" aria-label="Integration checks">
+              <button id="checkIntegrationHealthBtn" class="primary">Check API Config</button>
+              <button id="testWebshareBtn">Test Webshare</button>
+              <button id="loadWebshareProxiesBtn">Load Proxies</button>
+              <button id="testIxBtn">Test IXBrowser</button>
+              <button id="loadIxProfilesBtn">Load Profiles</button>
+            </div>
+            <div class="integrationWorkBlock">
+              <div class="workBlockHead">
+                <strong>Facebook Posting Profiles</strong>
+                <span>Open, close, and proxy-test only the selected work profile. The dedicated ShopYourLikes profile is handled separately below.</span>
+              </div>
+              <div class="integrationFormGrid">
+                <label>IXBrowser profile
+                  <select id="ixProfileSelect"></select>
+                </label>
+                <label>Webshare proxy
+                  <select id="webshareProxySelect"></select>
+                </label>
+              </div>
+              <div class="integrationButtonGrid">
+                <button id="openIxProfileBtn" class="primary">Open Profile</button>
+                <button id="openIxAssignedGroupBtn" class="primary">Open Assigned Group</button>
+                <button id="closeIxProfileBtn">Close Profile</button>
+                <button id="applyProxyToProfileBtn">Apply Proxy To Profile</button>
+                <button id="applyOneAttemptProxyBtn">Apply As 1 Comment Attempt</button>
+              </div>
+            </div>
+            <div class="integrationWorkBlock sylProfileBlock">
+              <div class="workBlockHead">
+                <div>
+                  <strong>Dedicated ShopYourLikes IXBrowser Profile</strong>
+                  <span>Select one IXBrowser profile for the ShopYourLikes extension/login. Keep it separate from Facebook posting profiles and do not rotate its IP automatically.</span>
+                </div>
+              </div>
+              <div class="integrationFormGrid">
+                <label>ShopYourLikes IXBrowser profile
+                  <select id="shopyourlikesIxProfileSelect">
+                    <option value="">Click Load Profiles first</option>
+                  </select>
+                </label>
+                <label>ShopYourLikes proxy
+                  <select id="shopyourlikesBrowserProxySelect"></select>
+                </label>
+                <label>Saved SYL IX profile ID <input id="dedicatedIxProfileId" spellcheck="false" placeholder="Selected IX profile id"></label>
+                <label>Saved SYL IX profile name <input id="dedicatedIxProfileName" spellcheck="false" placeholder="Selected IX profile name"></label>
+                <label>Start URL <input id="shopyourlikesBrowserStartUrl" spellcheck="false" placeholder="https://www.shopyourlikes.com/"></label>
+                <label>Profile path <input id="shopyourlikesBrowserProfilePath" spellcheck="false" placeholder="data/shopyourlikes-browser-profile"></label>
+                <label class="switch line"><input id="shopyourlikesBrowserUseProxy" type="checkbox"><span>Use selected dedicated proxy/IP</span></label>
+              </div>
+              <div class="integrationButtonGrid">
+                <button id="saveShopYourLikesIxProfileBtn">Save Selected SYL IX Profile</button>
+                <button id="openShopYourLikesIxProfileBtn" class="primary">Open SYL IX Profile</button>
+                <button id="openShopYourLikesBrowserBtn">Open Legacy Local Edge SYL Browser</button>
+                <button id="closeShopYourLikesBrowserBtn">Close Legacy Local Edge SYL Browser</button>
+                <button id="testShopYourLikesProxyBtn">Test SYL Proxy</button>
+              </div>
+              <div id="shopYourLikesBrowserStatus" class="inlineNotice neutral">Install the ShopYourLikes extension manually once in this browser profile, then reuse it.</div>
+            </div>
+            <div id="ixSessionStatus" class="inlineNotice neutral">IXBrowser profiles appear below after Test IXBrowser and Load Profiles succeed.</div>
+            <div class="splitOutput">
+              <pre id="integrationOutput" class="events">No integration calls yet.</pre>
+              <div id="proxyProfileLists" class="miniLists"></div>
+            </div>
+          </section>
+
+          <section class="panel wide systemLead tabLead" data-view="system">
+            <div class="panelHead">
+              <div>
+                <h2>Security Audit</h2>
+                <p>Read-only check of dashboard binding, Windows listening ports, firewall profiles, and local agent processes.</p>
+              </div>
+              <button id="runSecurityAuditBtn" class="primary">Run Local Audit</button>
+            </div>
+            <div class="securityStatusGrid">
+              <div><strong>Dashboard host</strong><span id="securityDashboardHost">-</span></div>
+              <div><strong>Last audit</strong><span id="securityLastAuditAt">-</span></div>
+              <div><strong>Token gate</strong><span id="securityTokenGate">-</span></div>
+              <div><strong>Cross-origin</strong><span id="securityOriginGate">-</span></div>
+            </div>
+            <pre id="securityAuditOutput" class="events">Run the audit to review local ports and machine-level exposure.</pre>
+          </section>
+
+          <section class="panel wide" data-view="overview" data-ux-tier="advanced">
+            <div class="panelHead">
+              <h2>New Todo For Hermes</h2>
+              <span class="hint">Plan first. External actions stay locked unless you arm them.</span>
+            </div>
+            <div class="composeGrid">
+              <label>Title <input id="jobTitle" value="Plan next Facebook agent step"></label>
+              <label>Mode
+                <select id="jobMode">
+                  <option value="plan">Plan only</option>
+                  <option value="execute">Execute safe local work</option>
+                </select>
+              </label>
+              <label class="span2">Task
+                <textarea id="jobText" placeholder="Example: Use the dashboard state and Miro schema to produce the next approval-gated step."></textarea>
+              </label>
+            </div>
+          </section>
+
+          <section class="panel postingLead tabLead postingIntro" data-view="posting">
+            <div class="panelHead">
+              <div>
+                <h2>Production Posting</h2>
+                <p>Four steps. Configure once, then run the full live pipeline.</p>
+              </div>
+            </div>
+            <ol class="prodStepsTrail" aria-label="Production steps">
+              <li><b>1</b><strong>Rules</strong><span>Timing &amp; pause guards</span></li>
+              <li><b>2</b><strong>Inputs</strong><span>Groups, sources, comment</span></li>
+              <li><b>3</b><strong>Assign</strong><span>Profiles &#x2192; groups</span></li>
+              <li><b>4</b><strong>Run</strong><span>Live posting &amp; status</span></li>
+            </ol>
+          </section>
+
+          <section class="panel prodStep" data-view="posting" data-prod-step="1">
+            <div class="panelHead">
+              <div>
+                <span class="stepBadge">Step 1</span>
+                <h2>Posting Rules</h2>
+                <p>Cadence, link placement, and when the workflow pauses itself.</p>
+              </div>
+            </div>
+            <div class="formGrid">
+              <label>Peak timezone <input id="peakHoursTimezone"></label>
+              <label>Peak start <input id="peakStartTime" type="time"></label>
+              <label>Peak stop <input id="peakStopTime" type="time"></label>
+              <label>Posts per profile/day <input id="postsPerProfilePerDay" type="number" min="1" max="100"></label>
+              <label>Move account after comments <input id="commentsBeforeAccountMove" type="number" min="1" max="100"></label>
+              <label>Link placement <input id="linkPlacement"></label>
+              <label data-ux-tier="advanced" class="switch line"><input id="randomMinutesBetweenPosts" type="checkbox"><span>Randomize minutes between posts</span></label>
+              <label data-ux-tier="advanced">Fallback fixed minutes <input id="minutesBetweenPosts" type="number" min="1" max="1440"></label>
+              <label data-ux-tier="advanced">Minimum minutes <input id="minMinutesBetweenPosts" type="number" min="1" max="1440"></label>
+              <label data-ux-tier="advanced">Maximum minutes <input id="maxMinutesBetweenPosts" type="number" min="1" max="1440"></label>
+              <label data-ux-tier="advanced">Save account after comments <input id="maxCommentsBeforeAccountSave" type="number" min="1" max="500"></label>
+              <label data-ux-tier="advanced">Required deal signal <input id="requireDealSignal"></label>
+            </div>
+            <div class="checks">
+              <label class="switch"><input id="pauseOnErrors" type="checkbox"><span>Pause on errors</span></label>
+              <label class="switch" data-ux-tier="advanced"><input id="pinFirstComment" type="checkbox"><span>Pin first comment</span></label>
+              <label class="switch" data-ux-tier="advanced"><input id="postBodyLinkAllowed" type="checkbox"><span>Allow link in post body</span></label>
+              <label class="switch" data-ux-tier="advanced"><input id="pauseOnInvalidProxy" type="checkbox"><span>Pause on invalid proxy</span></label>
+              <label class="switch" data-ux-tier="advanced"><input id="pauseOnLimitedAccount" type="checkbox"><span>Pause on limited account</span></label>
+            </div>
+          </section>
+
+          <section class="panel prodStep" data-view="posting" data-prod-step="2">
+            <div class="panelHead">
+              <div>
+                <span class="stepBadge">Step 2</span>
+                <h2>Inputs</h2>
+                <p>Groups, source URLs, shortlinks, and the first-comment template.</p>
+              </div>
+            </div>
+            <div class="formGrid">
+              <div class="inlineAction span2">
+                <input id="groupUrlInput" placeholder="Paste one Facebook group URL">
+                <button id="addGroupUrlBtn">Add Group URL</button>
+              </div>
+              <label class="span2">Groups URLs <textarea id="groups" spellcheck="false"></textarea></label>
+              <label>Source URLs <textarea id="sourceUrls" spellcheck="false"></textarea></label>
+              <label>Shortlinks <textarea id="shortlinks" spellcheck="false"></textarea></label>
+              <label class="span2">First comment template <textarea id="commentTemplate"></textarea></label>
+              <label data-ux-tier="advanced">Moderator approval notes <textarea id="moderatorAccountNotes" placeholder="Optional group-specific rules. Moderator accounts are configured in Profiles and are used only to approve pending posts."></textarea></label>
+              <label data-ux-tier="advanced">Owned groups by profile <textarea id="ownedGroupsByProfile" spellcheck="false"></textarea></label>
+              <label data-ux-tier="advanced">Facebook profile status <textarea id="facebookProfileStatus" spellcheck="false"></textarea></label>
+              <label data-ux-tier="advanced">Descriptions path <input id="readyDescriptionsPath"></label>
+              <label data-ux-tier="advanced">Images path <input id="readyImagesPath"></label>
+            </div>
+          </section>
+
+          <section class="panel wide tabLead" data-view="prod">
+            <div class="panelHead">
+              <h2>Production control center</h2>
+              <p class="muted">Live autonomous posting — status, safety, controls, and the pipeline steps. Cross-account comments and the no-photo skip are always on. The CPU governor keeps the box from starving the separate Pinterest agent.</p>
+            </div>
+            <div class="panelBody">
+              <div id="prodHeadline" style="font-size:1.1rem;font-weight:700;margin:.25rem 0 .75rem;">Loading production status…</div>
+              <div id="prodStatusGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.5rem;margin-bottom:1rem;"></div>
+              <h3>Controls</h3>
+              <div class="miniActions">
+                <button id="prodGoLiveBtn" class="primary mainTestButton" type="button">&#9654; Go Live</button>
+                <button id="prodPauseBtn" type="button">&#10073;&#10073; Pause (dry-run)</button>
+                <button id="prodEnableBtn" type="button">Enable autopilot</button>
+                <button id="prodDisableBtn" type="button">Disable autopilot</button>
+                <label class="hasTooltip" data-tooltip="Max profiles posting at once. The CPU governor still throttles to real headroom and yields to Pinterest, so 4 only runs when the box can take it.">Concurrency
+                  <select id="prodConcurrency" style="margin-left:.3rem;"><option value="2">2</option><option value="3">3</option><option value="4">4</option></select>
+                </label>
+              </div>
+              <h3 style="margin-top:1rem;">Pipeline actions</h3>
+              <div class="miniActions">
+                <button id="prodDiscoverBtn" type="button">1 &middot; Run discovery</button>
+                <button id="prodFillBtn" type="button">2 &middot; Fill buffer now</button>
+                <button id="prodTickBtn" type="button">3 &middot; Run one post tick</button>
+                <button id="prodRefreshBtn" type="button">&#8635; Refresh status</button>
+              </div>
+              <div id="prodActionResult" class="muted" style="margin-top:.5rem;min-height:1.2em;"></div>
+              <h3 style="margin-top:1rem;">Live pipeline</h3>
+              <div id="prodCurrentCycle" class="muted" style="margin-bottom:.5rem;">…</div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start;">
+                <div><div style="font-weight:600;margin-bottom:.3rem;">Activity — latest steps (live)</div><div id="prodActivityFeed" style="font-size:.82rem;max-height:300px;overflow:auto;border:1px solid #e3e6ea;border-radius:6px;padding:.4rem;background:#fafbfc;">…</div></div>
+                <div><div style="font-weight:600;margin-bottom:.3rem;">Recent landed posts</div><div id="prodRecentPosts" style="font-size:.82rem;max-height:300px;overflow:auto;border:1px solid #e3e6ea;border-radius:6px;padding:.4rem;background:#fafbfc;">…</div></div>
+              </div>
+              <h3 style="margin-top:1rem;">How production runs (each cycle)</h3>
+              <ol id="prodSteps" class="muted" style="line-height:1.5;padding-left:1.2rem;">
+                <li><b>Discovery</b> keeps the candidate pool fed from Walmart deal categories (toys, women's plus, garden, summer, home, kitchen, kids).</li>
+                <li><b>Buffer fill</b> (4-at-a-time, CPU-governed): per product it generates the ShopYourLikes link + Mavlynk shortlink + an approved customer-review image. Products with <b>no review photos are skipped for 14 days</b> (auto-retried), so the fill reaches photo-having products.</li>
+                <li><b>Autopilot tick</b> (every ~2 min): picks up to <i>Concurrency</i> eligible profiles (past their per-profile spacing) that have ready products and <b>publishes them in parallel</b> — opens staggered 8s apart, throttled by the CPU governor.</li>
+                <li>Each post is <b>publish-only</b>; then a <b>different random profile with group access</b> adds the first comment on the exact permalink (realism). No access &rarr; comment skipped, post kept.</li>
+                <li>Posts held for <b>moderator approval</b> are approved by a moderator profile (serialized, one at a time, time-bounded).</li>
+                <li>When the daily cap is reached it <b>prepares tomorrow's buffer</b>. The watchdog restarts the server if it goes down. The <b>Pinterest agent is never touched</b>.</li>
+              </ol>
+            </div>
+          </section>
+
+          <section class="panel wide testPostPanel" data-view="test">
+            <div class="panelHead">
+              <div>
+                <h2>1-Post Test & Published URL</h2>
+                <p>Run one complete test with one random profile and one random group. The connector publishes text + HD image, captures the Facebook post URL, then adds and pins the first comment.</p>
+              </div>
+              <div class="miniActions">
+                <button id="runRandomE2eTestHandoffBtn" class="primary mainTestButton">Run 1-Post Full Test</button>
+                <button id="runParallelTestBtn" class="primary mainTestButton">Run <span id="parallelTestCountLabel">3</span> Parallel Posts</button>
+                <label class="hasTooltip" data-tooltip="How many posts to publish at the SAME TIME in the test (default 3 = reliable sweet spot on this 9-core box). Worker opens are staggered 8s apart to avoid iX collisions.">Parallel <input id="parallelPostsInput" type="number" min="1" max="6" value="3" style="width:3.2rem"></label>
+                <button id="clearTestRunBtn">Stop / Clear Test</button>
+              </div>
+            </div>
+            <div class="prodRunSwitches">
+              <label class="switch line hasTooltip" data-tooltip="When OFF, the base review JPG is used directly. Faster. When ON, ChatGPT browser regenerates each image in HD/upright (slower).">
+                <input id="chatgptHdEnabledTest" data-mirror-of="chatgptHdEnabled" type="checkbox">
+                <span><strong id="chatgptHdEnabledTestLabel">ChatGPT HD image step: OFF (fast)</strong><small>Applies to test &amp; prod. Off = use base review image directly.</small></span>
+              </label>
+            </div>
+            <div class="testPostFlow">
+              <div><strong>Prepare</strong><span>Runs fresh discovery, image selection, HD image, ShopYourLikes, Mavlynk, then builds one row for the selected product.</span></div>
+              <div><strong>Post</strong><span>The live connector opens the selected IXBrowser profile, types the post text, uploads the HD image, and verifies the published post.</span></div>
+              <div><strong>Post URL</strong><span>The dashboard captures the verified Facebook permalink and stores it in logs and daily tracking before the comment step starts.</span></div>
+              <div><strong>Comment</strong><span>The connector opens the verified post URL, adds the first comment with the shortlink, and verifies the pin action when Facebook allows it.</span></div>
+            </div>
+            <div id="testPostProgress" class="currentProgress panelProgress idle" aria-live="polite">
+              <div class="currentProgressHead">
+                <strong id="testPostProgressTitle">Idle</strong>
+                <span id="testPostProgressPercent">0%</span>
+              </div>
+              <div class="currentProgressTrack"><i id="testPostProgressFill"></i></div>
+              <span id="testPostProgressDetail">Click Run 1-Post Full Test to start the workflow.</span>
+            </div>
+            <div id="testPipelineSteps" class="pipelineSteps" aria-live="polite"></div>
+            <div id="testRunResult" class="testRunResult inlineNotice neutral">No 1-post test result yet.</div>
+            <div id="testParallelLanes" aria-live="polite"></div>
+            <div class="formGrid">
+              <label class="span2">Published Facebook post URL <input id="publishedPostUrlInput" data-transient="true" spellcheck="false" placeholder="https://www.facebook.com/groups/.../posts/..."></label>
+              <label>Plan ID <input id="publishedPostPlanIdInput" data-transient="true" spellcheck="false" placeholder="Optional plan id"></label>
+              <label>Profile name / ID <input id="publishedPostProfileInput" data-transient="true" spellcheck="false" placeholder="Optional IXBrowser profile"></label>
+              <label class="span2">Group URL <input id="publishedPostGroupInput" data-transient="true" spellcheck="false" placeholder="Optional Facebook group URL"></label>
+              <div class="miniActions span2">
+                <button id="recordPublishedPostUrlBtn" class="primary">Record Facebook Post URL</button>
+                <button id="recoverFirstCommentBtn">Recover First Comment</button>
+              </div>
+            </div>
+            <div id="publishedPostUrlStatus" class="inlineNotice neutral">No Facebook post URL recorded in this browser session.</div>
+          </section>
+
+          <section class="panel wide prodStep" data-view="posting" data-prod-step="3">
+            <div class="panelHead">
+              <div>
+                <span class="stepBadge">Step 3</span>
+                <h2>Assign Profiles to Groups</h2>
+                <p>Build the matrix, then either split evenly or by percentage.</p>
+              </div>
+              <div class="miniActions">
+                <button id="buildGroupAssignmentsBtn">Build Matrix</button>
+                <button id="evenGroupSplitBtn">Even Split</button>
+                <button id="percentGroupSplitBtn" class="primary">Apply % Split</button>
+              </div>
+            </div>
+            <div id="groupAssignmentSummary" class="inlineNotice neutral">Add group URLs and profiles, then build the assignment matrix.</div>
+            <div class="assignmentPolicy" data-ux-tier="advanced">
+              <div><strong>Add groups anytime</strong><span>Use Posting Inputs or the Add Group field here. The matrix rebuilds from every saved group URL.</span></div>
+              <div><strong>Dispatch by percentage</strong><span>Set each group share, then Apply % Split to distribute profiles across the group URLs.</span></div>
+              <div><strong>Blocked group fallback</strong><span>If a profile cannot post in one group, the run should try another saved group. If no group works, skip that profile and log the profile name as an issue.</span></div>
+            </div>
+            <div class="assignmentTools">
+              <div class="inlineAction">
+                <input id="assignmentGroupUrlInput" placeholder="Add another Facebook group URL">
+                <button id="addAssignmentGroupUrlBtn">Add Group</button>
+              </div>
+              <button id="copyLoadedProfilesBtn">Use Loaded IX Profiles</button>
+              <button id="selectAllProfilesBtn" data-ux-tier="advanced">Select All Visible</button>
+              <button id="clearVisibleProfilesBtn" data-ux-tier="advanced">Clear Visible</button>
+            </div>
+            <div id="groupAssignmentBuilder" class="assignmentBuilder"></div>
+            <label class="assignmentOutput" data-ux-tier="advanced">Saved assignment plan
+              <textarea id="groupProfileAssignments" spellcheck="false" placeholder="The generated group/profile plan is saved here."></textarea>
+            </label>
+          </section>
+
+          <section class="panel wide prodStep prodRunStep" data-view="posting" data-prod-step="4">
+            <div class="panelHead">
+              <div>
+                <span class="stepBadge">Step 4</span>
+                <h2>Run Production</h2>
+                <p>Prep refreshes data. Start Live Full Run posts to all assigned groups end-to-end.</p>
+              </div>
+              <div class="miniActions">
+                <button id="runFullPrepPipelineBtn" class="ghostButton">Run Full Prep Pipeline</button>
+                <button id="preparePostingPlanBtn">Prepare Full Posting Plan</button>
+                <button id="runLiveFullPostingPlanBtn" class="danger">Start Live Full Run</button>
+              </div>
+            </div>
+            <div class="prodRunSwitches">
+              <label class="switch line hasTooltip" data-tooltip="When OFF, the base review JPG is used directly for posting. Saves 4-6 minutes per product. When ON, ChatGPT browser regenerates each image in HD/upright (slow).">
+                <input id="chatgptHdEnabledRail" data-mirror-of="chatgptHdEnabled" type="checkbox">
+                <span><strong id="chatgptHdEnabledRailLabel">ChatGPT HD image step: OFF (fast)</strong><small>Applies to test &amp; prod. Off = use base review image directly.</small></span>
+              </label>
+            </div>
+            <div class="prodRunChecklist" aria-label="Live run sequence">
+              <div><b>1</b><strong>Open profile</strong><span>IXBrowser launches the assigned posting profile.</span></div>
+              <div><b>2</b><strong>Compose &amp; post</strong><span>Types text, uploads selected image, clicks Post.</span></div>
+              <div><b>3</b><strong>Verify permalink</strong><span>Captures the newest post ID from the FB response.</span></div>
+              <div><b>4</b><strong>Approve if pending</strong><span>Moderator profile only if the post needs approval.</span></div>
+              <div><b>5</b><strong>Comment &amp; pin</strong><span>Same profile adds the Mavlynk shortlink comment.</span></div>
+            </div>
+          </section>
+
+          <section class="panel wide sourceBuilderPanel tabLead" data-view="content">
+            <div class="panelHead">
+              <div>
+                <h2>Product Source Finder</h2>
+                <p>Build daily source pages for Walmart now, while keeping the workflow editable for any retailer later.</p>
+              </div>
+              <div class="miniActions">
+                <button id="rebuildProductSourcesBtn">Rebuild URLs</button>
+                <button id="runProductDiscoveryBtn" class="primary">Discover Products</button>
+                <button id="openBrowserDiscoveryBtn">Open Local Browser</button>
+                <button id="captureBrowserDiscoveryBtn">Capture Local Page</button>
+                <button id="queueHermesBrowserBtn">Hermes Browser Task</button>
+                <button id="queueDealBtn">Plan Filters</button>
+              </div>
+            </div>
+            <div class="filterSwitchGrid">
+              <label class="switch line"><input id="productDiscoveryEnabled" type="checkbox"><span>Discovery enabled</span></label>
+              <label class="switch line"><input id="discoveryDailyRefreshEnabled" type="checkbox"><span>Daily refresh</span></label>
+              <label class="switch line"><input id="discoveryRequireProSeller" data-discovery-filter="true" type="checkbox"><span>Pro Sellers</span></label>
+              <label class="switch line"><input id="discoveryIncludeClearance" data-discovery-filter="true" type="checkbox"><span>Clearance</span></label>
+              <label class="switch line"><input id="discoveryIncludeReducedPrice" data-discovery-filter="true" type="checkbox"><span>Reduced Price</span></label>
+              <label class="switch line"><input id="discoveryIncludeRollback" data-discovery-filter="true" type="checkbox"><span>Rollback</span></label>
+            </div>
+            <div class="formGrid sourceGrid">
+              <label>Primary store <input id="discoveryPrimaryStore" spellcheck="false"></label>
+              <label>Minimum activity signal <input id="discoveryMinActivitySignal" spellcheck="false"></label>
+              <label>Local browser source URL <input id="browserDiscoverySourceUrl" data-transient="true" spellcheck="false" placeholder="Use generated Walmart URL, then solve human check manually if shown"></label>
+              <label>Discovery browser <input value="Local Edge only - IXBrowser is reserved for Facebook profiles" readonly></label>
+              <label>Assigned profiles <input id="discoveryAssignedProfileCount" readonly></label>
+              <label>Daily post target <input id="discoveryDailyPostTarget" readonly></label>
+              <label>Candidate buffer % <input id="discoveryCandidateBufferPercent" type="number" min="0" max="300"></label>
+              <label>Daily candidate target <input id="discoveryTargetCandidateCount" readonly></label>
+              <label>Allowed retailer domains <textarea id="discoveryAllowedRetailers" spellcheck="false"></textarea></label>
+              <label>Walmart category/source URLs <textarea id="walmartCategorySources" data-discovery-source="true" spellcheck="false" placeholder="Name | URL, one per line"></textarea></label>
+              <label>Walmart search queries <textarea id="walmartSearchQueries" data-discovery-source="true" spellcheck="false" placeholder="One query per line, like garden or summer"></textarea></label>
+              <label>Other store source URLs <textarea id="otherStoreSourceUrls" data-discovery-source="true" spellcheck="false" placeholder="Amazon, Target, or any store discovery URLs, one per line"></textarea></label>
+              <label class="span2">Generated daily source URLs <textarea id="generatedSourceUrls" spellcheck="false"></textarea></label>
+              <label class="span2">Ranking rules <textarea id="discoveryRankingRules" spellcheck="false"></textarea></label>
+              <label class="span2">Source notes <textarea id="productDiscoveryNotes"></textarea></label>
+            </div>
+          </section>
+
+          <section class="panel wide" data-view="content">
+            <div class="panelHead">
+              <div>
+                <h2>Product Page Assets</h2>
+              <p>Hermes should inspect each product page, collect five positive customer review image candidates, select the best one, send it to ChatGPT HD for upright rotation if needed, and use the downloaded HD image for the Facebook plan.</p>
+              </div>
+              <div class="miniActions">
+                <button id="prepareProductAssetsBtn" class="primary">Prepare Asset Checks</button>
+                <button id="openProductAssetsFolderBtn">Open Image Folder</button>
+                <button id="queueProductImagesBtn">Plan Image Capture</button>
+              </div>
+            </div>
+            <div class="formGrid">
+              <label class="switch line"><input id="productAssetsEnabled" type="checkbox"><span>Product image workflow enabled</span></label>
+              <label class="switch line"><input id="productAssetsApprovalRequired" type="checkbox"><span>Require human approval for selected images</span></label>
+              <label>Product URLs <textarea id="productUrls" spellcheck="false" placeholder="One product page URL per line. Source method comes later."></textarea></label>
+              <label>Review image candidates <textarea id="reviewImageCandidates" spellcheck="false" placeholder="Detected candidate source URLs. Prepare Product Assets collects up to 5, then Hermes selects the best one."></textarea></label>
+              <label>Candidates reviewed <input id="reviewCandidateCount" type="number" min="1" max="5" readonly></label>
+              <label>Final images per product <input id="reviewImagesPerProduct" type="number" min="1" max="1" readonly></label>
+              <label>Minimum review stars <input id="minReviewRating" type="number" min="1" max="5"></label>
+              <label>Preferred review stars <input id="preferredReviewRating" type="number" min="1" max="5"></label>
+              <label>Assets output path <input id="productAssetsOutputPath" spellcheck="false"></label>
+              <label class="switch line"><input id="chatgptHdEnabled" type="checkbox"><span>ChatGPT HD image step (applies to test &amp; prod) &#8212; off uses base review image directly (much faster)</span></label>
+              <label>ChatGPT CDP endpoint <input id="chatgptEdgeCdp" spellcheck="false"></label>
+              <label>ChatGPT Edge user data <input id="chatgptEdgeUserDataDir" spellcheck="false"></label>
+              <label>ChatGPT Edge profile <input id="chatgptEdgeProfileDirectory" spellcheck="false"></label>
+              <label class="switch line"><input id="requireCustomerReviewImages" type="checkbox"><span>Use customer review images</span></label>
+              <label class="switch line"><input id="requireRealisticImages" type="checkbox"><span>Reject stock/duplicate-looking images</span></label>
+              <label class="switch line"><input id="requirePositiveReviewsOnly" type="checkbox"><span>Only images from positive reviews</span></label>
+              <label>Selected Facebook image <textarea id="selectedReviewImages" spellcheck="false" placeholder="Auto-filled by Prepare Product Assets: Hermes-selected local .jpg/.png review image per product, pending human approval when HD is not ready."></textarea></label>
+              <label>Product asset notes <textarea id="productAssetsNotes"></textarea></label>
+            </div>
+          </section>
+
+          <section class="panel wide workflowOutputPanel" data-view="content posting test operations">
+            <div class="panelHead">
+              <div>
+                <h2>Prepared Workflow Output</h2>
+                <p>Local discovery, asset-check, and posting-plan actions write files here and add approval items.</p>
+              </div>
+              <button id="clearWorkflowOutputBtn">Clear</button>
+            </div>
+            <pre id="workflowActionOutput" class="events">No workflow action has run in this browser session.</pre>
+          </section>
+
+          <section class="panel wide" data-view="content">
+            <div class="panelHead">
+              <div>
+                <h2>Text Rotation</h2>
+                <p>Paste one text per line. The agent uses lines in order so Facebook posts and pinned first comments do not repeat.</p>
+              </div>
+              <button id="queueTextRotationBtn">Check Rotation</button>
+            </div>
+            <div class="formGrid">
+              <label class="switch line"><input id="usePostTextsInOrder" type="checkbox"><span>Use post texts in order</span></label>
+              <label class="switch line"><input id="avoidPostTextReuse" type="checkbox"><span>Avoid post text reuse</span></label>
+              <label>Facebook post texts <textarea id="postTexts" spellcheck="false" placeholder="One Facebook post body per line. No link in the post body."></textarea></label>
+              <div id="textEmojiStatus" class="hint span2">Emoji check runs after the dashboard state loads.</div>
+              <label>First comment lead-ins <textarea id="commentLeadIns" spellcheck="false" placeholder="One expression per line before the Mavlynk link."></textarea></label>
+              <label>Next post text line <input id="postTextCursor" type="number" min="0"></label>
+              <label>Next comment lead-in line <input id="commentLeadInCursor" type="number" min="0"></label>
+              <label class="switch line"><input id="useCommentLeadInsInOrder" type="checkbox"><span>Use comment lead-ins in order</span></label>
+              <label class="switch line"><input id="avoidCommentLeadInReuse" type="checkbox"><span>Avoid comment lead-in reuse</span></label>
+              <label class="span2">Rotation notes <textarea id="contentRotationNotes"></textarea></label>
+            </div>
+          </section>
+
+          <section class="panel" data-view="content" data-ux-tier="advanced">
+            <div class="panelHead">
+              <h2>Deal Source</h2>
+              <span class="hint">Legacy summary fields kept for prompt compatibility.</span>
+            </div>
+            <div class="formGrid">
+              <label>Source <input id="dealSourceName"></label>
+              <label>Allowed retailers <textarea id="allowedRetailers" spellcheck="false"></textarea></label>
+              <label>Selected filters <input id="selectedFilters"></label>
+              <label>Price <input id="priceFilter"></label>
+              <label>Brand <input id="brandFilter"></label>
+              <label>Color <input id="colorFilter"></label>
+              <label>Category <input id="categoryFilter"></label>
+              <label class="span2">Notes <textarea id="dealNotes"></textarea></label>
+            </div>
+          </section>
+
+          <section class="panel wide affiliateLead tabLead" data-view="affiliate">
+            <div class="panelHead">
+              <div>
+                <h2>Affiliate & Shortlink Pipeline</h2>
+                <p>Generate ShopYourLikes links through the fixed IXBrowser profile, then shorten the final posting URL with Mavlynk.</p>
+              </div>
+            </div>
+            <div class="formGrid">
+              <label class="switch line"><input id="affiliateEnabled" type="checkbox"><span>ShopYourLikes enabled</span></label>
+              <label>Affiliate service <input id="affiliateService"></label>
+              <label class="switch line"><input id="affiliateProxyEnabled" type="checkbox"><span>Reserve dedicated US proxy/IP for ShopYourLikes browser profile</span></label>
+              <label class="switch line"><input id="affiliateProxyStaticOnly" type="checkbox"><span>Require static/private proxy</span></label>
+              <label>Affiliate proxy country <input id="affiliateProxyRequiredCountry" maxlength="2" spellcheck="false"></label>
+              <label>Affiliate proxy status <input id="affiliateProxyStatus" readonly></label>
+              <label class="switch line"><input id="affiliateProxyApiRequestsMustUseProxy" type="checkbox"><span>Require dedicated proxy before ShopYourLikes actions</span></label>
+              <label class="switch line"><input id="affiliateApiRequestsUseDedicatedProxy" type="checkbox"><span>ShopYourLikes browser uses this proxy</span></label>
+              <label class="switch line"><input id="shortlinkApiRequestsUseAffiliateProxy" type="checkbox"><span>Force Mavlynk through this proxy</span></label>
+              <label class="switch line"><input id="affiliateProxyLockedToSelectedProxy" type="checkbox"><span>Lock to selected proxy</span></label>
+              <label>Selected proxy ID <input id="affiliateProxySelectedProxyId" readonly></label>
+              <label>Selected proxy address <input id="affiliateProxyAddress" readonly></label>
+              <label>Selected proxy port <input id="affiliateProxyPortState" readonly></label>
+              <label>Last observed IP <input id="affiliateProxyLastObservedIp" readonly></label>
+              <label>Last observed country <input id="affiliateProxyLastObservedCountry" readonly></label>
+              <div class="miniActions span2">
+                <button id="assignAffiliateProxyBtn">Assign US Webshare Proxy</button>
+                <button id="testAffiliateProxyBtn">Test Affiliate Proxy</button>
+              </div>
+              <label class="switch line"><input id="useDedicatedIxProfile" type="checkbox"><span>Use fixed IXBrowser profile for ShopYourLikes</span></label>
+              <label class="switch line"><input id="dedicatedIxProfileFixedIp" type="checkbox"><span>Dedicated profile IP is fixed</span></label>
+              <label>ShopYourLikes IX profile ID <input id="dedicatedIxProfileId" spellcheck="false" placeholder="Give this when ready"></label>
+              <label>ShopYourLikes IX profile name <input id="dedicatedIxProfileName" spellcheck="false" placeholder="Optional profile name"></label>
+              <label class="switch line"><input id="rotateDedicatedProfileIp" type="checkbox"><span>Allow IP rotation for this profile</span></label>
+              <label class="switch line"><input id="generateShortlinksInDedicatedProfile" type="checkbox"><span>Generate Mavlynk shortlinks in same profile</span></label>
+              <label class="switch line"><input id="cleanExistingAffiliateLinks" type="checkbox"><span>Clean existing affiliate links first</span></label>
+              <label class="switch line"><input id="shortenAfterAffiliate" type="checkbox"><span>Shorten after affiliate link</span></label>
+              <label>Shortlink provider <input id="shortlinkProvider"></label>
+              <label class="switch line"><input id="shortlinkEnabled" type="checkbox"><span>Mavlynk enabled</span></label>
+              <label class="switch line"><input id="shortlinkUseAffiliateDedicatedIxProfile" type="checkbox"><span>Force Mavlynk through same IX profile</span></label>
+              <label>Original/source links <textarea id="affiliateOriginalLinks" spellcheck="false"></textarea></label>
+              <label>Cleaned links <textarea id="affiliateCleanedLinks" spellcheck="false"></textarea></label>
+              <label>ShopYourLikes links <textarea id="shopyourlikesLinks" spellcheck="false"></textarea></label>
+              <label>Final Mavlynk shortlinks <textarea id="finalShortlinks" spellcheck="false"></textarea></label>
+              <div class="miniActions span2">
+                <button id="generateShopYourLikesExtensionLinksBtn" class="primary">Generate SYL Link(s) + Mavlynk Shortlink(s)</button>
+              </div>
+              <div id="shopyourlikesExtensionStatus" class="inlineNotice neutral span2">Uses the saved dedicated SYL IXBrowser profile: opens each product page, runs the ShopYourLikes extension, then shortens the generated SYL link with Mavlynk. If no SYL link is available, use the Mavlynk clean-product-URL fallback. The Mavlynk shortlink is used for posting.</div>
+              <label class="span2">Affiliate notes <textarea id="affiliateNotes"></textarea></label>
+              <label class="span2">Mavlynk notes <textarea id="shortlinkNotes"></textarea></label>
+            </div>
+          </section>
+
+          <section class="panel profileLead tabLead" data-view="profiles">
+            <div class="panelHead">
+              <h2>Webshare / IP</h2>
+              <div class="miniActions">
+                <button id="markIpFailedBtn">Mark IP Failed</button>
+                <button id="queueIpBtn">Plan IP Check</button>
+              </div>
+            </div>
+            <div class="formGrid">
+              <label class="switch line"><input id="webshareEnabled" type="checkbox"><span>Enabled</span></label>
+              <label>API status <input id="webshareApiStatus"></label>
+              <label>Current IP <input id="currentIp" spellcheck="false"></label>
+              <label>Failed IPs <textarea id="failedIps" spellcheck="false"></textarea></label>
+              <label class="span2">Notes <textarea id="webshareNotes"></textarea></label>
+              <label>Proxy provider <input id="proxyProvider"></label>
+              <label class="switch line"><input id="proxyProviderEnabled" type="checkbox"><span>Webshare provider enabled</span></label>
+              <label>Required proxy location <input id="requiredProxyLocation"></label>
+              <label>Provider status <input id="proxyProviderApiStatus"></label>
+              <label class="span2">Provider notes <textarea id="proxyProviderNotes"></textarea></label>
+            </div>
+          </section>
+
+          <section class="panel" data-view="profiles">
+            <div class="panelHead">
+              <h2>IXBrowser Profiles</h2>
+              <span id="activeProfileCount" class="badge">0 active</span>
+            </div>
+            <div class="formGrid">
+              <label>Comment-limited profile <input id="commentLimitProfile" spellcheck="false" placeholder="Profile ID/name, or load/select profile in Integrations"></label>
+              <label>Comment-limit reason <input id="commentLimitReason" spellcheck="false" placeholder="Facebook comment limit or IP/account review required"></label>
+              <div class="miniActions span2">
+                <button id="recordIpAttemptBtn">Record 1 IP Attempt</button>
+                <button id="markOneAttemptFailedBtn" class="danger">One Attempt Failed</button>
+                <button id="markCommentLimitedBtn" class="danger">Mark Cannot Comment</button>
+              </div>
+              <label class="switch line"><input id="ixbrowserEnabled" type="checkbox"><span>Enabled</span></label>
+              <label>API/account selector <input id="accountSelector"></label>
+              <label>Max profiles per run <input id="maxProfilesPerRun" type="number" min="1" max="200"></label>
+              <label>Max concurrent profiles <input id="maxConcurrentProfiles" type="number" min="1" max="4"></label>
+              <label class="span2">Profiles for next run <textarea id="profilesForNextRun" spellcheck="false" placeholder="One IXBrowser profile id/name per line. Hermes should use only this run queue."></textarea></label>
+              <label class="span2">Do-not-use profiles <textarea id="blockedProfiles" spellcheck="false" placeholder="One IXBrowser profile ID/name per line, e.g. wise"></textarea></label>
+              <label class="span2">Moderator approval accounts <textarea id="moderatorProfiles" spellcheck="false" placeholder="One IXBrowser moderator/admin profile per line. Used only to approve pending group posts, never for normal posting/commenting."></textarea></label>
+              <label>Active profiles <textarea id="activeProfiles" spellcheck="false"></textarea></label>
+              <label class="failedProfilesLabel">Failed profiles
+                <div class="failedProfilesActions">
+                  <button id="clearFailedProfilesBtn" type="button" class="ghostButton dangerGhost" data-confirm="Clear ALL accumulated profile failures? This appends profile_unblocked override lines for every currently-blocked profile and lets them post again. Truly bad profiles (suspended/disabled accounts) are left untouched.">Clear failed profiles</button>
+                  <button id="refreshFailedProfilesBtn" type="button" class="ghostButton">Refresh</button>
+                </div>
+                <textarea id="failedProfiles" spellcheck="false"></textarea>
+              </label>
+              <label class="span2">Profile / IP mapping <textarea id="profileIpMap" spellcheck="false"></textarea></label>
+              <label class="span2">Profile run notes <textarea id="profileRunNotes"></textarea></label>
+              <label class="span2">Notes <textarea id="ixbrowserNotes"></textarea></label>
+            </div>
+          </section>
+
+          <section class="panel" data-view="integrations" data-ux-tier="advanced">
+            <div class="panelHead">
+              <h2>ShopYourLikes Extension / IXBrowser Workflow</h2>
+              <button id="queueExtensionBtn">Plan Extension Setup</button>
+            </div>
+            <div class="formGrid">
+              <label class="switch line"><input id="extensionEnabled" type="checkbox"><span>ShopYourLikes workflow enabled</span></label>
+              <label>Service name <input id="extensionName"></label>
+              <label>Extension/source notes <input id="extensionSource"></label>
+              <label class="switch line"><input id="shopifyUrlWorkflow" type="checkbox"><span>Clean source URL workflow</span></label>
+              <label class="span2">Notes <textarea id="extensionNotes"></textarea></label>
+            </div>
+          </section>
+
+          <section class="panel wide" data-view="operations">
+            <h2>Daily Tracking</h2>
+            <div class="formGrid">
+              <label>Action/comment log <textarea id="dailyActionLog" spellcheck="false"></textarea></label>
+              <label>Tracking notes <textarea id="trackingNotes"></textarea></label>
+            </div>
+          </section>
+
+          <section class="panel wide" data-view="operations" data-ux-tier="advanced">
+            <h2>Operational Files</h2>
+            <div id="fileGrid" class="fileGrid"></div>
+          </section>
+
+          <section class="panel wide" data-view="operations" data-ux-tier="advanced">
+            <div class="panelHead">
+              <h2>Registers</h2>
+              <span class="hint">Edit lists directly. Save Everything stores them to disk.</span>
+            </div>
+            <div id="registerGrid" class="registerGrid"></div>
+          </section>
+
+          <section class="panel wide" data-view="operations" data-ux-tier="advanced">
+            <div class="panelHead">
+              <h2>Jobs</h2>
+              <button id="clearBtn">Clear Finished</button>
+            </div>
+            <div id="jobs" class="jobs"></div>
+          </section>
+
+          <section class="panel wide" data-view="operations" data-ux-tier="advanced">
+            <h2>Events</h2>
+            <pre id="events" class="events"></pre>
+          </section>
+        </section>
+      </section>
+    </main>
+    <button id="setupWizardLauncher" class="setupLauncher hasTooltip" type="button" aria-label="Open setup wizard" data-tooltip="Open setup wizard">?</button>
+    <section id="setupWizard" class="wizardOverlay" role="dialog" aria-modal="true" aria-labelledby="setupWizardTitle" hidden>
+      <div class="wizardShell">
+        <header class="wizardHeader">
+          <div>
+            <span class="wizardKicker">Setup wizard</span>
+            <h2 id="setupWizardTitle">Production Workflow Setup</h2>
+            <p id="setupWizardSubtitle">Follow the steps once, then use Review before every bulk run.</p>
+          </div>
+          <button id="setupWizardClose" class="ghostButton wizardClose" type="button" aria-label="Close setup wizard">X</button>
+        </header>
+        <div class="wizardBody">
+          <nav class="wizardSteps" aria-label="Setup steps">
+            <button class="wizardStep active" data-wizard-step="safety" type="button"><span>1</span><strong>Safety</strong><small>Locks and limits</small><b data-wizard-status="safety">Check</b></button>
+            <button class="wizardStep" data-wizard-step="apis" type="button"><span>2</span><strong>APIs</strong><small>Keys and services</small><b data-wizard-status="apis">Check</b></button>
+            <button class="wizardStep" data-wizard-step="profiles" type="button"><span>3</span><strong>Profiles</strong><small>IXBrowser setup</small><b data-wizard-status="profiles">Check</b></button>
+            <button class="wizardStep" data-wizard-step="products" type="button"><span>4</span><strong>Products</strong><small>Filter URLs</small><b data-wizard-status="products">Check</b></button>
+            <button class="wizardStep" data-wizard-step="images" type="button"><span>5</span><strong>Images</strong><small>ChatGPT HD</small><b data-wizard-status="images">Check</b></button>
+            <button class="wizardStep" data-wizard-step="links" type="button"><span>6</span><strong>Links</strong><small>SYL + Mavlynk</small><b data-wizard-status="links">Check</b></button>
+            <button class="wizardStep" data-wizard-step="posting" type="button"><span>7</span><strong>Posting</strong><small>Groups and text</small><b data-wizard-status="posting">Check</b></button>
+            <button class="wizardStep" data-wizard-step="review" type="button"><span>8</span><strong>Review</strong><small>Ready check</small><b data-wizard-status="review">Check</b></button>
+          </nav>
+          <div class="wizardContent">
+            <section class="wizardPanel active" data-wizard-panel="safety">
+              <h3>Safety First</h3>
+              <p>Keep live outside actions locked while configuring. Bulk mode is capped at 4 normal IXBrowser profiles at a time by default.</p>
+              <div id="wizardSafetyChecks" class="wizardChecks"></div>
+              <div class="wizardActions">
+                <button class="primary" data-wizard-action="safe-defaults" type="button">Apply Safe Defaults</button>
+                <button data-wizard-action="save-all" type="button">Save</button>
+                <button data-wizard-next="apis" type="button">Next</button>
+              </div>
+            </section>
+            <section class="wizardPanel" data-wizard-panel="apis">
+              <h3>API Keys And Services</h3>
+              <p>Confirm Webshare, IXBrowser local API, Mavlynk, Firecrawl, and optional AI keys. Secret fields stay masked after save.</p>
+              <div id="wizardApiChecks" class="wizardChecks"></div>
+              <div class="wizardActions">
+                <button data-wizard-open="credentials" data-wizard-focus="ixbrowserBaseUrl" type="button">Open API Fields</button>
+                <button class="primary" data-wizard-action="check-api" type="button">Check API Config</button>
+                <button data-wizard-action="save-all" type="button">Save</button>
+                <button data-wizard-next="profiles" type="button">Next</button>
+              </div>
+            </section>
+            <section class="wizardPanel" data-wizard-panel="profiles">
+              <h3>IXBrowser Profiles</h3>
+              <p>Use up to 4 posting profiles in parallel by default. Keep the dedicated ShopYourLikes profile separate and never auto-close it after normal Facebook work.</p>
+              <div id="wizardProfileChecks" class="wizardChecks"></div>
+              <div class="wizardActions">
+                <button data-wizard-open="profiles" data-wizard-focus="maxConcurrentProfiles" type="button">Open Profile Settings</button>
+                <button class="primary" data-wizard-action="load-ix" type="button">Load IX Profiles</button>
+                <button data-wizard-open="integrations" data-wizard-focus="shopyourlikesIxProfileSelect" type="button">Open SYL Profile</button>
+                <button data-wizard-next="products" type="button">Next</button>
+              </div>
+            </section>
+            <section class="wizardPanel" data-wizard-panel="products">
+              <h3>Product Discovery</h3>
+              <p>Build Walmart filter/source URLs, then discover product URLs. If Walmart shows human verification, solve it in the local browser and capture the page.</p>
+              <div id="wizardProductChecks" class="wizardChecks"></div>
+              <div class="wizardActions">
+                <button data-wizard-open="content" data-wizard-focus="generatedSourceUrls" type="button">Open Source Finder</button>
+                <button data-wizard-action="rebuild-products" type="button">Rebuild URLs</button>
+                <button class="primary" data-wizard-action="discover-products" type="button">Discover Products</button>
+                <button data-wizard-next="images" type="button">Next</button>
+              </div>
+            </section>
+            <section class="wizardPanel" data-wizard-panel="images">
+              <h3>Images And ChatGPT HD</h3>
+              <p>Prepare exactly one approved JPG/PNG review image per product. ChatGPT HD opens the configured Edge profile in a new CDP window and leaves normal Edge profiles open after work finishes.</p>
+              <div id="wizardImageChecks" class="wizardChecks"></div>
+              <div class="wizardActions">
+                <button data-wizard-open="content" data-wizard-focus="chatgptEdgeProfileDirectory" type="button">Open Image Settings</button>
+                <button id="openChatGptBrowserWizardBtn" data-wizard-action="open-chatgpt-browser" type="button">Open ChatGPT Profile</button>
+                <button class="primary" data-wizard-action="prepare-assets" type="button">Prepare Asset Checks</button>
+                <button data-wizard-action="open-assets-folder" type="button">Open Image Folder</button>
+                <button data-wizard-next="links" type="button">Next</button>
+              </div>
+            </section>
+            <section class="wizardPanel" data-wizard-panel="links">
+              <h3>Affiliate And Shortlinks</h3>
+              <p>Generate ShopYourLikes affiliate links in the dedicated IXBrowser profile, then shorten with Mavlynk. If SYL is unavailable, shorten the clean product URL with Mavlynk.</p>
+              <div id="wizardLinkChecks" class="wizardChecks"></div>
+              <div class="wizardActions">
+                <button data-wizard-open="affiliate" data-wizard-focus="affiliateEnabled" type="button">Open Link Settings</button>
+                <button class="primary" data-wizard-action="generate-links" type="button">Run SYL + Mavlynk</button>
+                <button data-wizard-next="posting" type="button">Next</button>
+              </div>
+            </section>
+            <section class="wizardPanel" data-wizard-panel="posting">
+              <h3>Posting Plan</h3>
+              <p>Check groups, profile assignments, post text rotation, pinned-comment lead-ins, shortlinks, and approved images before creating the approval queue.</p>
+              <div id="wizardPostingChecks" class="wizardChecks"></div>
+              <div class="wizardActions">
+                <button data-wizard-open="posting" data-wizard-focus="groups" type="button">Open Posting Inputs</button>
+                <button data-wizard-open="content" data-wizard-focus="postTexts" type="button">Open Text Rotation</button>
+                <button class="primary" data-wizard-action="prepare-posting" type="button">Prepare Posting Plan</button>
+                <button data-wizard-next="review" type="button">Next</button>
+              </div>
+            </section>
+            <section class="wizardPanel" data-wizard-panel="review">
+              <h3>Final Review</h3>
+              <p>Save everything, review warnings, approve queued items, then start work only when you intentionally arm live external actions.</p>
+              <div id="wizardReviewChecks" class="wizardChecks"></div>
+              <div class="wizardActions">
+                <button data-wizard-open="overview" data-wizard-focus="readinessGrid" type="button">Open Readiness</button>
+                <button data-wizard-action="save-all" type="button">Save Everything</button>
+                <button class="primary" data-wizard-action="open-approvals" type="button">Open Approvals</button>
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
+    </section>
+    <div id="toast" class="toast" hidden></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
