@@ -10097,7 +10097,7 @@ function isTransientCommentProfileFailure(validation = {}) {
   // "comment_blocked:marker_scoped_comment_button_not_found"), so scan BOTH. Genuine FB
   // rejections (comment_did_not_persist..., cannot_comment, action_blocked,
   // comment_profile_cannot_access_post_permalink) are NOT in this list and stay benchable.
-  const locateMissRe = /target_marker_root_not_found|target_marker_not_visible|target_marker_article_not_visible|expected_post_permalink_mismatch|marker_scoped_comment_button_not_found|marker_scoped_comment_box_not_found|permalink_scoped_comment_box_not_found|target_marker_not_visible_for_permalink_comment_fallback|comment_box_not_found|comment_button_not_found|no_comment_box|0_comment_boxes|comment_box_count_0|comment_(?:box|button|composer)_(?:locate|selector)_timeout|comment_selector_timeout/i;
+  const locateMissRe = /target_marker_root_not_found|target_marker_not_visible|target_marker_article_not_visible|expected_post_permalink_mismatch|marker_scoped_comment_button_not_found|marker_scoped_comment_box_not_found|permalink_scoped_comment_box_not_found|target_marker_not_visible_for_permalink_comment_fallback|comment_box_not_found|comment_button_not_found|no_comment_box|0_comment_boxes|comment_box_count_0|comment_(?:box|button|composer)_(?:locate|selector)_timeout|comment_selector_timeout|comment_target_unavailable|comment_target_unavailable_or_pending|comment_target_not_ready|comment_target_pending/i;
   if (locateMissRe.test(blockReason) || errors.some((e) => locateMissRe.test(e))) {
     return true;
   }
