@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-04T17:55:52.932Z",
+  "updatedAt": "2026-06-04T20:53:47.884Z",
   "testRun": {
     "status": "done",
     "active": false,
@@ -163,8 +163,8 @@
     "maxCommentsBeforeAccountSave": 10,
     "postsPerProfilePerDay": 15,
     "peakHoursTimezone": "America/New_York",
-    "peakStartTime": "00:00",
-    "peakStopTime": "23:59",
+    "peakStartTime": "18:00",
+    "peakStopTime": "23:00",
     "requireDealSignal": "10+ bought since yesterday",
     "linkPlacement": "pinned_first_comment",
     "pinFirstComment": false,
@@ -3465,7 +3465,7 @@
     "enabled": true,
     "apiStatus": "not configured",
     "maxProfilesPerRun": 5,
-    "maxConcurrentProfiles": 1,
+    "maxConcurrentProfiles": 3,
     "profilesForNextRun": "",
     "activeProfiles": "",
     "blockedProfiles": "wise",
