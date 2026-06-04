@@ -489,6 +489,8 @@ function defaultState() {
       reusePostedProductAfterDays: 7,
       retryNoReviewPhotoAfterDays: 14,
       assetBufferTarget: 0,
+      assetFillBatchSize: 9, // prepare products "9 by 9" — one #40 SYL session + one ChatGPT-HD conversation per batch
+
       autopilotDiscoveryMaxAgeHours: 20,
       maxDiscoveryPagesPerSource: 5,
       requireProSeller: true,
@@ -7343,9 +7345,12 @@ function assetBufferTargetCount(state = readState()) {
   const explicit = clampNumber(state.productDiscovery?.assetBufferTarget, 0, 500, 0);
   if (explicit) return explicit;
   // Auto: keep ~a day's worth of posts ready (unique profiles x posts/profile).
+  // Floor at 9 so there is ALWAYS a standing reserve of >=9 ready products (matches the
+  // "9 by 9" batch unit + the ChatGPT-HD per-conversation limit), so posting never waits
+  // on image-gen and leftover reserve survives past the window close for the next night.
   const profiles = new Set(filterExcludedProfileSlots(postingSlots(state), {}).map((slot) => slot.profileKey)).size || 1;
   const perProfile = clampNumber(state.rules?.postsPerProfilePerDay, 1, 20, 5);
-  return Math.max(6, Math.min(200, profiles * perProfile));
+  return Math.max(9, Math.min(200, profiles * perProfile));
 }
 
 function productHasReadyAssets(product, state = readState(), reviewImages = null) {
@@ -7486,7 +7491,11 @@ async function fillAssetBufferAsync(options = {}) {
     // Matches the dead shared-SYL-#40-CDP-session errors so the fill aborts instead of
     // hammering a dead session product-after-product (the 499-failures-in-a-burst pattern).
     const DEAD_SYL_SESSION_RE = /has been closed|context or browser|connection closed|protocol error.*closed|target (?:page|closed)|session closed/i;
-    const batchSize = clampNumber(options.batchSize || readState().productDiscovery?.assetFillBatchSize, 1, 8, 4);
+    // Batch unit = 9 by default ("9 by 9"): the SYL link-gen runs the whole batch in ONE #40
+    // session AND the ChatGPT-HD step generates all 9 images in ONE conversation (its per-
+    // conversation limit is 9) — so one batch == one HD conversation, no mid-batch rotation,
+    // minimum lost time. Ceiling raised 8->12 to allow the 9 unit (plus a little headroom).
+    const batchSize = clampNumber(options.batchSize || readState().productDiscovery?.assetFillBatchSize, 1, 12, 9);
     let emptyBatches = 0;
     try {
       // BATCHED fill (operator wants "3-by-3 / 4-by-4"): process batchSize products per round.
@@ -7866,10 +7875,10 @@ async function autopilotTickAsync(options = {}) {
         if (poolExhausted) {
           decision.detail = "pool_exhausted_discovering";
           autopilotMaybeRefreshDiscoveryAsync("pool_exhausted", { force: true })
-            .then((d) => { if (d && d.ok && !d.skipped && !__assetBufferFillInFlight) return fillAssetBufferAsync({ max: Math.min(Math.max(buffer.target || 6, maxWorkers * 2), 8) }); })
+            .then((d) => { if (d && d.ok && !d.skipped && !__assetBufferFillInFlight) return fillAssetBufferAsync({ max: Math.min(Math.max(buffer.target || 9, maxWorkers * 2), 12) }); })
             .catch((err) => logEvent("autopilot_pool_replenish_error", { error: oneLineField(err.message || String(err), 160) }));
         } else if (!__assetBufferFillInFlight) {
-          fillAssetBufferAsync({ max: Math.min(Math.max(buffer.shortfall || 0, maxWorkers * 2), 8) }).catch((err) => logEvent("autopilot_fill_error", { error: oneLineField(err.message || String(err), 160) }));
+          fillAssetBufferAsync({ max: Math.min(Math.max(buffer.shortfall || 0, maxWorkers * 2), 12) }).catch((err) => logEvent("autopilot_fill_error", { error: oneLineField(err.message || String(err), 160) }));
         }
       }
       __autopilotLastDecision = decision;
@@ -7880,7 +7889,7 @@ async function autopilotTickAsync(options = {}) {
     // Keep the buffer TOPPED while posting: if below target, kick a background fill now (don't
     // wait for it to drain to 0). Fire-and-forget + single-flight so this tick still posts.
     if (!dryRun && state.operator?.autopilotAutoFill !== false && buffer.shortfall > 0 && !__assetBufferFillInFlight) {
-      fillAssetBufferAsync({ max: Math.min(Math.max(buffer.shortfall, maxWorkers), 8) }).catch(() => {});
+      fillAssetBufferAsync({ max: Math.min(Math.max(buffer.shortfall, maxWorkers), 12) }).catch(() => {});
     }
 
     const workerProfiles = eligibleProfiles.slice(0, maxWorkers);
