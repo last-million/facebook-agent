@@ -8885,7 +8885,14 @@ function postingPlanRowForRecord(body = {}) {
   const planId = oneLineField(body.planId || body.plan_id || "", 140);
   const sequence = Number(body.sequence || body.seq || 0);
   if (!planId && !sequence) return null;
-  return rows.find((row) => (!planId || row.planId === planId) && (!sequence || Number(row.sequence) === sequence)) || null;
+  // EXACT match (planId + sequence) is the only confident identification of the posted row.
+  if (planId && sequence) return rows.find((row) => row.planId === planId && Number(row.sequence) === sequence) || null;
+  if (sequence) return rows.find((row) => Number(row.sequence) === sequence) || null;
+  // planId ONLY: never guess across sequences — matching the FIRST row records the WRONG product
+  // (the duplicate-post bug: the actually-posted product never gets marked used → re-picked next
+  // tick → posted again). Only resolve when the plan has exactly one row for that id.
+  const matches = rows.filter((row) => row.planId === planId);
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function recordPublishedFacebookPostUrl(body) {
@@ -8909,7 +8916,10 @@ function recordPublishedFacebookPostUrl(body) {
   state.posting.publishedPostUrls = appendUniqueRecordLine(state.posting.publishedPostUrls || "", line);
   state.tracking.dailyActionLog = appendUniqueRecordLine(state.tracking.dailyActionLog || "", line);
   const nextState = writeState(state);
-  const row = postingPlanRowForRecord(body);
+  // Prefer the EXACT posted row the caller hands us — it knows precisely which product/post text
+  // was published. Re-deriving by planId+sequence is only a fallback for the external
+  // record-post-url endpoint. (Recording the wrong row's product was the duplicate-post bug.)
+  const row = (body.row && typeof body.row === "object") ? body.row : postingPlanRowForRecord(body);
   if (row) markLivePostedRegisters(row, postUrl);
   logEvent("facebook_post_url_recorded", { planId, profile, groupUrl, postUrl });
   return {
@@ -12020,7 +12030,9 @@ async function completeVerifiedFacebookPostWithComment({
   const actualGroupUrl = facebookGroupUrlFromPostUrl(postUrl) || groupUrl;
   recordPublishedFacebookPostUrl({
     postUrl,
+    row,
     planId: row.planId,
+    sequence: row.sequence,
     profile: row.profile || ready.profileId,
     groupUrl: actualGroupUrl,
   });
@@ -13433,7 +13445,9 @@ async function runFacebookFirstCommentRecoveryFromPostUrl(body = {}) {
   if (response.ok) {
     recordPublishedFacebookPostUrl({
       postUrl,
+      row,
       planId: row.planId,
+      sequence: row.sequence,
       profile: row.profile || ready.profileId,
       groupUrl,
     });
