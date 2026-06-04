@@ -249,6 +249,7 @@ async function facebookLoginSnapshot(page) {
       ['account_deactivated', /\b(your account (?:has been )?deactivated|account deactivated)\b/],
       ['account_locked', /\b(your account (?:has been )?locked|account locked|temporarily locked)\b/],
       ['identity_review_required', /\b(confirm your identity|identity confirmation required|request a review|disagree with decision|we need to review your account)\b/],
+      ['publish_identity_required', /confirm your identity before you can publish|before you can publish as this page/],
       ['account_restricted', /\b(you can't use facebook right now|you cannot use facebook right now|your account is restricted|restricted from using facebook)\b/],
     ];
     const accountMatch = accountChecks.find(([, pattern]) => pattern.test(lower));
@@ -263,6 +264,27 @@ async function facebookLoginSnapshot(page) {
       snippet: text.slice(0, 500),
     };
   }).catch((err) => ({ loginRequired: false, error: err.message || String(err) }));
+}
+
+// Detects a PAGE-PUBLISH block dialog that FB raises right after clicking Post, e.g.
+// "Confirm your identity before you can publish as this Page. Open the Facebook app on your
+// phone and follow the instructions." This is a page/account-level restriction — the post does
+// NOT go live. It appears at post-SUBMIT time (often as a modal), so the login/nav account-block
+// check never sees it (a reload dismisses it first). Scans the FULL page + any dialog text (not
+// the 1200-char login snippet) so it is caught regardless of page length.
+async function detectPublishBlockDialog(page) {
+  return await page.evaluate(() => {
+    const collect = (root) => (root && (root.innerText || root.textContent) || '').replace(/\s+/g, ' ');
+    let text = collect(document.body);
+    for (const d of document.querySelectorAll('[role="dialog"], [role="alertdialog"]')) text += ' ' + collect(d);
+    const lower = text.toLowerCase();
+    const patterns = [
+      ['publish_identity_confirmation', /confirm your identity before you can publish|before you can publish as this page|confirm your identity.{0,40}publish as this page/],
+      ['page_publish_blocked', /you can't publish as this page|you cannot publish as this page|this page can't post|page is restricted from posting|can't post as this page/],
+    ];
+    const hit = patterns.find(([, re]) => re.test(lower));
+    return hit ? { blocked: true, reason: hit[0], snippet: text.slice(0, 400) } : { blocked: false };
+  }).catch(() => ({ blocked: false }));
 }
 
 async function assertFacebookLoggedIn(page, stage = 'facebook') {
@@ -3485,6 +3507,16 @@ async function main() {
   logTiming('after_post_clicked');
 
   await humanPause(2200, 3600);
+  // PAGE-PUBLISH BLOCK (e.g. "Confirm your identity before you can publish as this Page"): detect
+  // it the moment it appears — BEFORE any reload/fast-path can dismiss it — and surface a HARD
+  // account block so the server auto-blacklists this profile (it cannot publish until resolved).
+  {
+    const publishBlock = await detectPublishBlockDialog(page);
+    if (publishBlock.blocked) {
+      console.log(JSON.stringify({ step: 'facebook_publish_blocked', stage: 'post_submit', ...publishBlock }));
+      throw new Error(`facebook_account_suspended_or_disabled at post_submit: confirm your identity before you can publish as this Page (${publishBlock.reason})`);
+    }
+  }
   const composerStillOpen = await composerIsOpen(page).catch(() => false);
   const postTextStillInComposer = composerStillOpen && await waitForComposerText(page, payload.postText, 1500).catch(() => false);
   if (postTextStillInComposer) {
