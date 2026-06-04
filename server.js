@@ -404,6 +404,8 @@ function defaultState() {
       randomMinutesBetweenPosts: true,
       minMinutesBetweenPosts: 5,
       maxMinutesBetweenPosts: 16,
+      secondsBetweenPostsMin: 0,
+      secondsBetweenPostsMax: 0,
       commentsBeforeAccountMove: 5,
       maxCommentsBeforeAccountSave: 10,
       postsPerProfilePerDay: 5,
@@ -1378,6 +1380,15 @@ function normalizeWorkflowState(state) {
     const previousMin = state.rules.minMinutesBetweenPosts;
     state.rules.minMinutesBetweenPosts = state.rules.maxMinutesBetweenPosts;
     state.rules.maxMinutesBetweenPosts = previousMin;
+  }
+  // Optional SECONDS-based spacing window (0 = disabled -> use minutes above).
+  // When max>0, the per-profile gap is a RANDOM value in [min,max] seconds.
+  state.rules.secondsBetweenPostsMin = clampNumber(state.rules.secondsBetweenPostsMin, 0, 3600, 0);
+  state.rules.secondsBetweenPostsMax = clampNumber(state.rules.secondsBetweenPostsMax, 0, 3600, 0);
+  if (state.rules.secondsBetweenPostsMin > state.rules.secondsBetweenPostsMax && state.rules.secondsBetweenPostsMax > 0) {
+    const prevSecMin = state.rules.secondsBetweenPostsMin;
+    state.rules.secondsBetweenPostsMin = state.rules.secondsBetweenPostsMax;
+    state.rules.secondsBetweenPostsMax = prevSecMin;
   }
   state.rules.commentsBeforeAccountMove = clampNumber(state.rules.commentsBeforeAccountMove, 1, 100, 5);
   state.rules.maxCommentsBeforeAccountSave = clampNumber(state.rules.maxCommentsBeforeAccountSave, 1, 500, 10);
@@ -7816,7 +7827,14 @@ async function autopilotTickAsync(options = {}) {
     // OWN per-profile spacing. Concurrency = up to maxConcurrentProfiles workers,
     // each a DIFFERENT profile (mirrors the proven full-plan batching).
     const now = Date.now();
-    const minGapMs = clampNumber(state.rules?.minMinutesBetweenPosts || state.rules?.minutesBetweenPosts, 1, 1440, 5) * 60 * 1000;
+    // Per-profile spacing gap. If a SECONDS window is configured (secondsBetweenPostsMax>0),
+    // use a RANDOM gap in [min,max] SECONDS (anti-bot jitter, sub-minute capable); otherwise
+    // fall back to the minutes-based spacing.
+    const __secMax = clampNumber(state.rules?.secondsBetweenPostsMax, 0, 3600, 0);
+    const __secMin = clampNumber(state.rules?.secondsBetweenPostsMin, 0, 3600, 0);
+    const minGapMs = __secMax > 0
+      ? randomInt(Math.min(__secMin, __secMax), Math.max(__secMin, __secMax)) * 1000
+      : clampNumber(state.rules?.minMinutesBetweenPosts || state.rules?.minutesBetweenPosts, 1, 1440, 5) * 60 * 1000;
     const maxWorkers = clampNumber(state.ixbrowser?.maxConcurrentProfiles, 1, MAX_CONCURRENT_NORMAL_IX_PROFILES, MAX_CONCURRENT_NORMAL_IX_PROFILES);
     decision.maxWorkers = maxWorkers;
     const withCapacity = capacity.profiles.filter((p) => p.remaining > 0);
