@@ -2884,7 +2884,18 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
       }
     }
   }
-  return { opened: false, url: page.url(), visited, method: 'marker_not_found_after_full_scroll' };
+  // PERMISSION SIGNAL: if NONE of the visited urls kept an admin-queue path, every
+  // /pending_posts|/manage_post_queue request 302-redirected to the group FEED — which Facebook
+  // only does when this account is NOT an admin/moderator of the group. Surface that distinctly so
+  // the server can (a) NOT misread it as "post is not pending" and (b) try the next moderator.
+  const reachedAdminSurface = visited.some((u) => /\/(pending_posts|manage_post_queue|posts\/pending)/i.test(String(u || '')));
+  return {
+    opened: false,
+    url: page.url(),
+    visited,
+    adminSurfaceReachable: reachedAdminSurface,
+    method: reachedAdminSurface ? 'marker_not_found_after_full_scroll' : 'pending_queue_redirected_to_feed_no_admin_surface',
+  };
 }
 
 async function approvePendingPost(page, context, payload, gid, marker) {
@@ -2946,6 +2957,15 @@ async function approvePendingPost(page, context, payload, gid, marker) {
   if (!approvalResult.clicked) {
     const reviewSurface = await openGroupReviewSurface(page, groupUrl, marker, payload.publisherFacebookUserId || payload.facebookUserId, gid);
     attempts.push({ target: groupUrl, ...reviewSurface });
+    // Emit an explicit surface-reachability signal the server keys off of (separate from the
+    // overloaded "no pending article" reason): false => approver is not a moderator of this group.
+    console.log(JSON.stringify({
+      step: 'admin_approval_surface',
+      adminSurfaceReachable: reviewSurface.adminSurfaceReachable !== false,
+      landedUrl: reviewSurface.url,
+      method: reviewSurface.method,
+      visited: (reviewSurface.visited || []).slice(-5),
+    }));
     approvalResult = await clickApproveForVisibleMarker(page, marker, payload.publisherFacebookUserId || payload.facebookUserId, gid);
     attempts.push({ target: page.url(), ...(await collectVerifiedUrls('review_surface')) });
   }

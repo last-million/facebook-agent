@@ -10322,18 +10322,28 @@ function facebookAdminApprovalValidationFromLog(objects = [], postUrl = "") {
   // real diagnostic scan ran AND the marker wasn't verified (so we never bail on a session
   // error, which would not produce this diagnostic).
   const diagnosticStep = latestLiveLogStep(objects, "admin_approval_diagnostic");
+  // PERMISSION SIGNAL from the connector: false => every /pending_posts request redirected to the
+  // group feed, i.e. the approving account is NOT a moderator of THIS group.
+  const surfaceStep = latestLiveLogStep(objects, "admin_approval_surface");
+  const approverLacksAdminRole = Boolean(surfaceStep && surfaceStep.adminSurfaceReachable === false);
   const noPendingPostForPublisher = Boolean(
     diagnosticStep &&
     /no_pending_article_matched_publisher/i.test(String(diagnosticStep.reason || "")) &&
-    !markerVisible
+    !markerVisible &&
+    // ONLY trust "post is not pending" when the moderation queue ACTUALLY rendered (admin surface
+    // reachable). A feed redirect (non-admin) produces the same reason string but proves nothing —
+    // it must NOT be read as "not pending" (that was the bug that left every post pending forever).
+    !approverLacksAdminRole
   );
   const errors = [];
   const warnings = [];
+  if (approverLacksAdminRole) errors.push("admin_approval_surface_unavailable_approver_not_admin");
   if (!markerVisible) errors.push("admin_approval_post_marker_not_verified");
   if (!postMediaVerified) errors.push("admin_approval_post_image_not_verified");
   if (!approvalStep?.clicked && markerVisible && postMediaVerified) warnings.push("admin_approval_button_not_needed_or_not_found");
   return {
     noPendingPostForPublisher,
+    approverLacksAdminRole,
     ok: errors.length === 0,
     errors,
     warnings,
@@ -10726,6 +10736,17 @@ async function approvePendingFacebookPostWithAdminProfiles({ row, ready, groupUr
       // landed), NOT pending. No other moderator will find it pending either, so stop the
       // whole cycle now instead of opening every moderator (~1min each, ~6min total). This
       // frees the shared box fast and never competes with the Pinterest agent.
+      // APPROVER IS NOT A MODERATOR OF THIS GROUP: the pending queue redirected to the feed for
+      // this profile. Do NOT fast-bail — a DIFFERENT configured moderator (e.g. 42 vs 41) may hold
+      // the role. Try the next profile instead.
+      if (attempt.validation?.approverLacksAdminRole) {
+        logEvent("facebook_admin_approval_profile_not_admin_of_group", {
+          profileId: attempt.profileId,
+          profile: attempt.profile,
+          groupUrl,
+        });
+        continue;
+      }
       if (attempt.validation?.noPendingPostForPublisher) {
         logEvent("facebook_admin_approval_no_pending_post_fast_bail", {
           profileId: attempt.profileId,
@@ -10745,6 +10766,16 @@ async function approvePendingFacebookPostWithAdminProfiles({ row, ready, groupUr
         reason: "marker_not_on_url_other_profiles_would_see_same",
       });
     }
+  }
+  // LOUD operator signal: if EVERY configured moderator profile redirected away from the pending
+  // queue, none of them actually moderate this group. This is an operator/permission problem, NOT
+  // "post is not pending" — surface it unmistakably so posts don't silently pile up pending.
+  if (attempts.length > 0 && attempts.every((a) => a.validation?.approverLacksAdminRole)) {
+    logEvent("facebook_admin_approval_no_admin_profile_has_rights", {
+      groupUrl,
+      triedProfiles: [...new Set(attempts.map((a) => a.profileId))],
+      message: "Configured moderator profiles are NOT admins/moderators of this group. Grant them the moderator role on Facebook for this group, or configure profiles that already moderate it.",
+    });
   }
   if (budgetExceeded) {
     logEvent("facebook_admin_approval_budget_exceeded", {
