@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-04T04:47:18.987Z",
+  "updatedAt": "2026-06-04T14:02:58.521Z",
   "testRun": {
     "status": "done",
     "active": false,
@@ -3465,7 +3465,7 @@
     "enabled": true,
     "apiStatus": "not configured",
     "maxProfilesPerRun": 5,
-    "maxConcurrentProfiles": 3,
+    "maxConcurrentProfiles": 1,
     "profilesForNextRun": "",
     "activeProfiles": "",
     "blockedProfiles": "wise",
