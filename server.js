@@ -7811,6 +7811,14 @@ async function autopilotTickAsync(options = {}) {
     decision.buffer = { readyCount: buffer.readyCount, target: buffer.target, shortfall: buffer.shortfall };
 
     // PHASE A: prepare tomorrow when outside schedule or the daily cap is met.
+    // COMMENT RE-SWEEP: guarantee every already-live post eventually gets its different-profile
+    // first comment (its product is retired on publish, so the autopilot won't re-pick it; this
+    // catches any post whose inline comment attempt failed under 3-by-3). Fire-and-forget,
+    // single-flight, armed-gated, throttled to once / 90s, yields to active posting.
+    if (!dryRun && state.operator?.autopilotEnabled && state.operator?.armedForExternalActions
+        && !__commentResweepInFlight && (Date.now() - __lastCommentResweepAt) > 90000) {
+      resweepUncommentedFacebookPostsAsync({ max: 5 }).catch(() => {});
+    }
     if (!scheduleOpen || capacity.totalRemaining <= 0) {
       decision.action = "prepare_tomorrow";
       decision.detail = !scheduleOpen ? "outside_schedule" : "daily_cap_reached";
@@ -10116,7 +10124,7 @@ function isTransientCommentProfileFailure(validation = {}) {
   // "comment_blocked:marker_scoped_comment_button_not_found"), so scan BOTH. Genuine FB
   // rejections (comment_did_not_persist..., cannot_comment, action_blocked,
   // comment_profile_cannot_access_post_permalink) are NOT in this list and stay benchable.
-  const locateMissRe = /target_marker_root_not_found|target_marker_not_visible|target_marker_article_not_visible|expected_post_permalink_mismatch|marker_scoped_comment_button_not_found|marker_scoped_comment_box_not_found|permalink_scoped_comment_box_not_found|target_marker_not_visible_for_permalink_comment_fallback|comment_box_not_found|comment_button_not_found|no_comment_box|0_comment_boxes|comment_box_count_0|comment_(?:box|button|composer)_(?:locate|selector)_timeout|comment_selector_timeout|comment_target_unavailable|comment_target_unavailable_or_pending|comment_target_not_ready|comment_target_pending/i;
+  const locateMissRe = /target_marker_root_not_found|target_marker_not_visible|target_marker_article_not_visible|expected_post_permalink_mismatch|marker_scoped_comment_button_not_found|marker_scoped_comment_box_not_found|permalink_scoped_comment_box_not_found|target_marker_not_visible_for_permalink_comment_fallback|comment_box_not_found|comment_button_not_found|no_comment_box|0_comment_boxes|comment_box_count_0|comment_(?:box|button|composer)_(?:locate|selector)_timeout|comment_selector_timeout|comment_target_unavailable|comment_target_unavailable_or_pending|comment_target_not_ready|comment_target_pending|ixbrowser_profile_busy|comment_recovery_profile_busy|profile_busy|profile_in_use/i;
   if (locateMissRe.test(blockReason) || errors.some((e) => locateMissRe.test(e))) {
     return true;
   }
@@ -10325,15 +10333,18 @@ function facebookAdminApprovalValidationFromLog(objects = [], postUrl = "") {
   // PERMISSION SIGNAL from the connector: false => every /pending_posts request redirected to the
   // group feed, i.e. the approving account is NOT a moderator of THIS group.
   const surfaceStep = latestLiveLogStep(objects, "admin_approval_surface");
-  const approverLacksAdminRole = Boolean(surfaceStep && surfaceStep.adminSurfaceReachable === false);
+  // adminSurfaceReachable: true = queue rendered (real moderator) | false = redirected to feed
+  // (not a moderator of THIS group) | null = INCONCLUSIVE (numeric gid unresolved — prove nothing).
+  const surfaceReachable = surfaceStep ? surfaceStep.adminSurfaceReachable : undefined;
+  const approverLacksAdminRole = surfaceReachable === false;
   const noPendingPostForPublisher = Boolean(
     diagnosticStep &&
     /no_pending_article_matched_publisher/i.test(String(diagnosticStep.reason || "")) &&
     !markerVisible &&
-    // ONLY trust "post is not pending" when the moderation queue ACTUALLY rendered (admin surface
-    // reachable). A feed redirect (non-admin) produces the same reason string but proves nothing —
-    // it must NOT be read as "not pending" (that was the bug that left every post pending forever).
-    !approverLacksAdminRole
+    // ONLY trust "post is not pending" when the moderation queue ACTUALLY rendered (surface===true).
+    // A feed redirect (non-admin) or an inconclusive gid produces the same reason but proves nothing
+    // — must NOT be read as "not pending" (the bug that left every post pending forever).
+    surfaceReachable === true
   );
   const errors = [];
   const warnings = [];
@@ -12040,6 +12051,83 @@ async function addRequiredFirstCommentWithDifferentProfile({ row, ready, groupUr
     postValidation: postValidation || null,
     closeResults,
   };
+}
+
+// ── COMMENT RE-SWEEP — guarantee every LIVE post gets a different-profile first comment ─────────
+// A post is published (and its product retired, to prevent duplicate posting) BEFORE the first
+// comment is attempted. If that inline attempt fails (commenter busy / none eligible this moment /
+// transient miss), the post would stay live-but-uncommented forever — the autopilot never re-picks
+// a retired product. This sweep finds recently-published posts that still lack a DIFFERENT-profile
+// verified comment and re-attempts the COMMENT ONLY (never reposts: product stays retired, the
+// per-run 20-count is untouched). Reconstructs the full row from posting-plan.jsonl by planId+seq.
+// Single-flight, armed-gated, throttled, yields to active posting, budget-bounded.
+let __commentResweepInFlight = null;
+let __lastCommentResweepAt = 0;
+async function resweepUncommentedFacebookPostsAsync(options = {}) {
+  if (__commentResweepInFlight) return __commentResweepInFlight;
+  __commentResweepInFlight = (async () => {
+    const summary = { checked: 0, recommented: 0, stillMissing: 0, errors: [] };
+    try {
+      const state = readState();
+      // Re-commenting is an EXTERNAL action — gate on the universal kill switch unless forced.
+      if (!options.force && !(state.operator?.autopilotEnabled && state.operator?.armedForExternalActions)) {
+        return summary;
+      }
+      const windowMs = clampNumber(options.windowHours, 1, 168, 24) * 3600 * 1000;
+      const cutoff = Date.now() - windowMs;
+      const maxToFix = clampNumber(options.max, 1, 50, 10);
+      const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 8000 });
+      const publishedByUrl = new Map();
+      for (const r of rows) {
+        if (!r || !r.postUrl) continue;
+        const isPublished = /^published/.test(String(r.event || "")) || ["published", "published_with_warning", "published_after_admin_approval"].includes(String(r.status || ""));
+        if (!isPublished) continue;
+        const at = Date.parse(r.at || "") || 0;
+        if (at && at < cutoff) continue;
+        publishedByUrl.set(r.postUrl, r); // keep the latest published row per permalink
+      }
+      for (const [postUrl, ev] of publishedByUrl) {
+        if (summary.recommented >= maxToFix) break;
+        const publisherId = Number(ev.profileId || 0);
+        if (latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) continue; // already has a different-profile comment
+        const row = postingPlanRowForRecord({ planId: ev.planId, sequence: ev.sequence });
+        const commentText = String(row?.commentTextPreview || row?.link || "").trim();
+        if (!row || !commentText) { summary.stillMissing += 1; continue; } // cannot reconstruct the comment
+        await waitForPostingIdle({ label: "comment_resweep" });
+        if (latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) continue; // a concurrent post may have just commented it
+        summary.checked += 1;
+        const groupUrl = facebookGroupUrlFromPostUrl(postUrl) || ev.actualGroupUrl || ev.groupUrl || row.groupUrl;
+        const ready = { profileId: publisherId, imagePath: row.imagePath || ev.imagePath || "" };
+        const closeResults = [];
+        try {
+          const res = await addRequiredFirstCommentWithDifferentProfile({
+            row,
+            ready,
+            groupUrl,
+            postUrl,
+            imagePath: ready.imagePath,
+            postValidation: { ok: true, errors: [], warnings: ["comment_resweep_recover"] },
+            ledgerKey: livePostLedgerKey(row, publisherId),
+            closeResults,
+          });
+          if (res?.ok || latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) summary.recommented += 1;
+          else summary.stillMissing += 1;
+        } catch (err) {
+          summary.errors.push(oneLineField(err.message || String(err), 160));
+        }
+      }
+    } catch (err) {
+      summary.errors.push("fatal:" + oneLineField(err.message || String(err), 160));
+    } finally {
+      __lastCommentResweepAt = Date.now();
+      __commentResweepInFlight = null;
+    }
+    if (summary.checked || summary.recommented || summary.errors.length) {
+      logEvent("facebook_comment_resweep_complete", summary);
+    }
+    return summary;
+  })();
+  return __commentResweepInFlight;
 }
 
 async function completeVerifiedFacebookPostWithComment({
@@ -16728,6 +16816,11 @@ const server = http.createServer(async (req, res) => {
     const body = await readJson(req);
     const result = await runFacebookFirstCommentRecoveryFromPostUrl({ ...body, fullRun: body.fullRun === true });
     return json(res, 200, result);
+  }
+  if (req.method === "POST" && url.pathname === "/api/posting/resweep-comments") {
+    const body = await readJson(req);
+    const result = await resweepUncommentedFacebookPostsAsync({ force: true, max: clampNumber(body.max, 1, 50, 10), windowHours: clampNumber(body.windowHours, 1, 168, 24) });
+    return json(res, 200, { ok: true, ...result });
   }
   if (req.method === "POST" && url.pathname === "/api/posting/run-live-full-plan") {
     const body = await readJson(req);

@@ -249,7 +249,7 @@ async function facebookLoginSnapshot(page) {
       ['account_deactivated', /\b(your account (?:has been )?deactivated|account deactivated)\b/],
       ['account_locked', /\b(your account (?:has been )?locked|account locked|temporarily locked)\b/],
       ['identity_review_required', /\b(confirm your identity|identity confirmation required|request a review|disagree with decision|we need to review your account)\b/],
-      ['publish_identity_required', /confirm your identity before you can publish|before you can publish as this page/],
+      ['publish_identity_required', /confirm your identity before you can publish/],
       ['account_restricted', /\b(you can't use facebook right now|you cannot use facebook right now|your account is restricted|restricted from using facebook)\b/],
     ];
     const accountMatch = accountChecks.find(([, pattern]) => pattern.test(lower));
@@ -279,7 +279,10 @@ async function detectPublishBlockDialog(page) {
     for (const d of document.querySelectorAll('[role="dialog"], [role="alertdialog"]')) text += ' ' + collect(d);
     const lower = text.toLowerCase();
     const patterns = [
-      ['publish_identity_confirmation', /confirm your identity before you can publish|before you can publish as this page|confirm your identity.{0,40}publish as this page/],
+      // Require the CONTIGUOUS dialog phrase (not the bare "before you can publish as this page",
+      // which appears in benign help/setup chrome) so a healthy profile is never blacklisted by
+      // passive text. These are active block messages only.
+      ['publish_identity_confirmation', /confirm your identity before you can publish|confirm your identity.{0,40}publish as this page/],
       ['page_publish_blocked', /you can't publish as this page|you cannot publish as this page|this page can't post|page is restricted from posting|can't post as this page/],
     ];
     const hit = patterns.find(([, re]) => re.test(lower));
@@ -2893,8 +2896,13 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
     opened: false,
     url: page.url(),
     visited,
-    adminSurfaceReachable: reachedAdminSurface,
-    method: reachedAdminSurface ? 'marker_not_found_after_full_scroll' : 'pending_queue_redirected_to_feed_no_admin_surface',
+    // null = INCONCLUSIVE: without a numeric gid we cannot build a valid admin URL, so a feed
+    // landing is NOT proof the approver lacks rights — never let a flaky gid-resolve MASK a real
+    // moderator grant by reporting false here.
+    adminSurfaceReachable: numericGid ? reachedAdminSurface : null,
+    method: !numericGid
+      ? 'admin_surface_inconclusive_no_numeric_gid'
+      : (reachedAdminSurface ? 'marker_not_found_after_full_scroll' : 'pending_queue_redirected_to_feed_no_admin_surface'),
   };
 }
 
@@ -2961,7 +2969,7 @@ async function approvePendingPost(page, context, payload, gid, marker) {
     // overloaded "no pending article" reason): false => approver is not a moderator of this group.
     console.log(JSON.stringify({
       step: 'admin_approval_surface',
-      adminSurfaceReachable: reviewSurface.adminSurfaceReachable !== false,
+      adminSurfaceReachable: reviewSurface.adminSurfaceReachable === undefined ? true : reviewSurface.adminSurfaceReachable,
       landedUrl: reviewSurface.url,
       method: reviewSurface.method,
       visited: (reviewSurface.visited || []).slice(-5),
@@ -3166,12 +3174,17 @@ async function main() {
     // disabled — the moderator never sees the queue and every post is left pending (never approved).
     // Resolve the numeric id from the rendered group page FIRST.
     if (!gid) {
-      await page.goto(`https://www.facebook.com/groups/${gidRaw}`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-      await humanPause(2000, 3500);
-      await ensureFacebookLoggedIn(page, payload, 'approve_only_group').catch(() => {});
-      const resolvedGid = await resolveNumericGroupIdFromPage(page).catch(() => '');
-      if (resolvedGid) gid = resolvedGid;
-      console.log(JSON.stringify({ step: 'admin_approval_gid_resolved', gidRaw, gid: gid || '', resolved: Boolean(resolvedGid) }));
+      // RETRY: a transient render/login miss returns empty gid; if we then build the vanity admin
+      // URL it redirects to the feed and the server would wrongly conclude "approver not a moderator"
+      // — masking the operator's rights grant. Try up to twice before giving up (then INCONCLUSIVE).
+      for (let gidAttempt = 1; gidAttempt <= 2 && !gid; gidAttempt += 1) {
+        await page.goto(`https://www.facebook.com/groups/${gidRaw}`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+        await humanPause(2000, 3500);
+        await ensureFacebookLoggedIn(page, payload, 'approve_only_group').catch(() => {});
+        const resolvedGid = await resolveNumericGroupIdFromPage(page).catch(() => '');
+        if (resolvedGid) gid = resolvedGid;
+        console.log(JSON.stringify({ step: 'admin_approval_gid_resolved', gidRaw, gid: gid || '', resolved: Boolean(resolvedGid), attempt: gidAttempt }));
+      }
     }
     await approvePendingPost(page, context, payload, gid, marker);
     return;
@@ -3340,6 +3353,13 @@ async function main() {
       if (Date.now() - findOnlyStartedAt > FIND_ONLY_BUDGET_MS) { findOnlyBudgetExceeded = true; break; }
       await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => console.log(JSON.stringify({ step: 'goto_warn', target, message: e.message })));
       await ensureFacebookLoggedIn(page, payload, 'find_only_marker_scan');
+      // Resolve the numeric gid for a VANITY group (o-prefixed slug) so permalink/user-URL regexes
+      // are not built broken (/groups//...). Without this isFacebookGroupPostUrl rejects every
+      // candidate and submitted-URL recovery captures ZERO permalinks for this group.
+      if (!gid) {
+        const fg = await resolveNumericGroupIdFromPage(page).catch(() => '');
+        if (fg) { gid = fg; console.log(JSON.stringify({ step: 'find_only_gid_resolved', gidRaw, gid })); }
+      }
       visited.push(page.url());
       publisherGroupUserCandidatesFromFind = mergeGroupUserCandidates(
         publisherGroupUserCandidatesFromFind,
@@ -3533,7 +3553,10 @@ async function main() {
   {
     const publishBlock = await detectPublishBlockDialog(page);
     if (publishBlock.blocked) {
-      console.log(JSON.stringify({ step: 'facebook_publish_blocked', stage: 'post_submit', ...publishBlock }));
+      // Emit the SAME step the server's livePostLogValidation keys off (facebook_account_status_blocked)
+      // so validation.facebookAccountBlocked=true propagates and isHardAccountBlockOutcome quarantines
+      // this profile. (Emitting a custom step name left the flag false and the profile was re-picked.)
+      console.log(JSON.stringify({ step: 'facebook_account_status_blocked', stage: 'post_submit_publish_block', accountBlocked: true, accountBlockReason: publishBlock.reason, snippet: publishBlock.snippet }));
       throw new Error(`facebook_account_suspended_or_disabled at post_submit: confirm your identity before you can publish as this Page (${publishBlock.reason})`);
     }
   }
