@@ -6,9 +6,6 @@
     <meta name="dashboard-token" content="__DASHBOARD_TOKEN__">
     <title>Facebook Agent Control</title>
     <link rel="icon" href="data:,">
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&family=Public+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
     <link rel="stylesheet" href="/app.css">
   </head>
   <body>
@@ -33,6 +30,7 @@
           <button class="topNavItem" data-view-target="approvals" type="button">Approvals</button>
           <button class="topNavItem" data-view-target="credentials" type="button">Credentials</button>
           <button class="topNavItem" data-view-target="integrations" type="button">Integrations</button>
+          <button class="topNavItem" data-view-target="posting" type="button">Posting</button>
           <button class="topNavItem" data-view-target="prod" type="button">Prod</button>
           <button class="topNavItem" data-view-target="test" type="button">Test</button>
           <button class="topNavItem" data-view-target="content" type="button">Content</button>
@@ -550,7 +548,7 @@
             </div>
           </section>
 
-          <section class="panel postingLead tabLead postingIntro" data-view="prod">
+          <section class="panel postingLead tabLead postingIntro" data-view="posting">
             <div class="panelHead">
               <div>
                 <h2>Production Posting</h2>
@@ -565,7 +563,7 @@
             </ol>
           </section>
 
-          <section class="panel prodStep" data-view="prod" data-prod-step="1">
+          <section class="panel prodStep" data-view="posting" data-prod-step="1">
             <div class="panelHead">
               <div>
                 <span class="stepBadge">Step 1</span>
@@ -596,7 +594,7 @@
             </div>
           </section>
 
-          <section class="panel prodStep" data-view="prod" data-prod-step="2">
+          <section class="panel prodStep" data-view="posting" data-prod-step="2">
             <div class="panelHead">
               <div>
                 <span class="stepBadge">Step 2</span>
@@ -627,8 +625,8 @@
               <p class="muted">Live autonomous posting — status, safety, controls, and the pipeline steps. Cross-account comments and the no-photo skip are always on. The CPU governor keeps the box from starving the separate Pinterest agent.</p>
             </div>
             <div class="panelBody">
-              <div id="prodHeadline" class="prodHeadline">Loading production status…</div>
-              <div id="prodStatusGrid" class="prodStatusGrid"></div>
+              <div id="prodHeadline" style="font-size:1.1rem;font-weight:700;margin:.25rem 0 .75rem;">Loading production status…</div>
+              <div id="prodStatusGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.5rem;margin-bottom:1rem;"></div>
               <h3>Controls</h3>
               <div class="miniActions">
                 <button id="prodGoLiveBtn" class="primary mainTestButton" type="button">&#9654; Go Live</button>
@@ -649,9 +647,9 @@
               <div id="prodActionResult" class="muted" style="margin-top:.5rem;min-height:1.2em;"></div>
               <h3 style="margin-top:1rem;">Live pipeline</h3>
               <div id="prodCurrentCycle" class="muted" style="margin-bottom:.5rem;">…</div>
-              <div class="prodFeedGrid">
-                <div><div style="font-weight:600;margin-bottom:.3rem;">Activity — latest steps (live)</div><div id="prodActivityFeed" class="prodFeed">…</div></div>
-                <div><div style="font-weight:600;margin-bottom:.3rem;">Recent landed posts</div><div id="prodRecentPosts" class="prodFeed">…</div></div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;align-items:start;">
+                <div><div style="font-weight:600;margin-bottom:.3rem;">Activity — latest steps (live)</div><div id="prodActivityFeed" style="font-size:.82rem;max-height:300px;overflow:auto;border:1px solid #e3e6ea;border-radius:6px;padding:.4rem;background:#fafbfc;">…</div></div>
+                <div><div style="font-weight:600;margin-bottom:.3rem;">Recent landed posts</div><div id="prodRecentPosts" style="font-size:.82rem;max-height:300px;overflow:auto;border:1px solid #e3e6ea;border-radius:6px;padding:.4rem;background:#fafbfc;">…</div></div>
               </div>
               <h3 style="margin-top:1rem;">How production runs (each cycle)</h3>
               <ol id="prodSteps" class="muted" style="line-height:1.5;padding-left:1.2rem;">
@@ -663,31 +661,6 @@
                 <li>When the daily cap is reached it <b>prepares tomorrow's buffer</b>. The watchdog restarts the server if it goes down. The <b>Pinterest agent is never touched</b>.</li>
               </ol>
             </div>
-          </section>
-
-          <section class="panel wide prodRoles" data-view="prod">
-            <div class="panelHead">
-              <div>
-                <h2>Profile roles</h2>
-                <p class="muted">Pick which IXBrowser profiles act as moderators (approve pending posts), the ShopYourLikes link profile, and which profiles to exclude from posting. Populated from your live IXBrowser profile list.</p>
-              </div>
-              <div class="miniActions">
-                <button id="prodLoadProfilesBtn" type="button">&#8635; Load Profiles</button>
-                <button id="prodSaveRolesBtn" class="primary" type="button">Save Roles</button>
-              </div>
-            </div>
-            <div class="prodRolesGrid">
-              <label class="prodRoleField">Moderator accounts <small>approve pending posts only &middot; never post/comment</small>
-                <select id="prodModeratorProfileSelect" data-transient="true" data-runtime-control="true" multiple size="7"></select>
-              </label>
-              <label class="prodRoleField">ShopYourLikes profile <small>generates the SYL affiliate links</small>
-                <select id="prodSylProfileSelect" data-transient="true" data-runtime-control="true"><option value="">&#8212; none &#8212;</option></select>
-              </label>
-              <label class="prodRoleField">Excluded profiles <small>never used for posting</small>
-                <select id="prodExcludedProfileSelect" data-transient="true" data-runtime-control="true" multiple size="7"></select>
-              </label>
-            </div>
-            <div id="prodRolesStatus" class="inlineNotice neutral">Click <b>Load Profiles</b> to populate from IXBrowser, choose roles, then <b>Save Roles</b>. Ctrl/Cmd-click to select multiple.</div>
           </section>
 
           <section class="panel wide testPostPanel" data-view="test">
@@ -739,7 +712,7 @@
             <div id="publishedPostUrlStatus" class="inlineNotice neutral">No Facebook post URL recorded in this browser session.</div>
           </section>
 
-          <section class="panel wide prodStep" data-view="prod" data-prod-step="3">
+          <section class="panel wide prodStep" data-view="posting" data-prod-step="3">
             <div class="panelHead">
               <div>
                 <span class="stepBadge">Step 3</span>
@@ -773,7 +746,7 @@
             </label>
           </section>
 
-          <section class="panel wide prodStep prodRunStep" data-view="prod" data-prod-step="4">
+          <section class="panel wide prodStep prodRunStep" data-view="posting" data-prod-step="4">
             <div class="panelHead">
               <div>
                 <span class="stepBadge">Step 4</span>
@@ -877,7 +850,7 @@
             </div>
           </section>
 
-          <section class="panel wide workflowOutputPanel" data-view="content prod test operations">
+          <section class="panel wide workflowOutputPanel" data-view="content posting test operations">
             <div class="panelHead">
               <div>
                 <h2>Prepared Workflow Output</h2>
@@ -956,8 +929,8 @@
               </div>
               <label class="switch line"><input id="useDedicatedIxProfile" type="checkbox"><span>Use fixed IXBrowser profile for ShopYourLikes</span></label>
               <label class="switch line"><input id="dedicatedIxProfileFixedIp" type="checkbox"><span>Dedicated profile IP is fixed</span></label>
-              <label>ShopYourLikes IX profile ID <input id="affiliateDedicatedIxProfileIdView" spellcheck="false" placeholder="Set in Prod &#8594; Profile roles or Integrations" readonly></label>
-              <label>ShopYourLikes IX profile name <input id="affiliateDedicatedIxProfileNameView" spellcheck="false" placeholder="Set in Prod &#8594; Profile roles" readonly></label>
+              <label>ShopYourLikes IX profile ID <input id="dedicatedIxProfileId" spellcheck="false" placeholder="Give this when ready"></label>
+              <label>ShopYourLikes IX profile name <input id="dedicatedIxProfileName" spellcheck="false" placeholder="Optional profile name"></label>
               <label class="switch line"><input id="rotateDedicatedProfileIp" type="checkbox"><span>Allow IP rotation for this profile</span></label>
               <label class="switch line"><input id="generateShortlinksInDedicatedProfile" type="checkbox"><span>Generate Mavlynk shortlinks in same profile</span></label>
               <label class="switch line"><input id="cleanExistingAffiliateLinks" type="checkbox"><span>Clean existing affiliate links first</span></label>
