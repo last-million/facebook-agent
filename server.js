@@ -8022,7 +8022,7 @@ async function autopilotTickAsync(options = {}) {
         // outcomes, NOT per-worker — so concurrent workers cannot lose increments (read-modify-write race).
         return { profileId: Number(r.profileId || 0), ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", error: "" };
       } catch (err) {
-        autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: false, postUrl: "", errorText: oneLineField((err && (err.profileFailureReason || err.message)) || String(err), 240), profileRetryable: !!(err && err.profileRetryable), source: "autopilot" });
+        autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: false, postUrl: "", errorText: oneLineField((err && (err.profileFailureReason || err.message)) || String(err), 240), profileRetryable: !!(err && err.profileRetryable), validation: err && err.livePostValidation, source: "autopilot" });
         return { profileId: Number(r.profileId || 0), ok: false, postUrl: "", error: oneLineField((err && err.message) || String(err), 200) };
       }
     };
@@ -12087,7 +12087,9 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         publishedByUrl.set(r.postUrl, r); // keep the latest published row per permalink
       }
       for (const [postUrl, ev] of publishedByUrl) {
-        if (summary.recommented >= maxToFix) break;
+        // Bound by ATTEMPTS, not just successes: a post that can never be commented (no eligible
+        // commenter) must not make every 90s sweep do full-cost recovery work against it.
+        if (summary.recommented >= maxToFix || summary.checked >= maxToFix) break;
         const publisherId = Number(ev.profileId || 0);
         if (latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) continue; // already has a different-profile comment
         const row = postingPlanRowForRecord({ planId: ev.planId, sequence: ev.sequence });
@@ -12967,6 +12969,23 @@ async function runLiveFacebookPostFromPlan(body = {}) {
       }
       const liveObjects = err.livePostLog || [];
       const postUrl = firstFacebookPostUrlFromLog(liveObjects);
+      // PAGE/ACCOUNT HARD BLOCK mid-publish (e.g. "Confirm your identity before you can publish as
+      // this Page"): the connector logs post_clicked THEN throws, so without this the submitted-post
+      // recovery branch below swallows it into a generic "unverified publish" error and the profile
+      // is NEVER blacklisted (re-picked every tick). If no permalink was captured, quarantine HERE.
+      if (!postUrl && isFacebookAccountHardBlockedFailure(err.message || "", err.livePostValidation, liveObjects)) {
+        recordFacebookAccountHardBlock({
+          profile: row.profile || ready.profileId,
+          profileId: ready.profileId,
+          groupUrl,
+          reason: oneLineField(err.message || err.livePostValidation?.facebookAccountBlockReason || "Facebook account/page is blocked or requires identity confirmation before publishing.", 200),
+          source: "facebook_live_post_post_submit_block",
+        });
+        logEvent("facebook_live_post_account_blocked_try_next_profile", { planId: row.planId, sequence: row.sequence, profileId: ready.profileId, groupUrl, error: oneLineField(err.message || "", 180) });
+        const blockErr = new Error(`facebook_account_suspended_or_disabled: ${oneLineField(err.message || "account hard block", 180)}`);
+        blockErr.livePostValidation = err.livePostValidation || { ok: false, errors: ["facebook_account_status_blocked"], facebookAccountBlocked: true };
+        throw blockErr;
+      }
       if (postUrl || livePostLogShowsSubmittedPost(liveObjects)) {
         const validation = err.livePostValidation || livePostLogValidation(liveObjects, payload);
         if (postUrl) {
