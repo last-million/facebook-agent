@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-04T16:34:48.188Z",
+  "updatedAt": "2026-06-04T16:55:53.570Z",
   "testRun": {
     "status": "done",
     "active": false,
@@ -134,7 +134,7 @@
     "autopilotProfileAllowlist": "",
     "commentCooldownHours": 1,
     "autopilotMaxPostsPerRun": 20,
-    "autopilotPostsThisRun": 1,
+    "autopilotPostsThisRun": 0,
     "autopilotWorkerStaggerSeconds": 25,
     "adminApprovalSettleSeconds": 3,
     "parallelOpenStaggerSeconds": 8,
@@ -277,13 +277,13 @@
     "targetCandidateCount": 126,
     "rankingRules": "Prioritize fresh reduced-price products with clear deal signal, strong positive reviews, safe product images, affiliate compatibility, and no prior use in the posted-product register.",
     "notes": "Generated source URLs are discovery pages/searches, not final product URLs. Hermes should inspect these with a browser, rank candidates, reject products already posted, then move unique chosen product pages into Product URLs.",
-    "lastRunAt": "2026-06-04T15:02:35.504Z",
+    "lastRunAt": "2026-06-04T16:55:53.542Z",
     "lastRunStatus": "direct_discovery_saved",
     "lastRunParser": "jina_reader",
-    "lastRunCandidateCount": 219,
+    "lastRunCandidateCount": 322,
     "lastRunNewCandidateCount": 126,
-    "lastRunRefreshedCandidateCount": 93,
-    "lastSuccessfulRunAt": "2026-06-04T15:00:25.119Z"
+    "lastRunRefreshedCandidateCount": 196,
+    "lastSuccessfulRunAt": "2026-06-04T16:54:08.259Z"
   },
   "affiliate": {
     "service": "ShopYourLikes",
