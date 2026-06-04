@@ -2793,7 +2793,12 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
 }
 
 async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = '', groupId = '') {
-  const base = String(groupUrl || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+  const rawBase = String(groupUrl || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+  const numericGid = String(groupId || '').replace(/\D+/g, '');
+  // Admin surfaces only resolve with the NUMERIC group id; a vanity slug
+  // (/groups/o1498765.../pending_posts/) redirects to the group FEED, so the moderator never sees
+  // the pending queue and posts stay pending. Prefer the numeric-id base whenever we have it.
+  const base = numericGid ? `https://www.facebook.com/groups/${numericGid}` : rawBase;
   const targets = [
     `${base}/pending_posts/`,
     `${base}/pending_posts`,
@@ -3113,6 +3118,19 @@ async function main() {
   });
 
   if (payload.approveOnly) {
+    // The admin pending-queue surface (pending_posts / manage_post_queue) only resolves with the
+    // NUMERIC group id. When the group is addressed by a VANITY slug (e.g. /groups/o1498765421290862)
+    // gid is empty here, so FB redirects pending_posts to the group FEED and the author-link match is
+    // disabled — the moderator never sees the queue and every post is left pending (never approved).
+    // Resolve the numeric id from the rendered group page FIRST.
+    if (!gid) {
+      await page.goto(`https://www.facebook.com/groups/${gidRaw}`, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await humanPause(2000, 3500);
+      await ensureFacebookLoggedIn(page, payload, 'approve_only_group').catch(() => {});
+      const resolvedGid = await resolveNumericGroupIdFromPage(page).catch(() => '');
+      if (resolvedGid) gid = resolvedGid;
+      console.log(JSON.stringify({ step: 'admin_approval_gid_resolved', gidRaw, gid: gid || '', resolved: Boolean(resolvedGid) }));
+    }
     await approvePendingPost(page, context, payload, gid, marker);
     return;
   }
