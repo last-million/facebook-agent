@@ -8670,7 +8670,13 @@ function sanitizeFacebookGroupUrl(value, options = {}) {
   return parsed.toString();
 }
 
+const __fbGroupUrlListMemo = new Map();
 function sanitizeFacebookGroupUrlList(value) {
+  // Pure function of `value`; memoize string inputs. It is called per-status-line inside the
+  // per-profile/per-product block checks, so the same log lines get re-parsed thousands of times
+  // during one autopilotStatus/assetBufferStatus compute. Memoizing collapses that to once/line.
+  const __memoStr = typeof value === "string" ? value : null;
+  if (__memoStr !== null) { const hit = __fbGroupUrlListMemo.get(__memoStr); if (hit) return hit; }
   const embeddedUrls = Array.isArray(value)
     ? []
     : (String(value || "").match(/https?:\/\/(?:[^/\s|,]+\.)?facebook\.com\/groups\/[^\s|,)]+/gi) || []);
@@ -8691,7 +8697,9 @@ function sanitizeFacebookGroupUrlList(value) {
       // Ignore malformed attempted URLs in issue logs; keep the primary error concise.
     }
   }
-  return urls.slice(0, 20);
+  const __res = urls.slice(0, 20);
+  if (__memoStr !== null) { if (__fbGroupUrlListMemo.size > 50000) __fbGroupUrlListMemo.clear(); __fbGroupUrlListMemo.set(__memoStr, __res); }
+  return __res;
 }
 
 function sanitizeFacebookPostUrl(value) {
@@ -16120,7 +16128,7 @@ const IX_PROFILES_CACHE_TTL_MS = 45000;
 // A long TTL means the heavy compute runs at most ~once/15s no matter how hard the UI polls.
 let __autopilotStatusCache = { at: 0, body: null };
 let __assetBufferStatusCache = { at: 0, body: null };
-const STATUS_CACHE_TTL_MS = 15000;
+const STATUS_CACHE_TTL_MS = 300000;
 
 let lastHeartbeatTick = 0;
 setInterval(() => {
