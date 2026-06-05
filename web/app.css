@@ -460,13 +460,13 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 }
 .primary:hover { background: linear-gradient(180deg, #ffc869, var(--accent-strong)); }
 
-.danger {
+button.danger, .danger {
   background: linear-gradient(180deg, #ff7283, var(--danger));
   border-color: #ff7283;
-  color: #2a0a10;
+  color: #2a0a10 !important;
   font-weight: 700;
 }
-.danger:hover { background: linear-gradient(180deg, #ff8a98, #ff6072); }
+button.danger:hover, .danger:hover { background: linear-gradient(180deg, #ff8a98, #ff6072); }
 
 .ghostButton, .ghost {
   background: transparent;
