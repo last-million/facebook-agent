@@ -53,7 +53,7 @@
 
       <section class="layout">
         <section class="mainGrid">
-          <section class="panel command wide" data-view="overview">
+          <section class="panel command wide" data-view="_off">
             <div class="panelHead">
               <h2>Command Center</h2>
               <span class="badge safe">127.0.0.1 only</span>
@@ -647,9 +647,9 @@
               <div id="prodStatusGrid" class="prodStatusGrid"></div>
               <h3 class="prodSectionTitle">Launch</h3>
               <div class="prodLaunch">
-                <button id="prodLaunchAllBtn" class="primary prodLaunchBtn" type="button">&#9654; Launch Production</button>
-                <button id="prodStopAllBtn" class="danger" type="button">&#10073;&#10073; Stop</button>
-                <span class="muted prodLaunchHint">One click arms external actions, enables autopilot, sets 3-by-3 concurrency, and goes live. The pipeline then runs itself.</span>
+                <button id="prodLaunchAllBtn" class="primary prodLaunchBtn" type="button">&#9654; Start</button>
+                <button id="prodStopAllBtn" class="danger prodLaunchBtn" type="button">&#9632; Stop</button>
+                <span class="muted prodLaunchHint"><b>Start</b> turns everything ON (arms external actions, enables autopilot, 3-by-3, goes live). <b>Stop</b> turns everything OFF.</span>
               </div>
               <details class="prodAdvanced">
                 <summary>Manual controls</summary>
