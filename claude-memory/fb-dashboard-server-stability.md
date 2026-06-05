@@ -7,11 +7,16 @@ metadata:
   originSessionId: 80639e48-5193-4896-84b0-c65946091867
 ---
 
-The single-threaded Node dashboard server (`Desktop\facbeook agent\server.js`, port 9317) can wedge — *listening but unresponsive* → browser shows ERR_CONNECTION_REFUSED or hangs. Root cause (measured 2026-06-04): multi-tab dashboard polling saturates the event loop. The dashboard `refresh()` polls every 3s hitting `/api/state` (~36ms, returns the full 1.14 MB state) + `/api/approvals` (~120ms, `buildApprovalItems`), and the IXBrowser profile-list auto-load was ~650ms/call **uncached** — several open tabs × that = saturation.
+The single-threaded Node dashboard server (`Desktop\facbeook agent\server.js`, port 9317) can wedge — *listening but unresponsive* → browser shows ERR_CONNECTION_REFUSED or hangs.
 
-**FIX shipped (commit 6ad6678):**
-1. `server.js` `__ixProfilesCache` — 45s TTL + in-flight collapse on `POST /api/integrations/ixbrowser/profiles` (650ms cold → ~3ms cached).
-2. `data\fb-server-watchdog.ps1` now **health-checks** instead of port-only: probes `GET /` (6s timeout); two consecutive fails 4s apart ⇒ kills the port-9317 owner **only** (never the Pinterest 59812 owner) and restarts. Task `FB-Server-Watchdog` interval tightened 3min→1min. Verified: no-op against a healthy server.
+**TRUE root cause (measured + CPU-profiled 2026-06-04 night):** `/api/autopilot/status` + `/api/products/asset-buffer-status` became pathologically slow (~12s and ~6.8s PER CALL). `autopilotStatus`/`assetBufferStatus` fan out into `isProfileBlockedForPosting`/`isFacebookProfileQuarantinedForFacebook` which re-parse the whole `posting.facebookProfileStatus` + `ixbrowser.failedProfiles` logs **per-profile × per-product**, calling the pure `sanitizeFacebookGroupUrlList` on the SAME lines thousands of times. As those logs grew (500+ lines) the cost exploded. An **open Edge dashboard tab** (msedge, not node) polling those two endpoints then pinned the event loop → every fresh boot spun to ~2.5 cores and never served. (Diagnosed with `node --prof`: 90% in V8 regex engine; client found via `Get-NetTCPConnection -RemotePort 9317`.)
+
+**FIXES shipped (commits 6ad6678, a0c5792, b3b5213):**
+1. **Memoize `sanitizeFacebookGroupUrlList`** (pure fn, module-level Map) → autopilot/asset status ~12s → **~1.4s (9×)**. This was the real cure.
+2. **Cache** `/api/autopilot/status` + `/api/products/asset-buffer-status` (`STATUS_CACHE_TTL_MS=300s`) so polling can't re-trigger the heavy compute.
+3. **Dedup the status logs** (`data/_trimstate.js`): collapse `facebookProfileStatus`/`failedProfiles` to the latest line per (profile_id, group_url) — behavior-preserving (functions only use the latest). Backup at `data/workflow-state.prelaunch.bak.json`.
+4. `__ixProfilesCache` (45s TTL + in-flight collapse) on `POST /api/integrations/ixbrowser/profiles` (650ms→3ms).
+5. `data\fb-server-watchdog.ps1` now **health-checks** (`GET /`, 6s timeout, 2 fails 4s apart ⇒ kill the 9317-owner only, never Pinterest 59812, + restart); task interval 1min. NOTE: it correctly kills a genuinely-wedged server, so it will kill-LOOP if the server can't stay up — disable it (`Disable-ScheduledTask FB-Server-Watchdog`) while debugging a boot spin, re-enable after.
 
 **Manual recovery if it ever wedges again:** kill every `node` process EXCEPT the Pinterest pid (port 59812 owner), confirm 9317 is free, then `Start-ScheduledTask FB-Server-Watchdog`. Give it ~15s, then ping `GET http://127.0.0.1:9317/` expecting HTTP 200.
 
