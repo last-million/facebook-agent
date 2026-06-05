@@ -472,16 +472,12 @@
           <section class="panel wide integrationOps tabLead" data-view="integrations">
             <div class="panelHead">
               <div>
-                <h2>Browser & Proxy Control</h2>
-                <p>Read-only checks work anytime. Opening profiles and applying proxies require the external-action arm switch.</p>
+                <h2>Manual / Advanced Controls</h2>
+                <p>Optional tools for setup &amp; troubleshooting — the normal flow is the steps above + <b>Launch</b> in Prod. Opening profiles and applying proxies require the external-action arm switch.</p>
               </div>
-            </div>
-            <div class="integrationToolbar" aria-label="Integration checks">
-              <button id="checkIntegrationHealthBtn" class="primary">Check API Config</button>
-              <button id="testWebshareBtn">Test Webshare</button>
-              <button id="loadWebshareProxiesBtn">Load Proxies</button>
-              <button id="testIxBtn">Test IXBrowser</button>
-              <button id="loadIxProfilesBtn">Load Profiles</button>
+              <div class="miniActions">
+                <button id="checkIntegrationHealthBtn" class="primary">Check API Config</button>
+              </div>
             </div>
             <div class="integrationWorkBlock">
               <div class="workBlockHead">
@@ -507,30 +503,22 @@
             <div class="integrationWorkBlock sylProfileBlock">
               <div class="workBlockHead">
                 <div>
-                  <strong>Dedicated ShopYourLikes IXBrowser Profile</strong>
-                  <span>Select one IXBrowser profile for the ShopYourLikes extension/login. Keep it separate from Facebook posting profiles and do not rotate its IP automatically.</span>
+                  <strong>ShopYourLikes Profile — extension &amp; proxy</strong>
+                  <span>The SYL profile is chosen in <b>Profile Roles</b> above. Open it once here to install the ShopYourLikes extension and log in. Keep it separate from posting profiles.</span>
                 </div>
               </div>
               <div class="integrationFormGrid">
-                <label>ShopYourLikes IXBrowser profile
-                  <select id="shopyourlikesIxProfileSelect">
-                    <option value="">Click Load Profiles first</option>
-                  </select>
-                </label>
+                <label>Saved SYL IX profile ID <input id="dedicatedIxProfileId" spellcheck="false" placeholder="Set in Profile Roles" readonly></label>
+                <label>Saved SYL IX profile name <input id="dedicatedIxProfileName" spellcheck="false" placeholder="Set in Profile Roles" readonly></label>
                 <label>ShopYourLikes proxy
                   <select id="shopyourlikesBrowserProxySelect"></select>
                 </label>
-                <label>Saved SYL IX profile ID <input id="dedicatedIxProfileId" spellcheck="false" placeholder="Selected IX profile id"></label>
-                <label>Saved SYL IX profile name <input id="dedicatedIxProfileName" spellcheck="false" placeholder="Selected IX profile name"></label>
                 <label>Start URL <input id="shopyourlikesBrowserStartUrl" spellcheck="false" placeholder="https://www.shopyourlikes.com/"></label>
                 <label>Profile path <input id="shopyourlikesBrowserProfilePath" spellcheck="false" placeholder="data/shopyourlikes-browser-profile"></label>
                 <label class="switch line"><input id="shopyourlikesBrowserUseProxy" type="checkbox"><span>Use selected dedicated proxy/IP</span></label>
               </div>
               <div class="integrationButtonGrid">
-                <button id="saveShopYourLikesIxProfileBtn">Save Selected SYL IX Profile</button>
-                <button id="openShopYourLikesIxProfileBtn" class="primary">Open SYL IX Profile</button>
-                <button id="openShopYourLikesBrowserBtn">Open Legacy Local Edge SYL Browser</button>
-                <button id="closeShopYourLikesBrowserBtn">Close Legacy Local Edge SYL Browser</button>
+                <button id="openShopYourLikesIxProfileBtn" class="primary">Open SYL IX Profile (install extension)</button>
                 <button id="testShopYourLikesProxyBtn">Test SYL Proxy</button>
               </div>
               <div id="shopYourLikesBrowserStatus" class="inlineNotice neutral">Install the ShopYourLikes extension manually once in this browser profile, then reuse it.</div>
