@@ -132,13 +132,13 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   width: 100%;
   min-height: 100vh;
   display: grid;
-  grid-template-columns: 304px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto 1fr;
 }
 .layout { display: contents; }
 
 .topbar {
-  grid-column: 2;
+  grid-column: 1;
   grid-row: 1;
   position: sticky;
   top: 0;
@@ -311,15 +311,20 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 /* ============================== MAIN GRID + VIEW ENGINE ============================== */
 
 .mainGrid {
-  grid-column: 2;
+  grid-column: 1;
   grid-row: 2;
   display: grid;
   grid-template-columns: repeat(12, 1fr);
   gap: 16px;
   align-content: start;
-  padding: 20px 26px 60px;
+  width: 100%;
+  max-width: 1200px;
+  margin-inline: auto;
+  padding: 22px 26px 64px;
   min-width: 0;
 }
+/* center the sticky topbar content to match the capped main column */
+.topbar { padding-inline: max(26px, calc((100% - 1200px) / 2 + 26px)); }
 
 /* view engine — EXACT preservation of behavior */
 .viewsReady [data-view] { display: none; }
@@ -817,6 +822,10 @@ select[multiple] option:checked { background: var(--accent) linear-gradient(0deg
 /* ============================== PROD CONSOLE (live) ============================== */
 
 .prodHeadline { font-family: var(--font-display); font-size: 17px; font-weight: 700; margin: 2px 0 14px; }
+.prodHeadline.isLive { color: var(--ok); }
+.prodHeadline.isDry { color: var(--warn); }
+.prodHeadline.isOff { color: var(--soft); }
+.prodFeedTime { color: var(--soft); }
 .prodSectionTitle, .panelBody h3 { margin: 16px 0 8px; }
 .prodStatusGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 9px; margin-bottom: 14px; }
 .prodStatCard { display: flex; flex-direction: column; gap: 3px; }
@@ -824,6 +833,15 @@ select[multiple] option:checked { background: var(--accent) linear-gradient(0deg
 .prodStatValue { font-family: var(--font-mono); font-size: 17px; font-weight: 700; color: var(--text); }
 .prodStatCard.down, .prodStatCard.down .prodStatValue { color: var(--danger); }
 .prodControls { gap: 8px; }
+.prodLaunch { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 4px 0 10px; }
+.prodLaunchBtn { min-height: 52px; padding: 12px 30px; font-size: 16px; font-family: var(--font-display); font-weight: 700; letter-spacing: 0.01em; box-shadow: 0 12px 34px -12px var(--accent-glow); }
+.prodLaunchHint { flex: 1 1 240px; font-size: 12px; }
+.prodAdvanced { margin-top: 10px; border: 1px solid var(--line); border-radius: var(--r-md); padding: 0 12px; background: var(--surface-2); }
+.prodAdvanced > summary { cursor: pointer; padding: 10px 2px; color: var(--soft); font-size: 11px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; list-style: none; }
+.prodAdvanced > summary::-webkit-details-marker { display: none; }
+.prodAdvanced > summary::before { content: "▸ "; color: var(--accent); }
+.prodAdvanced[open] > summary::before { content: "▾ "; }
+.prodAdvanced .miniActions { padding-bottom: 12px; }
 .prodControls label { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
 .prodControls select { width: auto; min-width: 70px; }
 .prodActionResult { margin-top: 8px; min-height: 1.2em; font-size: 12.5px; font-family: var(--font-mono); }
@@ -897,7 +915,7 @@ select[multiple] option:checked { background: var(--accent) linear-gradient(0deg
 
 /* ============================== MENU TOGGLE (mobile) ============================== */
 
-.menuToggle { display: none; }
+.menuToggle, #sidebarToggle, #saveAllTop, #saveAllBtn { display: none !important; }
 
 /* ============================== RESPONSIVE LADDER ============================== */
 

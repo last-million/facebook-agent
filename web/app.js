@@ -236,6 +236,7 @@ function markDirty() {
   dirtyVersion += 1;
   dirty = true;
   renderDirtyStatus();
+  scheduleAutoSave();
 }
 
 function clearDirty() {
@@ -243,9 +244,42 @@ function clearDirty() {
   renderDirtyStatus();
 }
 
+// ── Auto-save (no Save button) + global Ctrl+Z undo ──────────────────────────────────────────
+let __autoSaveTimer = null;
+let __undoStack = [];
+let __lastSnapshot = null;
+let __undoBusy = false;
+function scheduleAutoSave() {
+  if (__autoSaveTimer) clearTimeout(__autoSaveTimer);
+  __autoSaveTimer = setTimeout(() => {
+    __autoSaveTimer = null;
+    if (dirty) saveAll({ quiet: true }).catch(() => {});
+  }, 850);
+}
+async function undoLastChange() {
+  if (!__undoStack.length) { showToast("Nothing left to undo."); return; }
+  const prev = __undoStack.pop();
+  __undoBusy = true;
+  try {
+    const st = JSON.parse(prev);
+    __lastSnapshot = prev;
+    renderState(st);
+    await saveAll({ quiet: true });
+    showToast("Reverted last change (Ctrl+Z).");
+  } catch (e) { showToast("Undo failed."); } finally { __undoBusy = false; }
+}
+document.addEventListener("keydown", (e) => {
+  if (!(e.ctrlKey || e.metaKey) || String(e.key || "").toLowerCase() !== "z" || e.shiftKey) return;
+  const t = e.target;
+  // let the browser's native per-character undo handle focused text fields
+  if (t && t.matches && t.matches("input:not([type=checkbox]):not([type=radio]):not([type=range]), textarea")) return;
+  e.preventDefault();
+  undoLastChange();
+});
+
 function renderDirtyStatus() {
   const el = $("dirtyStatus");
-  el.textContent = dirty ? "Unsaved edits" : "Saved";
+  el.textContent = dirty ? "Saving…" : "Auto-saved";
   el.className = `saveState ${dirty ? "dirty" : "clean"}`;
 }
 
@@ -1495,6 +1529,7 @@ function getValue(id) {
 
 function renderState(state) {
   workflowState = state;
+  if (__lastSnapshot === null && state) { try { __lastSnapshot = JSON.stringify(state); } catch (e) {} }
   $("stateUpdated").textContent = fmtTime(state.updatedAt);
   renderAnalytics();
   renderTestParallelLanes(state);
@@ -2523,20 +2558,32 @@ async function saveGeneratedAssignmentState() {
   }
 }
 
-async function saveAll() {
+async function saveAll(opts) {
+  if (__autoSaveTimer) { clearTimeout(__autoSaveTimer); __autoSaveTimer = null; }
+  const quiet = opts && opts.quiet;
   setBusy(true);
   try {
+    const prevSnapshot = __lastSnapshot;
     const state = collectState();
     const registers = collectRegisters();
     const [stateResult, registerResult] = await Promise.all([
       api("/api/state", { method: "PUT", body: JSON.stringify({ state }) }),
       api("/api/registers", { method: "PUT", body: JSON.stringify({ registers }) }),
     ]);
-    renderState(stateResult.state);
-    renderRegisters(registerResult.registers);
+    // undo history: remember the state BEFORE this save (skip while undoing)
+    if (!__undoBusy && prevSnapshot !== null) { __undoStack.push(prevSnapshot); if (__undoStack.length > 60) __undoStack.shift(); }
+    try { __lastSnapshot = JSON.stringify(stateResult.state); } catch (e) {}
+    if (quiet) {
+      // auto-save: keep state fresh WITHOUT re-rendering the form (no caret jump mid-edit)
+      workflowState = stateResult.state;
+      renderRegisters(registerResult.registers);
+    } else {
+      renderState(stateResult.state);
+      renderRegisters(registerResult.registers);
+    }
     clearDirty();
     renderReadiness();
-    showToast("Everything saved.");
+    if (!quiet) showToast("Everything saved.");
   } finally {
     setBusy(false);
   }
@@ -4371,6 +4418,89 @@ function renderProfileSelect() {
     if (saved) $("shopyourlikesIxProfileSelect").value = saved;
   }
   syncCommentLimitProfileFromSelected({ overwrite: false });
+  renderProdRoleSelects();
+}
+
+// ── Prod tab "Profile roles" selectors (moderators / ShopYourLikes / excluded) ──────────────
+// UI mirrors of the canonical textareas (#moderatorProfiles, #blockedProfiles) + the affiliate SYL
+// id/name. Populated from the live integrationProfiles list; SAVED through setValue + saveAll so
+// they route through collectState -> PUT /api/state and can never desync. Selects are
+// [data-transient] so the dirty tracker ignores them. Non-numeric manual lines (e.g. "wise") in
+// the textareas are preserved on save.
+function prodRoleIdsFromText(text) {
+  const set = new Set();
+  String(text || "").split(/\r?\n/).forEach(function (line) {
+    const m = String(line).trim().match(/^(\d+)/);
+    if (m) set.add(m[1]);
+  });
+  return set;
+}
+function prodRoleKeepNonId(text) {
+  return String(text || "").split(/\r?\n/).map(function (s) { return s.trim(); }).filter(function (l) { return l && !/^\d/.test(l); });
+}
+function prodRoleLabelFor(id) {
+  const p = integrationProfiles.find(function (x) { return String(x.profile_id || x.id) === String(id); });
+  const name = (p && (p.name || p.title)) || "";
+  return name ? (id + " - " + name) : String(id);
+}
+function renderProdRoleSelects() {
+  const mod = $("prodModeratorProfileSelect");
+  const exc = $("prodExcludedProfileSelect");
+  const syl = $("prodSylProfileSelect");
+  if (!mod && !exc && !syl) return;
+  const active = document.activeElement; // never clobber a select being edited
+  const hasProfiles = Array.isArray(integrationProfiles) && integrationProfiles.length > 0;
+  const optsFor = function (selectedSet) {
+    if (!hasProfiles) return '<option value="" disabled>Click Load Profiles first</option>';
+    return integrationProfiles.map(function (profile) {
+      const id = profile.profile_id || profile.id;
+      const name = profile.name || profile.title || ("Profile " + id);
+      const sel = selectedSet && selectedSet.has(String(id)) ? " selected" : "";
+      return '<option value="' + escapeHtml(String(id)) + '"' + sel + '>' + escapeHtml(id + " - " + name) + '</option>';
+    }).join("");
+  };
+  const ix = (workflowState && workflowState.ixbrowser) || {};
+  if (mod && mod !== active) mod.innerHTML = optsFor(prodRoleIdsFromText(ix.moderatorProfiles));
+  if (exc && exc !== active) exc.innerHTML = optsFor(prodRoleIdsFromText(ix.blockedProfiles));
+  if (syl && syl !== active) {
+    const savedSyl = String((workflowState && workflowState.affiliate && workflowState.affiliate.dedicatedIxProfileId) || "");
+    let html = '<option value="">— none —</option>';
+    if (hasProfiles) {
+      html += integrationProfiles.map(function (profile) {
+        const id = profile.profile_id || profile.id;
+        const name = profile.name || profile.title || ("Profile " + id);
+        const sel = String(id) === savedSyl ? " selected" : "";
+        return '<option value="' + escapeHtml(String(id)) + '"' + sel + '>' + escapeHtml(id + " - " + name) + '</option>';
+      }).join("");
+    }
+    syl.innerHTML = html;
+  }
+}
+async function saveProdRoles() {
+  if (!workflowState) return;
+  const selIds = function (sel) { return sel ? Array.prototype.slice.call(sel.selectedOptions).map(function (o) { return o.value; }).filter(Boolean) : []; };
+  const mod = $("prodModeratorProfileSelect");
+  const exc = $("prodExcludedProfileSelect");
+  const syl = $("prodSylProfileSelect");
+  const ix = workflowState.ixbrowser || {};
+  const modLines = prodRoleKeepNonId(ix.moderatorProfiles).concat(selIds(mod).map(prodRoleLabelFor));
+  const excLines = prodRoleKeepNonId(ix.blockedProfiles).concat(selIds(exc).map(prodRoleLabelFor));
+  setValue("moderatorProfiles", modLines.join("\n"));
+  setValue("blockedProfiles", excLines.join("\n"));
+  const sylId = syl ? syl.value : "";
+  if (sylId) {
+    setValue("dedicatedIxProfileId", sylId);
+    setValue("dedicatedIxProfileName", prodRoleLabelFor(sylId).replace(/^\d+\s*-\s*/, ""));
+    setValue("useDedicatedIxProfile", true);
+    setValue("dedicatedIxProfileFixedIp", true);
+    setValue("rotateDedicatedProfileIp", false);
+  }
+  markDirty();
+  await saveAll();
+  const status = $("prodRolesStatus");
+  if (status) { status.className = "inlineNotice ok"; status.textContent = "Saved: " + selIds(mod).length + " moderator(s), " + selIds(exc).length + " excluded" + (sylId ? (", SYL profile " + sylId) : "") + "."; }
+  renderProfileSelect();
+  showToast("Saved profile roles.");
 }
 
 function proxyOptionHtml(proxy) {
@@ -5331,7 +5461,7 @@ function uxAttachCollapseControls() {
         hl.textContent = live ? "● LIVE — autopilot is posting autonomously"
           : enabled ? "❚❚ ENABLED but DRY-RUN (not posting) — click Go Live"
           : "○ DISABLED — autopilot is off";
-        hl.style.color = live ? "#1a7f37" : enabled ? "#b08800" : "#888";
+        hl.className = "prodHeadline " + (live ? "isLive" : enabled ? "isDry" : "isOff");
       }
       const cells = [
         ["Mode", live ? "LIVE" : (enabled ? "dry-run" : "off")],
@@ -5351,10 +5481,9 @@ function uxAttachCollapseControls() {
       if (grid) {
         grid.innerHTML = cells.map(function (kv) {
           const danger = /DOWN/.test(String(kv[1]));
-          const color = danger ? "#b91c1c" : "#111";
-          return '<div style="background:#f6f7f9;border:1px solid #e3e6ea;border-radius:8px;padding:.5rem .7rem;">'
-            + '<div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.04em;">' + kv[0] + '</div>'
-            + '<div style="font-size:1.02rem;font-weight:600;color:' + color + ';">' + kv[1] + '</div></div>';
+          return '<div class="prodStatCard' + (danger ? ' down' : '') + '">'
+            + '<span class="prodStatLabel">' + kv[0] + '</span>'
+            + '<span class="prodStatValue">' + kv[1] + '</span></div>';
         }).join("");
       }
       const sel = $("prodConcurrency");
@@ -5375,7 +5504,7 @@ function uxAttachCollapseControls() {
           const t = String(e.at || "").slice(11, 19);
           const who = e.profileId ? (" · p" + e.profileId) : "";
           const w = (e.workers !== "" && e.workers != null) ? (" (w=" + e.workers + ")") : "";
-          return '<div style="padding:.15rem 0;border-bottom:1px solid #eee;"><span style="color:#6b7280">' + t + "</span> " + escapeHtml(e.label) + escapeHtml(who) + w + "</div>";
+          return '<div class="prodFeedRow"><span class="prodFeedTime">' + t + "</span> " + escapeHtml(e.label) + escapeHtml(who) + w + "</div>";
         }).join("") : '<span class="muted">No recent activity.</span>';
       }
       const postsEl = $("prodRecentPosts");
@@ -5383,9 +5512,10 @@ function uxAttachCollapseControls() {
         const ps = (activity && Array.isArray(activity.recentPosts)) ? activity.recentPosts : [];
         postsEl.innerHTML = ps.length ? ps.map(function (p) {
           const t = String(p.at || "").slice(11, 19);
-          return '<div style="padding:.15rem 0;border-bottom:1px solid #eee;"><span style="color:#6b7280">' + t + "</span> p" + escapeHtml(String(p.profile || "?")) + ' <a href="' + escapeHtml(p.postUrl) + '" target="_blank" rel="noopener" style="color:#0969da">post ↗</a></div>';
+          return '<div class="prodFeedRow"><span class="prodFeedTime">' + t + "</span> p" + escapeHtml(String(p.profile || "?")) + ' <a href="' + escapeHtml(p.postUrl) + '" target="_blank" rel="noopener" class="prodLink">post ↗</a></div>';
         }).join("") : '<span class="muted">No posts recorded yet.</span>';
       }
+      if (typeof renderProdRoleSelects === "function") renderProdRoleSelects();
     } catch (e) { /* transient */ }
   }
   async function prodPatchState(patch) {
@@ -5411,6 +5541,12 @@ function uxAttachCollapseControls() {
     prodOn("prodFillBtn", function () { prodResult("Filling buffer (runs in background, ~minutes)…"); api("/api/products/fill-asset-buffer", { method: "POST", body: JSON.stringify({ max: 10 }), timeoutMs: 1500000 }).then(function (r) { prodResult("Fill done: prepared " + (r && r.prepared != null ? r.prepared : "?") + ", ready=" + (r && r.readyCount != null ? r.readyCount : "?")); renderProdTab(); }).catch(function (e) { prodResult("Fill running/continuing server-side: " + ((e && e.message) || e)); }); });
     prodOn("prodTickBtn", async function () { prodResult("Running one tick (may take minutes)…"); const r = await api("/api/autopilot/tick", { method: "POST", body: "{}", timeoutMs: 1500000 }); const d = (r && r.decision) || {}; prodResult("Tick: " + (d.action || "-") + (d.posted != null ? (" — posted " + d.posted) : "")); renderProdTab(); });
     prodOn("prodRefreshBtn", renderProdTab);
+    prodOn("prodLaunchAllBtn", async function () { prodResult("Launching production…"); await prodPatchState({ operator: { autopilotEnabled: true, autopilotDryRun: false, armedForExternalActions: true }, ixbrowser: { maxConcurrentProfiles: 3 } }); prodResult("● LIVE — armed, autopilot on, 3-by-3, posting."); renderProdTab(); });
+    prodOn("prodStopAllBtn", async function () { prodResult("Stopping…"); await prodPatchState({ operator: { armedForExternalActions: false, autopilotEnabled: false } }); prodResult("Stopped — disarmed and autopilot off."); renderProdTab(); });
+    prodOn("prodLoadProfilesBtn", async function () { prodResult("Loading IXBrowser profiles…"); await loadIxProfiles(); renderProdRoleSelects(); const s = $("prodRolesStatus"); if (s) { s.className = "inlineNotice ok"; s.textContent = "Profiles loaded — choose roles (saves automatically)."; } });
+    ["prodModeratorProfileSelect", "prodSylProfileSelect", "prodExcludedProfileSelect"].forEach(function (id) { const el = $(id); if (el) el.addEventListener("change", function () { if (typeof saveProdRoles === "function") saveProdRoles(); }); });
+    prodOn("prodSaveRolesBtn", async function () { await saveProdRoles(); });
+    if (typeof renderProdRoleSelects === "function") renderProdRoleSelects();
   }
   function prodActive() { return document.body.dataset.activeView === "prod"; }
   function startProdPoll() { if (prodPollTimer) return; renderProdTab(); prodPollTimer = window.setInterval(function () { if (prodActive()) renderProdTab(); else { window.clearInterval(prodPollTimer); prodPollTimer = null; } }, 4000); }

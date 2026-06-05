@@ -52,8 +52,8 @@
       </header>
 
       <section class="layout">
-        <aside class="rail">
-          <section class="panel command">
+        <section class="mainGrid">
+          <section class="panel command wide" data-view="overview prod">
             <div class="panelHead">
               <h2>Command Center</h2>
               <span class="badge safe">127.0.0.1 only</span>
@@ -154,18 +154,6 @@
             <label>Trigger notes <textarea id="triggerNotes"></textarea></label>
           </section>
 
-          <section class="panel sidePanel" data-view="overview" data-ux-tier="advanced">
-            <h2>Quick Hermes Tasks</h2>
-            <div class="stack">
-              <button data-template="audit">Audit workflow state</button>
-              <button data-template="posting">Prepare posting checklist</button>
-              <button data-template="ip">Check IP/profile plan</button>
-              <button data-template="affiliate">Plan affiliate links</button>
-              <button data-template="product-images">Plan product images</button>
-              <button data-template="text-rotation">Check text rotation</button>
-              <button data-template="files">Design text file formats</button>
-            </div>
-          </section>
 
           <section class="panel sidePanel" data-view="monitor">
             <h2>Run Snapshot</h2>
@@ -185,9 +173,6 @@
               <div><dt>History</dt><dd id="approvalHistoryCountRail">0</dd></div>
             </dl>
           </section>
-        </aside>
-
-        <section class="mainGrid">
           <section class="panel wide heroPanel tabLead" data-view="overview">
             <div class="panelHead">
               <div>
@@ -629,23 +614,30 @@
             <div class="panelBody">
               <div id="prodHeadline" class="prodHeadline">Loading production status…</div>
               <div id="prodStatusGrid" class="prodStatusGrid"></div>
-              <h3>Controls</h3>
-              <div class="miniActions">
-                <button id="prodGoLiveBtn" class="primary mainTestButton" type="button">&#9654; Go Live</button>
-                <button id="prodPauseBtn" type="button">&#10073;&#10073; Pause (dry-run)</button>
-                <button id="prodEnableBtn" type="button">Enable autopilot</button>
-                <button id="prodDisableBtn" type="button">Disable autopilot</button>
-                <label class="hasTooltip" data-tooltip="Max profiles posting at once. The CPU governor still throttles to real headroom and yields to Pinterest, so 4 only runs when the box can take it.">Concurrency
-                  <select id="prodConcurrency" style="margin-left:.3rem;"><option value="2">2</option><option value="3">3</option><option value="4">4</option></select>
-                </label>
+              <h3 class="prodSectionTitle">Launch</h3>
+              <div class="prodLaunch">
+                <button id="prodLaunchAllBtn" class="primary prodLaunchBtn" type="button">&#9654; Launch Production</button>
+                <button id="prodStopAllBtn" class="danger" type="button">&#10073;&#10073; Stop</button>
+                <span class="muted prodLaunchHint">One click arms external actions, enables autopilot, sets 3-by-3 concurrency, and goes live. The pipeline then runs itself.</span>
               </div>
-              <h3 style="margin-top:1rem;">Pipeline actions</h3>
-              <div class="miniActions">
-                <button id="prodDiscoverBtn" type="button">1 &middot; Run discovery</button>
-                <button id="prodFillBtn" type="button">2 &middot; Fill buffer now</button>
-                <button id="prodTickBtn" type="button">3 &middot; Run one post tick</button>
-                <button id="prodRefreshBtn" type="button">&#8635; Refresh status</button>
-              </div>
+              <details class="prodAdvanced">
+                <summary>Manual controls</summary>
+                <div class="miniActions">
+                  <button id="prodGoLiveBtn" class="primary" type="button">&#9654; Go Live</button>
+                  <button id="prodPauseBtn" type="button">&#10073;&#10073; Pause (dry-run)</button>
+                  <button id="prodEnableBtn" type="button">Enable autopilot</button>
+                  <button id="prodDisableBtn" type="button">Disable autopilot</button>
+                  <label class="hasTooltip prodConcurrencyField" data-tooltip="Max profiles posting at once. The CPU governor still throttles to real headroom and yields to Pinterest.">Concurrency
+                    <select id="prodConcurrency"><option value="2">2</option><option value="3">3</option><option value="4">4</option></select>
+                  </label>
+                </div>
+                <div class="miniActions">
+                  <button id="prodDiscoverBtn" type="button">1 &middot; Run discovery</button>
+                  <button id="prodFillBtn" type="button">2 &middot; Fill buffer now</button>
+                  <button id="prodTickBtn" type="button">3 &middot; Run one post tick</button>
+                  <button id="prodRefreshBtn" type="button">&#8635; Refresh status</button>
+                </div>
+              </details>
               <div id="prodActionResult" class="muted" style="margin-top:.5rem;min-height:1.2em;"></div>
               <h3 style="margin-top:1rem;">Live pipeline</h3>
               <div id="prodCurrentCycle" class="muted" style="margin-bottom:.5rem;">…</div>
