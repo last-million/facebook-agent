@@ -746,14 +746,27 @@ select[multiple] option:checked { background: var(--accent) linear-gradient(0deg
 
 /* ============================== CREDENTIALS / SECRETS ============================== */
 
-.securityNote { padding: 11px 13px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface-2); color: var(--muted); font-size: 12.5px; }
-.secretGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
-.secretGroup { border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface-1); padding: 13px; }
-.secretGroup.essential { border-color: var(--accent-line); }
-.secretGroupHead { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
-.secretFields, .compactFields { display: grid; gap: 10px; }
-.secretSummary { color: var(--soft); font-size: 12px; font-family: var(--font-mono); }
-.secretClear { color: var(--danger); }
+.securityNote { padding: 11px 14px; border: 1px solid var(--accent-line); border-radius: var(--r-md); background: var(--accent-dim); color: var(--muted); font-size: 12.5px; line-height: 1.5; }
+.secretGrid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+.secretGroup { border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface-2); padding: 15px 16px; }
+.secretGroup.essential { border-color: var(--accent-line); background: linear-gradient(180deg, var(--accent-dim), transparent 64px), var(--surface-2); }
+.secretGroupHead { display: flex; flex-direction: column; gap: 3px; margin-bottom: 14px; padding-bottom: 11px; border-bottom: 1px solid var(--line); }
+.secretGroupHead strong { font-family: var(--font-display); font-size: 13px; letter-spacing: 0.01em; }
+.secretGroupHead span { color: var(--soft); font-size: 12px; }
+.secretFields, .compactFields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px 16px; align-items: end; }
+.secretFields .span2, .compactFields .span2 { grid-column: 1 / -1; }
+.secretFields .secretClear, .compactFields .secretClear { grid-column: 1 / -1; margin: -7px 0 2px; padding: 2px 0; font-size: 11.5px; }
+.secretClear span { color: var(--soft); }
+.secretClear input { accent-color: var(--danger); }
+.secretSummary { margin-top: 13px; color: var(--soft); font-size: 12px; font-family: var(--font-mono); padding: 10px 13px; border: 1px dashed var(--line); border-radius: var(--r-md); line-height: 1.6; }
+.secretSummary:empty { display: none; }
+/* reveal (show/hide) toggle injected into masked key fields */
+.revealWrap { position: relative; display: block; margin-top: 5px; }
+.revealWrap input { margin-top: 0; padding-right: 42px; }
+.revealBtn { position: absolute; right: 5px; top: 5px; bottom: 5px; min-height: 0; padding: 0 9px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--surface-3); color: var(--soft); font-size: 13px; line-height: 1; opacity: .85; }
+.revealBtn:hover { opacity: 1; color: var(--text); transform: none; }
+.revealBtn.on { color: var(--accent); border-color: var(--accent-line); background: var(--accent-dim); }
+@media (max-width: 560px) { .secretFields, .compactFields { grid-template-columns: 1fr; } }
 
 /* ============================== INTEGRATIONS ============================== */
 

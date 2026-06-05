@@ -5559,3 +5559,35 @@ function uxAttachCollapseControls() {
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", initProd); else initProd();
 })();
 
+// ── Credential reveal (show/hide) toggles for masked secret key fields ───────────────────────
+// Secrets stay server-side only (data/secrets.local.json, gitignored, never sent to Hermes); the
+// UI never receives saved values. This only lets you SEE the new key you are typing before saving.
+(function credentialRevealToggles() {
+  const setup = () => {
+    const fields = document.querySelectorAll('[data-view~="credentials"] input[data-secret][type="password"]');
+    fields.forEach((input) => {
+      if (input.dataset.revealReady) return;
+      input.dataset.revealReady = "1";
+      const wrap = document.createElement("span");
+      wrap.className = "revealWrap";
+      input.parentNode.insertBefore(wrap, input);
+      wrap.appendChild(input);
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "revealBtn";
+      btn.setAttribute("aria-label", "Show or hide this key");
+      btn.setAttribute("tabindex", "-1");
+      btn.textContent = "Show";
+      btn.addEventListener("click", () => {
+        const reveal = input.type === "password";
+        input.type = reveal ? "text" : "password";
+        btn.classList.toggle("on", reveal);
+        btn.textContent = reveal ? "Hide" : "Show";
+        input.focus();
+      });
+      wrap.appendChild(btn);
+    });
+  };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", setup); else setup();
+})();
+
