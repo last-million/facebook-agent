@@ -2126,7 +2126,7 @@ async function runWizardAction(action) {
     if (action === "safe-defaults") return applyWizardSafeDefaults();
     if (action === "save-all") return await saveAll();
     if (action === "check-api") return await checkIntegrationHealth();
-    if (action === "load-ix") return await loadIxProfiles();
+    if (action === "load-ix") return await loadIxProfilesQuiet();
     if (action === "rebuild-products") return await rebuildProductDiscoveryUrls();
     if (action === "discover-products") return await runWorkflowAction("/api/products/discover", "Product discovery finished.");
     if (action === "open-chatgpt-browser") return await openDedicatedChatGptBrowser();
@@ -4545,6 +4545,19 @@ async function loadIxProfiles() {
   setIxSessionStatus("ok", `Detected ${integrationProfiles.length} IXBrowser profile(s). Use the profile dropdown here, then manage active/failed profiles in the Profiles menu.`);
 }
 
+// Non-blocking profile load (busy:false) — used by the auto-load + Prod/Integrations role pickers
+// so the dashboard is NEVER disabled while IXBrowser responds. A slow/hung IXBrowser must not
+// freeze the UI (that locked the whole Prod tab).
+async function loadIxProfilesQuiet() {
+  const result = await integrationPost("/api/integrations/ixbrowser/profiles", {}, { busy: false });
+  integrationProfiles = result.profiles || [];
+  renderProfileSelect();
+  renderIntegrationLists();
+  renderGroupAssignmentBuilder();
+  setIxSessionStatus("ok", `Detected ${integrationProfiles.length} IXBrowser profile(s).`);
+  return integrationProfiles;
+}
+
 async function openIxProfile() {
   if (!confirm("Open this IXBrowser profile? External actions must be armed.")) return;
   const profileId = $("ixProfileSelect").value;
@@ -5542,7 +5555,7 @@ function uxAttachCollapseControls() {
     prodOn("prodRefreshBtn", renderProdTab);
     prodOn("prodLaunchAllBtn", async function () { prodResult("Launching production…"); await prodPatchState({ operator: { autopilotEnabled: true, autopilotDryRun: false, armedForExternalActions: true }, ixbrowser: { maxConcurrentProfiles: 3 } }); prodResult("● LIVE — armed, autopilot on, 3-by-3, posting."); renderProdTab(); });
     prodOn("prodStopAllBtn", async function () { prodResult("Stopping…"); await prodPatchState({ operator: { armedForExternalActions: false, autopilotEnabled: false } }); prodResult("Stopped — disarmed and autopilot off."); renderProdTab(); });
-    prodOn("prodLoadProfilesBtn", async function () { prodResult("Loading IXBrowser profiles…"); await loadIxProfiles(); renderProdRoleSelects(); const s = $("prodRolesStatus"); if (s) { s.className = "inlineNotice ok"; s.textContent = "Profiles loaded — choose roles (saves automatically)."; } });
+    prodOn("prodLoadProfilesBtn", async function () { prodResult("Loading IXBrowser profiles…"); await loadIxProfilesQuiet(); renderProdRoleSelects(); const s = $("prodRolesStatus"); if (s) { s.className = "inlineNotice ok"; s.textContent = "Profiles loaded — choose roles (saves automatically)."; } });
     ["prodModeratorProfileSelect", "prodSylProfileSelect", "prodExcludedProfileSelect"].forEach(function (id) { const el = $(id); if (el) el.addEventListener("change", function () { if (typeof saveProdRoles === "function") saveProdRoles(); }); });
     prodOn("prodSaveRolesBtn", async function () { await saveProdRoles(); });
     if (typeof renderProdRoleSelects === "function") renderProdRoleSelects();
@@ -5598,7 +5611,7 @@ function uxAttachCollapseControls() {
     if (autoTried || typeof loadIxProfiles !== "function") return;
     autoTried = true;
     setState("setupState2", "loading from IXBrowser…", "warn");
-    try { await loadIxProfiles(); setState("setupState2", (integrationProfiles.length || 0) + " profiles loaded", "ok"); }
+    try { await loadIxProfilesQuiet(); setState("setupState2", (integrationProfiles.length || 0) + " profiles loaded", "ok"); }
     catch (e) { autoTried = false; setState("setupState2", "IXBrowser not reachable — click Load Profiles", "bad"); }
   }
   const onView = () => {
@@ -5608,7 +5621,7 @@ function uxAttachCollapseControls() {
   document.querySelectorAll("[data-view-target]").forEach((b) => b.addEventListener("click", () => setTimeout(onView, 90)));
   const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener("click", fn); };
   on("setupStepTestIx", async () => { setState("setupState1", "checking…", "warn"); try { await testIxBrowser(); setState("setupState1", "connected", "ok"); } catch (e) { setState("setupState1", "not reachable", "bad"); } });
-  on("setupStepLoadProfiles", async () => { setState("setupState2", "loading…", "warn"); try { await loadIxProfiles(); autoTried = true; setState("setupState2", (integrationProfiles.length || 0) + " profiles loaded", "ok"); } catch (e) { setState("setupState2", "not reachable", "bad"); } });
+  on("setupStepLoadProfiles", async () => { setState("setupState2", "loading…", "warn"); try { await loadIxProfilesQuiet(); autoTried = true; setState("setupState2", (integrationProfiles.length || 0) + " profiles loaded", "ok"); } catch (e) { setState("setupState2", "not reachable", "bad"); } });
   on("setupStepRoles", () => { const p = document.querySelector(".prodRoles"); if (p) { p.scrollIntoView({ behavior: "smooth", block: "center" }); p.classList.add("flash"); setTimeout(() => p.classList.remove("flash"), 1200); } });
   on("setupStepWebshare", async () => { setState("setupState4", "testing…", "warn"); try { await testWebshare(); setState("setupState4", "Webshare OK", "ok"); } catch (e) { setState("setupState4", "check key", "bad"); } });
   on("setupStepLoadProxies", async () => { try { await loadWebshareProxies(); setState("setupState4", "proxies loaded", "ok"); } catch (e) { setState("setupState4", "check Webshare", "bad"); } });
