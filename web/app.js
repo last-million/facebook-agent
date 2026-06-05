@@ -4448,46 +4448,44 @@ function renderProdRoleSelects() {
   const exc = $("prodExcludedProfileSelect");
   const syl = $("prodSylProfileSelect");
   if (!mod && !exc && !syl) return;
-  const active = document.activeElement; // never clobber a select being edited
   const hasProfiles = Array.isArray(integrationProfiles) && integrationProfiles.length > 0;
-  const optsFor = function (selectedSet) {
-    if (!hasProfiles) return '<option value="" disabled>Click Load Profiles first</option>';
-    return integrationProfiles.map(function (profile) {
-      const id = profile.profile_id || profile.id;
-      const name = profile.name || profile.title || ("Profile " + id);
-      const sel = selectedSet && selectedSet.has(String(id)) ? " selected" : "";
-      return '<option value="' + escapeHtml(String(id)) + '"' + sel + '>' + escapeHtml(id + " - " + name) + '</option>';
-    }).join("");
-  };
   const ix = (workflowState && workflowState.ixbrowser) || {};
-  if (mod && mod !== active) mod.innerHTML = optsFor(prodRoleIdsFromText(ix.moderatorProfiles));
-  if (exc && exc !== active) exc.innerHTML = optsFor(prodRoleIdsFromText(ix.blockedProfiles));
-  if (syl && syl !== active) {
-    const savedSyl = String((workflowState && workflowState.affiliate && workflowState.affiliate.dedicatedIxProfileId) || "");
-    let html = '<option value="">— none —</option>';
-    if (hasProfiles) {
-      html += integrationProfiles.map(function (profile) {
-        const id = profile.profile_id || profile.id;
-        const name = profile.name || profile.title || ("Profile " + id);
-        const sel = String(id) === savedSyl ? " selected" : "";
-        return '<option value="' + escapeHtml(String(id)) + '"' + sel + '>' + escapeHtml(id + " - " + name) + '</option>';
-      }).join("");
-    }
-    syl.innerHTML = html;
-  }
+  const modSet = prodRoleIdsFromText(ix.moderatorProfiles);
+  const excSet = prodRoleIdsFromText(ix.blockedProfiles);
+  const savedSyl = String((workflowState && workflowState.affiliate && workflowState.affiliate.dedicatedIxProfileId) || "");
+  const build = function (container, single, checkedSet) {
+    if (!container) return;
+    if (container.contains(document.activeElement)) return; // don't clobber a click in progress
+    if (!hasProfiles) { container.innerHTML = '<div class="profileCheckEmpty">Open this tab (or click Load Profiles) to list your live IXBrowser profiles.</div>'; return; }
+    const t = single ? "radio" : "checkbox";
+    const nm = single ? ' name="prodSylRadio"' : '';
+    let html = integrationProfiles.map(function (p) {
+      const id = String(p.profile_id || p.id);
+      const name = p.name || p.title || ("Profile " + id);
+      const checked = single ? (id === savedSyl) : checkedSet.has(id);
+      return '<label class="profileCheck"><input type="' + t + '" data-transient="true"' + nm + ' value="' + escapeHtml(id) + '"' + (checked ? ' checked' : '') + '> <span>' + escapeHtml(id + " - " + name) + '</span></label>';
+    }).join("");
+    if (single) html += '<label class="profileCheck"><input type="radio" data-transient="true" name="prodSylRadio" value=""' + (savedSyl ? '' : ' checked') + '> <span>&#8212; none &#8212;</span></label>';
+    container.innerHTML = html;
+  };
+  build(mod, false, modSet);
+  build(exc, false, excSet);
+  build(syl, true, null);
 }
 async function saveProdRoles() {
   if (!workflowState) return;
-  const selIds = function (sel) { return sel ? Array.prototype.slice.call(sel.selectedOptions).map(function (o) { return o.value; }).filter(Boolean) : []; };
+  const checkedIds = function (c) { return c ? Array.prototype.slice.call(c.querySelectorAll('input:checked')).map(function (i) { return i.value; }).filter(Boolean) : []; };
   const mod = $("prodModeratorProfileSelect");
   const exc = $("prodExcludedProfileSelect");
   const syl = $("prodSylProfileSelect");
   const ix = workflowState.ixbrowser || {};
-  const modLines = prodRoleKeepNonId(ix.moderatorProfiles).concat(selIds(mod).map(prodRoleLabelFor));
-  const excLines = prodRoleKeepNonId(ix.blockedProfiles).concat(selIds(exc).map(prodRoleLabelFor));
+  const modIds = checkedIds(mod), excIds = checkedIds(exc);
+  const modLines = prodRoleKeepNonId(ix.moderatorProfiles).concat(modIds.map(prodRoleLabelFor));
+  const excLines = prodRoleKeepNonId(ix.blockedProfiles).concat(excIds.map(prodRoleLabelFor));
   setValue("moderatorProfiles", modLines.join("\n"));
   setValue("blockedProfiles", excLines.join("\n"));
-  const sylId = syl ? syl.value : "";
+  const sylSel = syl ? syl.querySelector('input:checked') : null;
+  const sylId = sylSel ? sylSel.value : "";
   if (sylId) {
     setValue("dedicatedIxProfileId", sylId);
     setValue("dedicatedIxProfileName", prodRoleLabelFor(sylId).replace(/^\d+\s*-\s*/, ""));
@@ -4498,7 +4496,7 @@ async function saveProdRoles() {
   markDirty();
   await saveAll();
   const status = $("prodRolesStatus");
-  if (status) { status.className = "inlineNotice ok"; status.textContent = "Saved: " + selIds(mod).length + " moderator(s), " + selIds(exc).length + " excluded" + (sylId ? (", SYL profile " + sylId) : "") + "."; }
+  if (status) { status.className = "inlineNotice ok"; status.textContent = "Saved: " + modIds.length + " moderator(s), " + excIds.length + " excluded" + (sylId ? (", SYL profile " + sylId) : "") + "."; }
   renderProfileSelect();
   showToast("Saved profile roles.");
 }

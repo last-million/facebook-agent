@@ -712,15 +712,15 @@
               </div>
             </div>
             <div class="prodRolesGrid">
-              <label class="prodRoleField">Moderator accounts <small>approve pending posts only &middot; never post/comment</small>
-                <select id="prodModeratorProfileSelect" data-transient="true" data-runtime-control="true" multiple size="7"></select>
-              </label>
-              <label class="prodRoleField">ShopYourLikes profile <small>generates the SYL affiliate links</small>
-                <select id="prodSylProfileSelect" data-transient="true" data-runtime-control="true"><option value="">&#8212; none &#8212;</option></select>
-              </label>
-              <label class="prodRoleField">Excluded profiles <small>never used for posting</small>
-                <select id="prodExcludedProfileSelect" data-transient="true" data-runtime-control="true" multiple size="7"></select>
-              </label>
+              <div class="prodRoleField"><label class="prodRoleLabel">Moderator accounts <small>approve pending posts only &middot; never post/comment</small></label>
+                <div id="prodModeratorProfileSelect" class="profileCheckList"></div>
+              </div>
+              <div class="prodRoleField"><label class="prodRoleLabel">ShopYourLikes profile <small>pick one &middot; generates the SYL affiliate links</small></label>
+                <div id="prodSylProfileSelect" class="profileCheckList"></div>
+              </div>
+              <div class="prodRoleField"><label class="prodRoleLabel">Excluded profiles <small>never used for posting</small></label>
+                <div id="prodExcludedProfileSelect" class="profileCheckList"></div>
+              </div>
             </div>
             <div id="prodRolesStatus" class="inlineNotice neutral">Click <b>Load Profiles</b> to populate from IXBrowser, choose roles, then <b>Save Roles</b>. Ctrl/Cmd-click to select multiple.</div>
           </section>

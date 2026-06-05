@@ -875,7 +875,15 @@ select[multiple] option:checked { background: var(--accent) linear-gradient(0deg
 .prodRoleField { display: grid; gap: 5px; }
 .prodRoleField small { color: var(--soft); font-weight: 500; font-size: 11px; }
 .prodRoleField select { margin-top: 4px; }
+.prodRoleLabel { display: block; margin-bottom: 6px; }
+.profileCheckList { display: grid; gap: 1px; max-height: 230px; overflow: auto; border: 1px solid var(--line); border-radius: var(--r-sm); padding: 5px; background: var(--input); }
+.profileCheckList .profileCheck { padding: 6px 8px; }
+.profileCheckList .profileCheck input { width: auto; min-height: 0; accent-color: var(--accent); flex: 0 0 auto; }
+.profileCheckList .profileCheck input:checked + span { color: var(--accent-strong); font-weight: 600; }
+.profileCheckEmpty { color: var(--soft); font-size: 12px; padding: 10px; }
 #prodRolesStatus { margin-top: 12px; }
+/* Profile roles panel sits at the TOP of the Integrations tab */
+body[data-active-view="integrations"] .mainGrid .prodRoles.viewVisible { order: -4 !important; }
 
 /* CSS order: put live console + roles at the TOP of the Prod tab without moving DOM */
 .viewsReady .mainGrid [data-view].viewVisible.tabLead { order: -3; }
