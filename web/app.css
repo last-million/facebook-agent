@@ -875,13 +875,32 @@ select[multiple] option:checked { background: var(--accent) linear-gradient(0deg
 .prodRoleField { display: grid; gap: 5px; }
 .prodRoleField small { color: var(--soft); font-weight: 500; font-size: 11px; }
 .prodRoleField select { margin-top: 4px; }
-.prodRoleLabel { display: block; margin-bottom: 6px; }
-.profileCheckList { display: grid; gap: 1px; max-height: 230px; overflow: auto; border: 1px solid var(--line); border-radius: var(--r-sm); padding: 5px; background: var(--input); }
-.profileCheckList .profileCheck { padding: 6px 8px; }
-.profileCheckList .profileCheck input { width: auto; min-height: 0; accent-color: var(--accent); flex: 0 0 auto; }
-.profileCheckList .profileCheck input:checked + span { color: var(--accent-strong); font-weight: 600; }
-.profileCheckEmpty { color: var(--soft); font-size: 12px; padding: 10px; }
+.prodRolesGrid { gap: 16px; }
+.prodRoleField { border: 1px solid var(--line); border-top: 3px solid var(--line-strong); border-radius: var(--r-md); padding: 13px 14px 14px; background: var(--surface-1); }
+.prodRoleLabel { display: block; margin-bottom: 9px; font-family: var(--font-display); font-size: 14.5px; font-weight: 700; }
+.prodRoleLabel small { display: block; margin-top: 3px; font-family: var(--font-body); font-weight: 500; font-size: 11.5px; color: var(--soft); }
+.profileCheckList { display: grid; gap: 2px; max-height: 320px; overflow: auto; border: 1px solid var(--line); border-radius: var(--r-sm); padding: 6px; background: var(--input); }
+.profileCheckList .profileCheck { padding: 9px 11px; font-size: 13.5px; border-radius: var(--r-sm); }
+.profileCheckList .profileCheck input { width: 18px; height: 18px; min-height: 0; accent-color: var(--accent); flex: 0 0 auto; cursor: pointer; }
+.profileCheckList .profileCheck input:checked + span { font-weight: 700; }
+.profileCheckEmpty { color: var(--soft); font-size: 12.5px; padding: 12px; }
 #prodRolesStatus { margin-top: 12px; }
+/* ROLE-SPECIFIC COLORS — instantly shows which role you are picking for */
+.roleField-mod { border-top-color: var(--running); }
+.roleField-mod .prodRoleLabel { color: var(--running); }
+.roleField-mod .profileCheck input { accent-color: var(--running); }
+.roleField-mod .profileCheck input:checked + span { color: #9bd9ff; }
+.roleField-mod .profileCheck:has(input:checked) { background: var(--running-dim); }
+.roleField-syl { border-top-color: var(--accent); }
+.roleField-syl .prodRoleLabel { color: var(--accent-strong); }
+.roleField-syl .profileCheck input { accent-color: var(--accent); }
+.roleField-syl .profileCheck input:checked + span { color: var(--accent-strong); }
+.roleField-syl .profileCheck:has(input:checked) { background: var(--accent-dim); }
+.roleField-exc { border-top-color: var(--danger); }
+.roleField-exc .prodRoleLabel { color: var(--danger); }
+.roleField-exc .profileCheck input { accent-color: var(--danger); }
+.roleField-exc .profileCheck input:checked + span { color: #ff9aa6; text-decoration: line-through; }
+.roleField-exc .profileCheck:has(input:checked) { background: var(--danger-dim); }
 /* Integrations tab order: Setup steps FIRST, then Profile roles, then the rest */
 body[data-active-view="integrations"] .mainGrid .integrationSteps.viewVisible { order: -5 !important; }
 body[data-active-view="integrations"] .mainGrid .prodRoles.viewVisible { order: -4 !important; }
