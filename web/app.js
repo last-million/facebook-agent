@@ -2799,6 +2799,7 @@ function renderGroupAssignmentBuilder() {
   if (!builder) return;
   initializeGroupAssignmentDraft();
   const profiles = profileCandidatesForAssignments();
+  const eligibleCount = profiles.filter((p) => isAllowedNormalIxBrowserProfileLabel(p.label)).length;
   autoAssignGroupProfilesIfEmpty(profiles.map((profile) => profile.label));
   const groups = groupAssignmentDraft;
   $("groupAssignmentSummary").textContent = groups.length
@@ -2820,10 +2821,16 @@ function renderGroupAssignmentBuilder() {
           </div>
           <button class="iconButton dangerIcon hasTooltip" type="button" data-remove-assignment-group="${index}" data-tooltip="Remove this group URL from Posting Inputs and the assignment matrix." aria-label="Remove group ${index + 1}">&times;</button>
         </div>
-        <label>Profile share %
-          <input data-assignment-share type="number" min="0" max="100" value="${Number(entry.sharePercent) || 0}">
-        </label>
-        <small><span data-selected-count>${entry.profiles.length}</span> selected profile(s)</small>
+        <div class="shareSliderRow">
+          <div class="shareSliderHead"><span>Profile share</span><b data-share-label>${Number(entry.sharePercent) || 0}%</b></div>
+          <input data-assignment-share class="shareSlider" type="range" min="0" max="100" step="5" value="${Number(entry.sharePercent) || 0}" style="--fill:${Number(entry.sharePercent) || 0}%">
+          <div class="shareSliderFoot">
+            <button type="button" class="chipButton" data-share-quick="0">None</button>
+            <button type="button" class="chipButton" data-share-quick="50">Half</button>
+            <button type="button" class="chipButton" data-share-quick="100">All eligible</button>
+          </div>
+        </div>
+        <small><span data-selected-count>${entry.profiles.length}</span> of ${eligibleCount} eligible profile(s) selected</small>
       </div>
       <div class="profileChecklist">
         ${profiles.map((profile) => `
@@ -2894,12 +2901,11 @@ function normalizedGroupShares(entries) {
 
 function applyPercentGroupSplit() {
   collectGroupAssignmentData();
-  const profiles = profileCandidatesForAssignments().map((profile) => profile.label);
   if (!groupAssignmentDraft.length) return showToast("Add group URLs first.");
-  if (!profiles.length) return showToast("Load or type profiles first.");
-  assignProfilesByPercent(profiles);
-  renderGroupAssignmentBuilder();
-  markDirty();
+  const cards = document.querySelectorAll("[data-assignment-card]");
+  if (!cards.length) return showToast("Load or type profiles first.");
+  cards.forEach((card) => applyShareSliderToCard(card));
+  showToast("Applied each group's share slider.");
 }
 
 function autoAssignGroupProfilesIfEmpty(profiles) {
@@ -2929,6 +2935,24 @@ function assignProfilesByPercent(profiles) {
     entry.profiles = profiles.slice(cursor, cursor + counts[index]);
     cursor += counts[index];
   });
+}
+
+// Live per-group share slider: selects the first pct% of ELIGIBLE (allowed-normal) profiles for
+// THIS group, independently of other groups — so 100% = ALL eligible profiles for the group.
+function applyShareSliderToCard(card) {
+  if (!card) return;
+  const slider = card.querySelector("[data-assignment-share]");
+  if (!slider) return;
+  const pct = Math.max(0, Math.min(100, Number(slider.value) || 0));
+  slider.style.setProperty("--fill", pct + "%");
+  const label = card.querySelector("[data-share-label]");
+  if (label) label.textContent = pct + "%";
+  const eligible = Array.from(card.querySelectorAll("[data-assignment-profile]"))
+    .filter((box) => isAllowedNormalIxBrowserProfileLabel(box.value));
+  const n = Math.round(eligible.length * pct / 100);
+  eligible.forEach((box, i) => { box.checked = i < n; });
+  syncGroupAssignmentOutput();
+  markDirty();
 }
 
 function addGroupUrlToAssignments(value) {
@@ -5192,11 +5216,18 @@ $("moderatorProfiles")?.addEventListener("input", renderGroupAssignmentBuilder);
 
 $("groupAssignmentBuilder")?.addEventListener("input", (event) => {
   if (!event.target.matches("[data-assignment-share]")) return;
-  syncGroupAssignmentOutput();
-  markDirty();
+  applyShareSliderToCard(event.target.closest("[data-assignment-card]"));
 });
 
 $("groupAssignmentBuilder")?.addEventListener("click", (event) => {
+  const quick = event.target.closest("[data-share-quick]");
+  if (quick) {
+    event.preventDefault();
+    const card = quick.closest("[data-assignment-card]");
+    const slider = card && card.querySelector("[data-assignment-share]");
+    if (slider) { slider.value = quick.getAttribute("data-share-quick"); applyShareSliderToCard(card); }
+    return;
+  }
   const button = event.target.closest("[data-remove-assignment-group]");
   if (!button) return;
   event.preventDefault();
