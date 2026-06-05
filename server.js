@@ -16114,6 +16114,14 @@ function normalizeWeekday(value) {
 let __ixProfilesCache = { at: 0, data: null, inflight: null };
 const IX_PROFILES_CACHE_TTL_MS = 45000;
 
+// Heavy status endpoints the dashboard polls. autopilotStatus()/assetBufferStatus() fan out into
+// a per-profile x per-status-line x per-group-URL regex cascade that became pathologically slow as
+// the status logs grew; polled by an open dashboard tab they pin the event loop and wedge the box.
+// A long TTL means the heavy compute runs at most ~once/15s no matter how hard the UI polls.
+let __autopilotStatusCache = { at: 0, body: null };
+let __assetBufferStatusCache = { at: 0, body: null };
+const STATUS_CACHE_TTL_MS = 15000;
+
 let lastHeartbeatTick = 0;
 setInterval(() => {
   // Per-post-log retention: low-frequency (>=6h) fire-and-forget sweep so the detail-log dir
@@ -16581,10 +16589,18 @@ const server = http.createServer(async (req, res) => {
     }
   }
   if (req.method === "GET" && url.pathname === "/api/products/asset-buffer-status") {
-    return json(res, 200, { ok: true, buffer: assetBufferStatus() });
+    const now = Date.now();
+    if (!__assetBufferStatusCache.body || now - __assetBufferStatusCache.at >= STATUS_CACHE_TTL_MS) {
+      __assetBufferStatusCache = { at: now, body: { ok: true, buffer: assetBufferStatus() } };
+    }
+    return json(res, 200, __assetBufferStatusCache.body);
   }
   if (req.method === "GET" && url.pathname === "/api/autopilot/status") {
-    return json(res, 200, { ok: true, autopilot: autopilotStatus(), lastDecision: __autopilotLastDecision });
+    const now = Date.now();
+    if (!__autopilotStatusCache.body || now - __autopilotStatusCache.at >= STATUS_CACHE_TTL_MS) {
+      __autopilotStatusCache = { at: now, body: { ok: true, autopilot: autopilotStatus(), lastDecision: __autopilotLastDecision } };
+    }
+    return json(res, 200, __autopilotStatusCache.body);
   }
   if (req.method === "POST" && url.pathname === "/api/autopilot/tick") {
     const decision = await autopilotTickAsync({ manual: true });
