@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-05T02:20:54.117Z",
+  "updatedAt": "2026-06-05T03:22:32.120Z",
   "testRun": {
     "status": "done",
     "active": false,
@@ -175,14 +175,25 @@
   "posting": {
     "groups": "https://www.facebook.com/groups/o1498765421290862",
     "groupAssignmentMode": "percentage_manual_review",
-    "groupProfileAssignments": "# Facebook group/profile assignment plan\n# Generated locally from group URLs, profile checklists, and percentage split.\n\nGROUP 1 | share=100% | url=https://www.facebook.com/groups/o1498765421290862\n- 19 - 16\n- 12 - 11\n- 10 - 10\n- 8 - 8\n- 1 - 1\n- 14\n- 16\n",
+    "groupProfileAssignments": "# Facebook group/profile assignment plan\n# Generated locally from group URLs, profile checklists, and percentage split.\n\nGROUP 1 | share=100% | url=https://www.facebook.com/groups/o1498765421290862\n- 52 - 17\n- 51 - 15\n- 50 - 14\n- 49 - 13\n- 48 - 9\n- 47 - 7\n- 46 - 6\n- 45 - 5\n- 44 - 4\n- 19 - 16\n- 16 - 14\n- 14 - 12\n- 12 - 11\n- 10 - 10\n- 8 - 8\n- 1 - 1\n- 14\n- 16\n",
     "groupAssignmentData": [
       {
         "url": "https://www.facebook.com/groups/o1498765421290862",
         "sharePercent": 100,
         "requiresAdminApproval": true,
         "profiles": [
+          "52 - 17",
+          "51 - 15",
+          "50 - 14",
+          "49 - 13",
+          "48 - 9",
+          "47 - 7",
+          "46 - 6",
+          "45 - 5",
+          "44 - 4",
           "19 - 16",
+          "16 - 14",
+          "14 - 12",
           "12 - 11",
           "10 - 10",
           "8 - 8",
@@ -270,10 +281,10 @@
     "generatedSourceUrls": "https://www.walmart.com/shop/savings/toys?povid=GlobalNav_rWeb_BabyKidsToys_ToysGames_deals&facet=special_offers%3AClearance%7C%7Cspecial_offers%3AReduced+Price%7C%7Cspecial_offers%3ARollback%7C%7Cretailer_type%3APro+Sellers\nhttps://www.walmart.com/browse/womens-plus/5438_133195?facet=special_offers%3AClearance%7C%7Cspecial_offers%3AReduced+Price%7C%7Cspecial_offers%3ARollback%7C%7Cretailer_type%3APro+Sellers\nhttps://www.walmart.com/search?q=garden&facet=special_offers%3AClearance%7C%7Cspecial_offers%3AReduced+Price%7C%7Cspecial_offers%3ARollback%7C%7Cretailer_type%3APro+Sellers\nhttps://www.walmart.com/search?q=summer&facet=special_offers%3AClearance%7C%7Cspecial_offers%3AReduced+Price%7C%7Cspecial_offers%3ARollback%7C%7Cretailer_type%3APro+Sellers\nhttps://www.walmart.com/search?q=home&facet=special_offers%3AClearance%7C%7Cspecial_offers%3AReduced+Price%7C%7Cspecial_offers%3ARollback%7C%7Cretailer_type%3APro+Sellers\nhttps://www.walmart.com/search?q=kitchen&facet=special_offers%3AClearance%7C%7Cspecial_offers%3AReduced+Price%7C%7Cspecial_offers%3ARollback%7C%7Cretailer_type%3APro+Sellers\nhttps://www.walmart.com/search?q=kids&facet=special_offers%3AClearance%7C%7Cspecial_offers%3AReduced+Price%7C%7Cspecial_offers%3ARollback%7C%7Cretailer_type%3APro+Sellers",
     "minActivitySignal": "10+ bought since yesterday",
     "targetMode": "assigned_profiles_x_posts_per_day",
-    "assignedProfileCount": 7,
-    "dailyPostTarget": 105,
+    "assignedProfileCount": 18,
+    "dailyPostTarget": 270,
     "candidateBufferPercent": 20,
-    "targetCandidateCount": 126,
+    "targetCandidateCount": 324,
     "rankingRules": "Prioritize fresh reduced-price products with clear deal signal, strong positive reviews, safe product images, affiliate compatibility, and no prior use in the posted-product register.",
     "notes": "Generated source URLs are discovery pages/searches, not final product URLs. Hermes should inspect these with a browser, rank candidates, reject products already posted, then move unique chosen product pages into Product URLs."
   },

@@ -16997,9 +16997,10 @@ server.listen(PORT, HOST, () => {
   console.log(`Facebook Agent dashboard: http://${HOST}:${PORT}`);
   // Warm up the persistent image-selector service in WSL so the first asset
   // prep call doesn't pay the WSL cold-start.
-  ensureImageSelectorServiceRunning().catch((err) => {
-    logEvent("image_selector_service_warmup_error", { error: oneLineField(err.message || String(err), 240) });
-  });
+  // [WEDGE-DEBUG] temporarily disabled to isolate the boot wedge (see _wedgewatch).
+  // ensureImageSelectorServiceRunning().catch((err) => {
+  //   logEvent("image_selector_service_warmup_error", { error: oneLineField(err.message || String(err), 240) });
+  // });
   // Stage 3 autonomous publisher. Dormant unless operator.autopilotEnabled +
   // armed; dry-run by default (logs decisions, never posts) until
   // operator.autopilotDryRun is set false.
