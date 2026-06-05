@@ -5319,6 +5319,7 @@ function uxInitCollapsiblePanels() {
   const collapsed = uxLoadCollapsedPanels();
   document.querySelectorAll("section.panel").forEach((panel) => {
     if (panel.classList.contains("command")) return;
+    if (panel.classList.contains("noCollapse")) return;
     const head = panel.querySelector(".panelHead");
     if (!head) return;
     panel.classList.add("collapsible");
