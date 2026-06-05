@@ -435,14 +435,14 @@ button {
   padding: 8px 14px;
   border: 1px solid var(--line-strong);
   border-radius: var(--r-sm);
-  background: var(--surface-2);
+  background: var(--surface-3);
   color: var(--text);
   font-weight: 600;
   font-size: 13px;
   cursor: pointer;
   transition: background .14s, border-color .14s, transform .08s, box-shadow .14s;
 }
-button:hover { background: var(--surface-3); border-color: var(--line-strong); transform: translateY(-1px); }
+button:hover { background: #243244; border-color: var(--soft); transform: translateY(-1px); }
 button:active { transform: translateY(0); }
 button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible,
