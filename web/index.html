@@ -426,6 +426,49 @@
             <div id="secretSummary" class="secretSummary"></div>
           </section>
 
+          <section class="panel wide integrationSteps tabLead" data-view="integrations">
+            <div class="panelHead">
+              <div>
+                <h2>Setup — follow these steps in order</h2>
+                <p>Connect IXBrowser, pull your live connected profiles, then assign roles. Each step turns green when it succeeds.</p>
+              </div>
+            </div>
+            <ol class="setupSteps">
+              <li class="setupStep">
+                <span class="setupNum">1</span>
+                <div class="setupBody">
+                  <strong>Connect IXBrowser</strong>
+                  <span>Confirm the local IXBrowser API is reachable on this machine.</span>
+                  <div class="setupActions"><button id="setupStepTestIx">Test IXBrowser</button><b class="setupState" id="setupState1">not checked</b></div>
+                </div>
+              </li>
+              <li class="setupStep">
+                <span class="setupNum">2</span>
+                <div class="setupBody">
+                  <strong>Load live profiles</strong>
+                  <span>Pull every connected IXBrowser profile into the dashboard so the role pickers list them. This runs automatically when you open this tab.</span>
+                  <div class="setupActions"><button id="setupStepLoadProfiles" class="primary">Load Profiles</button><b class="setupState" id="setupState2">not loaded</b></div>
+                </div>
+              </li>
+              <li class="setupStep">
+                <span class="setupNum">3</span>
+                <div class="setupBody">
+                  <strong>Assign profile roles</strong>
+                  <span>Pick the ShopYourLikes profile, the moderator accounts, and the profiles to exclude — all from the live list. Saves automatically.</span>
+                  <div class="setupActions"><button id="setupStepRoles" class="primary">Open Profile Roles</button></div>
+                </div>
+              </li>
+              <li class="setupStep">
+                <span class="setupNum">4</span>
+                <div class="setupBody">
+                  <strong>Webshare proxies</strong>
+                  <span>Test Webshare and load the proxy inventory for the posting profiles.</span>
+                  <div class="setupActions"><button id="setupStepWebshare">Test Webshare</button><button id="setupStepLoadProxies">Load Proxies</button><b class="setupState" id="setupState4">not checked</b></div>
+                </div>
+              </li>
+            </ol>
+          </section>
+
           <section class="panel wide integrationOps tabLead" data-view="integrations">
             <div class="panelHead">
               <div>
@@ -657,7 +700,7 @@
             </div>
           </section>
 
-          <section class="panel wide prodRoles" data-view="prod">
+          <section class="panel wide prodRoles" data-view="prod integrations">
             <div class="panelHead">
               <div>
                 <h2>Profile roles</h2>

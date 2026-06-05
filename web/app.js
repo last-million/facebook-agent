@@ -5591,3 +5591,30 @@ function uxAttachCollapseControls() {
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", setup); else setup();
 })();
 
+// ── Integrations: auto-load LIVE IXBrowser profiles + step-by-step wiring ─────────────────────
+(function integrationSetup() {
+  let autoTried = false;
+  const setState = (id, text, cls) => { const el = document.getElementById(id); if (el) { el.textContent = text; el.className = "setupState " + (cls || ""); } };
+  async function autoLoadProfiles() {
+    if (Array.isArray(integrationProfiles) && integrationProfiles.length) { setState("setupState2", integrationProfiles.length + " profiles loaded", "ok"); return; }
+    if (autoTried || typeof loadIxProfiles !== "function") return;
+    autoTried = true;
+    setState("setupState2", "loading from IXBrowser…", "warn");
+    try { await loadIxProfiles(); setState("setupState2", (integrationProfiles.length || 0) + " profiles loaded", "ok"); }
+    catch (e) { autoTried = false; setState("setupState2", "IXBrowser not reachable — click Load Profiles", "bad"); }
+  }
+  const onView = () => {
+    const v = document.body.dataset.activeView;
+    if (v === "integrations" || v === "prod") autoLoadProfiles();
+  };
+  document.querySelectorAll("[data-view-target]").forEach((b) => b.addEventListener("click", () => setTimeout(onView, 90)));
+  const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener("click", fn); };
+  on("setupStepTestIx", async () => { setState("setupState1", "checking…", "warn"); try { await testIxBrowser(); setState("setupState1", "connected", "ok"); } catch (e) { setState("setupState1", "not reachable", "bad"); } });
+  on("setupStepLoadProfiles", async () => { setState("setupState2", "loading…", "warn"); try { await loadIxProfiles(); autoTried = true; setState("setupState2", (integrationProfiles.length || 0) + " profiles loaded", "ok"); } catch (e) { setState("setupState2", "not reachable", "bad"); } });
+  on("setupStepRoles", () => { const p = document.querySelector(".prodRoles"); if (p) { p.scrollIntoView({ behavior: "smooth", block: "center" }); p.classList.add("flash"); setTimeout(() => p.classList.remove("flash"), 1200); } });
+  on("setupStepWebshare", async () => { setState("setupState4", "testing…", "warn"); try { await testWebshare(); setState("setupState4", "Webshare OK", "ok"); } catch (e) { setState("setupState4", "check key", "bad"); } });
+  on("setupStepLoadProxies", async () => { try { await loadWebshareProxies(); setState("setupState4", "proxies loaded", "ok"); } catch (e) { setState("setupState4", "check Webshare", "bad"); } });
+  const boot = () => setTimeout(onView, 500);
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
+})();
+
