@@ -16107,6 +16107,13 @@ function normalizeWeekday(value) {
   return map[key] || "";
 }
 
+// Short-lived cache for the ixBrowser profile list. The dashboard auto-loads this on every
+// open/tab-switch and each cold call costs ~500-750ms (network to the local ixBrowser API).
+// A 45s TTL + in-flight collapse makes repeat/multi-tab loads nearly free and stops the
+// profile picker from hammering ixBrowser (a prior source of event-loop saturation).
+let __ixProfilesCache = { at: 0, data: null, inflight: null };
+const IX_PROFILES_CACHE_TTL_MS = 45000;
+
 let lastHeartbeatTick = 0;
 setInterval(() => {
   // Per-post-log retention: low-frequency (>=6h) fire-and-forget sweep so the detail-log dir
@@ -16341,11 +16348,23 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, sampleCount: rows.profiles.length, total: rows.total });
   }
   if (req.method === "POST" && url.pathname === "/api/integrations/ixbrowser/profiles") {
-    const data = await ixBrowserRequest("profile-list", { page: 1, limit: 100 });
-    const rows = ixBrowserProfileRows(data);
-    const profiles = rows.profiles.map(sanitizeIxBrowserProfile);
-    logEvent("ixbrowser_profiles_loaded", { count: profiles.length });
-    return json(res, 200, { count: rows.total || profiles.length, profiles });
+    const now = Date.now();
+    if (__ixProfilesCache.data && now - __ixProfilesCache.at < IX_PROFILES_CACHE_TTL_MS) {
+      return json(res, 200, { ...__ixProfilesCache.data, cached: true });
+    }
+    if (!__ixProfilesCache.inflight) {
+      __ixProfilesCache.inflight = (async () => {
+        const data = await ixBrowserRequest("profile-list", { page: 1, limit: 100 });
+        const rows = ixBrowserProfileRows(data);
+        const profiles = rows.profiles.map(sanitizeIxBrowserProfile);
+        const payload = { count: rows.total || profiles.length, profiles };
+        __ixProfilesCache = { at: Date.now(), data: payload, inflight: null };
+        logEvent("ixbrowser_profiles_loaded", { count: profiles.length });
+        return payload;
+      })().catch((err) => { __ixProfilesCache.inflight = null; throw err; });
+    }
+    const payload = await __ixProfilesCache.inflight;
+    return json(res, 200, payload);
   }
   if (req.method === "POST" && url.pathname === "/api/integrations/ixbrowser/open") {
     requireExternalArmed();
