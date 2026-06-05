@@ -24,3 +24,8 @@ data/*
 
 # local git config (created when HOME pointed at repo during setup)
 .gitconfig
+
+# one-off profiling/timing/load test scripts (local only)
+/_spinprof.js
+/_*.cpuprofile
+data/_*
