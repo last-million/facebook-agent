@@ -882,7 +882,8 @@ select[multiple] option:checked { background: var(--accent) linear-gradient(0deg
 .profileCheckList .profileCheck input:checked + span { color: var(--accent-strong); font-weight: 600; }
 .profileCheckEmpty { color: var(--soft); font-size: 12px; padding: 10px; }
 #prodRolesStatus { margin-top: 12px; }
-/* Profile roles panel sits at the TOP of the Integrations tab */
+/* Integrations tab order: Setup steps FIRST, then Profile roles, then the rest */
+body[data-active-view="integrations"] .mainGrid .integrationSteps.viewVisible { order: -5 !important; }
 body[data-active-view="integrations"] .mainGrid .prodRoles.viewVisible { order: -4 !important; }
 
 /* CSS order: put live console + roles at the TOP of the Prod tab without moving DOM */
