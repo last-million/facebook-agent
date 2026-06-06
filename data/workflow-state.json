@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-06T15:47:59.068Z",
+  "updatedAt": "2026-06-06T16:33:08.747Z",
   "testRun": {
     "status": "done",
     "active": false,
@@ -133,8 +133,8 @@
     "autopilotDryRun": false,
     "autopilotProfileAllowlist": "",
     "commentCooldownHours": 48,
-    "autopilotMaxPostsPerRun": 3,
-    "autopilotPostsThisRun": 2,
+    "autopilotMaxPostsPerRun": 6,
+    "autopilotPostsThisRun": 0,
     "autopilotWorkerStaggerSeconds": 25,
     "adminApprovalSettleSeconds": 3,
     "parallelOpenStaggerSeconds": 8,
