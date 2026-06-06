@@ -9234,6 +9234,20 @@ function parseJsonLogObjects(text) {
   return rows;
 }
 
+// The live-posting connector opens the ixBrowser profile INSIDE the child process and logs its CDP
+// endpoint as {step:'ix_open'|'ix_open_fallback', endpoint}. The server-side endpoint cache is NOT
+// populated by this path, so to REUSE a kept-open session (batch cross-comment) we harvest the LAST
+// ix_open endpoint from the connector log. Inert unless a caller reads .cdpEndpoint (batch path only).
+function cdpEndpointFromLog(objects = []) {
+  let endpoint = "";
+  for (const item of Array.isArray(objects) ? objects : []) {
+    if (!item || typeof item !== "object") continue;
+    const step = String(item.step || "");
+    if ((step === "ix_open" || step === "ix_open_fallback") && item.endpoint) endpoint = String(item.endpoint);
+  }
+  return endpoint;
+}
+
 function firstFacebookPostUrlFromLog(objects = []) {
   const candidates = [];
   for (const item of objects) {
@@ -9834,6 +9848,7 @@ async function runLiveFacebookPostScript(payload, options = {}) {
     stderr,
     objects,
     postUrl: firstFacebookPostUrlFromLog(objects),
+    cdpEndpoint: cdpEndpointFromLog(objects), // inert unless the batch cross-comment path reads it
     candidatePostUrls: facebookPostCandidateUrlsFromLog(objects, payload.groupUrl || ""),
     validation,
   };

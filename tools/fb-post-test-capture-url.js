@@ -3056,20 +3056,49 @@ async function main() {
   }
   logTiming('main_started');
 
-  const open = await ixPost('profile-open', {
-    profile_id: Number(payload.profileId),
-    args: ['--disable-popup-blocking', targetUrl],
-    load_extensions: true,
-    cookies_backup: false,
-    load_profile_info_page: false,
-  }, Number(payload.profileOpenTimeoutMs || 70000));
-  const endpoint = open.data.ws || ('http://' + open.data.debugging_address);
-  console.log(JSON.stringify({ step: 'ix_open', endpoint }));
-  logTiming('after_ix_profile_open');
+  // BATCH SESSION REUSE (flag-gated by the server; payload.reuseCdpEndpoint is set ONLY by the batch
+  // cross-comment path). When present, SKIP the ~1-min ixPost('profile-open') and attach to the already-
+  // open session; if that connect fails (dead/race) we fall back to a fresh open at connectOverCDP below.
+  // When absent (EVERY normal call) this runs the proven profile-open verbatim — byte-for-byte unchanged.
+  const reusedCdpEndpoint = payload.reuseCdpEndpoint ? String(payload.reuseCdpEndpoint) : "";
+  let endpoint;
+  if (reusedCdpEndpoint) {
+    endpoint = reusedCdpEndpoint;
+    console.log(JSON.stringify({ step: 'ix_reuse', endpoint }));
+    logTiming('after_ix_reuse_connect_skipped');
+  } else {
+    const open = await ixPost('profile-open', {
+      profile_id: Number(payload.profileId),
+      args: ['--disable-popup-blocking', targetUrl],
+      load_extensions: true,
+      cookies_backup: false,
+      load_profile_info_page: false,
+    }, Number(payload.profileOpenTimeoutMs || 70000));
+    endpoint = open.data.ws || ('http://' + open.data.debugging_address);
+    console.log(JSON.stringify({ step: 'ix_open', endpoint }));
+    logTiming('after_ix_profile_open');
+  }
 
   let browser;
   try {
-  browser = await chromium.connectOverCDP(endpoint, { timeout: 30000 });
+  try {
+    browser = await chromium.connectOverCDP(endpoint, { timeout: reusedCdpEndpoint ? 8000 : 30000 });
+  } catch (connErr) {
+    if (!reusedCdpEndpoint) throw connErr; // normal path: behaviour identical to before
+    // Reuse endpoint died between the server's liveness check and this connect -> fall back to a FRESH
+    // open so the (cross-)comment still completes. This is the load-bearing reuse safety net.
+    console.log(JSON.stringify({ step: 'ix_reuse_connect_failed', endpoint, error: String((connErr && connErr.message) || connErr).slice(0, 200), fallback: 'fresh_open' }));
+    const freshOpen = await ixPost('profile-open', {
+      profile_id: Number(payload.profileId),
+      args: ['--disable-popup-blocking', targetUrl],
+      load_extensions: true,
+      cookies_backup: false,
+      load_profile_info_page: false,
+    }, Number(payload.profileOpenTimeoutMs || 70000));
+    endpoint = freshOpen.data.ws || ('http://' + freshOpen.data.debugging_address);
+    console.log(JSON.stringify({ step: 'ix_open_fallback', endpoint }));
+    browser = await chromium.connectOverCDP(endpoint, { timeout: 30000 });
+  }
   const context = browser.contexts()[0] || await browser.newContext();
   // CPU SAVER (no-GPU box): block the heavy resources the posting flow never
   // needs -- autoplay video/audio + fonts are the main software-rendering CPU
@@ -4394,7 +4423,12 @@ async function main() {
   }, null, 2));
 
   } finally {
-    if (browser) await browser.close().catch(() => {});
+    // KEEP-OPEN (batch): payload.keepBrowserOpen is set ONLY by the batch poster path so the iX window
+    // survives for a later cross-comment to reuse via connectOverCDP. browser.close() on a CDP-ATTACHED
+    // browser closes the REMOTE iX window (not just the local handle), so we must NOT call it here for
+    // keep-open runs — the server's batch teardown owns the eventual close. Default (no flag) = close, unchanged.
+    if (browser && !payload.keepBrowserOpen) await browser.close().catch(() => {});
+    else if (browser && payload.keepBrowserOpen) console.log(JSON.stringify({ step: 'ix_kept_open_for_batch', endpoint }));
   }
 }
 
