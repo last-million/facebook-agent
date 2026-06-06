@@ -4902,76 +4902,28 @@ async function selectBestReviewImageWithHermes(product, candidates, state, optio
     let choice = 0;
     let selectorLabel = "openai_fast_direct";
     let attemptError = null;
-    // Primary: persistent HTTP image-selector service in WSL on port 9318.
-    // Long-running Python server avoids the ~50-60s WSL cold-start per call;
-    // each call is now ~7-15s (just the OpenAI API). If service is down,
-    // fall back to per-call wsl spawn (original ~50-60s path).
-    for (let attempt = 1; attempt <= 2 && !choice; attempt += 1) {
+    // The persistent HTTP image-selector service (WSL, port 9318) is the ONLY model path. Per-call
+    // `wsl.exe … python3 fast-image-selector.py` and the hermes CLI both HANG ~75s+ on this box
+    // (proven), so they are removed from the hot path. On a miss we (re)start the service, AWAIT it,
+    // and retry the HTTP call; if it still can't decide, we drop to the local quality gate (outer catch).
+    for (let attempt = 1; attempt <= 3 && !choice; attempt += 1) {
       const attemptPrompt = attempt === 1
         ? prompt
         : `IMPORTANT: Return ONLY this exact JSON shape, nothing else:\n{"choice":N,"accepted":true,"reject":false,"reason":"short visual reason","confidence":0.6}\nN is an integer from 1 to ${candidates.length} for the most natural-looking customer-photo image.\n\n${prompt}`;
       let stdout = "";
-      let serviceUsed = false;
       try {
         stdout = await callImageSelectorService(attemptPrompt, Math.min(selectorTimeoutMs, 90000));
-        serviceUsed = true;
       } catch (svcErr) {
-        if (attempt === 1) {
-          logEvent("image_selector_service_unavailable_falling_back", { error: oneLineField(svcErr.message || String(svcErr), 240) });
-          // Try to (re)start the service so the next call has a chance.
-          ensureImageSelectorServiceRunning().catch(() => {});
-        }
-        try {
-          const result = await execFileAsync("wsl.exe", [
-            "-d", "Ubuntu-24.04",
-            "--exec", "/bin/bash", "-lc",
-            `set -a; [ -f /root/.hermes/.env ] && source /root/.hermes/.env; set +a; cd "$1" && python3 tools/fast-image-selector.py "$2"`,
-            "fast-image-selector",
-            WSL_PROJECT,
-            attemptPrompt,
-          ], {
-            cwd: ROOT,
-            windowsHide: true,
-            timeout: Math.min(selectorTimeoutMs, 90000),
-            maxBuffer: 1024 * 1024,
-          });
-          stdout = result.stdout || result.stderr || "";
-        } catch (err) {
-          attemptError = err;
-          if (attempt < 2) logEvent("openai_image_review_retry", { productKey: product.key, attempt, error: oneLineField(err.message || String(err), 240) });
-          continue;
-        }
+        attemptError = svcErr;
+        logEvent("image_selector_service_retry", { productKey: product.key, attempt, error: oneLineField(svcErr.message || String(svcErr), 240) });
+        try { await ensureImageSelectorServiceRunning(); } catch {} // (re)start + AWAIT, then retry the HTTP service
+        continue;
       }
       parsed = parseJsonObjectFromText(stdout);
       choice = clampNumber(parsed?.choice, 1, candidates.length, 0);
       if (!choice) {
-        attemptError = new Error(`OpenAI fast selector returned no valid choice on attempt ${attempt} (service=${serviceUsed}).`);
-        if (attempt < 2) logEvent("openai_image_review_retry", { productKey: product.key, attempt, parsed: parsed ? JSON.stringify(parsed).slice(0, 300) : "" });
-      }
-    }
-    // Fallback: Hermes CLI if direct API call failed both attempts.
-    if (!choice) {
-      logEvent("openai_image_review_falling_back_to_hermes", { productKey: product.key, lastError: oneLineField(attemptError?.message || "", 240) });
-      selectorLabel = "hermes_default_llm";
-      try {
-        const { stdout, stderr } = await execFileAsync("wsl.exe", [
-          "-d", "Ubuntu-24.04",
-          "--exec", "/bin/bash", "-lc",
-          `cd "$1" && ${HERMES_BIN} -m "$3" -z "$2"`,
-          "hermes-image-selector",
-          WSL_PROJECT,
-          prompt,
-          HERMES_FAST_MODEL,
-        ], {
-          cwd: ROOT,
-          windowsHide: true,
-          timeout: selectorTimeoutMs,
-          maxBuffer: 1024 * 1024,
-        });
-        parsed = parseJsonObjectFromText(stdout || stderr);
-        choice = clampNumber(parsed?.choice, 1, candidates.length, 0);
-      } catch (err) {
-        attemptError = err;
+        attemptError = new Error(`Image selector service returned no valid choice on attempt ${attempt}.`);
+        if (attempt < 3) { logEvent("openai_image_review_retry", { productKey: product.key, attempt, parsed: parsed ? JSON.stringify(parsed).slice(0, 300) : "" }); try { await ensureImageSelectorServiceRunning(); } catch {} }
       }
     }
     if (!choice) throw attemptError || new Error("Image selector did not return a valid choice.");
