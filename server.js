@@ -6851,6 +6851,21 @@ function postingSlots(state) {
   const postsPerProfile = clampNumber(state.rules.postsPerProfilePerDay, 1, 20, 5);
   const maxProfilesPerRun = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 1000000, 100000);
   const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
+  // FRESH-FIRST coverage: order each group's profiles by least-posted-today then least-lifetime BEFORE
+  // emitting slots, so the LOW slot indexes (which the plan fills first when products/scarce per-index
+  // assets are limited) go to the freshest/rested profiles — not the raw groupAssignmentData order
+  // (which lists heavily-used profiles first and starved fresh ones of ready rows). Ledger maps are
+  // computed ONCE here (NOT per slot). __cnt is key-type robust (number or string profileId keys).
+  const __todayByPid = (autopilotPublishedTodayByProfile(state).byProfile) || new Map();
+  const __histByPid = autopilotPostHistoryByProfile();
+  const __cnt = (m, label) => { const pid = profileIdFromLabel(label); return m.get(pid) || m.get(String(pid)) || 0; };
+  const orderFreshFirst = (profiles) => (Array.isArray(profiles) ? profiles : []).map((p, i) => ({ p, i })).sort((a, b) => {
+    const ta = __cnt(__todayByPid, a.p), tb = __cnt(__todayByPid, b.p);
+    if (ta !== tb) return ta - tb;
+    const ha = __cnt(__histByPid, a.p), hb = __cnt(__histByPid, b.p);
+    if (ha !== hb) return ha - hb;
+    return a.i - b.i;
+  }).map((x) => x.p);
   const allGroupUrls = [
     ...groups.map((group) => String(group.url || "").trim()),
     ...recordLines(state.posting?.groups),
@@ -6861,7 +6876,7 @@ function postingSlots(state) {
     for (const group of groups) {
       const groupUrl = String(group.url || "").trim();
       if (!groupUrl) continue;
-      for (const profile of Array.isArray(group.profiles) ? group.profiles : []) {
+      for (const profile of orderFreshFirst(group.profiles)) {
         const label = String(profile || "").trim();
         if (!label) continue;
         const profileId = profileIdFromLabel(label);
@@ -6978,6 +6993,17 @@ function isTransientPostingProfileFailureLine(line = "") {
 
 const PROFILE_FAILURE_STICKY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const PROFILE_TRANSIENT_FAILURE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const PROFILE_COMMENT_FAILURE_MAX_AGE_MS = 45 * 60 * 1000;
+
+// A profile whose ONLY failure was first-comment verification (the POST actually published) gets a SHORT
+// graduated cooldown — long enough for the tick to move on to fresh profiles, but NOT the full 24h sticky
+// block (the post succeeded). NARROW: requires status=cannot_post_in_group AND a comment-verification
+// reason, so it never shortens the cooldown for genuine cannot_post / suspended / member-block lines.
+function isCommentVerificationFailureLine(line = "") {
+  const text = String(line || "").toLowerCase();
+  if (!/status=cannot_post_in_group/i.test(text)) return false;
+  return /required first comment was not verified|comment was not verified|comment_blocked:|comment_target_unavailable_or_pending|comment_profile_cannot_access_post_permalink|marker_scoped_comment_button_not_found/i.test(text);
+}
 
 function recordLineAgeMs(line) {
   const match = String(line || "").match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/);
@@ -6990,6 +7016,10 @@ function recordLineAgeMs(line) {
 function postingFailureLineExceededAgeBudget(line) {
   const ageMs = recordLineAgeMs(line);
   if (!Number.isFinite(ageMs)) return false;
+  // Comment-verification-only failure (the post DID publish) → SHORT 45-min cooldown, checked FIRST, so
+  // the tick skips the profile briefly then lets it back — instead of a 24h sticky block for a post that
+  // actually worked (the cause of the p51 over-block + re-pick storm).
+  if (isCommentVerificationFailureLine(line)) return ageMs > PROFILE_COMMENT_FAILURE_MAX_AGE_MS;
   if (isTransientPostingProfileFailureLine(line)) return ageMs > PROFILE_TRANSIENT_FAILURE_MAX_AGE_MS;
   return ageMs > PROFILE_FAILURE_STICKY_MAX_AGE_MS;
 }
@@ -8256,13 +8286,18 @@ function preparePostingPlan(options = {}) {
     const linkForPreview = shortlink || (state.affiliate?.enabled !== false ? "" : product.url);
     const commentText = String(state.posting.commentTemplate || "{lead_in} {link}")
       .replace("{lead_in}", commentLeadIn)
-      .replace("{link}", linkForPreview);
+      .replace("{link}", linkForPreview)
+      .replace(/\s{2,}/g, " ")
+      .trim();
     const missingAssets = [];
     if (!shortlink) missingAssets.push(state.affiliate?.enabled !== false ? "shopyourlikes_mavlynk_shortlink" : "mavlynk_shortlink");
     if (!imageRecord) missingAssets.push("positive_review_image");
     else if (!imageRecord.approved) missingAssets.push("human_approved_review_image");
     if (!postText) missingAssets.push("unique_post_text");
-    if (!commentLeadIn) missingAssets.push("unique_comment_lead_in");
+    // commentLeadIn is intentionally NOT a readiness gate. It is a cosmetic comment intro (the comment
+    // template may not even use {lead_in}). With a small lead-in pool + avoid-reuse, gating on it BLOCKED
+    // every row past the pool size — starving all but the first ~9 profiles of ready rows so fresh
+    // profiles were never selected. The comment text above already tolerates an empty lead-in.
     const readyForLiveConnector = missingAssets.length === 0;
     rows.push({
       at,
