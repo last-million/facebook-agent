@@ -8040,8 +8040,20 @@ async function autopilotTickAsync(options = {}) {
       try {
         const v = await runLiveFacebookPostFromPlan({ fullRun: true, autopilot: true, planId: r.planId, sequence: r.sequence });
         autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", errorText: (v && (v.error || v.reason)) || "", validation: v && v.validation, source: "autopilot" });
-        // NOTE: the per-run counter is incremented ONCE post-batch (below) from the actual landed
-        // outcomes, NOT per-worker — so concurrent workers cannot lose increments (read-modify-write race).
+        // PER-POST counter: bump the run counter the INSTANT this post lands so progress shows live
+        // (1/6, 2/6…) and auto-stop fires immediately at N — not only after the whole slow tick ends.
+        // The readState→writeState is synchronous (no await between), so it is atomic in single-threaded
+        // JS even across concurrent workers; the pre-dispatch trim caps the batch so we never overshoot N.
+        if (!dryRun && v && (v.ok || v.postUrl)) {
+          const sNow = readState();
+          const newCount = autopilotPostsThisRunCount(sNow) + 1;
+          sNow.operator = sNow.operator || {};
+          sNow.operator.autopilotPostsThisRun = newCount;
+          writeState(sNow, { controlWrite: true });
+          logEvent("autopilot_post_counted", { profileId: Number(r.profileId || 0), postsThisRun: newCount });
+          const lim = autopilotRunLimit(sNow);
+          if (lim > 0 && newCount >= lim) autopilotAutoDisarm("run_limit_reached", `posted ${newCount}/${lim} this run`);
+        }
         return { profileId: Number(r.profileId || 0), ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", error: "" };
       } catch (err) {
         autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: false, postUrl: "", errorText: oneLineField((err && (err.profileFailureReason || err.message)) || String(err), 240), profileRetryable: !!(err && err.profileRetryable), validation: err && err.livePostValidation, source: "autopilot" });
@@ -8089,14 +8101,10 @@ async function autopilotTickAsync(options = {}) {
     // JS they cannot interleave — whichever runs first, the other reads the post-write value; (c) the
     // pre-dispatch trim already capped this batch to the remaining allowance. So total never exceeds N.
     if (!dryRun && decision.posted > 0) {
-      const sNow = readState();
-      const newCount = autopilotPostsThisRunCount(sNow) + decision.posted;
-      sNow.operator = sNow.operator || {};
-      sNow.operator.autopilotPostsThisRun = newCount;
-      writeState(sNow, { controlWrite: true });
-      decision.postsThisRun = newCount;
-      const lim = autopilotRunLimit(sNow);
-      if (lim > 0 && newCount >= lim) autopilotAutoDisarm("run_limit_reached", `posted ${newCount}/${lim} this run`);
+      // The per-run counter is now bumped PER-POST inside runWorker (above), so progress shows live and
+      // auto-stop fires the instant the Nth post lands. Here we ONLY read it back for the decision log —
+      // re-incrementing here would double-count and trip auto-disarm at N/2.
+      decision.postsThisRun = autopilotPostsThisRunCount(readState());
     }
     decision.action = "published";
     __autopilotLastDecision = decision;
@@ -8136,7 +8144,16 @@ function startAutopilotScheduler() {
     } catch (err) {
       logEvent("autopilot_scheduler_error", { error: oneLineField(err.message || String(err), 200) });
     } finally {
-      const secs = clampNumber(readState().operator?.autopilotTickSeconds, 30, 3600, 120);
+      const op = readState().operator || {};
+      const normalSecs = clampNumber(op.autopilotTickSeconds, 30, 3600, 120);
+      // FAST-RETRY: when the last tick couldn't post only because the ready buffer was momentarily
+      // empty / still topping up (the fill is fire-and-forget in the background), re-tick SOON so a
+      // freshly-prepared product posts within ~25s instead of eating the full ~120s idle penalty —
+      // the "prepare in parallel, never block posting" win. We do NOT fast-retry wait_spacing (that
+      // gap is deliberate throttle-safety) or terminal states (done / limit reached / window closed).
+      const waitingOnAssets = __autopilotLastDecision && /^(fill_then_wait|no_ready_row|plan_unavailable)$/.test(String(__autopilotLastDecision.action || ""));
+      const armed = op.autopilotEnabled && op.armedForExternalActions;
+      const secs = (armed && waitingOnAssets) ? clampNumber(op.autopilotFastRetrySeconds, 10, 120, 25) : normalSecs;
       __autopilotSchedulerTimer = setTimeout(tick, secs * 1000);
     }
   };
@@ -11554,21 +11571,32 @@ async function recoverFacebookCommentPinWithProfiles({ row, ready, groupUrl, pos
   };
 }
 
-// Serialize cross-account comment sessions box-wide. Each commenter opens its OWN iX
-// profile in a child process and holds a live page through a ~minute-long preflight +
-// submit. With several posts in parallel, multiple commenters (plus publisher closes)
-// churn ~8 iX windows through the single local iX API, and a profile-close fired by one
-// path tears down a window another commenter is mid-use -> "Target page/context/browser
-// has been closed". Running comments ONE AT A TIME (exactly like acquireAdminApprovalLock
-// does for moderators) removes that collision AND lowers peak iX/CPU load. Cost is
-// wall-clock only (comments queue instead of overlapping); the post itself already landed.
-let __commentLockChain = Promise.resolve();
+// Bounded-concurrency comment gate (was strictly one-at-a-time). Each commenter opens its OWN iX
+// profile in a child process and holds a live page through a ~minute-long preflight + submit. Running
+// comments ONE AT A TIME made several posts' comments serialize into a multi-minute tail. We now allow
+// a SMALL number to overlap (operator.maxConcurrentComments, default 2, capped at 4) — DIFFERENT
+// profiles only, so each commenter has its own iX window and one path's profile-close can't tear down
+// another's (per-profile collisions stay prevented by withIxBrowserProfileOpenLock + acquireNormalIxProfileUse).
+// This roughly halves comment wall-clock; the post already landed, and the resweep still backstops 100%.
+let __commentSemaphoreActive = 0;
+const __commentSemaphoreWaiters = [];
 function acquireCommentLock() {
-  let release;
-  const next = new Promise((res) => { release = res; });
-  const prior = __commentLockChain;
-  __commentLockChain = prior.then(() => next);
-  return prior.then(() => release);
+  const limit = clampNumber(readState().operator?.maxConcurrentComments, 1, 4, 2);
+  return new Promise((resolveAcquire) => {
+    const grant = () => {
+      __commentSemaphoreActive += 1;
+      let released = false;
+      resolveAcquire(() => {
+        if (released) return; // idempotent release
+        released = true;
+        __commentSemaphoreActive -= 1;
+        const nextWaiter = __commentSemaphoreWaiters.shift();
+        if (nextWaiter) nextWaiter(); // wake exactly one queued commenter
+      });
+    };
+    if (__commentSemaphoreActive < limit) grant();
+    else __commentSemaphoreWaiters.push(grant);
+  });
 }
 
 // Serialize the PUBLISH + URL-CAPTURE critical section box-wide. This is what makes
