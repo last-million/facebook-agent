@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-06T02:24:40.894Z",
+  "updatedAt": "2026-06-06T02:43:27.700Z",
   "testRun": {
     "status": "done",
     "active": false,
@@ -3474,7 +3474,7 @@
   "ixbrowser": {
     "enabled": true,
     "apiStatus": "not configured",
-    "maxProfilesPerRun": 5,
+    "maxProfilesPerRun": 100000,
     "maxConcurrentProfiles": 3,
     "profilesForNextRun": "",
     "activeProfiles": "",
