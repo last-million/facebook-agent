@@ -579,7 +579,7 @@ function defaultState() {
     ixbrowser: {
       enabled: true,
       apiStatus: "not configured",
-      maxProfilesPerRun: 50, // distinct profiles a run may rotate through (was 5 — that burned the same 5 accounts and got them Facebook-throttled; spread load across ALL assigned profiles)
+      maxProfilesPerRun: 100000, // effectively "use ALL assigned profiles" (was 5 — that burned the same 5 accounts into a Facebook throttle). Scales to 3000+ profiles; least-used-first keeps each account's load minimal.
       maxConcurrentProfiles: MAX_CONCURRENT_NORMAL_IX_PROFILES,
       profilesForNextRun: "",
       activeProfiles: "",
@@ -1501,7 +1501,7 @@ function normalizeWorkflowState(state) {
     state.affiliateProxy.lockedToSelectedProxy = true;
     state.affiliateProxy.apiRequestsMustUseProxy = true;
   }
-  state.ixbrowser.maxProfilesPerRun = clampNumber(state.ixbrowser.maxProfilesPerRun, 1, 200, 50);
+  state.ixbrowser.maxProfilesPerRun = clampNumber(state.ixbrowser.maxProfilesPerRun, 1, 1000000, 100000);
   state.ixbrowser.maxConcurrentProfiles = clampNumber(
     state.ixbrowser.maxConcurrentProfiles,
     1,
@@ -6897,7 +6897,7 @@ function shuffledCopy(items = []) {
 function postingSlots(state) {
   const slots = [];
   const postsPerProfile = clampNumber(state.rules.postsPerProfilePerDay, 1, 20, 5);
-  const maxProfilesPerRun = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 200, 50);
+  const maxProfilesPerRun = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 1000000, 100000);
   const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
   const allGroupUrls = [
     ...groups.map((group) => String(group.url || "").trim()),
@@ -7676,6 +7676,33 @@ function autopilotPublishedTodayByProfile(state = readState()) {
   return { byProfile, byGroup, total, lastPostAt, lastAtByProfile };
 }
 
+// ALL-TIME published-post count per profile, straight from the ledger (the automatic action history).
+// Used to ALWAYS pick the LEAST-used accounts first, so lifetime posting load spreads evenly across
+// every profile and no single account gets hammered into a Facebook velocity throttle.
+let __postHistoryCache = { at: 0, map: null };
+function autopilotPostHistoryByProfile() {
+  if (__postHistoryCache.map && Date.now() - __postHistoryCache.at < 60000) return __postHistoryCache.map;
+  const byProfile = new Map();
+  const seen = new Set();
+  try {
+    const raw = fs.readFileSync(FB_LIVE_POST_LEDGER_FILE, "utf8");
+    for (const line of raw.split(/\r?\n/)) {
+      const t = line.trim();
+      if (!t || t.indexOf('"postUrl":"http') === -1) continue; // successful publishes only
+      let r; try { r = JSON.parse(t); } catch { continue; }
+      const pid = Number(r.profileId || 0);
+      const u = String(r.postUrl || "");
+      if (!pid || !u.startsWith("http")) continue;
+      const dk = pid + "|" + u;
+      if (seen.has(dk)) continue; // one post counts once
+      seen.add(dk);
+      byProfile.set(pid, (byProfile.get(pid) || 0) + 1);
+    }
+  } catch {}
+  __postHistoryCache = { at: Date.now(), map: byProfile };
+  return byProfile;
+}
+
 function autopilotCapacityByProfile(state = readState()) {
   // A count-mode run (operator.autopilotMaxPostsPerRun > 0) is bounded ONLY by the requested count:
   // the per-profile DAILY cap is intentionally lifted so the run always reaches the number asked for
@@ -7972,7 +7999,11 @@ async function autopilotTickAsync(options = {}) {
     const eligibleIds = new Set(eligibleProfiles.map((p) => p.profileId));
     // FAIRNESS: order ready rows so the LEAST-used profiles (fewest posts today) are picked first,
     // spreading posting opportunity equally across available profiles.
-    const usageByPid = new Map(eligibleProfiles.map((p) => [Number(p.profileId), p.postedToday || 0]));
+    // ACCOUNT-SAFETY FAIRNESS: order by each profile's ALL-TIME action history (fewest posts ever
+    // first), not just today, so lifetime load spreads evenly across all (3000+) profiles and no
+    // account gets hammered into a Facebook throttle. Falls back to today's count if no history.
+    const postHistory = autopilotPostHistoryByProfile();
+    const usageByPid = new Map(eligibleProfiles.map((p) => [Number(p.profileId), (postHistory.get(Number(p.profileId)) || 0) * 1000 + (p.postedToday || 0)]));
     const recentlyFailed = recentlyFailedProfileSet(state);
     // GROUP FAIRNESS: today's per-group counts (from the same single ledger scan) so the picker
     // prefers the least-posted group first, then the least-used profile — equal across BOTH.
@@ -8366,7 +8397,7 @@ async function ixBrowserPostingFallbackSlots(state = readState(), options = {}) 
 
   const data = await ixBrowserRequest("profile-list", { page: 1, limit: 100 });
   const rows = ixBrowserProfileRows(data);
-  const maxProfiles = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 200, 50);
+  const maxProfiles = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 1000000, 100000);
   let ledgerEntries = [];
   try { ledgerEntries = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 }); } catch {}
   const eligible = [];
