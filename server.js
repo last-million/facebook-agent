@@ -7788,6 +7788,22 @@ function autopilotAutoDisarm(reason, detail) {
   s.operator.armedForExternalActions = false;
   writeState(s, { controlWrite: true });
   logEvent("autopilot_auto_disarmed", { reason, detail });
+  // 100% COMMENTS to the very end: a count run disarms the instant it hits N, which would otherwise
+  // stop the armed-gated comment resweep — leaving a tail post (whose posters were still busy at
+  // inline-comment time) uncommented. Kick a few FORCED resweeps (now that posting is idle, the
+  // proven-access poster profiles are free) so every post still gets its different-profile comment.
+  if (reason === "run_limit_reached") {
+    (async () => {
+      for (let pass = 0; pass < 5; pass += 1) {
+        try {
+          const r = await resweepUncommentedFacebookPostsAsync({ force: true, max: 50, windowHours: 12 });
+          if (!r || (r.checked === 0 && r.recommented === 0)) break; // nothing left to comment
+        } catch {}
+        await sleep(5000);
+      }
+      logEvent("autopilot_final_comment_resweep_done", { reason });
+    })().catch(() => {});
+  }
 }
 // Fresh-read gate: may the autopilot publish RIGHT NOW? Re-read on each call so a mid-tick
 // disable/disarm or a reached run-limit takes effect immediately (not only at the next tick).
@@ -11867,6 +11883,42 @@ function orderReadyRowsLeastUsed(rows, postCountByPid, failedSet = new Set(), gr
   });
 }
 
+// Profiles that SUCCESSFULLY posted to THIS group recently have PROVEN comment access — you must be
+// a member to post. Using them as the top first-comment candidates is the "cross-comment among the
+// batch's own posters" path: it guarantees the comment lands (no membership guessing), derived purely
+// from the ledger (no fragile open-session reuse needed). Newest-first, excludes the post's own
+// publisher, skips SYL/blocked/quarantined. Bounded read from the end of the ledger.
+function recentGroupPosterCommentCandidates(groupUrl, state = readState(), options = {}) {
+  const excludeId = Number(options.excludeProfileId || 0);
+  const gkey = normalizedFacebookGroupKey(String(groupUrl || ""));
+  if (!gkey) return [];
+  const maxAgeMs = clampNumber(options.maxAgeHours, 1, 720, 72) * 3600000;
+  const nowMs = Date.now();
+  const seen = new Set();
+  const out = [];
+  try {
+    const lines = fs.readFileSync(FB_LIVE_POST_LEDGER_FILE, "utf8").split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0 && out.length < 12; i -= 1) {
+      const t = lines[i].trim();
+      if (!t || t.indexOf('"postUrl":"http') === -1) continue; // successful publishes only
+      let r; try { r = JSON.parse(t); } catch { continue; }
+      if (!r.postUrl) continue;
+      if (normalizedFacebookGroupKey(String(r.groupUrl || r.actualGroupUrl || "")) !== gkey) continue;
+      const ts = Date.parse(r.at || "");
+      if (Number.isFinite(ts) && nowMs - ts > maxAgeMs) continue;
+      const pid = Number(r.profileId || 0);
+      if (!pid || pid === excludeId || seen.has(pid)) continue;
+      const label = String(r.profile || pid);
+      if (isDedicatedShopYourLikesProfileLabel(label, state)) continue;
+      if (isBlockedIxBrowserProfileLabel(label, state)) continue;
+      if (isFacebookProfileQuarantinedForFacebook(label, state, groupUrl)) continue;
+      seen.add(pid);
+      out.push({ profileId: pid, profile: r.profile || String(pid), source: "recent_group_poster" });
+    }
+  } catch {}
+  return out;
+}
+
 async function addRequiredFirstCommentWithDifferentProfile({ row, ready, groupUrl, postUrl, imagePath, postValidation, ledgerKey, closeResults }) {
   const state = readState();
   const configuredProfiles = commentRecoveryFallbackProfilesForGroup(row, groupUrl, state, { excludeProfileId: ready.profileId });
@@ -11885,6 +11937,18 @@ async function addRequiredFirstCommentWithDifferentProfile({ row, ready, groupUr
   const confirmedTier = orderProfilesLeastUsedFirst(commentProfiles.filter((p) => !/probe/i.test(String(p.source || ""))), commentUsage, commentRecentlyFailed);
   const probeTier = orderProfilesLeastUsedFirst(commentProfiles.filter((p) => /probe/i.test(String(p.source || ""))), commentUsage, commentRecentlyFailed);
   commentProfiles = [...confirmedTier, ...probeTier];
+  // PROVEN-ACCESS FIRST (default on): prepend profiles that recently POSTED to this group — they are
+  // guaranteed members, so the first comment attempt lands before the no-access cap can trip. This is
+  // the cross-comment-among-posters guarantee; the resweep then catches any post whose posters were
+  // still busy at inline-comment time. Set operator.provenPosterCommentFirst=false to disable.
+  if (state.operator?.provenPosterCommentFirst !== false) {
+    const have = new Set(commentProfiles.map((p) => Number(p.profileId || p.profile_id || 0)));
+    const posters = recentGroupPosterCommentCandidates(groupUrl, state, { excludeProfileId: ready.profileId })
+      .filter((p) => !have.has(Number(p.profileId)));
+    if (posters.length) {
+      commentProfiles = [...posters, ...commentProfiles].slice(0, Math.max(MAX_COMMENT_FALLBACK_PROFILES, posters.length + 2));
+    }
+  }
   appendFacebookLivePostLedger({
     event: "comment_profile_required_planned",
     key: ledgerKey,
