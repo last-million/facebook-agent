@@ -3500,7 +3500,18 @@ async function main() {
 
   const composerOpen = await openComposerWithRecovery(page, payload.groupUrl);
   console.log(JSON.stringify({ step: 'composer_open_attempted', ...composerOpen, diagnostic: composerOpen.opened ? undefined : composerOpen.diagnostic }));
-  if (!composerOpen.opened) throw new Error('could not open composer');
+  if (!composerOpen.opened) {
+    // Distinguish a TRUE membership/question gate (operator must join the group) from a generic /
+    // transient composer-open miss — otherwise the server collapses both to "cannot_post_in_group"
+    // and wrongly benches profiles. A distinct error lets the server label it not_a_member_of_group.
+    const d = composerOpen.diagnostic || {};
+    const btns = Array.isArray(d.buttons) ? d.buttons : [];
+    const probe = `${d.title || ''} ${d.dialogText || ''} ${btns.map((b) => String(b && b.label || '').toLowerCase()).join(' | ')}`.toLowerCase();
+    if (/join group|request to join|pending approval|cancel request|must be a member|you are not a member|only members can|members of this group|invitation only|invited to join|private group|answer.*question.*join|membership question/.test(probe)) {
+      throw new Error('facebook_group_membership_required_not_a_member');
+    }
+    throw new Error('could not open composer');
+  }
   logTiming('after_composer_opened');
   await humanPause(900, 1700);
   publisherGroupUserCandidates = mergeGroupUserCandidates(

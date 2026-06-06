@@ -10011,6 +10011,13 @@ function isFacebookGroupRenderUnavailableFailure(message = "") {
   return true;
 }
 
+// The account is NOT a member of the group (or it's request-to-join / membership-question gated).
+// This is a GROUP/CONFIG problem, NOT profile health — never bench the profile for it; the operator
+// must add the account to the group OR assign it a group it already belongs to.
+function isFacebookGroupMembershipFailure(message = "") {
+  return /facebook_group_membership_required_not_a_member|not a member|request to join|must be a member|only members can|members of this group|join group|invitation only|invited to join|membership question/i.test(String(message || ""));
+}
+
 function isFacebookProfileOpenOrLoginFailure(message = "") {
   return /ixbrowser.*(?:profile-open|profile open|timeout|timed out|login|required|error)|profile-open.*(?:timeout|timed out|error)|facebook_login_required_for_profile|facebook login required|checkpoint|two-factor|two factor|connectovercdp|cdp.*(?:timeout|timed out|refused|closed)|target page|browser has been closed/i.test(String(message || ""));
 }
@@ -13459,15 +13466,28 @@ async function runLiveFacebookPostFromPlan(body = {}) {
   const allGroupRenderUnavailable = groupErrors.length > 0
     ? groupErrors.every((item) => isFacebookGroupRenderUnavailableFailure(item.error || ""))
     : isFacebookGroupRenderUnavailableFailure(lastError?.message || "");
+  // Membership failure = account isn't in the group: a GROUP/CONFIG issue, not profile health.
+  const allMembershipFailure = groupErrors.length > 0
+    ? groupErrors.every((item) => isFacebookGroupMembershipFailure(item.error || ""))
+    : isFacebookGroupMembershipFailure(lastError?.message || "");
+  const dontBenchProfile = allGroupRenderUnavailable || allMembershipFailure;
   recordPostingProfileGroupIssue({
     profile: row.profile || ready.profileId,
     profileId: ready.profileId,
     groupUrl: ready.groupUrl,
     attemptedGroupUrls: attemptedGroups,
     reason: lastError?.message || "No configured Facebook group accepted this profile for posting.",
-    skipProfile: !allGroupRenderUnavailable,
+    skipProfile: !dontBenchProfile, // never bench on a group-render OR membership problem
   });
-  if (allGroupRenderUnavailable) {
+  if (allMembershipFailure) {
+    logEvent("posting_profile_not_a_member_of_group", {
+      profileId: ready.profileId,
+      profile: row.profile || "",
+      groupUrl: ready.groupUrl,
+      attempts: groupErrors.length,
+      message: "Account is NOT a member of this group — add it on Facebook OR assign it a group it already belongs to. Profile NOT benched.",
+    });
+  } else if (allGroupRenderUnavailable) {
     logEvent("posting_group_render_unavailable_profile_not_benched", {
       profileId: ready.profileId,
       profile: row.profile || "",
