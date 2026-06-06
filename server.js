@@ -579,7 +579,7 @@ function defaultState() {
     ixbrowser: {
       enabled: true,
       apiStatus: "not configured",
-      maxProfilesPerRun: 5,
+      maxProfilesPerRun: 50, // distinct profiles a run may rotate through (was 5 — that burned the same 5 accounts and got them Facebook-throttled; spread load across ALL assigned profiles)
       maxConcurrentProfiles: MAX_CONCURRENT_NORMAL_IX_PROFILES,
       profilesForNextRun: "",
       activeProfiles: "",
@@ -1501,7 +1501,7 @@ function normalizeWorkflowState(state) {
     state.affiliateProxy.lockedToSelectedProxy = true;
     state.affiliateProxy.apiRequestsMustUseProxy = true;
   }
-  state.ixbrowser.maxProfilesPerRun = clampNumber(state.ixbrowser.maxProfilesPerRun, 1, 200, 5);
+  state.ixbrowser.maxProfilesPerRun = clampNumber(state.ixbrowser.maxProfilesPerRun, 1, 200, 50);
   state.ixbrowser.maxConcurrentProfiles = clampNumber(
     state.ixbrowser.maxConcurrentProfiles,
     1,
@@ -6897,7 +6897,7 @@ function shuffledCopy(items = []) {
 function postingSlots(state) {
   const slots = [];
   const postsPerProfile = clampNumber(state.rules.postsPerProfilePerDay, 1, 20, 5);
-  const maxProfilesPerRun = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 200, 5);
+  const maxProfilesPerRun = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 200, 50);
   const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
   const allGroupUrls = [
     ...groups.map((group) => String(group.url || "").trim()),
@@ -8366,7 +8366,7 @@ async function ixBrowserPostingFallbackSlots(state = readState(), options = {}) 
 
   const data = await ixBrowserRequest("profile-list", { page: 1, limit: 100 });
   const rows = ixBrowserProfileRows(data);
-  const maxProfiles = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 200, 5);
+  const maxProfiles = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 200, 50);
   let ledgerEntries = [];
   try { ledgerEntries = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 }); } catch {}
   const eligible = [];
