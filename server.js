@@ -7951,11 +7951,13 @@ async function autopilotTickAsync(options = {}) {
     const eligibleIds = new Set(eligibleProfiles.map((p) => p.profileId));
     // FAIRNESS: order ready rows so the LEAST-used profiles (fewest posts today) are picked first,
     // spreading posting opportunity equally across available profiles.
-    // ACCOUNT-SAFETY FAIRNESS: order by each profile's ALL-TIME action history (fewest posts ever
-    // first), not just today, so lifetime load spreads evenly across all (3000+) profiles and no
-    // account gets hammered into a Facebook throttle. Falls back to today's count if no history.
+    // THROTTLE-SAFE FAIRNESS: recent volume is what trips Facebook throttles, so deprioritize profiles
+    // that already posted TODAY the hardest, THEN order by all-time history (fewest posts ever first).
+    // Net: a rested account ALWAYS goes before a recently-hammered one, and lifetime load still balances
+    // evenly among equally-rested accounts. (Earlier least-lifetime-only ordering wrongly tried the
+    // newer-but-recently-throttled accounts first and burned the run on cannot_post retries.)
     const postHistory = autopilotPostHistoryByProfile();
-    const usageByPid = new Map(eligibleProfiles.map((p) => [Number(p.profileId), (postHistory.get(Number(p.profileId)) || 0) * 1000 + (p.postedToday || 0)]));
+    const usageByPid = new Map(eligibleProfiles.map((p) => [Number(p.profileId), (p.postedToday || 0) * 1000000 + (postHistory.get(Number(p.profileId)) || 0)]));
     const recentlyFailed = recentlyFailedProfileSet(state);
     // GROUP FAIRNESS: today's per-group counts (from the same single ledger scan) so the picker
     // prefers the least-posted group first, then the least-used profile — equal across BOTH.
