@@ -2275,7 +2275,10 @@ async function saveSecrets() {
 
 function collectState() {
   const state = structuredClone(workflowState || {});
-  state.operator = {
+  // Spread the existing operator first so fields the main form does NOT manage — autopilotMaxPostsPerRun,
+  // autopilotDryRun, autopilotPostsThisRun, autopilotTickSeconds, etc. — survive a save (the Prod run-mode
+  // control relies on autopilotMaxPostsPerRun persisting).
+  state.operator = Object.assign({}, state.operator, {
     approvalRequired: operatorToggleValue("approvalRequired"),
     armedForExternalActions: operatorToggleValue("armedForExternalActions"),
     autopilotEnabled: operatorToggleValue("autopilotEnabled"),
@@ -2284,7 +2287,7 @@ function collectState() {
     runDays: getValue("runDays"),
     startTime: getValue("startTime"),
     stopTime: getValue("stopTime"),
-  };
+  });
   state.rules = {
     minutesBetweenPosts: Number(getValue("minutesBetweenPosts") || 0),
     randomMinutesBetweenPosts: getValue("randomMinutesBetweenPosts"),
@@ -5483,6 +5486,7 @@ function uxAttachCollapseControls() {
   let prodPollTimer = null;
   async function renderProdTab() {
     try {
+      populateProdRunMode((workflowState && workflowState.operator) || {}); // snappy + survives a failed status fetch
       const [statusRes, health, activity] = await Promise.all([
         api("/api/autopilot/status").catch(() => null),
         api("/api/prod/health").catch(() => null),
@@ -5494,6 +5498,7 @@ function uxAttachCollapseControls() {
       if (!st) { const r = await api("/api/state").catch(() => null); st = r ? (r.state || r) : {}; }
       const op = (st && st.operator) || {};
       const ix = (st && st.ixbrowser) || {};
+      populateProdRunMode(op);
       const enabled = ap.enabled != null ? ap.enabled : op.autopilotEnabled;
       const dryRun = op.autopilotDryRun !== false;
       const live = Boolean(enabled) && !dryRun;
@@ -5513,6 +5518,7 @@ function uxAttachCollapseControls() {
         ["Buffer ready", (buf.readyCount != null ? buf.readyCount : "?") + " / " + (buf.target != null ? buf.target : "?")],
         ["Posted today", String(cap.totalPostedToday != null ? cap.totalPostedToday : "-")],
         ["Capacity left", String(cap.totalRemaining != null ? cap.totalRemaining : "-")],
+        ["Run target", op.scheduleEnabled ? ("⏰ " + (op.startTime || "--:--") + "–" + (op.stopTime || "--:--")) : (Number(op.autopilotMaxPostsPerRun) > 0 ? ((op.autopilotPostsThisRun || 0) + "/" + op.autopilotMaxPostsPerRun + " posts") : "unlimited")],
         ["Tick", (ap.tickSeconds != null ? ap.tickSeconds : "?") + "s"],
         ["CPU governor", (op.cpuGovernorMaxPercent != null ? op.cpuGovernorMaxPercent : 85) + "%"],
         ["Box CPU", health ? (health.cpuPercent + "%") : "?"],
@@ -5566,16 +5572,38 @@ function uxAttachCollapseControls() {
     const st = (r && (r.state || r)) || {};
     st.operator = st.operator || {};
     st.ixbrowser = st.ixbrowser || {};
+    st.rules = st.rules || {};
     if (patch.operator) Object.assign(st.operator, patch.operator);
     if (patch.ixbrowser) Object.assign(st.ixbrowser, patch.ixbrowser);
+    if (patch.rules) Object.assign(st.rules, patch.rules);
     await api("/api/state", { method: "PUT", body: JSON.stringify({ state: st }) });
+  }
+  // ── Prod run mode: "stop after N posts" (count) OR "run between start & end time" (time) ─────
+  let prodRunModeTouched = false;
+  function prodRunModeValue() { const r = document.querySelector('input[name="prodRunMode"]:checked'); return r ? r.value : "count"; }
+  function prodApplyRunModeVisibility() {
+    const mode = prodRunModeValue();
+    document.querySelectorAll('#prodRunMode .prodModeFields').forEach(function (el) { el.hidden = (el.getAttribute("data-mode-fields") !== mode); });
+  }
+  function populateProdRunMode(op) {
+    if (prodRunModeTouched) return; // don't overwrite what the operator is actively setting
+    op = op || (workflowState && workflowState.operator) || {};
+    const radio = document.querySelector('input[name="prodRunMode"][value="' + (op.scheduleEnabled ? "time" : "count") + '"]');
+    if (radio) radio.checked = true;
+    const setIf = function (id, val) { const el = $(id); if (el && document.activeElement !== el) el.value = (val == null ? "" : String(val)); };
+    const mp = Number(op.autopilotMaxPostsPerRun);
+    setIf("prodMaxPosts", mp > 0 ? mp : "");
+    setIf("prodStartTime", op.startTime || "");
+    setIf("prodStopTime", op.stopTime || "");
+    setIf("prodScheduleTimezone", op.scheduleTimezone || "");
+    prodApplyRunModeVisibility();
   }
   function prodResult(msg) { const el = $("prodActionResult"); if (el) el.textContent = msg; }
   function prodOn(id, fn) { const el = $(id); if (el) el.addEventListener("click", async function () { try { await fn(); } catch (e) { prodResult("Error: " + ((e && e.message) || e)); } }); }
   function bindProd() {
     if (!$("prodStatusGrid")) return;
-    prodOn("prodGoLiveBtn", async function () { prodResult("Going live…"); await prodPatchState({ operator: { autopilotEnabled: true, autopilotDryRun: false } }); prodResult("● LIVE — autopilot posting."); renderProdTab(); });
-    prodOn("prodPauseBtn", async function () { prodResult("Pausing…"); await prodPatchState({ operator: { autopilotDryRun: true } }); prodResult("Paused (dry-run) — not posting."); renderProdTab(); });
+    prodOn("prodGoLiveBtn", async function () { prodResult("Going live…"); prodSyncFormAndCache({ autopilotEnabled: true, autopilotDryRun: false }); await prodPatchState({ operator: { autopilotEnabled: true, autopilotDryRun: false } }); prodResult("● LIVE — autopilot posting."); renderProdTab(); });
+    prodOn("prodPauseBtn", async function () { prodResult("Pausing…"); prodSyncFormAndCache({ autopilotDryRun: true }); await prodPatchState({ operator: { autopilotDryRun: true } }); prodResult("Paused (dry-run) — not posting."); renderProdTab(); });
     prodOn("prodEnableBtn", async function () { await prodPatchState({ operator: { autopilotEnabled: true } }); prodResult("Autopilot enabled."); renderProdTab(); });
     prodOn("prodDisableBtn", async function () { await prodPatchState({ operator: { autopilotEnabled: false } }); prodResult("Autopilot disabled."); renderProdTab(); });
     const sel = $("prodConcurrency");
@@ -5584,8 +5612,55 @@ function uxAttachCollapseControls() {
     prodOn("prodFillBtn", function () { prodResult("Filling buffer (runs in background, ~minutes)…"); api("/api/products/fill-asset-buffer", { method: "POST", body: JSON.stringify({ max: 10 }), timeoutMs: 1500000 }).then(function (r) { prodResult("Fill done: prepared " + (r && r.prepared != null ? r.prepared : "?") + ", ready=" + (r && r.readyCount != null ? r.readyCount : "?")); renderProdTab(); }).catch(function (e) { prodResult("Fill running/continuing server-side: " + ((e && e.message) || e)); }); });
     prodOn("prodTickBtn", async function () { prodResult("Running one tick (may take minutes)…"); const r = await api("/api/autopilot/tick", { method: "POST", body: "{}", timeoutMs: 1500000 }); const d = (r && r.decision) || {}; prodResult("Tick: " + (d.action || "-") + (d.posted != null ? (" — posted " + d.posted) : "")); renderProdTab(); });
     prodOn("prodRefreshBtn", renderProdTab);
-    prodOn("prodLaunchAllBtn", async function () { prodResult("Launching production…"); await prodPatchState({ operator: { autopilotEnabled: true, autopilotDryRun: false, armedForExternalActions: true }, ixbrowser: { maxConcurrentProfiles: 3 } }); prodResult("● LIVE — armed, autopilot on, 3-by-3, posting."); renderProdTab(); });
-    prodOn("prodStopAllBtn", async function () { prodResult("Stopping…"); await prodPatchState({ operator: { armedForExternalActions: false, autopilotEnabled: false } }); prodResult("Stopped — disarmed and autopilot off."); renderProdTab(); });
+    // Keep the (hidden) operator control toggles + cached workflowState in lock-step with what we
+    // write directly, so the main form's auto-save (collectState) can NEVER silently revert an
+    // arm/disarm or the run-mode fields. opPatch keys present here win in both the DOM and the cache.
+    function prodSyncFormAndCache(opPatch, rulesPatch) {
+      opPatch = opPatch || {};
+      const chk = function (id, v) { const el = $(id); if (el) el.checked = !!v; };
+      const inp = function (id, v) { const el = $(id); if (el && v != null) el.value = String(v); };
+      if ("autopilotEnabled" in opPatch) chk("autopilotEnabledRail", opPatch.autopilotEnabled);
+      if ("armedForExternalActions" in opPatch) chk("armedForExternalActionsRail", opPatch.armedForExternalActions);
+      if ("scheduleEnabled" in opPatch) chk("scheduleEnabled", opPatch.scheduleEnabled);
+      if ("startTime" in opPatch) inp("startTime", opPatch.startTime);
+      if ("stopTime" in opPatch) inp("stopTime", opPatch.stopTime);
+      if ("scheduleTimezone" in opPatch) inp("scheduleTimezone", opPatch.scheduleTimezone);
+      if (rulesPatch && "peakStartTime" in rulesPatch) inp("peakStartTime", rulesPatch.peakStartTime || "");
+      if (rulesPatch && "peakStopTime" in rulesPatch) inp("peakStopTime", rulesPatch.peakStopTime || "");
+      if (typeof workflowState === "object" && workflowState) {
+        workflowState.operator = Object.assign({}, workflowState.operator || {}, opPatch);
+        if (rulesPatch) workflowState.rules = Object.assign({}, workflowState.rules || {}, rulesPatch);
+      }
+    }
+    document.querySelectorAll('input[name="prodRunMode"]').forEach(function (r) { r.addEventListener("change", function () { prodRunModeTouched = true; prodApplyRunModeVisibility(); if (workflowState && workflowState.operator) workflowState.operator.scheduleEnabled = (r.value === "time"); }); });
+    const prodMaxEl = $("prodMaxPosts");
+    if (prodMaxEl) prodMaxEl.addEventListener("input", function () { prodRunModeTouched = true; const n = parseInt(prodMaxEl.value, 10); if (workflowState && workflowState.operator && n > 0) workflowState.operator.autopilotMaxPostsPerRun = n; });
+    ["prodStartTime", "prodStopTime", "prodScheduleTimezone"].forEach(function (id) { const el = $(id); if (el) el.addEventListener("input", function () { prodRunModeTouched = true; }); });
+    prodOn("prodLaunchAllBtn", async function () {
+      const mode = prodRunModeValue();
+      const base = { autopilotEnabled: true, autopilotDryRun: false, armedForExternalActions: true };
+      let patch, msg;
+      if (mode === "time") {
+        const startT = (($("prodStartTime") || {}).value || "").trim();
+        const stopT = (($("prodStopTime") || {}).value || "").trim();
+        const tz = ((($("prodScheduleTimezone") || {}).value || "").trim()) || "America/New_York";
+        if (!startT || !stopT) { prodResult("⚠ Set both a start and end time first."); return; }
+        patch = { operator: Object.assign({}, base, { scheduleEnabled: true, startTime: startT, stopTime: stopT, scheduleTimezone: tz, autopilotMaxPostsPerRun: 0 }), ixbrowser: { maxConcurrentProfiles: 3 } };
+        msg = "● LIVE — posting between " + startT + " and " + stopT + " (" + tz + "); no post-count limit.";
+      } else {
+        const n = Math.max(0, Math.min(500, parseInt((($("prodMaxPosts") || {}).value || ""), 10) || 0));
+        if (!n) { prodResult("⚠ Enter how many posts (1–500) first."); return; }
+        patch = { operator: Object.assign({}, base, { scheduleEnabled: false, autopilotMaxPostsPerRun: n, autopilotPostsThisRun: 0 }), rules: { peakStartTime: "", peakStopTime: "" }, ixbrowser: { maxConcurrentProfiles: 3 } };
+        msg = "● LIVE — will post " + n + " then auto-stop.";
+      }
+      prodResult("Launching…");
+      prodSyncFormAndCache(patch.operator, patch.rules); // sync BEFORE the await so a concurrent auto-save is already consistent
+      await prodPatchState(patch);
+      prodResult(msg);
+      prodRunModeTouched = false;
+      renderProdTab();
+    });
+    prodOn("prodStopAllBtn", async function () { prodResult("Stopping…"); prodSyncFormAndCache({ armedForExternalActions: false, autopilotEnabled: false }); await prodPatchState({ operator: { armedForExternalActions: false, autopilotEnabled: false } }); prodResult("Stopped — disarmed and autopilot off."); renderProdTab(); });
     prodOn("prodLoadProfilesBtn", async function () { prodResult("Loading IXBrowser profiles…"); await loadIxProfilesQuiet(); renderProdRoleSelects(); const s = $("prodRolesStatus"); if (s) { s.className = "inlineNotice ok"; s.textContent = "Profiles loaded — choose roles (saves automatically)."; } });
     ["prodModeratorProfileSelect", "prodSylProfileSelect", "prodExcludedProfileSelect"].forEach(function (id) { const el = $(id); if (el) el.addEventListener("change", function () { if (typeof saveProdRoles === "function") saveProdRoles(); }); });
     prodOn("prodSaveRolesBtn", async function () { await saveProdRoles(); });
@@ -5595,7 +5670,7 @@ function uxAttachCollapseControls() {
   function startProdPoll() { if (prodPollTimer) return; renderProdTab(); prodPollTimer = window.setInterval(function () { if (prodActive()) renderProdTab(); else { window.clearInterval(prodPollTimer); prodPollTimer = null; } }, 4000); }
   function initProd() {
     bindProd();
-    document.querySelectorAll("[data-view-target]").forEach(function (b) { b.addEventListener("click", function () { window.setTimeout(function () { if (prodActive()) startProdPoll(); }, 60); }); });
+    document.querySelectorAll("[data-view-target]").forEach(function (b) { b.addEventListener("click", function () { window.setTimeout(function () { if (prodActive()) { prodRunModeTouched = false; startProdPoll(); } }, 60); }); });
     if (prodActive()) startProdPoll();
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", initProd); else initProd();

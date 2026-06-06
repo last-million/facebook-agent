@@ -646,6 +646,23 @@
               <div id="prodHeadline" class="prodHeadline">Loading production status…</div>
               <div id="prodStatusGrid" class="prodStatusGrid"></div>
               <h3 class="prodSectionTitle">Launch</h3>
+              <div class="prodRunMode" id="prodRunMode">
+                <div class="prodModeRow">
+                  <span class="prodModeTitle">Run mode</span>
+                  <label class="prodModePick"><input type="radio" name="prodRunMode" value="count"><span>&#128290; Stop after N posts</span></label>
+                  <label class="prodModePick"><input type="radio" name="prodRunMode" value="time"><span>&#9200; Run between start &amp; end time</span></label>
+                </div>
+                <div class="prodModeFields" data-mode-fields="count">
+                  <label>Posts this run <input id="prodMaxPosts" type="number" min="1" max="500" step="1" placeholder="20"></label>
+                  <span class="prodModeHint muted">Posts exactly this many, then stops automatically.</span>
+                </div>
+                <div class="prodModeFields" data-mode-fields="time" hidden>
+                  <label>Start time <input id="prodStartTime" type="time"></label>
+                  <label>End time <input id="prodStopTime" type="time"></label>
+                  <label>Timezone <input id="prodScheduleTimezone" type="text" placeholder="America/New_York"></label>
+                  <span class="prodModeHint muted">Posts continuously while the clock is inside this window — no post-count limit.</span>
+                </div>
+              </div>
               <div class="prodLaunch">
                 <button id="prodLaunchAllBtn" class="primary prodLaunchBtn" type="button">&#9654; Start</button>
                 <button id="prodStopAllBtn" class="danger prodLaunchBtn" type="button">&#9632; Stop</button>
