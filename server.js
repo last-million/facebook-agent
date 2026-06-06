@@ -6866,6 +6866,15 @@ function postingSlots(state) {
     if (ha !== hb) return ha - hb;
     return a.i - b.i;
   }).map((x) => x.p);
+  // Memoize per distinct profiles array (once per group) so the sort isn't recomputed for every
+  // postNumber round — matters at 3000 profiles × many post-rounds.
+  const __freshOrderMemo = new Map();
+  const orderFreshFirstCached = (profiles) => {
+    if (__freshOrderMemo.has(profiles)) return __freshOrderMemo.get(profiles);
+    const ordered = orderFreshFirst(profiles);
+    __freshOrderMemo.set(profiles, ordered);
+    return ordered;
+  };
   const allGroupUrls = [
     ...groups.map((group) => String(group.url || "").trim()),
     ...recordLines(state.posting?.groups),
@@ -6876,7 +6885,7 @@ function postingSlots(state) {
     for (const group of groups) {
       const groupUrl = String(group.url || "").trim();
       if (!groupUrl) continue;
-      for (const profile of orderFreshFirst(group.profiles)) {
+      for (const profile of orderFreshFirstCached(group.profiles)) {
         const label = String(profile || "").trim();
         if (!label) continue;
         const profileId = profileIdFromLabel(label);
@@ -7602,8 +7611,17 @@ async function backfillProductTitlesAsync(options = {}) {
 // inside schedule, the scheduler auto-publishes ready buffer products within
 // per-profile daily caps, then prepares tomorrow's buffer once the cap is met.
 // Manual flows are unaffected; only autopilot-context posts bypass approval.
+let __todayByProfileCache = { at: 0, tz: "", result: null };
 function autopilotPublishedTodayByProfile(state = readState()) {
   const tz = state.operator?.scheduleTimezone || state.rules?.peakHoursTimezone || "America/New_York";
+  // SCALE: this is a full synchronous ledger scan called multiple times per tick (postingSlots +
+  // capacity + picker). A short 30s cache collapses those to ONE scan — the main event-loop-block /
+  // shared-box (Pinterest) starvation risk at large ledger sizes. The cache is INVALIDATED the instant
+  // a post lands (runWorker), so fairness/cap counts stay accurate; idle/fast-retry ticks reuse it.
+  // Returned Maps are read-only by all callers.
+  if (__todayByProfileCache.result && __todayByProfileCache.tz === tz && Date.now() - __todayByProfileCache.at < 30000) {
+    return __todayByProfileCache.result;
+  }
   // Reuse ONE Intl formatter (dateKeyForTimezone makes a new one per call, which
   // cost ~1s across hundreds of ledger lines), and pre-filter by UTC date prefix
   // so formatToParts only runs on ~today's lines.
@@ -7655,7 +7673,9 @@ function autopilotPublishedTodayByProfile(state = readState()) {
   } catch (err) {
     if (err.code !== "ENOENT") logEvent("autopilot_ledger_read_error", { error: oneLineField(err.message || String(err), 160) });
   }
-  return { byProfile, byGroup, total, lastPostAt, lastAtByProfile };
+  const result = { byProfile, byGroup, total, lastPostAt, lastAtByProfile };
+  __todayByProfileCache = { at: Date.now(), tz, result };
+  return result;
 }
 
 // ALL-TIME published-post count per profile, straight from the ledger (the automatic action history).
@@ -7663,7 +7683,7 @@ function autopilotPublishedTodayByProfile(state = readState()) {
 // every profile and no single account gets hammered into a Facebook velocity throttle.
 let __postHistoryCache = { at: 0, map: null };
 function autopilotPostHistoryByProfile() {
-  if (__postHistoryCache.map && Date.now() - __postHistoryCache.at < 60000) return __postHistoryCache.map;
+  if (__postHistoryCache.map && Date.now() - __postHistoryCache.at < 300000) return __postHistoryCache.map; // 5min: all-time count drifts slowly; avoids a full ledger scan every ~25s fast-retry tick
   const byProfile = new Map();
   const seen = new Set();
   try {
@@ -8080,6 +8100,7 @@ async function autopilotTickAsync(options = {}) {
           sNow.operator = sNow.operator || {};
           sNow.operator.autopilotPostsThisRun = newCount;
           writeState(sNow, { controlWrite: true });
+          __todayByProfileCache = { at: 0, tz: "", result: null }; // a post landed -> next tick rescans today-counts so fresh-first fairness + daily caps stay accurate
           logEvent("autopilot_post_counted", { profileId: Number(r.profileId || 0), postsThisRun: newCount });
           const lim = autopilotRunLimit(sNow);
           if (lim > 0 && newCount >= lim) autopilotAutoDisarm("run_limit_reached", `posted ${newCount}/${lim} this run`);
