@@ -1397,7 +1397,7 @@ function normalizeWorkflowState(state) {
   state.rules.postsPerProfilePerDay = clampNumber(state.rules.postsPerProfilePerDay, 1, 20, 5);
   // HARD per-run post limiter fields (defense-in-depth; readers also clampNumber): 0 = unlimited.
   state.operator = state.operator || {};
-  state.operator.autopilotMaxPostsPerRun = clampNumber(state.operator.autopilotMaxPostsPerRun, 0, 1000, 0);
+  state.operator.autopilotMaxPostsPerRun = clampNumber(state.operator.autopilotMaxPostsPerRun, 0, 1000000, 0);
   state.operator.autopilotPostsThisRun = clampNumber(state.operator.autopilotPostsThisRun, 0, 1000000, 0);
   state.operator.commentCooldownHours = clampNumber(state.operator.commentCooldownHours, 1, 720, 48);
   const blockedProfileLines = normalizedProfileListLines(state.ixbrowser?.blockedProfiles);
@@ -7637,6 +7637,7 @@ function autopilotPublishedTodayByProfile(state = readState()) {
   const utcPrefixes = new Set([nowMs - dayMs, nowMs, nowMs + dayMs].map((ms) => new Date(ms).toISOString().slice(0, 10)));
   const today = dayKeyOf(new Date(nowMs));
   const byProfile = new Map();
+  const byGroup = new Map(); // per-group today-counts for group fairness (piggybacked on this scan)
   const seen = new Set();
   const lastAtByProfile = new Map();
   let total = 0;
@@ -7658,6 +7659,10 @@ function autopilotPublishedTodayByProfile(state = readState()) {
       if (seen.has(dedupe)) continue;
       seen.add(dedupe);
       byProfile.set(profileId, (byProfile.get(profileId) || 0) + 1);
+      // Key on the CONFIG groupUrl (the vanity URL we posted TO) — not actualGroupUrl (the numeric
+      // permalink) — so these counts align with the ready-row groupUrls used in orderReadyRowsLeastUsed.
+      const gkey = normalizedFacebookGroupKey(String(row.groupUrl || row.actualGroupUrl || ""));
+      if (gkey) byGroup.set(gkey, (byGroup.get(gkey) || 0) + 1);
       total += 1;
       const ts = Date.parse(at);
       if (Number.isFinite(ts)) {
@@ -7668,11 +7673,17 @@ function autopilotPublishedTodayByProfile(state = readState()) {
   } catch (err) {
     if (err.code !== "ENOENT") logEvent("autopilot_ledger_read_error", { error: oneLineField(err.message || String(err), 160) });
   }
-  return { byProfile, total, lastPostAt, lastAtByProfile };
+  return { byProfile, byGroup, total, lastPostAt, lastAtByProfile };
 }
 
 function autopilotCapacityByProfile(state = readState()) {
-  const perProfile = clampNumber(state.rules?.postsPerProfilePerDay, 1, 20, 5);
+  // A count-mode run (operator.autopilotMaxPostsPerRun > 0) is bounded ONLY by the requested count:
+  // the per-profile DAILY cap is intentionally lifted so the run always reaches the number asked for
+  // (operator opted out of the 75/day-style throttle and has plenty of profiles). Continuous/time
+  // runs keep the daily cap (now raisable up to 1000/profile) as their safety throttle.
+  const runLimit = clampNumber(state.operator?.autopilotMaxPostsPerRun, 0, 1000000, 0);
+  const dailyCap = clampNumber(state.rules?.postsPerProfilePerDay, 1, 1000, 5);
+  const perProfile = runLimit > 0 ? Math.max(runLimit, dailyCap) : dailyCap;
   const published = autopilotPublishedTodayByProfile(state);
   const profiles = new Map();
   for (const slot of filterExcludedProfileSlots(postingSlots(state), {})) {
@@ -7763,7 +7774,9 @@ async function autopilotMaybeRefreshDiscoveryAsync(reason, options = {}) {
 // autopilotMaxPostsPerRun (0=unlimited) caps how many posts a single armed run makes; when hit,
 // the autopilot AUTO-DISARMS (enabled=false + armed=false) so it cannot overshoot or keep going.
 function autopilotRunLimit(state = readState()) {
-  return clampNumber(state.operator?.autopilotMaxPostsPerRun, 0, 1000, 0);
+  // Match autopilotCapacityByProfile's clamp (1e6): a COUNT run must be able to reach exactly N
+  // even for large N. (Was 1000 — which silently auto-disarmed any count run above 1000 posts.)
+  return clampNumber(state.operator?.autopilotMaxPostsPerRun, 0, 1000000, 0);
 }
 function autopilotPostsThisRunCount(state = readState()) {
   return clampNumber(state.operator?.autopilotPostsThisRun, 0, 1000000, 0);
@@ -7924,7 +7937,11 @@ async function autopilotTickAsync(options = {}) {
     try {
       // discoveryAlreadyRun: the line above already refreshed candidates — without this,
       // preparePostingPlanWithFallbackProfiles runs a SECOND un-throttled discovery every tick.
-      plan = await preparePostingPlanWithFallbackProfiles({ testPost: false, autopilot: true, discoveryAlreadyRun: true, limit: Math.min(capacity.totalRemaining, 10) });
+      // COUNT mode keeps a DEEPER ready pool per tick so the group+profile fairness sort has rows
+      // for multiple groups to spread across (postingSlots front-loads group[0], so a shallow pool
+      // can be all one group). maxWorkers (3) still caps posts/tick, so this never overshoots N.
+      const __planCap = autopilotRunLimit(state) > 0 ? 30 : 10;
+      plan = await preparePostingPlanWithFallbackProfiles({ testPost: false, autopilot: true, discoveryAlreadyRun: true, limit: Math.min(capacity.totalRemaining, __planCap) });
     } catch (err) {
       decision.action = "plan_unavailable";
       decision.detail = oneLineField(err.message || String(err), 220);
@@ -7941,10 +7958,14 @@ async function autopilotTickAsync(options = {}) {
     // spreading posting opportunity equally across available profiles.
     const usageByPid = new Map(eligibleProfiles.map((p) => [Number(p.profileId), p.postedToday || 0]));
     const recentlyFailed = recentlyFailedProfileSet(state);
+    // GROUP FAIRNESS: today's per-group counts (from the same single ledger scan) so the picker
+    // prefers the least-posted group first, then the least-used profile — equal across BOTH.
+    const usageByGroupKey = autopilotPublishedTodayByProfile(state).byGroup || new Map();
     const readyRows = orderReadyRowsLeastUsed(
       latestPostingPlanRows(readState()).filter((row) => row.runType === "full_posting_plan" && row.planId === plan.planId && String(row.liveExecution || "").startsWith("ready")),
       usageByPid,
       recentlyFailed,
+      usageByGroupKey,
     );
     const picked = [];
     const usedIds = new Set();
@@ -11830,12 +11851,18 @@ function orderProfilesLeastUsedFirst(profiles, usageMap, failedSet = new Set()) 
   });
 }
 // Order ready posting-plan rows: healthy-least-used first, just-failed profiles last (fair + no stall).
-function orderReadyRowsLeastUsed(rows, postCountByPid, failedSet = new Set()) {
+function orderReadyRowsLeastUsed(rows, postCountByPid, failedSet = new Set(), groupCountByKey = new Map()) {
   return rows.slice().sort((a, b) => {
     const pa = Number(a.profileId || profileIdFromLabel(a.profile) || 0);
     const pb = Number(b.profileId || profileIdFromLabel(b.profile) || 0);
     const fa = failedSet.has(pa) ? 1 : 0, fb = failedSet.has(pb) ? 1 : 0;
     if (fa !== fb) return fa - fb;
+    // GROUP FAIRNESS (primary): with multiple groups, post to the LEAST-posted-today group first so
+    // posts spread EQUALLY across groups. Default-empty map => ga===gb===0 => other callers unchanged.
+    const ga = groupCountByKey.get(normalizedFacebookGroupKey(String(a.groupUrl || ""))) ?? 0;
+    const gb = groupCountByKey.get(normalizedFacebookGroupKey(String(b.groupUrl || ""))) ?? 0;
+    if (ga !== gb) return ga - gb;
+    // PROFILE FAIRNESS (secondary): least-posted-today profile within the chosen group tier.
     return (postCountByPid.get(pa) ?? 1e9) - (postCountByPid.get(pb) ?? 1e9);
   });
 }
