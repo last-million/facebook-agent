@@ -10635,12 +10635,44 @@ async function runFacebookAdminApprovalAttempt({ row, profileId, profileLabel, g
   }
 }
 
+// A VANITY group URL (/groups/o149…) and the NUMERIC permalink URL (/groups/1098…) are the SAME group
+// but normalize to different keys. Build the alias set from the ledger (it logs groupUrl=vanity AND a
+// numeric postUrl/actualGroupUrl for the same posts), so group-config matching works for BOTH forms —
+// otherwise the admin-approval gate never fires for a vanity-configured group and posts die in review.
+let __groupAliasCache = { at: 0, map: null };
+function groupKeyAliasSet(groupUrl) {
+  const base = normalizedFacebookGroupKey(String(groupUrl || ""));
+  if (!base) return new Set();
+  if (!__groupAliasCache.map || Date.now() - __groupAliasCache.at > 300000) {
+    const pairs = new Map();
+    const link = (a, b) => { if (!pairs.has(a)) pairs.set(a, new Set()); pairs.get(a).add(b); };
+    try {
+      const lines = fs.readFileSync(FB_LIVE_POST_LEDGER_FILE, "utf8").split(/\r?\n/);
+      for (const ln of lines) {
+        const t = ln.trim(); if (!t || t.indexOf('"postUrl":"http') === -1) continue;
+        let r; try { r = JSON.parse(t); } catch { continue; }
+        const k1 = normalizedFacebookGroupKey(String(r.groupUrl || ""));
+        const k2 = normalizedFacebookGroupKey(String(r.actualGroupUrl || facebookGroupUrlFromPostUrl(r.postUrl) || ""));
+        if (k1 && k2 && k1 !== k2) { link(k1, k2); link(k2, k1); }
+      }
+    } catch {}
+    __groupAliasCache = { at: Date.now(), map: pairs };
+  }
+  const out = new Set([base]);
+  const al = __groupAliasCache.map.get(base);
+  if (al) for (const a of al) out.add(a);
+  return out;
+}
+function groupsMatchByAlias(urlA, urlB) {
+  const a = groupKeyAliasSet(urlA), b = groupKeyAliasSet(urlB);
+  for (const k of a) if (b.has(k)) return true;
+  return false;
+}
 function isAdminApprovalEnabledForGroup(groupUrl, state = readState()) {
-  const targetKey = normalizedFacebookGroupKey(groupUrl);
-  if (!targetKey) return false;
+  if (!normalizedFacebookGroupKey(groupUrl)) return false;
   const assignments = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
   for (const group of assignments) {
-    if (normalizedFacebookGroupKey(group?.url) !== targetKey) continue;
+    if (!groupsMatchByAlias(groupUrl, group?.url)) continue; // vanity<->numeric aware
     return Boolean(group?.requiresAdminApproval || group?.requires_admin_approval || group?.adminApproval || group?.admin_approval);
   }
   return false;
