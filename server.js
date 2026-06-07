@@ -1462,7 +1462,7 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.reserveTarget = clampNumber(state.posting.contentSources.reserveTarget, 1, 1000, 20); // keep this many copied products ready
   state.posting.contentSources.reserveRefillAt = clampNumber(state.posting.contentSources.reserveRefillAt, 0, Math.max(0, state.posting.contentSources.reserveTarget - 1), 10); // resume harvesting when reserve drops to this
   state.posting.contentSources.harvestProfilesPerGroup = clampNumber(state.posting.contentSources.harvestProfilesPerGroup, 1, 6, 3); // # member profiles to harvest each group with IN PARALLEL (spreads load)
-  if (typeof state.posting.contentSources.postCta !== "string") state.posting.contentSources.postCta = "🛒 Deal link in the first comment 👇"; // CTA appended to copied-product posts (editable; "" = none)
+  if (typeof state.posting.contentSources.postCta !== "string") state.posting.contentSources.postCta = ""; // optional CTA line ABOVE the emoji+title+tags signature (blank = clean deal post)
   else state.posting.contentSources.postCta = state.posting.contentSources.postCta.slice(0, 300);
   state.operator = state.operator || {};
   state.operator.contentSourcesEnabled = state.posting.contentSources.enabled === true;
@@ -8452,6 +8452,15 @@ function cleanHarvestedPostText(raw) {
   return t;
 }
 
+// A SHORT clean product TITLE for the post signature line (emoji + title + 2 hashtags). Distils the
+// harvested caption: strip the seller's junk (via cleanHarvestedPostText), take the first sentence, cap ~95 chars.
+function harvestedShortTitle(raw) {
+  let t = cleanHarvestedPostText(raw);
+  t = (t.split(/(?<=[.!?])\s+|\n/)[0] || t).trim();
+  if (t.length > 95) { t = t.slice(0, 95); const sp = t.lastIndexOf(" "); if (sp > 45) t = t.slice(0, sp); t = t.trim(); }
+  return t;
+}
+
 function preparePostingPlan(options = {}) {
   const state = readState();
   const overrideProductUrls = Array.isArray(options.productUrls)
@@ -8538,8 +8547,11 @@ function preparePostingPlan(options = {}) {
     // post-text, the review-image channel, and ShopYourLikes link-gen.
     const harvestedRec = String(product.key || "").startsWith("harvested:") ? harvestedRecordForKey(product.key, state) : null;
     const postCta = String(state.posting?.contentSources?.postCta || "").trim();
+    // HARVESTED post body = the optional CTA only; the unique "emoji + SHORT product title + hashtags"
+    // signature line is auto-appended by livePostPayloadForRow (clean deal post, NOT the seller's caption).
+    // The clean short title flows via row.title -> computePostMarkerPhrase below.
     const postText = harvestedRec
-      ? (cleanHarvestedPostText(harvestedRec.text) + (postCta ? `\n\n${postCta}` : "")).trim()
+      ? postCta
       : rotationValue(postTexts, state.contentRotation.postTextCursor, index, state.contentRotation.avoidPostTextReuse);
     const commentLeadIn = rotationValue(commentLeadIns, state.contentRotation.commentLeadInCursor, index, state.contentRotation.avoidCommentLeadInReuse);
     const affiliateLink = affiliateShortlinkForProduct(product, state);
@@ -8561,7 +8573,7 @@ function preparePostingPlan(options = {}) {
     if (harvestedRec) { if (!image) missingAssets.push("harvested_image"); } // harvested image is the downloaded local file, not a review-image record
     else if (!imageRecord) missingAssets.push("positive_review_image");
     else if (!imageRecord.approved) missingAssets.push("human_approved_review_image");
-    if (!postText) missingAssets.push("unique_post_text");
+    if (!postText && !harvestedRec) missingAssets.push("unique_post_text"); // harvested text comes from the auto signature line (emoji + short title + tags)
     // commentLeadIn is intentionally NOT a readiness gate. It is a cosmetic comment intro (the comment
     // template may not even use {lead_in}). With a small lead-in pool + avoid-reuse, gating on it BLOCKED
     // every row past the pool size — starving all but the first ~9 profiles of ready rows so fresh
@@ -8589,7 +8601,7 @@ function preparePostingPlan(options = {}) {
       productKey: product.key,
       productId: product.productId,
       retailer: product.store,
-      title: harvestedRec ? (String(harvestedRec.text || "").slice(0, 120) || product.title) : (product.storedTitle || product.title), // harvested: its description; else the real discovered title
+      title: harvestedRec ? (harvestedShortTitle(harvestedRec.text) || product.title) : (product.storedTitle || product.title), // harvested: a CLEAN short product title -> feeds the emoji+title+tags signature; else the discovered title
       productDiscoveryAt: runType === "full_posting_plan" ? (state.productDiscovery?.lastSuccessfulRunAt || "") : "",
       productDiscoveryStatus: runType === "full_posting_plan" ? (state.productDiscovery?.lastRunStatus || "") : "",
       postText,
