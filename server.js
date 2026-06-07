@@ -8448,6 +8448,7 @@ function cleanHarvestedPostText(raw) {
     else { const sp = cut.lastIndexOf(" "); if (sp > 90) cut = cut.slice(0, sp); }
     t = cut.trim();
   }
+  t = t.replace(/\s*…+\s*$/, "").replace(/[\s,;:•\-]+$/, "").trim(); // drop any trailing orphan ellipsis/punctuation
   return t;
 }
 
