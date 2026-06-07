@@ -7662,8 +7662,10 @@ async function harvestContentSourcesAsync(options = {}) {
     const harvestCount = clampNumber(options.harvestCount || (effectiveTarget - reserve), 1, 20, 4); // grab the GAP toward the (day or night) target in one harvest (capped at 20/session)
     for (let i = 0; i < pairs.length; i += 4) { // 4-by-4
       const round = pairs.slice(i, i + 4);
-      await waitForPostingIdle({ label: "harvest_sources" }).catch(() => {});   // posting always wins
-      await waitForCpuHeadroom({ label: "harvest_sources" }).catch(() => {});    // yield to a busy box + Pinterest
+      // NO waitForPostingIdle: harvesting (low-risk browsing) runs CONCURRENTLY with posting so the reserve
+      // NEVER empties mid-production. Contention is handled safely by the per-profile lock (posting's profiles
+      // return 409 and are skipped) + the CPU governor below — harvesting just uses whatever profiles are free.
+      await waitForCpuHeadroom({ label: "harvest_sources" }).catch(() => {});    // CPU protection only (still yields to a busy box + the Pinterest agent)
       await Promise.all(round.map(async (pair) => {
         let release = null;
         try { release = acquireNormalIxProfileUse(pair.profileId, "facebook_harvest"); }
