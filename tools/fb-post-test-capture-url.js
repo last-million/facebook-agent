@@ -3028,9 +3028,89 @@ async function approvePendingPost(page, context, payload, gid, marker) {
   }, null, 2));
 }
 
+// HARVEST: read a SOURCE group's /media grid, open the first N media posts, and extract each post's
+// TEXT + IMAGE + the LINK in its first comment. READ-ONLY (never posts/comments). Returns [{href,text,image,link}].
+async function harvestGroupFeed(page, count) {
+  const out = [];
+  const seenLinks = new Set(); // dedup harvested PRODUCTS by their first-comment URL (each product = unique url)
+  await page.waitForTimeout(3000);
+  // Robustly load the /media grid: wait for photo tiles, then scroll until enough DISTINCT posts are loaded.
+  try { await page.waitForSelector('a[href*="fbid="]', { timeout: 25000 }); } catch (_) {}
+  for (let s = 0; s < 14; s++) {
+    const n = await page.evaluate(() => document.querySelectorAll('a[href*="/photo"][href*="fbid="]').length).catch(() => 0);
+    if (n >= Math.max(30, 0)) break;
+    await page.mouse.wheel(0, 2400).catch(() => {});
+    await page.waitForTimeout(1500);
+  }
+  const collected = await page.evaluate(() => {
+    const items = []; const seen = new Set();
+    for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+      const h = a.href || '';
+      if (!/\/photo/i.test(h) || !/fbid=/i.test(h)) continue;   // ONLY photo-viewer links (clean post; /posts/ pages carry sidebar ADS)
+      if (/set=p\./i.test(h)) continue;                          // skip profile/cover photos
+      const fbid = (h.match(/fbid=(\d+)/) || [])[1] || '';
+      const postId = (h.match(/set=gm?\.(\d+)/) || [])[1] || fbid;
+      if (!postId || seen.has(postId)) continue; seen.add(postId); // ONE entry per distinct post, in grid order (latest first)
+      items.push({ href: h, postId });
+    }
+    return { found: items.length, items: items.slice(0, 60) };
+  });
+  console.log(JSON.stringify({ step: 'harvest_media_links', found: collected.found, sample: collected.items.slice(0, 6).map((l) => l.href.slice(0, 90)) }));
+  const links = collected.items;
+  for (let i = 0; i < links.length && out.length < count; i++) {
+    const item = links[i];
+    try {
+      await page.goto(item.href, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      await page.waitForTimeout(4000);
+      // expand "See more" so the full caption is in the DOM (best-effort)
+      try { const sm = await page.$x ? null : null; } catch (_) {}
+      try { await page.evaluate(() => { for (const el of Array.from(document.querySelectorAll('div[role="button"],span'))) { if (/^see more$/i.test((el.innerText || '').trim())) { el.click(); break; } } }); await page.waitForTimeout(800); } catch (_) {}
+      const data = await page.evaluate(() => {
+        const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+        const isUrl = (s) => /^https?:\/\//i.test(s.trim()) || /^www\./i.test(s.trim());
+        const isChrome = (s) => /^(Like|Comment|Share|Reply|See more|See less|All reactions|Active|Write a comment|See translation|Most relevant|Top fan|Author|Follow|Send|Share to|Sponsored|·)\b/i.test(s) || /^\d+\s*(comment|share|reaction|like)/i.test(s);
+        const cands = [];
+        for (const el of Array.from(document.querySelectorAll('div[dir="auto"], span[dir="auto"]'))) {
+          const t = clean(el.innerText);
+          if (t.length >= 12 && t.length <= 6000 && !isUrl(t) && !isChrome(t)) cands.push(t);
+        }
+        cands.sort((a, b) => b.length - a.length);
+        const ogTitle = clean((document.querySelector('meta[property="og:title"]') || {}).content);
+        const ogDesc = clean((document.querySelector('meta[property="og:description"]') || {}).content);
+        let text = cands[0] || ogDesc || ogTitle || '';
+        let image = '', max = 0;
+        for (const im of Array.from(document.querySelectorAll('img'))) {
+          const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
+          if (w >= 350 && h >= 200 && w * h > max && !/emoji|static|rsrc\.php/i.test(im.src)) { max = w * h; image = im.src; }
+        }
+        const META = /facebook\.com|fbcdn|messenger|fb\.me|meta\.(ai|com)|instagram\.com|whatsapp\.com|oculus|threads\.net/i;
+        let link = '';
+        const hrefs = Array.from(document.querySelectorAll('a[href]')).map((a) => a.href || '');
+        for (const h of hrefs) { // l.facebook.com redirect -> the real external target
+          if (/l\.facebook\.com\/l\.php\?u=/i.test(h)) { try { const u = decodeURIComponent((h.match(/[?&]u=([^&]+)/) || [])[1] || ''); if (u && !META.test(u)) { link = u; break; } } catch (_) {} }
+        }
+        if (!link) for (const h of hrefs) { if (/^https?:\/\//i.test(h) && !META.test(h)) { link = h; break; } }
+        // clean the link: drop FB tracking params (fbclid, brid, aem) -> the bare product/affiliate URL
+        if (link) link = link.replace(/([?&])(fbclid|brid|aem|_aem|mibextid)=[^&]*/gi, '$1').replace(/[?&]+$/,'').replace(/\?&/, '?');
+        return { text, image, link, ogTitle, ogDesc, candCount: cands.length, top3: cands.slice(0, 3) };
+      });
+      const dkey = (data.link || '').split(/[?#]/)[0] || ('post:' + item.postId); // unique PRODUCT key = first-comment URL
+      if (seenLinks.has(dkey)) { console.log(JSON.stringify({ step: 'harvest_skip_duplicate', key: dkey })); continue; }
+      seenLinks.add(dkey);
+      out.push({ href: item.href, productKey: dkey, ...data });
+      console.log(JSON.stringify({ step: 'harvest_item', n: out.length, textLen: (data.text || '').length, textPreview: (data.text || '').slice(0, 120), hasImage: !!data.image, link: data.link, key: dkey }));
+    } catch (e) {
+      console.log(JSON.stringify({ step: 'harvest_item_error', href: item.href.slice(0, 120), error: String((e && e.message) || e).slice(0, 160) }));
+    }
+  }
+  return out;
+}
+
 async function main() {
   const payload = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-  const targetUrl = (payload.commentOnly || payload.approveOnly || payload.verifyOnly || payload.pinOnly) && payload.postUrl ? payload.postUrl : payload.groupUrl;
+  const targetUrl = payload.harvestOnly && payload.groupUrl
+    ? (String(payload.groupUrl).replace(/\/+$/, '').replace(/\/media$/i, '') + '/media')
+    : ((payload.commentOnly || payload.approveOnly || payload.verifyOnly || payload.pinOnly) && payload.postUrl ? payload.postUrl : payload.groupUrl);
   // Group identifier may be a NUMERIC id (/groups/123456…) OR a vanity slug
   // (/groups/o1498765421290862). Numeric ids are used directly; a vanity slug
   // navigates fine but its numeric id (needed for permalink/user-url matching during
@@ -3195,6 +3275,16 @@ async function main() {
       }
     } catch (_) {}
   });
+
+  if (payload.harvestOnly) {
+    const harvestCount = Math.max(1, Math.min(20, Number(payload.harvestCount || 4)));
+    console.log(JSON.stringify({ step: 'harvest_started', mediaUrl: targetUrl, count: harvestCount }));
+    let harvested = [];
+    try { harvested = await harvestGroupFeed(page, harvestCount); }
+    catch (e) { console.log(JSON.stringify({ step: 'harvest_error', error: String((e && e.message) || e).slice(0, 300) })); }
+    console.log(JSON.stringify({ step: 'harvest_result', count: harvested.length, items: harvested }));
+    return; // the finally block closes the browser
+  }
 
   if (payload.approveOnly) {
     // The admin pending-queue surface (pending_posts / manage_post_queue) only resolves with the
