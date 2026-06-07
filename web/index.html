@@ -804,6 +804,11 @@
             .sp-badge{font-size:.66rem;padding:1px 7px;border-radius:999px;border:1px solid #2a3344}
             .sp-badge.posted{color:#7ee0a5;border-color:#2f5b41}
             .sp-badge.pending{color:#f0a93b;border-color:#5b4a2f}
+            .sp-card-src{font-size:.62rem;padding:1px 6px;border-radius:999px;border:1px solid #2a3344;opacity:.9}
+            .sp-card-src.copied{color:#8ab4ff;border-color:#2f3f5b}
+            .sp-card-src.web{color:#c9a0ff;border-color:#4a2f5b}
+            .sp-filter{font-size:.74rem;padding:3px 10px}
+            .sp-filter.sp-active{border-color:#f0a93b;color:#f0a93b}
             .scrapedModalOverlay{position:fixed;inset:0;background:rgba(0,0,0,.72);display:flex;align-items:center;justify-content:center;z-index:9999}
             .scrapedModalCard{background:#141a24;border:1px solid #2a3344;border-radius:14px;max-width:560px;width:92%;max-height:88vh;overflow:auto;padding:18px;position:relative}
             .scrapedModalClose{position:absolute;top:8px;right:12px;background:none;border:none;color:#9fb0c3;font-size:1.6rem;cursor:pointer;line-height:1}
@@ -815,13 +820,18 @@
           <section class="panel wide prodStep" data-view="prod" data-prod-step="2c">
             <div class="panelHead">
               <div>
-                <span class="stepBadge">Scraped</span>
-                <h2>Scraped Products <span class="badge" data-tone="muted" id="scrapedProductsCount">0</span></h2>
-                <p>Products harvested from your source groups. Click one to see its full text, image, and link. The image is deleted after the product is posted; its text + link are kept so it is never re-posted (unless re-found after 10 days).</p>
+                <span class="stepBadge">Saved</span>
+                <h2>Saved Products <span class="badge" data-tone="muted" id="scrapedProductsCount">0</span></h2>
+                <p>All products saved from BOTH sources — <b>copied from groups</b> and <b>web scraping</b>. Click one to see its text, image, and link. Copied-product images are deleted after posting (text + link kept to avoid re-posts).</p>
               </div>
-              <button id="refreshScrapedBtn" type="button">Refresh</button>
+              <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                <button class="sp-filter sp-active" data-spfilter="all" type="button">All</button>
+                <button class="sp-filter" data-spfilter="copied" type="button">Copied from groups</button>
+                <button class="sp-filter" data-spfilter="web" type="button">Web scraping</button>
+                <button id="refreshScrapedBtn" type="button">Refresh</button>
+              </div>
             </div>
-            <div id="scrapedProductsList" class="scrapedGrid"><div style="opacity:.6">No scraped products yet.</div></div>
+            <div id="scrapedProductsList" class="scrapedGrid"><div style="opacity:.6">No saved products yet.</div></div>
           </section>
 
           <div id="scrapedModal" class="scrapedModalOverlay" style="display:none">

@@ -16693,6 +16693,30 @@ const server = http.createServer(async (req, res) => {
       return res.end(fs.readFileSync(fp));
     } catch (e) { res.writeHead(500); return res.end("error"); }
   }
+  if (req.method === "GET" && url.pathname === "/api/products/discovered") {
+    // WEB-SCRAPING products (Walmart/Amazon discovery) saved in product-candidates.jsonl, newest-first, deduped.
+    const st = readState();
+    const registers = readRegisters();
+    const usedKeys = recentlyUsedProductKeys(registers.usedProducts, st);
+    const rows = readJsonlFile(st.files.productCandidates || "data/product-candidates.jsonl");
+    const seen = new Set(); const out = [];
+    for (let i = rows.length - 1; i >= 0 && out.length < 300; i -= 1) {
+      const r = rows[i]; if (!r || !r.productKey) continue;
+      const k = String(r.productKey).toLowerCase();
+      if (seen.has(k)) continue; seen.add(k);
+      out.push({
+        productKey: r.productKey,
+        title: r.title || "",
+        url: r.url || "",
+        store: r.store || "",
+        imageUrl: r.imageUrl || "",
+        status: r.status || "",
+        used: usedKeys.has(k),
+        lastSeenAt: r.lastSeenAt || r.at || "",
+      });
+    }
+    return json(res, 200, { discovered: out, total: out.length });
+  }
   if (req.method === "POST" && url.pathname === "/api/security/audit") {
     const report = await runSecurityAudit();
     const state = readState();

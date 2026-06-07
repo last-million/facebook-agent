@@ -5480,48 +5480,78 @@ function uxAttachCollapseControls() {
 function uxAttachScrapedProducts() {
   const list = $("scrapedProductsList");
   if (!list) return;
+  let allItems = [];
+  let filter = "all";
   async function load() {
     try {
-      const data = await api("/api/content-sources/harvested");
-      const rows = (data && data.harvested) || [];
-      const countEl = $("scrapedProductsCount");
-      if (countEl) countEl.textContent = String(rows.length);
-      if (!rows.length) { list.innerHTML = '<div style="opacity:.6">No scraped products yet.</div>'; return; }
-      list.innerHTML = "";
-      for (const r of rows) {
-        const card = document.createElement("div");
-        card.className = "scrapedCard";
-        const posted = r.posted ? '<span class="sp-badge posted">posted</span>' : '<span class="sp-badge pending">pending</span>';
-        const imgBadge = r.imageDeleted ? '<span class="sp-badge">img deleted</span>' : (r.hasImage ? '<span class="sp-badge">has image</span>' : '<span class="sp-badge">no image</span>');
-        card.innerHTML = '<div class="sp-text"></div><div class="sp-meta">' + posted + imgBadge + '</div>';
-        card.querySelector(".sp-text").textContent = (r.text || "(no text)").slice(0, 160);
-        card.addEventListener("click", () => openModal(r));
-        list.appendChild(card);
-      }
-    } catch (err) { list.innerHTML = '<div style="opacity:.6">Could not load scraped products.</div>'; }
+      const [hv, wd] = await Promise.all([
+        api("/api/content-sources/harvested").catch(() => ({ harvested: [] })),
+        api("/api/products/discovered").catch(() => ({ discovered: [] })),
+      ]);
+      const copied = ((hv && hv.harvested) || []).map((r) => ({
+        source: "copied", productKey: r.productKey, title: r.text || "", url: r.firstCommentUrl || "",
+        hasImage: r.hasImage, imageDeleted: r.imageDeleted, posted: r.posted,
+        status: r.posted ? "posted" : "pending", harvestedAt: r.harvestedAt, sourceGroupUrl: r.sourceGroupUrl,
+      }));
+      const web = ((wd && wd.discovered) || []).map((r) => ({
+        source: "web", productKey: r.productKey, title: r.title || "", url: r.url || "",
+        imageUrl: r.imageUrl || "", status: r.used ? "used" : (r.status || "candidate"), store: r.store, lastSeenAt: r.lastSeenAt,
+      }));
+      allItems = [...copied, ...web];
+      render();
+    } catch (err) { list.innerHTML = '<div style="opacity:.6">Could not load saved products.</div>'; }
   }
-  async function openModal(r) {
+  function render() {
+    const items = allItems.filter((it) => filter === "all" || it.source === filter);
+    const countEl = $("scrapedProductsCount");
+    if (countEl) countEl.textContent = String(items.length);
+    if (!items.length) { list.innerHTML = '<div style="opacity:.6">No saved products in this view.</div>'; return; }
+    list.innerHTML = "";
+    for (const it of items) {
+      const card = document.createElement("div");
+      card.className = "scrapedCard";
+      const srcBadge = '<span class="sp-card-src ' + it.source + '">' + (it.source === "copied" ? "copied" : "web") + '</span>';
+      const statusCls = (it.status === "posted" || it.status === "used") ? "posted" : "pending";
+      const statusBadge = '<span class="sp-badge ' + statusCls + '">' + it.status + '</span>';
+      card.innerHTML = '<div class="sp-text"></div><div class="sp-meta">' + srcBadge + statusBadge + '</div>';
+      card.querySelector(".sp-text").textContent = (it.title || "(no text)").slice(0, 160);
+      card.addEventListener("click", () => openModal(it));
+      list.appendChild(card);
+    }
+  }
+  async function openModal(it) {
     const modal = $("scrapedModal"); if (!modal) return;
     const img = $("scrapedModalImg");
     img.removeAttribute("src"); img.style.display = "none";
-    if (r.hasImage && !r.imageDeleted) {
+    if (it.source === "copied" && it.hasImage && !it.imageDeleted) {
       try {
-        const res = await fetch("/api/content-sources/harvested-image?key=" + encodeURIComponent(r.productKey), { headers: { "x-dashboard-token": DASHBOARD_TOKEN } });
+        const res = await fetch("/api/content-sources/harvested-image?key=" + encodeURIComponent(it.productKey), { headers: { "x-dashboard-token": DASHBOARD_TOKEN } });
         if (res.ok) { img.src = URL.createObjectURL(await res.blob()); img.style.display = ""; }
       } catch {}
+    } else if (it.source === "web" && it.imageUrl) {
+      img.src = it.imageUrl; img.style.display = "";
     }
-    $("scrapedModalText").textContent = r.text || "(no text)";
+    $("scrapedModalText").textContent = it.title || "(no text)";
     const link = $("scrapedModalLink");
-    link.textContent = r.firstCommentUrl || "(no link)";
-    link.href = r.firstCommentUrl || "#";
-    const status = [r.posted ? ("Posted: " + r.posted) : "Not posted yet"];
-    if (r.imageDeleted) status.push("Image deleted after posting (text + link kept).");
-    if (r.harvestedAt) status.push("Harvested: " + r.harvestedAt);
-    if (r.sourceGroupUrl) status.push("Source: " + r.sourceGroupUrl);
+    link.textContent = it.url || "(no link)";
+    link.href = it.url || "#";
+    const status = [it.source === "copied" ? "Source: copied from group" : ("Source: web scraping" + (it.store ? " (" + it.store + ")" : ""))];
+    status.push("Status: " + it.status);
+    if (it.imageDeleted) status.push("Image deleted after posting (text + link kept).");
+    if (it.harvestedAt) status.push("Harvested: " + it.harvestedAt);
+    if (it.sourceGroupUrl) status.push("From: " + it.sourceGroupUrl);
+    if (it.lastSeenAt) status.push("Last seen: " + it.lastSeenAt);
     $("scrapedModalStatus").textContent = status.join("  •  ");
     modal.style.display = "flex";
   }
   function close() { const m = $("scrapedModal"); if (m) m.style.display = "none"; }
+  for (const btn of document.querySelectorAll(".sp-filter")) {
+    btn.addEventListener("click", () => {
+      filter = btn.dataset.spfilter || "all";
+      for (const b of document.querySelectorAll(".sp-filter")) b.classList.toggle("sp-active", b === btn);
+      render();
+    });
+  }
   $("refreshScrapedBtn")?.addEventListener("click", () => load());
   $("scrapedModalClose")?.addEventListener("click", close);
   $("scrapedModal")?.addEventListener("click", (e) => { if (e.target === $("scrapedModal")) close(); });
