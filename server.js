@@ -1459,8 +1459,9 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.groupsText = String(state.posting.contentSources.groupsText || "").slice(0, 20000);
   state.posting.contentSources.notes = String(state.posting.contentSources.notes || "").slice(0, 5000);
   state.posting.contentSources.exclusive = state.posting.contentSources.exclusive === true; // ONLY post copied products (skip web discovery)
-  state.posting.contentSources.reserveTarget = clampNumber(state.posting.contentSources.reserveTarget, 1, 1000, 20); // keep this many copied products ready
-  state.posting.contentSources.reserveRefillAt = clampNumber(state.posting.contentSources.reserveRefillAt, 0, Math.max(0, state.posting.contentSources.reserveTarget - 1), 10); // resume harvesting when reserve drops to this
+  state.posting.contentSources.reserveTarget = clampNumber(state.posting.contentSources.reserveTarget, 1, 5000, 20); // DAYTIME working buffer of ready copied products
+  state.posting.contentSources.reserveRefillAt = clampNumber(state.posting.contentSources.reserveRefillAt, 0, Math.max(0, state.posting.contentSources.reserveTarget - 1), 10); // daytime: resume harvesting when reserve drops to this
+  state.posting.contentSources.overnightReserveTarget = clampNumber(state.posting.contentSources.overnightReserveTarget, state.posting.contentSources.reserveTarget, 5000, Math.max(state.posting.contentSources.reserveTarget, 200)); // OVERNIGHT: stock up to this many for the whole next day
   state.posting.contentSources.harvestProfilesPerGroup = clampNumber(state.posting.contentSources.harvestProfilesPerGroup, 1, 6, 3); // # member profiles to harvest each group with IN PARALLEL (spreads load)
   if (typeof state.posting.contentSources.postCta !== "string") state.posting.contentSources.postCta = ""; // optional CTA line ABOVE the emoji+title+tags signature (blank = clean deal post)
   else state.posting.contentSources.postCta = state.posting.contentSources.postCta.slice(0, 300);
@@ -7595,15 +7596,28 @@ async function harvestContentSourcesAsync(options = {}) {
   __harvestSourcesInFlight = (async () => {
     const state = readState();
     if (state.operator?.contentSourcesEnabled !== true) { __harvestNextAt = Date.now() + 300000; return { skipped: "disabled" }; }
-    // RESERVE hysteresis: fill the copied-product reserve to reserveTarget, pause, then resume harvesting
-    // only once posting has drained it down to reserveRefillAt. Both editable from the dashboard.
+    // TWO-TIER RESERVE (editable from the dashboard):
+    //  - DAYTIME (posting window open): keep a SMALL working buffer (reserveTarget, e.g. 20) with hysteresis
+    //    (resume only when drained to reserveRefillAt, e.g. 10) so harvesting doesn't fight active posting.
+    //  - OVERNIGHT (window closed): stock UP to overnightReserveTarget (e.g. 400) for the whole next day,
+    //    while the profiles are free. The big overnight stock then drains through the day; the daytime
+    //    20/10 is just a safety net if it ever runs low during posting.
     const cs = state.posting?.contentSources || {};
-    const reserveTarget = clampNumber(cs.reserveTarget, 1, 1000, 20);
+    const reserveTarget = clampNumber(cs.reserveTarget, 1, 5000, 20);
     const reserveRefillAt = clampNumber(cs.reserveRefillAt, 0, Math.max(0, reserveTarget - 1), 10);
+    const overnightTarget = clampNumber(cs.overnightReserveTarget, reserveTarget, 5000, Math.max(reserveTarget, 200));
     const reserve = readHarvestedProducts(state).filter((r) => r && !r.posted && r.imageLocalPath && r.firstCommentUrl).length;
-    if (reserve >= reserveTarget) __harvestReservePaused = true;
-    if (reserve <= reserveRefillAt) __harvestReservePaused = false;
-    if (__harvestReservePaused) { __harvestNextAt = Date.now() + 60000; logEvent("harvest_reserve_satisfied", { reserve, target: reserveTarget, refillAt: reserveRefillAt }); return { reserveSatisfied: reserve }; }
+    const windowOpen = autopilotPostingWindowOpen(state);
+    let effectiveTarget;
+    if (windowOpen) {
+      effectiveTarget = reserveTarget;
+      if (reserve >= reserveTarget) __harvestReservePaused = true;
+      if (reserve <= reserveRefillAt) __harvestReservePaused = false;
+    } else {
+      effectiveTarget = overnightTarget;
+      __harvestReservePaused = reserve >= overnightTarget; // night: just fill to the big target, no hysteresis
+    }
+    if (__harvestReservePaused) { __harvestNextAt = Date.now() + (windowOpen ? 60000 : 120000); logEvent("harvest_reserve_satisfied", { reserve, target: effectiveTarget, window: windowOpen ? "day" : "night" }); return { reserveSatisfied: reserve }; }
     const lines = recordLines(state.posting?.contentSources?.groupsText);
     const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
     const perGroup = clampNumber(cs.harvestProfilesPerGroup, 1, 6, 3); // MULTI-PROFILE: harvest each group with N profiles in PARALLEL so load is spread (no single account hammered) + resilient if one is throttled
@@ -7631,7 +7645,7 @@ async function harvestContentSourcesAsync(options = {}) {
     if (!pairs.length) { __harvestNextAt = Date.now() + 300000; return { groups: 0 }; }
     const existingByUrl = new Map(readHarvestedProducts(state).map((r) => [String(r.firstCommentUrl || ""), r]));
     let harvestedNew = 0, skippedSeen = 0, reusedOld = 0;
-    const harvestCount = clampNumber(options.harvestCount || (reserveTarget - reserve), 1, 20, 4); // grab the whole reserve GAP in one harvest (a healthy member loads many tiles per session)
+    const harvestCount = clampNumber(options.harvestCount || (effectiveTarget - reserve), 1, 20, 4); // grab the GAP toward the (day or night) target in one harvest (capped at 20/session)
     for (let i = 0; i < pairs.length; i += 4) { // 4-by-4
       const round = pairs.slice(i, i + 4);
       await waitForPostingIdle({ label: "harvest_sources" }).catch(() => {});   // posting always wins

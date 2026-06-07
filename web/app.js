@@ -1578,6 +1578,7 @@ function renderState(state) {
   setValue("contentSourcesExclusive", state.posting.contentSources?.exclusive);
   setValue("contentSourcesReserveTarget", state.posting.contentSources?.reserveTarget);
   setValue("contentSourcesReserveRefillAt", state.posting.contentSources?.reserveRefillAt);
+  setValue("contentSourcesOvernightTarget", state.posting.contentSources?.overnightReserveTarget);
   setValue("contentSourcesProfilesPerGroup", state.posting.contentSources?.harvestProfilesPerGroup);
   setValue("contentSourcesPostCta", state.posting.contentSources?.postCta);
   setValue("contentSourceGroupsText", state.posting.contentSources?.groupsText);
@@ -2336,6 +2337,7 @@ function collectState() {
       exclusive: getValue("contentSourcesExclusive") === true,
       reserveTarget: Number(getValue("contentSourcesReserveTarget")) || 20,
       reserveRefillAt: Number(getValue("contentSourcesReserveRefillAt")) || 10,
+      overnightReserveTarget: Number(getValue("contentSourcesOvernightTarget")) || 400,
       harvestProfilesPerGroup: Number(getValue("contentSourcesProfilesPerGroup")) || 3,
       postCta: getValue("contentSourcesPostCta"),
       groupsText: getValue("contentSourceGroupsText"),
