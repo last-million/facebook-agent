@@ -8014,6 +8014,9 @@ let __autopilotLastDiscoveryAt = 0;
 async function autopilotMaybeRefreshDiscoveryAsync(reason, options = {}) {
   if (__autopilotDiscoveryInFlight) return { skipped: "in_flight" };
   const state = readState();
+  // EXCLUSIVE copy-mode: only copied products post, so web product discovery (Walmart/Amazon scraping) is
+  // wasted work and would keep refilling the old web-product list. Skip it entirely while exclusive is on.
+  if (state.operator?.contentSourcesExclusive === true) return { skipped: "content_sources_exclusive" };
   const maxAgeHours = clampNumber(state.productDiscovery?.autopilotDiscoveryMaxAgeHours, 1, 168, 20);
   const lastRun = Date.parse(state.productDiscovery?.lastSuccessfulRunAt || "") || 0;
   const stale = !lastRun || (Date.now() - lastRun) > maxAgeHours * 3600 * 1000;
