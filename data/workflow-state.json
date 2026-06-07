@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-07T04:04:07.508Z",
+  "updatedAt": "2026-06-07T15:59:20.636Z",
   "testRun": {
     "status": "done",
     "active": false,
@@ -133,8 +133,8 @@
     "autopilotDryRun": false,
     "autopilotProfileAllowlist": "",
     "commentCooldownHours": 48,
-    "autopilotMaxPostsPerRun": 6,
-    "autopilotPostsThisRun": 1,
+    "autopilotMaxPostsPerRun": 4,
+    "autopilotPostsThisRun": 0,
     "autopilotWorkerStaggerSeconds": 25,
     "adminApprovalSettleSeconds": 3,
     "parallelOpenStaggerSeconds": 8,
@@ -3548,6 +3548,7 @@
     "blacklistedProducts": "data/blacklisted-products.txt",
     "usedPostTexts": "data/used-post-texts.txt",
     "usedCommentLeadIns": "data/used-comment-leadins.txt",
-    "errors": "data/errors.txt"
+    "errors": "data/errors.txt",
+    "harvestedProducts": "data/harvested-products.jsonl"
   }
 }
