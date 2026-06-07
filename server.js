@@ -8088,23 +8088,12 @@ async function autopilotTickAsync(options = {}) {
         return { profileId: Number(r.profileId || 0), ok: false, postUrl: "", error: `skipped_${gate.reason}` };
       }
       try {
-        const v = await runLiveFacebookPostFromPlan({ fullRun: true, autopilot: true, planId: r.planId, sequence: r.sequence });
+        const v = await runLiveFacebookPostFromPlan({ fullRun: true, autopilot: true, planId: r.planId, sequence: r.sequence, countTowardRun: true });
         autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", errorText: (v && (v.error || v.reason)) || "", validation: v && v.validation, source: "autopilot" });
-        // PER-POST counter: bump the run counter the INSTANT this post lands so progress shows live
-        // (1/6, 2/6…) and auto-stop fires immediately at N — not only after the whole slow tick ends.
-        // The readState→writeState is synchronous (no await between), so it is atomic in single-threaded
-        // JS even across concurrent workers; the pre-dispatch trim caps the batch so we never overshoot N.
-        if (!dryRun && v && (v.ok || v.postUrl)) {
-          const sNow = readState();
-          const newCount = autopilotPostsThisRunCount(sNow) + 1;
-          sNow.operator = sNow.operator || {};
-          sNow.operator.autopilotPostsThisRun = newCount;
-          writeState(sNow, { controlWrite: true });
-          __todayByProfileCache = { at: 0, tz: "", result: null }; // a post landed -> next tick rescans today-counts so fresh-first fairness + daily caps stay accurate
-          logEvent("autopilot_post_counted", { profileId: Number(r.profileId || 0), postsThisRun: newCount });
-          const lim = autopilotRunLimit(sNow);
-          if (lim > 0 && newCount >= lim) autopilotAutoDisarm("run_limit_reached", `posted ${newCount}/${lim} this run`);
-        }
+        // The per-run counter is now bumped at the RECORD moment inside completeVerifiedFacebookPostWithComment
+        // (gated by ready.__autopilotRunPost = body.countTowardRun), so a post that LANDS but whose comment/
+        // cleanup errors afterward is STILL counted exactly once — fixing the rare under-count where
+        // "stop at N" could overshoot by 1 (e.g. p48: posted, but its worker threw right after landing).
         return { profileId: Number(r.profileId || 0), ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", error: "" };
       } catch (err) {
         autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: false, postUrl: "", errorText: oneLineField((err && (err.profileFailureReason || err.message)) || String(err), 240), profileRetryable: !!(err && err.profileRetryable), validation: err && err.livePostValidation, source: "autopilot" });
@@ -12379,6 +12368,22 @@ async function completeVerifiedFacebookPostWithComment({
     profile: row.profile || ready.profileId,
     groupUrl: actualGroupUrl,
   });
+  // PER-POST run counter, bumped at the RECORD moment — so a post that LANDS but whose comment/cleanup
+  // throws afterward is STILL counted exactly once (fixes the rare "stop at N could do N+1" under-count).
+  // Gated to autopilot RUN posts (ready.__autopilotRunPost, set only by the tick via countTowardRun — NOT
+  // #test) + idempotent (ready.__runCounted). Synchronous readState→writeState = atomic in single-threaded JS.
+  if (ready.__autopilotRunPost && !ready.__runCounted) {
+    ready.__runCounted = true;
+    const sNow = readState();
+    const newCount = autopilotPostsThisRunCount(sNow) + 1;
+    sNow.operator = sNow.operator || {};
+    sNow.operator.autopilotPostsThisRun = newCount;
+    writeState(sNow, { controlWrite: true });
+    __todayByProfileCache = { at: 0, tz: "", result: null }; // post landed -> next tick rescans fairness/caps
+    logEvent("autopilot_post_counted", { profileId: ready.profileId, postsThisRun: newCount, source: "on_record" });
+    const lim = autopilotRunLimit(sNow);
+    if (lim > 0 && newCount >= lim) autopilotAutoDisarm("run_limit_reached", `posted ${newCount}/${lim} this run`);
+  }
   appendFacebookLivePostLedger({
     event: approvalResult?.ok ? "published_after_admin_approval" : "published",
     key: ledgerKey,
@@ -12637,6 +12642,11 @@ async function runLiveFacebookPostFromPlan(body = {}) {
   const rows = latestPostingPlanRows(state);
   const row = selectedPostingPlanRow(rows, body);
   const ready = assertPostingRowReadyForLive(row, body);
+  // Mark this as an autopilot RUN post (counts toward operator.autopilotMaxPostsPerRun). Set ONLY for the
+  // autopilot tick (body.countTowardRun) — NOT #test (which also passes autopilot:true). The counter is
+  // bumped at the RECORD moment in completeVerifiedFacebookPostWithComment, so a landed-then-errored post
+  // is still counted exactly once (auto-stop-at-N stays exact).
+  if (body.countTowardRun) ready.__autopilotRunPost = true;
   if (body.fullRun) {
     assertProductionScheduleOpen(state);
     // Autopilot posts prepared buffer products that may predate the latest
