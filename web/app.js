@@ -1576,6 +1576,7 @@ function renderState(state) {
   setValue("facebookProfileStatus", state.posting.facebookProfileStatus);
   setValue("contentSourcesEnabled", state.posting.contentSources?.enabled);
   setValue("contentSourcesExclusive", state.posting.contentSources?.exclusive);
+  setValue("contentSourcesReserveAuto", state.posting.contentSources?.reserveAuto !== false);
   setValue("contentSourcesReserveTarget", state.posting.contentSources?.reserveTarget);
   setValue("contentSourcesReserveRefillAt", state.posting.contentSources?.reserveRefillAt);
   setValue("contentSourcesOvernightTarget", state.posting.contentSources?.overnightReserveTarget);
@@ -2335,6 +2336,7 @@ function collectState() {
     contentSources: {
       enabled: getValue("contentSourcesEnabled") === true,
       exclusive: getValue("contentSourcesExclusive") === true,
+      reserveAuto: getValue("contentSourcesReserveAuto") !== false,
       reserveTarget: Number(getValue("contentSourcesReserveTarget")) || 20,
       reserveRefillAt: Number(getValue("contentSourcesReserveRefillAt")) || 10,
       overnightReserveTarget: Number(getValue("contentSourcesOvernightTarget")) || 400,
