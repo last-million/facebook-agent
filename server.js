@@ -1458,8 +1458,10 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.enabled = state.posting.contentSources.enabled === true;
   state.posting.contentSources.groupsText = String(state.posting.contentSources.groupsText || "").slice(0, 20000);
   state.posting.contentSources.notes = String(state.posting.contentSources.notes || "").slice(0, 5000);
+  state.posting.contentSources.exclusive = state.posting.contentSources.exclusive === true; // ONLY post copied products (skip web discovery)
   state.operator = state.operator || {};
   state.operator.contentSourcesEnabled = state.posting.contentSources.enabled === true;
+  state.operator.contentSourcesExclusive = state.posting.contentSources.enabled === true && state.posting.contentSources.exclusive === true;
   state.productAssets.reviewImagesPerProduct = 1;
   state.productAssets.reviewCandidateCount = clampNumber(state.productAssets.reviewCandidateCount, 1, REVIEW_IMAGE_CANDIDATE_COUNT, REVIEW_IMAGE_CANDIDATE_COUNT);
   state.productAssets.chatgptEdgeUserDataDir = normalizedChatGptEdgeUserDataDir(state.productAssets.chatgptEdgeUserDataDir);
@@ -2598,11 +2600,16 @@ function collectProductUrlsForPosting(state, options = {}) {
   const harvestedKeys = state.operator?.contentSourcesEnabled === true
     ? readHarvestedProducts(state).filter((r) => r && !r.posted && r.imageLocalPath && r.firstCommentUrl).map((r) => r.productKey)
     : [];
-  return filterBlacklistedProducts(attachStoredProductTitles(uniqueProductUrls([
-    ...harvestedKeys,
+  // EXCLUSIVE mode: post ONLY copied products (skip web-discovery products entirely). When off, copied
+  // products are mixed in FIRST but web-discovery products still flow.
+  const webDiscovery = state.operator?.contentSourcesExclusive === true ? [] : [
     ...recordLines(state.productAssets?.productUrls),
     ...recordLines(state.posting?.sourceUrls),
     ...candidates,
+  ];
+  return filterBlacklistedProducts(attachStoredProductTitles(uniqueProductUrls([
+    ...harvestedKeys,
+    ...webDiscovery,
   ], state), titleMap), state, null, options);
 }
 

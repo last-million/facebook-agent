@@ -1575,6 +1575,7 @@ function renderState(state) {
   setValue("ownedGroupsByProfile", state.posting.ownedGroupsByProfile);
   setValue("facebookProfileStatus", state.posting.facebookProfileStatus);
   setValue("contentSourcesEnabled", state.posting.contentSources?.enabled);
+  setValue("contentSourcesExclusive", state.posting.contentSources?.exclusive);
   setValue("contentSourceGroupsText", state.posting.contentSources?.groupsText);
   setValue("contentSourcesNotes", state.posting.contentSources?.notes);
   renderGroupAssignmentBuilder();
@@ -2328,6 +2329,7 @@ function collectState() {
     facebookProfileStatus: getValue("facebookProfileStatus"),
     contentSources: {
       enabled: getValue("contentSourcesEnabled") === true,
+      exclusive: getValue("contentSourcesExclusive") === true,
       groupsText: getValue("contentSourceGroupsText"),
       notes: getValue("contentSourcesNotes"),
     },
