@@ -1574,6 +1574,9 @@ function renderState(state) {
   setValue("commentTemplate", state.posting.commentTemplate);
   setValue("ownedGroupsByProfile", state.posting.ownedGroupsByProfile);
   setValue("facebookProfileStatus", state.posting.facebookProfileStatus);
+  setValue("contentSourcesEnabled", state.posting.contentSources?.enabled);
+  setValue("contentSourceGroupsText", state.posting.contentSources?.groupsText);
+  setValue("contentSourcesNotes", state.posting.contentSources?.notes);
   renderGroupAssignmentBuilder();
 
   setValue("productAssetsEnabled", state.productAssets.enabled);
@@ -2323,6 +2326,11 @@ function collectState() {
     commentTemplate: getValue("commentTemplate"),
     ownedGroupsByProfile: getValue("ownedGroupsByProfile"),
     facebookProfileStatus: getValue("facebookProfileStatus"),
+    contentSources: {
+      enabled: getValue("contentSourcesEnabled") === true,
+      groupsText: getValue("contentSourceGroupsText"),
+      notes: getValue("contentSourcesNotes"),
+    },
   };
   state.productAssets = {
     enabled: getValue("productAssetsEnabled"),

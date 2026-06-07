@@ -425,6 +425,10 @@ function defaultState() {
       groupAssignmentMode: "percentage_manual_review",
       groupProfileAssignments: "",
       groupAssignmentData: [],
+      // CONTENT SOURCE GROUPS (default OFF): harvest recent posts (text + image + the link in the first
+      // comment) from these source FB groups and re-use them as ready-to-post content. enabled=false =>
+      // byte-for-byte current behavior (nothing reads groupsText). One facebook.com/groups/… URL per line.
+      contentSources: { enabled: false, groupsText: "", notes: "" },
       groupFallbackPolicy: "if a profile cannot post in its selected group, try the next available group URL from this run; if no group works, skip that profile and record the issue with profile id/name",
       profileGroupIssueLogEndpoint: "/api/posting/profile-group-issue",
       publishedPostUrls: "",
@@ -1446,6 +1450,15 @@ function normalizeWorkflowState(state) {
         : [],
     })).filter((entry) => entry.url)
     : [];
+  // CONTENT SOURCE GROUPS (default OFF). Normalize the config + MIRROR the master flag onto operator so
+  // hot-path gates read operator.contentSourcesEnabled === true. When off (default), everything downstream
+  // is inert (nothing reads groupsText). One facebook.com/groups/… URL per line.
+  if (!state.posting.contentSources || typeof state.posting.contentSources !== "object") state.posting.contentSources = {};
+  state.posting.contentSources.enabled = state.posting.contentSources.enabled === true;
+  state.posting.contentSources.groupsText = String(state.posting.contentSources.groupsText || "").slice(0, 20000);
+  state.posting.contentSources.notes = String(state.posting.contentSources.notes || "").slice(0, 5000);
+  state.operator = state.operator || {};
+  state.operator.contentSourcesEnabled = state.posting.contentSources.enabled === true;
   state.productAssets.reviewImagesPerProduct = 1;
   state.productAssets.reviewCandidateCount = clampNumber(state.productAssets.reviewCandidateCount, 1, REVIEW_IMAGE_CANDIDATE_COUNT, REVIEW_IMAGE_CANDIDATE_COUNT);
   state.productAssets.chatgptEdgeUserDataDir = normalizedChatGptEdgeUserDataDir(state.productAssets.chatgptEdgeUserDataDir);
