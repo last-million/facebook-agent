@@ -2592,7 +2592,14 @@ function collectProductUrlsForPosting(state, options = {}) {
     .map((row) => row.url || row.productUrl)
     .filter(Boolean);
   if (latestOnly) return filterBlacklistedProducts(attachStoredProductTitles(uniqueProductUrls(candidates, state), titleMap), state, null, options);
+  // HARVESTED content sources (default OFF): inject UNPOSTED harvested products as synthetic url lines,
+  // FIRST so they post before web-discovery products. canonicalProduct accepts harvested:<hash> keys;
+  // posted ones drop out (their image is deleted). When the feature is off this list is empty.
+  const harvestedKeys = state.operator?.contentSourcesEnabled === true
+    ? readHarvestedProducts(state).filter((r) => r && !r.posted && r.imageLocalPath && r.firstCommentUrl).map((r) => r.productKey)
+    : [];
   return filterBlacklistedProducts(attachStoredProductTitles(uniqueProductUrls([
+    ...harvestedKeys,
     ...recordLines(state.productAssets?.productUrls),
     ...recordLines(state.posting?.sourceUrls),
     ...candidates,
@@ -7411,6 +7418,12 @@ function assetBufferTargetCount(state = readState()) {
 
 function productHasReadyAssets(product, state = readState(), reviewImages = null) {
   if (!product) return false;
+  // HARVESTED products: ready when the record has its downloaded image (still on disk) + the first-comment
+  // link, and it has NOT been posted yet. No ShopYourLikes shortlink needed (link = the harvested url).
+  if (String(product.key || "").startsWith("harvested:")) {
+    const rec = harvestedRecordForKey(product.key, state);
+    return Boolean(rec && !rec.posted && rec.firstCommentUrl && rec.imageLocalPath && fs.existsSync(safeProjectPath(rec.imageLocalPath)));
+  }
   const images = reviewImages || selectedReviewImageLines(state);
   const image = reviewImageForProduct(images, product);
   if (!image || !image.approved) return false;
@@ -7441,6 +7454,7 @@ function assetBufferStatus(state = readState(), registers = readRegisters()) {
     const key = String(product.key || "").toLowerCase();
     if (usedKeys.has(key)) continue;
     if (noPhotoKeys.has(key)) continue; // reliable scrape confirmed no review photos — skip until retry window
+    if (key.startsWith("harvested:")) { if (productHasReadyAssets(product, state, reviewImages)) ready.push(product); else pending.push(product); continue; }
     if (approvedKeys.has(key) && shortlinkKeys.has(key)) ready.push(product);
     else pending.push(product);
   }
@@ -7532,6 +7546,82 @@ let __assetBufferFillInFlight = null;
 // the buffer hits target or no eligible products remain. Single-flight; safe to
 // fire-and-forget after discovery or after a post publishes. Applies equally to
 // prod and test (both consume the same ready buffer).
+// ===== CONTENT-SOURCE HARVEST (default OFF) =====================================================
+// Spawn the connector in READ-ONLY harvestOnly mode for ONE group/profile; return its parsed items[].
+async function runHarvestConnector(groupUrl, profileId, harvestCount) {
+  const scriptPath = liveFacebookPostingScriptPath();
+  const payloadDir = path.join(DATA_DIR, "harvest-requests");
+  fs.mkdirSync(payloadDir, { recursive: true });
+  const payloadPath = path.join(payloadDir, `harvest-${Date.now()}-${crypto.randomBytes(5).toString("hex")}.json`);
+  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4) }));
+  try {
+    const { stdout } = await execFileAsync("node", [scriptPath, payloadPath], { cwd: ROOT, windowsHide: true, timeout: 6 * 60 * 1000, maxBuffer: 24 * 1024 * 1024 });
+    const objs = parseJsonLogObjects(stdout);
+    const result = objs.filter((o) => o && o.step === "harvest_result").pop();
+    return (result && Array.isArray(result.items)) ? result.items : [];
+  } finally {
+    try { fs.unlinkSync(payloadPath); } catch (_) {}
+  }
+}
+
+let __harvestSourcesInFlight = null;
+let __harvestNextAt = 0;
+let __harvestEmptyRounds = 0;
+// Parallel 4-by-4 harvest across DISTINCT member profiles. Single-flight, posting/CPU-governed, dedups
+// by first-comment URL on disk, persists records + downloaded images. Re-scan cadence via __harvestNextAt.
+async function harvestContentSourcesAsync(options = {}) {
+  if (__harvestSourcesInFlight) return __harvestSourcesInFlight;
+  __harvestSourcesInFlight = (async () => {
+    const state = readState();
+    if (state.operator?.contentSourcesEnabled !== true) { __harvestNextAt = Date.now() + 300000; return { skipped: "disabled" }; }
+    const lines = recordLines(state.posting?.contentSources?.groupsText);
+    const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
+    let rr = 0; const pairs = [];
+    for (const line of lines) {
+      const m = String(line).match(/(https?:\/\/[^\s|@]*groups\/[^\s|@/]+)/i);
+      if (!m) continue;
+      const pidMatch = String(line).match(/[|@]\s*(\d{1,6})/); // optional "url | profileId" (a member profile)
+      const profileId = pidMatch ? Number(pidMatch[1]) : (pool.length ? pool[rr++ % pool.length] : 0);
+      if (profileId) pairs.push({ groupUrl: m[1], profileId });
+    }
+    if (!pairs.length) { __harvestNextAt = Date.now() + 300000; return { groups: 0 }; }
+    const seenUrls = new Set(readHarvestedProducts(state).map((r) => String(r.firstCommentUrl || "")));
+    let harvestedNew = 0, skippedSeen = 0;
+    const harvestCount = clampNumber(options.harvestCount || 4, 1, 20, 4);
+    for (let i = 0; i < pairs.length; i += 4) { // 4-by-4
+      const round = pairs.slice(i, i + 4);
+      await waitForPostingIdle({ label: "harvest_sources" }).catch(() => {});   // posting always wins
+      await waitForCpuHeadroom({ label: "harvest_sources" }).catch(() => {});    // yield to a busy box + Pinterest
+      await Promise.all(round.map(async (pair) => {
+        let release = null;
+        try { release = acquireNormalIxProfileUse(pair.profileId, "facebook_harvest"); }
+        catch (e) { logEvent("harvest_profile_busy_skipped", { profileId: pair.profileId }); return; } // posting/discovery owns it -> skip
+        try {
+          const items = await runHarvestConnector(pair.groupUrl, pair.profileId, harvestCount);
+          for (const it of items) {
+            const url = String(it.link || "").trim();
+            if (!url || seenUrls.has(url)) { if (url) skippedSeen++; continue; } // url-dedup: never take the same product twice
+            let rel = "";
+            if (it.imageLocalPath) { try { rel = path.relative(ROOT, it.imageLocalPath).replace(/\\/g, "/"); } catch (_) { rel = ""; } }
+            const persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl }, readState());
+            if (persisted) { seenUrls.add(url); harvestedNew++; }
+          }
+          logEvent("harvest_group_done", { profileId: pair.profileId, groupUrl: pair.groupUrl, got: items.length });
+        } catch (e) { logEvent("harvest_connector_error", { profileId: pair.profileId, error: oneLineField((e && e.message) || String(e), 160) }); }
+        finally { try { if (release) release(); } catch (_) {} }
+      }));
+      if (i + 4 < pairs.length) await sleep(clampNumber(options.interRoundGapMs || 25000, 5000, 120000, 25000)); // anti-throttle pacing
+    }
+    // RE-SCAN cadence: drain fast when producing; re-scan ~every minute when idle; back off when long-exhausted.
+    if (harvestedNew > 0) { __harvestEmptyRounds = 0; __harvestNextAt = Date.now(); }
+    else { __harvestEmptyRounds += 1; __harvestNextAt = Date.now() + (__harvestEmptyRounds >= 30 ? 300000 : 60000); }
+    logEvent("harvest_round", { groups: pairs.length, harvestedNew, skippedSeen, emptyRounds: __harvestEmptyRounds, nextInSec: Math.round((__harvestNextAt - Date.now()) / 1000) });
+    return { groups: pairs.length, harvestedNew, skippedSeen };
+  })().catch((e) => { logEvent("harvest_sources_error", { error: oneLineField((e && e.message) || String(e), 200) }); __harvestNextAt = Date.now() + 120000; return { error: true }; })
+    .finally(() => { __harvestSourcesInFlight = null; });
+  return __harvestSourcesInFlight;
+}
+
 async function fillAssetBufferAsync(options = {}) {
   if (__assetBufferFillInFlight) return __assetBufferFillInFlight;
   __assetBufferFillInFlight = (async () => {
@@ -7942,6 +8032,13 @@ async function autopilotTickAsync(options = {}) {
         && !__commentResweepInFlight && (Date.now() - __lastCommentResweepAt) > 90000) {
       resweepUncommentedFacebookPostsAsync({ max: 5 }).catch(() => {});
     }
+    // CONTENT-SOURCE HARVEST (default OFF): fire-and-forget, single-flight, armed-gated, ~1-min re-scan
+    // cadence (__harvestNextAt). Harvests source groups' posts (text + image + first-comment link) into
+    // the buffer in parallel 4-by-4. When contentSourcesEnabled is off this never fires.
+    if (!dryRun && state.operator?.contentSourcesEnabled === true && state.operator?.armedForExternalActions
+        && !__harvestSourcesInFlight && Date.now() >= __harvestNextAt) {
+      harvestContentSourcesAsync({}).catch(() => {});
+    }
     if (!scheduleOpen || capacity.totalRemaining <= 0) {
       decision.action = "prepare_tomorrow";
       decision.detail = !scheduleOpen ? "outside_schedule" : "daily_cap_reached";
@@ -8348,12 +8445,16 @@ function preparePostingPlan(options = {}) {
     const concurrency = concurrencyBatchForSlot(slot, state);
     const product = planProducts[index];
     const originalProductIndex = Math.max(0, products.findIndex((candidate) => candidate.key === product.key));
-    const postText = rotationValue(postTexts, state.contentRotation.postTextCursor, index, state.contentRotation.avoidPostTextReuse);
+    // HARVESTED products carry their OWN text + image + link (the first-comment url) — bypass the rotation
+    // post-text, the review-image channel, and ShopYourLikes link-gen.
+    const harvestedRec = String(product.key || "").startsWith("harvested:") ? harvestedRecordForKey(product.key, state) : null;
+    const postText = harvestedRec ? String(harvestedRec.text || "").trim()
+      : rotationValue(postTexts, state.contentRotation.postTextCursor, index, state.contentRotation.avoidPostTextReuse);
     const commentLeadIn = rotationValue(commentLeadIns, state.contentRotation.commentLeadInCursor, index, state.contentRotation.avoidCommentLeadInReuse);
     const affiliateLink = affiliateShortlinkForProduct(product, state);
-    const shortlink = linkForProductAtIndex(product, originalProductIndex, products, state);
-    const imageRecord = reviewImageForProduct(reviewImages, product);
-    const image = imageRecord?.approved ? imageRecord.raw : "";
+    const shortlink = harvestedRec ? String(harvestedRec.firstCommentUrl || "") : linkForProductAtIndex(product, originalProductIndex, products, state);
+    const imageRecord = harvestedRec ? null : reviewImageForProduct(reviewImages, product);
+    const image = harvestedRec ? String(harvestedRec.imageLocalPath || "") : (imageRecord?.approved ? imageRecord.raw : "");
     const delay = state.rules.randomMinutesBetweenPosts
       ? randomInt(state.rules.minMinutesBetweenPosts || 5, state.rules.maxMinutesBetweenPosts || 16)
       : clampNumber(state.rules.minutesBetweenPosts, 1, 1440, 12);
@@ -8366,7 +8467,8 @@ function preparePostingPlan(options = {}) {
       .trim();
     const missingAssets = [];
     if (!shortlink) missingAssets.push(state.affiliate?.enabled !== false ? "shopyourlikes_mavlynk_shortlink" : "mavlynk_shortlink");
-    if (!imageRecord) missingAssets.push("positive_review_image");
+    if (harvestedRec) { if (!image) missingAssets.push("harvested_image"); } // harvested image is the downloaded local file, not a review-image record
+    else if (!imageRecord) missingAssets.push("positive_review_image");
     else if (!imageRecord.approved) missingAssets.push("human_approved_review_image");
     if (!postText) missingAssets.push("unique_post_text");
     // commentLeadIn is intentionally NOT a readiness gate. It is a cosmetic comment intro (the comment
@@ -8396,7 +8498,7 @@ function preparePostingPlan(options = {}) {
       productKey: product.key,
       productId: product.productId,
       retailer: product.store,
-      title: product.storedTitle || product.title, // prefer the REAL discovered title over the numeric slug fallback
+      title: harvestedRec ? (String(harvestedRec.text || "").slice(0, 120) || product.title) : (product.storedTitle || product.title), // harvested: its description; else the real discovered title
       productDiscoveryAt: runType === "full_posting_plan" ? (state.productDiscovery?.lastSuccessfulRunAt || "") : "",
       productDiscoveryStatus: runType === "full_posting_plan" ? (state.productDiscovery?.lastRunStatus || "") : "",
       postText,
@@ -9086,6 +9188,14 @@ function recordPublishedFacebookPostUrl(body) {
   // record-post-url endpoint. (Recording the wrong row's product was the duplicate-post bug.)
   const row = (body.row && typeof body.row === "object") ? body.row : postingPlanRowForRecord(body);
   if (row) markLivePostedRegisters(row, postUrl);
+  // HARVESTED product just posted -> DELETE the downloaded image to save HDD, but KEEP its text+url forever
+  // (the record stays with posted set, so the harvester's url-dedup never re-fetches it).
+  if (row && String(row.productKey || "").startsWith("harvested:")) {
+    try {
+      if (row.image) { const ip = safeProjectPath(row.image); if (fs.existsSync(ip)) { fs.unlinkSync(ip); logEvent("harvested_image_deleted", { productKey: row.productKey, image: row.image }); } }
+    } catch (e) { logEvent("harvested_image_deletion_error", { productKey: row.productKey, error: oneLineField(e.message || String(e), 140) }); }
+    try { updateHarvestedProductRecord(row.productKey, { posted: new Date().toISOString(), imageDeleted: true }); } catch (_) {}
+  }
   logEvent("facebook_post_url_recorded", { planId, profile, groupUrl, postUrl });
   return {
     state: nextState,
