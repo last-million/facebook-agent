@@ -8438,7 +8438,7 @@ function preparePostingPlan(options = {}) {
   const commentLeadIns = contentRotationLines(state.contentRotation?.commentLeadIns);
   const reviewImages = selectedReviewImageLines(state);
   const productPool = options.testPost ? products : usableProducts;
-  const productsWithApprovedImages = productPool.filter((product) => reviewImageForProduct(reviewImages, product)?.approved);
+  const productsWithApprovedImages = productPool.filter((product) => String(product.key || "").startsWith("harvested:") || reviewImageForProduct(reviewImages, product)?.approved); // harvested products carry their OWN downloaded image -> front of the plan, within the limit
   const planProducts = [
     ...productsWithApprovedImages,
     ...productPool.filter((product) => !productsWithApprovedImages.some((approved) => approved.key === product.key)),
@@ -12168,6 +12168,11 @@ function orderProfilesLeastUsedFirst(profiles, usageMap, failedSet = new Set()) 
 // Order ready posting-plan rows: healthy-least-used first, just-failed profiles last (fair + no stall).
 function orderReadyRowsLeastUsed(rows, postCountByPid, failedSet = new Set(), groupCountByKey = new Map()) {
   return rows.slice().sort((a, b) => {
+    // HARVESTED content-source products post FIRST — the whole point of the feature is to publish the
+    // copied products. When content-sources is off there are none, so this is inert (all === 1).
+    const ha = String(a.productKey || "").startsWith("harvested:") ? 0 : 1;
+    const hb = String(b.productKey || "").startsWith("harvested:") ? 0 : 1;
+    if (ha !== hb) return ha - hb;
     const pa = Number(a.profileId || profileIdFromLabel(a.profile) || 0);
     const pb = Number(b.profileId || profileIdFromLabel(b.profile) || 0);
     const fa = failedSet.has(pa) ? 1 : 0, fb = failedSet.has(pb) ? 1 : 0;
