@@ -1579,7 +1579,6 @@ function renderState(state) {
   setValue("contentSourcesReserveAuto", state.posting.contentSources?.reserveAuto !== false);
   setValue("contentSourcesReserveTarget", state.posting.contentSources?.reserveTarget);
   setValue("contentSourcesReserveRefillAt", state.posting.contentSources?.reserveRefillAt);
-  setValue("contentSourcesOvernightTarget", state.posting.contentSources?.overnightReserveTarget);
   setValue("contentSourcesProfilesPerGroup", state.posting.contentSources?.harvestProfilesPerGroup);
   setValue("contentSourcesPostCta", state.posting.contentSources?.postCta);
   setValue("contentSourceGroupsText", state.posting.contentSources?.groupsText);
@@ -2339,7 +2338,6 @@ function collectState() {
       reserveAuto: getValue("contentSourcesReserveAuto") !== false,
       reserveTarget: Number(getValue("contentSourcesReserveTarget")) || 20,
       reserveRefillAt: Number(getValue("contentSourcesReserveRefillAt")) || 10,
-      overnightReserveTarget: Number(getValue("contentSourcesOvernightTarget")) || 400,
       harvestProfilesPerGroup: Number(getValue("contentSourcesProfilesPerGroup")) || 3,
       postCta: getValue("contentSourcesPostCta"),
       groupsText: getValue("contentSourceGroupsText"),
@@ -5507,7 +5505,7 @@ function uxAttachScrapedProducts() {
         const pct = Math.max(0, Math.min(100, rv.pct || 0));
         const bar = $("reserveProgressBar"); if (bar) bar.style.width = pct + "%";
         const pe = $("reserveProgressPct"); if (pe) pe.textContent = pct + "%" + (rv.full ? " ✓ full" : "");
-        const le = $("reserveProgressLabel"); if (le) le.textContent = "Reserve: " + rv.ready + " / " + rv.target + " ready (" + (rv.window === "day" ? "daytime" : "overnight") + " target)";
+        const le = $("reserveProgressLabel"); if (le) le.textContent = "Reserve: " + rv.ready + " / " + rv.target + " ready" + (rv.full ? "" : " — harvesting…");
       } else if (wrap) { wrap.style.display = "none"; }
       const copied = ((hv && hv.harvested) || []).map((r) => ({
         source: "copied", productKey: r.productKey, title: r.text || "", url: r.firstCommentUrl || "",

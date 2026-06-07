@@ -7596,10 +7596,11 @@ let __harvestReservePaused = false; // hysteresis: pause harvesting at reserveTa
 function harvestAutoReserves(state) {
   const daily = Math.max(1, Number(state.productDiscovery?.dailyPostTarget || 0)
     || (countAssignedProfiles(state) * clampNumber(state.rules?.postsPerProfilePerDay, 1, 20, 5)));
-  const overnight = Math.max(20, Math.min(5000, Math.ceil(daily * 1.5)));
-  const daytime = Math.max(10, Math.min(80, Math.ceil(daily * 0.2)));
-  const refillAt = Math.max(5, Math.floor(daytime * 0.5));
-  return { daily, overnight, daytime, refillAt };
+  // SINGLE steady working reserve, kept topped up by CONTINUOUS parallel harvesting (no big overnight batch —
+  // source groups don't post at night either). Sized to bridge between harvests so production never stalls.
+  const target = Math.max(15, Math.min(60, Math.ceil(daily * 0.1)));
+  const refillAt = Math.max(8, Math.floor(target * 0.6));
+  return { daily, target, refillAt };
 }
 // Parallel 4-by-4 harvest across DISTINCT member profiles. Single-flight, posting/CPU-governed, dedups
 // by first-comment URL on disk, persists records + downloaded images. Re-scan cadence via __harvestNextAt.
@@ -7608,30 +7609,20 @@ async function harvestContentSourcesAsync(options = {}) {
   __harvestSourcesInFlight = (async () => {
     const state = readState();
     if (state.operator?.contentSourcesEnabled !== true) { __harvestNextAt = Date.now() + 300000; return { skipped: "disabled" }; }
-    // TWO-TIER RESERVE (editable from the dashboard):
-    //  - DAYTIME (posting window open): keep a SMALL working buffer (reserveTarget, e.g. 20) with hysteresis
-    //    (resume only when drained to reserveRefillAt, e.g. 10) so harvesting doesn't fight active posting.
-    //  - OVERNIGHT (window closed): stock UP to overnightReserveTarget (e.g. 400) for the whole next day,
-    //    while the profiles are free. The big overnight stock then drains through the day; the daytime
-    //    20/10 is just a safety net if it ever runs low during posting.
+    // SINGLE STEADY RESERVE (no day/night tiers): keep a small working buffer topped up by CONTINUOUS
+    // parallel harvesting so production runs non-stop. Harvest runs day AND night, grabbing NEW listings as
+    // they appear; pauses at target, resumes at refillAt. No big overnight batch (source groups don't post
+    // at night), so on first start it just prepares a small buffer and begins, then feeds itself in parallel.
     const cs = state.posting?.contentSources || {};
-    const auto = cs.reserveAuto !== false; // DEFAULT ON: size the reserves from the REAL daily posting capacity
+    const auto = cs.reserveAuto !== false; // DEFAULT ON: size the buffer from the REAL daily posting capacity
     const a = auto ? harvestAutoReserves(state) : null;
-    const reserveTarget = auto ? a.daytime : clampNumber(cs.reserveTarget, 1, 5000, 20);
+    const reserveTarget = auto ? a.target : clampNumber(cs.reserveTarget, 1, 5000, 20);
     const reserveRefillAt = auto ? a.refillAt : clampNumber(cs.reserveRefillAt, 0, Math.max(0, reserveTarget - 1), 10);
-    const overnightTarget = auto ? a.overnight : clampNumber(cs.overnightReserveTarget, reserveTarget, 5000, Math.max(reserveTarget, 200));
     const reserve = readHarvestedProducts(state).filter((r) => r && !r.posted && r.imageLocalPath && r.firstCommentUrl).length;
-    const windowOpen = autopilotPostingWindowOpen(state);
-    let effectiveTarget;
-    if (windowOpen) {
-      effectiveTarget = reserveTarget;
-      if (reserve >= reserveTarget) __harvestReservePaused = true;
-      if (reserve <= reserveRefillAt) __harvestReservePaused = false;
-    } else {
-      effectiveTarget = overnightTarget;
-      __harvestReservePaused = reserve >= overnightTarget; // night: just fill to the big target, no hysteresis
-    }
-    if (__harvestReservePaused) { __harvestNextAt = Date.now() + (windowOpen ? 60000 : 120000); logEvent("harvest_reserve_satisfied", { reserve, target: effectiveTarget, window: windowOpen ? "day" : "night" }); return { reserveSatisfied: reserve }; }
+    if (reserve >= reserveTarget) __harvestReservePaused = true;
+    if (reserve <= reserveRefillAt) __harvestReservePaused = false;
+    if (__harvestReservePaused) { __harvestNextAt = Date.now() + 60000; logEvent("harvest_reserve_satisfied", { reserve, target: reserveTarget }); return { reserveSatisfied: reserve }; }
+    const effectiveTarget = reserveTarget;
     const lines = recordLines(state.posting?.contentSources?.groupsText);
     const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
     const perGroup = clampNumber(cs.harvestProfilesPerGroup, 1, 6, 3); // MULTI-PROFILE: harvest each group with N profiles in PARALLEL so load is spread (no single account hammered) + resilient if one is throttled
@@ -16800,13 +16791,10 @@ const server = http.createServer(async (req, res) => {
     const csCfg = st.posting?.contentSources || {};
     const autoR = csCfg.reserveAuto !== false;
     const ar = autoR ? harvestAutoReserves(st) : null;
-    const windowOpen = autopilotPostingWindowOpen(st);
-    const dayTarget = autoR ? ar.daytime : clampNumber(csCfg.reserveTarget, 1, 5000, 20);
-    const nightTarget = autoR ? ar.overnight : clampNumber(csCfg.overnightReserveTarget, dayTarget, 5000, 200);
-    const target = windowOpen ? dayTarget : nightTarget;
+    const target = autoR ? ar.target : clampNumber(csCfg.reserveTarget, 1, 5000, 20);
     const readyCount = rows.filter((r) => !r.posted && r.hasImage).length;
     const pct = target > 0 ? Math.min(100, Math.round((readyCount / target) * 100)) : 0;
-    return json(res, 200, { harvested: rows, total: rows.length, reserve: { ready: readyCount, target, pct, window: windowOpen ? "day" : "night", dayTarget, nightTarget, full: readyCount >= target } });
+    return json(res, 200, { harvested: rows, total: rows.length, reserve: { ready: readyCount, target, pct, full: readyCount >= target } });
   }
   if (req.method === "GET" && url.pathname === "/api/content-sources/harvested-image") {
     const rec = harvestedRecordForKey(url.searchParams.get("key") || "");
