@@ -1462,6 +1462,8 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.reserveTarget = clampNumber(state.posting.contentSources.reserveTarget, 1, 1000, 20); // keep this many copied products ready
   state.posting.contentSources.reserveRefillAt = clampNumber(state.posting.contentSources.reserveRefillAt, 0, Math.max(0, state.posting.contentSources.reserveTarget - 1), 10); // resume harvesting when reserve drops to this
   state.posting.contentSources.harvestProfilesPerGroup = clampNumber(state.posting.contentSources.harvestProfilesPerGroup, 1, 6, 3); // # member profiles to harvest each group with IN PARALLEL (spreads load)
+  if (typeof state.posting.contentSources.postCta !== "string") state.posting.contentSources.postCta = "🛒 Deal link in the first comment 👇"; // CTA appended to copied-product posts (editable; "" = none)
+  else state.posting.contentSources.postCta = state.posting.contentSources.postCta.slice(0, 300);
   state.operator = state.operator || {};
   state.operator.contentSourcesEnabled = state.posting.contentSources.enabled === true;
   state.operator.contentSourcesExclusive = state.posting.contentSources.enabled === true && state.posting.contentSources.exclusive === true;
@@ -8427,6 +8429,28 @@ function startAutopilotScheduler() {
   logEvent("autopilot_scheduler_started");
 }
 
+// Turn a harvested caption into a tidy post body: drop "see more" leakage, hashtags, urls, and common
+// dropship CTAs, collapse whitespace, then truncate to a sane length at a sentence/word boundary.
+function cleanHarvestedPostText(raw) {
+  let t = String(raw || "").replace(/\r/g, "");
+  t = t.replace(/…\s*$/,"").replace(/\s*(en voir plus|voir plus|see more|see translation|mehr ansehen|ver m[aá]s|altro)\s*$/i, "");
+  t = t.replace(/\b(en voir plus|voir plus|see more)\b/gi, "");
+  t = t.replace(/#[\p{L}\p{N}_]+/gu, "");
+  t = t.replace(/https?:\/\/\S+/gi, "");
+  t = t.replace(/\b(shop please|check link|link in (the )?(bio|comment[s]?)|peek at affiliate[^.\n]*|to receive a message[^.\n]*\.?|order (here|now)|dm me(\s+for[^.\n]*)?|comment[^.\n]*below)\b/gi, "");
+  // tidy orphaned punctuation left by the removed phrases (e.g. ",, ." -> ".")
+  t = t.replace(/,\s*,+/g, ",").replace(/,\s*\./g, ".").replace(/\.\s*\.+/g, ".").replace(/\s+,/g, ",").replace(/^[\s,.;:!?-]+/, "");
+  t = t.replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").replace(/\s+([.,!?])/g, "$1").replace(/[ \t]+\n/g, "\n").trim();
+  if (t.length > 180) {
+    let cut = t.slice(0, 180);
+    const stop = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("! "), cut.lastIndexOf("? "));
+    if (stop > 90) cut = cut.slice(0, stop + 1);
+    else { const sp = cut.lastIndexOf(" "); if (sp > 90) cut = cut.slice(0, sp); }
+    t = cut.trim();
+  }
+  return t;
+}
+
 function preparePostingPlan(options = {}) {
   const state = readState();
   const overrideProductUrls = Array.isArray(options.productUrls)
@@ -8512,7 +8536,9 @@ function preparePostingPlan(options = {}) {
     // HARVESTED products carry their OWN text + image + link (the first-comment url) — bypass the rotation
     // post-text, the review-image channel, and ShopYourLikes link-gen.
     const harvestedRec = String(product.key || "").startsWith("harvested:") ? harvestedRecordForKey(product.key, state) : null;
-    const postText = harvestedRec ? String(harvestedRec.text || "").trim()
+    const postCta = String(state.posting?.contentSources?.postCta || "").trim();
+    const postText = harvestedRec
+      ? (cleanHarvestedPostText(harvestedRec.text) + (postCta ? `\n\n${postCta}` : "")).trim()
       : rotationValue(postTexts, state.contentRotation.postTextCursor, index, state.contentRotation.avoidPostTextReuse);
     const commentLeadIn = rotationValue(commentLeadIns, state.contentRotation.commentLeadInCursor, index, state.contentRotation.avoidCommentLeadInReuse);
     const affiliateLink = affiliateShortlinkForProduct(product, state);

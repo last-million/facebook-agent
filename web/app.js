@@ -1578,6 +1578,8 @@ function renderState(state) {
   setValue("contentSourcesExclusive", state.posting.contentSources?.exclusive);
   setValue("contentSourcesReserveTarget", state.posting.contentSources?.reserveTarget);
   setValue("contentSourcesReserveRefillAt", state.posting.contentSources?.reserveRefillAt);
+  setValue("contentSourcesProfilesPerGroup", state.posting.contentSources?.harvestProfilesPerGroup);
+  setValue("contentSourcesPostCta", state.posting.contentSources?.postCta);
   setValue("contentSourceGroupsText", state.posting.contentSources?.groupsText);
   setValue("contentSourcesNotes", state.posting.contentSources?.notes);
   renderGroupAssignmentBuilder();
@@ -2334,6 +2336,8 @@ function collectState() {
       exclusive: getValue("contentSourcesExclusive") === true,
       reserveTarget: Number(getValue("contentSourcesReserveTarget")) || 20,
       reserveRefillAt: Number(getValue("contentSourcesReserveRefillAt")) || 10,
+      harvestProfilesPerGroup: Number(getValue("contentSourcesProfilesPerGroup")) || 3,
+      postCta: getValue("contentSourcesPostCta"),
       groupsText: getValue("contentSourceGroupsText"),
       notes: getValue("contentSourcesNotes"),
     },
