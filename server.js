@@ -1459,6 +1459,8 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.groupsText = String(state.posting.contentSources.groupsText || "").slice(0, 20000);
   state.posting.contentSources.notes = String(state.posting.contentSources.notes || "").slice(0, 5000);
   state.posting.contentSources.exclusive = state.posting.contentSources.exclusive === true; // ONLY post copied products (skip web discovery)
+  state.posting.contentSources.reserveTarget = clampNumber(state.posting.contentSources.reserveTarget, 1, 1000, 20); // keep this many copied products ready
+  state.posting.contentSources.reserveRefillAt = clampNumber(state.posting.contentSources.reserveRefillAt, 0, Math.max(0, state.posting.contentSources.reserveTarget - 1), 10); // resume harvesting when reserve drops to this
   state.operator = state.operator || {};
   state.operator.contentSourcesEnabled = state.posting.contentSources.enabled === true;
   state.operator.contentSourcesExclusive = state.posting.contentSources.enabled === true && state.posting.contentSources.exclusive === true;
@@ -7576,6 +7578,7 @@ let __harvestNextAt = 0;
 let __harvestEmptyRounds = 0;
 let __harvestWorkingProfileByGroup = new Map(); // groupUrl -> a PROVEN member profile (learned automatically)
 let __harvestProfileAttemptByGroup = new Map(); // groupUrl -> rotating index; advances when an auto-pick reads nothing
+let __harvestReservePaused = false; // hysteresis: pause harvesting at reserveTarget, resume at reserveRefillAt
 // Parallel 4-by-4 harvest across DISTINCT member profiles. Single-flight, posting/CPU-governed, dedups
 // by first-comment URL on disk, persists records + downloaded images. Re-scan cadence via __harvestNextAt.
 async function harvestContentSourcesAsync(options = {}) {
@@ -7583,6 +7586,15 @@ async function harvestContentSourcesAsync(options = {}) {
   __harvestSourcesInFlight = (async () => {
     const state = readState();
     if (state.operator?.contentSourcesEnabled !== true) { __harvestNextAt = Date.now() + 300000; return { skipped: "disabled" }; }
+    // RESERVE hysteresis: fill the copied-product reserve to reserveTarget, pause, then resume harvesting
+    // only once posting has drained it down to reserveRefillAt. Both editable from the dashboard.
+    const cs = state.posting?.contentSources || {};
+    const reserveTarget = clampNumber(cs.reserveTarget, 1, 1000, 20);
+    const reserveRefillAt = clampNumber(cs.reserveRefillAt, 0, Math.max(0, reserveTarget - 1), 10);
+    const reserve = readHarvestedProducts(state).filter((r) => r && !r.posted && r.imageLocalPath && r.firstCommentUrl).length;
+    if (reserve >= reserveTarget) __harvestReservePaused = true;
+    if (reserve <= reserveRefillAt) __harvestReservePaused = false;
+    if (__harvestReservePaused) { __harvestNextAt = Date.now() + 60000; logEvent("harvest_reserve_satisfied", { reserve, target: reserveTarget, refillAt: reserveRefillAt }); return { reserveSatisfied: reserve }; }
     const lines = recordLines(state.posting?.contentSources?.groupsText);
     const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
     const pairs = [];
@@ -9232,7 +9244,7 @@ function recordPublishedFacebookPostUrl(body) {
     try {
       if (row.image) { const ip = safeProjectPath(row.image); if (fs.existsSync(ip)) { fs.unlinkSync(ip); logEvent("harvested_image_deleted", { productKey: row.productKey, image: row.image }); } }
     } catch (e) { logEvent("harvested_image_deletion_error", { productKey: row.productKey, error: oneLineField(e.message || String(e), 140) }); }
-    try { updateHarvestedProductRecord(row.productKey, { posted: new Date().toISOString(), imageDeleted: true }); } catch (_) {}
+    try { updateHarvestedProductRecord(row.productKey, { posted: new Date().toISOString(), imageDeleted: true, postUrl: String(postUrl || "") }); } catch (_) {}
   }
   logEvent("facebook_post_url_recorded", { planId, profile, groupUrl, postUrl });
   return {
@@ -16697,6 +16709,7 @@ const server = http.createServer(async (req, res) => {
       sourceGroupUrl: r.sourceGroupUrl || "",
       harvestedAt: r.harvestedAt || "",
       posted: r.posted || "",
+      postUrl: r.postUrl || "",
       imageDeleted: !!r.imageDeleted,
       hasImage: Boolean(r.imageLocalPath && !r.imageDeleted && (() => { try { return fs.existsSync(safeProjectPath(r.imageLocalPath)); } catch { return false; } })()),
     })).reverse(); // newest first

@@ -1576,6 +1576,8 @@ function renderState(state) {
   setValue("facebookProfileStatus", state.posting.facebookProfileStatus);
   setValue("contentSourcesEnabled", state.posting.contentSources?.enabled);
   setValue("contentSourcesExclusive", state.posting.contentSources?.exclusive);
+  setValue("contentSourcesReserveTarget", state.posting.contentSources?.reserveTarget);
+  setValue("contentSourcesReserveRefillAt", state.posting.contentSources?.reserveRefillAt);
   setValue("contentSourceGroupsText", state.posting.contentSources?.groupsText);
   setValue("contentSourcesNotes", state.posting.contentSources?.notes);
   renderGroupAssignmentBuilder();
@@ -2330,6 +2332,8 @@ function collectState() {
     contentSources: {
       enabled: getValue("contentSourcesEnabled") === true,
       exclusive: getValue("contentSourcesExclusive") === true,
+      reserveTarget: Number(getValue("contentSourcesReserveTarget")) || 20,
+      reserveRefillAt: Number(getValue("contentSourcesReserveRefillAt")) || 10,
       groupsText: getValue("contentSourceGroupsText"),
       notes: getValue("contentSourcesNotes"),
     },
@@ -5490,7 +5494,7 @@ function uxAttachScrapedProducts() {
       ]);
       const copied = ((hv && hv.harvested) || []).map((r) => ({
         source: "copied", productKey: r.productKey, title: r.text || "", url: r.firstCommentUrl || "",
-        hasImage: r.hasImage, imageDeleted: r.imageDeleted, posted: r.posted,
+        hasImage: r.hasImage, imageDeleted: r.imageDeleted, posted: r.posted, postUrl: r.postUrl || "",
         status: r.posted ? "posted" : "pending", harvestedAt: r.harvestedAt, sourceGroupUrl: r.sourceGroupUrl,
       }));
       const web = ((wd && wd.discovered) || []).map((r) => ({
@@ -5541,7 +5545,9 @@ function uxAttachScrapedProducts() {
     if (it.harvestedAt) status.push("Harvested: " + it.harvestedAt);
     if (it.sourceGroupUrl) status.push("From: " + it.sourceGroupUrl);
     if (it.lastSeenAt) status.push("Last seen: " + it.lastSeenAt);
-    $("scrapedModalStatus").textContent = status.join("  •  ");
+    const st = $("scrapedModalStatus");
+    st.textContent = status.join("  •  ");
+    if (it.postUrl) { const a = document.createElement("a"); a.href = it.postUrl; a.target = "_blank"; a.rel = "noopener"; a.style.color = "#f0a93b"; a.style.display = "block"; a.style.marginTop = "6px"; a.textContent = "View live post ↗"; st.appendChild(a); }
     modal.style.display = "flex";
   }
   function close() { const m = $("scrapedModal"); if (m) m.style.display = "none"; }
