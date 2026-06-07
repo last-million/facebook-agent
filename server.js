@@ -7603,16 +7603,16 @@ async function harvestContentSourcesAsync(options = {}) {
       if (!m) continue;
       const groupUrl = m[1];
       const pidMatch = String(line).match(/[|@]\s*(\d{1,6})/); // OPTIONAL "url | profileId" pin; otherwise FULLY AUTOMATIC
-      let profileId = 0, autoPicked = false;
+      let profileId = 0, autoPicked = false, pinned = false;
       if (pidMatch) {
-        profileId = Number(pidMatch[1]);
+        profileId = Number(pidMatch[1]); pinned = true; // manual pin -> never auto-rotate away
       } else if (__harvestWorkingProfileByGroup.has(groupUrl)) {
-        profileId = __harvestWorkingProfileByGroup.get(groupUrl); // reuse the PROVEN member learned earlier
+        profileId = __harvestWorkingProfileByGroup.get(groupUrl); // reuse the learned member (but still rotatable if it goes dry)
       } else if (pool.length) {
         profileId = pool[(__harvestProfileAttemptByGroup.get(groupUrl) || 0) % pool.length]; // rotate across runs to FIND a member
         autoPicked = true;
       }
-      if (profileId) pairs.push({ groupUrl, profileId, autoPicked });
+      if (profileId) pairs.push({ groupUrl, profileId, autoPicked, pinned });
     }
     if (!pairs.length) { __harvestNextAt = Date.now() + 300000; return { groups: 0 }; }
     const existingByUrl = new Map(readHarvestedProducts(state).map((r) => [String(r.firstCommentUrl || ""), r]));
@@ -7652,7 +7652,7 @@ async function harvestContentSourcesAsync(options = {}) {
           // -> remember it for next time. An auto-picked profile that read NOTHING (likely not a member) ->
           // rotate to the next profile on the next run until a member is found.
           if (items.length > 0) { __harvestWorkingProfileByGroup.set(pair.groupUrl, pair.profileId); }
-          else if (pair.autoPicked) {
+          else if (!pair.pinned) { // ANY non-pinned profile (auto-picked OR cached-but-now-dry/throttled) -> rotate to the next
             __harvestProfileAttemptByGroup.set(pair.groupUrl, (__harvestProfileAttemptByGroup.get(pair.groupUrl) || 0) + 1);
             if (__harvestWorkingProfileByGroup.get(pair.groupUrl) === pair.profileId) __harvestWorkingProfileByGroup.delete(pair.groupUrl);
           }
