@@ -1459,7 +1459,8 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.groupsText = String(state.posting.contentSources.groupsText || "").slice(0, 20000);
   state.posting.contentSources.notes = String(state.posting.contentSources.notes || "").slice(0, 5000);
   state.posting.contentSources.exclusive = state.posting.contentSources.exclusive === true; // ONLY post copied products (skip web discovery)
-  state.posting.contentSources.reserveTarget = clampNumber(state.posting.contentSources.reserveTarget, 1, 5000, 20); // DAYTIME working buffer of ready copied products
+  state.posting.contentSources.reserveAuto = state.posting.contentSources.reserveAuto !== false; // AUTO-size all reserves from daily posting capacity (default ON)
+  state.posting.contentSources.reserveTarget = clampNumber(state.posting.contentSources.reserveTarget, 1, 5000, 20); // DAYTIME working buffer (manual override when auto is OFF)
   state.posting.contentSources.reserveRefillAt = clampNumber(state.posting.contentSources.reserveRefillAt, 0, Math.max(0, state.posting.contentSources.reserveTarget - 1), 10); // daytime: resume harvesting when reserve drops to this
   state.posting.contentSources.overnightReserveTarget = clampNumber(state.posting.contentSources.overnightReserveTarget, state.posting.contentSources.reserveTarget, 5000, Math.max(state.posting.contentSources.reserveTarget, 200)); // OVERNIGHT: stock up to this many for the whole next day
   state.posting.contentSources.harvestProfilesPerGroup = clampNumber(state.posting.contentSources.harvestProfilesPerGroup, 1, 6, 3); // # member profiles to harvest each group with IN PARALLEL (spreads load)
@@ -7589,6 +7590,17 @@ let __harvestEmptyRounds = 0;
 let __harvestWorkingProfilesByGroup = new Map(); // groupUrl -> Set of PROVEN member profiles (learned automatically)
 let __harvestProfileAttemptByGroup = new Map(); // groupUrl -> rotating exploration index (discovers new members each round)
 let __harvestReservePaused = false; // hysteresis: pause harvesting at reserveTarget, resume at reserveRefillAt
+// AUTO reserve sizing from the box's REAL daily posting capacity (assigned profiles x posts/profile/day,
+// already computed into productDiscovery.dailyPostTarget). overnight = tomorrow's posts + 50% safety buffer;
+// daytime = a small working buffer (safety net while the overnight stock drains). Scales as profiles/posts change.
+function harvestAutoReserves(state) {
+  const daily = Math.max(1, Number(state.productDiscovery?.dailyPostTarget || 0)
+    || (countAssignedProfiles(state) * clampNumber(state.rules?.postsPerProfilePerDay, 1, 20, 5)));
+  const overnight = Math.max(20, Math.min(5000, Math.ceil(daily * 1.5)));
+  const daytime = Math.max(10, Math.min(80, Math.ceil(daily * 0.2)));
+  const refillAt = Math.max(5, Math.floor(daytime * 0.5));
+  return { daily, overnight, daytime, refillAt };
+}
 // Parallel 4-by-4 harvest across DISTINCT member profiles. Single-flight, posting/CPU-governed, dedups
 // by first-comment URL on disk, persists records + downloaded images. Re-scan cadence via __harvestNextAt.
 async function harvestContentSourcesAsync(options = {}) {
@@ -7603,9 +7615,11 @@ async function harvestContentSourcesAsync(options = {}) {
     //    while the profiles are free. The big overnight stock then drains through the day; the daytime
     //    20/10 is just a safety net if it ever runs low during posting.
     const cs = state.posting?.contentSources || {};
-    const reserveTarget = clampNumber(cs.reserveTarget, 1, 5000, 20);
-    const reserveRefillAt = clampNumber(cs.reserveRefillAt, 0, Math.max(0, reserveTarget - 1), 10);
-    const overnightTarget = clampNumber(cs.overnightReserveTarget, reserveTarget, 5000, Math.max(reserveTarget, 200));
+    const auto = cs.reserveAuto !== false; // DEFAULT ON: size the reserves from the REAL daily posting capacity
+    const a = auto ? harvestAutoReserves(state) : null;
+    const reserveTarget = auto ? a.daytime : clampNumber(cs.reserveTarget, 1, 5000, 20);
+    const reserveRefillAt = auto ? a.refillAt : clampNumber(cs.reserveRefillAt, 0, Math.max(0, reserveTarget - 1), 10);
+    const overnightTarget = auto ? a.overnight : clampNumber(cs.overnightReserveTarget, reserveTarget, 5000, Math.max(reserveTarget, 200));
     const reserve = readHarvestedProducts(state).filter((r) => r && !r.posted && r.imageLocalPath && r.firstCommentUrl).length;
     const windowOpen = autopilotPostingWindowOpen(state);
     let effectiveTarget;

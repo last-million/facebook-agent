@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-07T22:08:07.236Z",
+  "updatedAt": "2026-06-07T23:02:51.660Z",
   "testRun": {
     "status": "done",
     "active": false,
@@ -213,7 +213,8 @@
       "reserveTarget": 20,
       "reserveRefillAt": 10,
       "harvestProfilesPerGroup": 3,
-      "postCta": ""
+      "postCta": "",
+      "overnightReserveTarget": 400
     },
     "groupFallbackPolicy": "if a profile cannot post in its selected group, try the next available group URL from this run; if no group works, skip that profile and record the issue with profile id/name",
     "profileGroupIssueLogEndpoint": "/api/posting/profile-group-issue",
