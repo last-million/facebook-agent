@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-07T17:01:17.965Z",
+  "updatedAt": "2026-06-07T17:36:12.233Z",
   "testRun": {
     "status": "done",
     "active": false,
@@ -133,8 +133,8 @@
     "autopilotDryRun": false,
     "autopilotProfileAllowlist": "",
     "commentCooldownHours": 48,
-    "autopilotMaxPostsPerRun": 1,
-    "autopilotPostsThisRun": 1,
+    "autopilotMaxPostsPerRun": 5,
+    "autopilotPostsThisRun": 0,
     "autopilotWorkerStaggerSeconds": 25,
     "adminApprovalSettleSeconds": 3,
     "parallelOpenStaggerSeconds": 8,
@@ -150,7 +150,8 @@
     "runDays": "Mon\nTue\nWed\nThu\nFri\nSat\nSun",
     "startTime": "",
     "stopTime": "",
-    "contentSourcesEnabled": false
+    "contentSourcesEnabled": true,
+    "contentSourcesExclusive": false
   },
   "rules": {
     "minutesBetweenPosts": 6,
@@ -205,9 +206,10 @@
       }
     ],
     "contentSources": {
-      "enabled": false,
-      "groupsText": "",
-      "notes": ""
+      "enabled": true,
+      "groupsText": "https://www.facebook.com/groups/o38679876833911",
+      "notes": "",
+      "exclusive": false
     },
     "groupFallbackPolicy": "if a profile cannot post in its selected group, try the next available group URL from this run; if no group works, skip that profile and record the issue with profile id/name",
     "profileGroupIssueLogEndpoint": "/api/posting/profile-group-issue",
@@ -292,14 +294,7 @@
     "candidateBufferPercent": 20,
     "targetCandidateCount": 324,
     "rankingRules": "Prioritize fresh reduced-price products with clear deal signal, strong positive reviews, safe product images, affiliate compatibility, and no prior use in the posted-product register.",
-    "notes": "Generated source URLs are discovery pages/searches, not final product URLs. Hermes should inspect these with a browser, rank candidates, reject products already posted, then move unique chosen product pages into Product URLs.",
-    "lastRunAt": "2026-06-07T16:58:33.825Z",
-    "lastRunStatus": "direct_discovery_saved",
-    "lastRunParser": "jina_reader",
-    "lastRunCandidateCount": 504,
-    "lastRunNewCandidateCount": 324,
-    "lastRunRefreshedCandidateCount": 180,
-    "lastSuccessfulRunAt": "2026-06-07T16:58:25.442Z"
+    "notes": "Generated source URLs are discovery pages/searches, not final product URLs. Hermes should inspect these with a browser, rank candidates, reject products already posted, then move unique chosen product pages into Product URLs."
   },
   "affiliate": {
     "service": "ShopYourLikes",
