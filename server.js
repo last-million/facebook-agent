@@ -1887,19 +1887,28 @@ function harvestSyntheticKey(url) {
 }
 function readHarvestedProducts(state = readState()) {
   const file = state.files?.harvestedProducts || "data/harvested-products.jsonl";
-  try { return readJsonlFile(file); } catch { return []; }
+  let rows = [];
+  try { rows = readJsonlFile(file); } catch { return []; }
+  // APPEND-ONLY log: dedup by firstCommentUrl, LAST occurrence wins (reflects the latest update). This makes
+  // appends + updates clobber-proof under concurrent harvest+post — no read-all-then-write-all that could
+  // drop a record (the live-run record-loss bug). The file only grows by ~1 line per post; small for the use case.
+  const byUrl = new Map();
+  for (const r of rows) { if (r && r.firstCommentUrl) byUrl.set(String(r.firstCommentUrl), r); }
+  return [...byUrl.values()];
 }
 function harvestedRecordForKey(key, state = readState()) {
   const k = String(key || "");
   return readHarvestedProducts(state).find((r) => r && (r.productKey === k || harvestSyntheticKey(r.firstCommentUrl) === k)) || null;
 }
+function appendHarvestedProductLine(file, record) {
+  try { const fp = safeProjectPath(file); fs.mkdirSync(path.dirname(fp), { recursive: true }); fs.appendFileSync(fp, JSON.stringify(record) + "\n"); return true; } catch (_) { return false; }
+}
 function appendHarvestedProduct(record, state = readState()) {
   const file = state.files?.harvestedProducts || "data/harvested-products.jsonl";
   const url = String(record?.firstCommentUrl || "").trim();
   if (!url) return false;
-  const rows = readHarvestedProducts(state);
-  if (rows.some((r) => String(r.firstCommentUrl || "") === url)) return false; // idempotent dedup by url
-  rows.push({
+  if (readHarvestedProducts(state).some((r) => String(r.firstCommentUrl || "") === url)) return false; // dedup by url
+  return appendHarvestedProductLine(file, {
     firstCommentUrl: url,
     productKey: record.productKey || harvestSyntheticKey(url),
     text: String(record.text || "").slice(0, 4000),
@@ -1909,17 +1918,14 @@ function appendHarvestedProduct(record, state = readState()) {
     posted: "",
     imageDeleted: false,
   });
-  writeJsonlFile(file, rows);
-  return true;
 }
 function updateHarvestedProductRecord(key, patch, state = readState()) {
   const file = state.files?.harvestedProducts || "data/harvested-products.jsonl";
   const k = String(key || "");
-  const rows = readHarvestedProducts(state);
-  let changed = false;
-  for (const r of rows) { if (r && (r.productKey === k || harvestSyntheticKey(r.firstCommentUrl) === k)) { Object.assign(r, patch || {}); changed = true; } }
-  if (changed) writeJsonlFile(file, rows);
-  return changed;
+  const rec = readHarvestedProducts(state).find((r) => r && (r.productKey === k || harvestSyntheticKey(r.firstCommentUrl) === k));
+  if (!rec) return false;
+  // append the MERGED record (latest-wins on read) — never rewrites the whole file, so nothing can be lost
+  return appendHarvestedProductLine(file, Object.assign({}, rec, patch || {}));
 }
 
 function appendJsonlAbsoluteFile(filePath, row) {
