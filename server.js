@@ -1461,6 +1461,7 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.exclusive = state.posting.contentSources.exclusive === true; // ONLY post copied products (skip web discovery)
   state.posting.contentSources.reserveTarget = clampNumber(state.posting.contentSources.reserveTarget, 1, 1000, 20); // keep this many copied products ready
   state.posting.contentSources.reserveRefillAt = clampNumber(state.posting.contentSources.reserveRefillAt, 0, Math.max(0, state.posting.contentSources.reserveTarget - 1), 10); // resume harvesting when reserve drops to this
+  state.posting.contentSources.harvestProfilesPerGroup = clampNumber(state.posting.contentSources.harvestProfilesPerGroup, 1, 6, 3); // # member profiles to harvest each group with IN PARALLEL (spreads load)
   state.operator = state.operator || {};
   state.operator.contentSourcesEnabled = state.posting.contentSources.enabled === true;
   state.operator.contentSourcesExclusive = state.posting.contentSources.enabled === true && state.posting.contentSources.exclusive === true;
@@ -7582,8 +7583,8 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount) {
 let __harvestSourcesInFlight = null;
 let __harvestNextAt = 0;
 let __harvestEmptyRounds = 0;
-let __harvestWorkingProfileByGroup = new Map(); // groupUrl -> a PROVEN member profile (learned automatically)
-let __harvestProfileAttemptByGroup = new Map(); // groupUrl -> rotating index; advances when an auto-pick reads nothing
+let __harvestWorkingProfilesByGroup = new Map(); // groupUrl -> Set of PROVEN member profiles (learned automatically)
+let __harvestProfileAttemptByGroup = new Map(); // groupUrl -> rotating exploration index (discovers new members each round)
 let __harvestReservePaused = false; // hysteresis: pause harvesting at reserveTarget, resume at reserveRefillAt
 // Parallel 4-by-4 harvest across DISTINCT member profiles. Single-flight, posting/CPU-governed, dedups
 // by first-comment URL on disk, persists records + downloaded images. Re-scan cadence via __harvestNextAt.
@@ -7603,27 +7604,32 @@ async function harvestContentSourcesAsync(options = {}) {
     if (__harvestReservePaused) { __harvestNextAt = Date.now() + 60000; logEvent("harvest_reserve_satisfied", { reserve, target: reserveTarget, refillAt: reserveRefillAt }); return { reserveSatisfied: reserve }; }
     const lines = recordLines(state.posting?.contentSources?.groupsText);
     const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
+    const perGroup = clampNumber(cs.harvestProfilesPerGroup, 1, 6, 3); // MULTI-PROFILE: harvest each group with N profiles in PARALLEL so load is spread (no single account hammered) + resilient if one is throttled
     const pairs = [];
     for (const line of lines) {
       const m = String(line).match(/(https?:\/\/[^\s|@]*groups\/[^\s|@/]+)/i);
       if (!m) continue;
       const groupUrl = m[1];
-      const pidMatch = String(line).match(/[|@]\s*(\d{1,6})/); // OPTIONAL "url | profileId" pin; otherwise FULLY AUTOMATIC
-      let profileId = 0, autoPicked = false, pinned = false;
-      if (pidMatch) {
-        profileId = Number(pidMatch[1]); pinned = true; // manual pin -> never auto-rotate away
-      } else if (__harvestWorkingProfileByGroup.has(groupUrl)) {
-        profileId = __harvestWorkingProfileByGroup.get(groupUrl); // reuse the learned member (but still rotatable if it goes dry)
-      } else if (pool.length) {
-        profileId = pool[(__harvestProfileAttemptByGroup.get(groupUrl) || 0) % pool.length]; // rotate across runs to FIND a member
-        autoPicked = true;
+      const pidMatch = String(line).match(/[|@]\s*(\d{1,6})/); // OPTIONAL "url | profileId" pin
+      if (pidMatch) { pairs.push({ groupUrl, profileId: Number(pidMatch[1]), pinned: true }); continue; }
+      // AUTOMATIC + MULTI-PROFILE: known members first (up to perGroup-1), always keep >=1 slot exploring NEW profiles
+      // so it keeps discovering members even when all known ones are momentarily throttled.
+      const memberSet = __harvestWorkingProfilesByGroup.get(groupUrl) || new Set();
+      const chosen = [];
+      const memberCap = Math.max(1, perGroup - 1);
+      for (const pid of memberSet) { if (chosen.length >= memberCap) break; if (!chosen.includes(pid)) chosen.push(pid); }
+      let attempt = __harvestProfileAttemptByGroup.get(groupUrl) || 0, guard = 0;
+      while (chosen.length < perGroup && pool.length && guard < pool.length * 2) {
+        const pid = pool[attempt % pool.length]; attempt += 1; guard += 1;
+        if (!chosen.includes(pid)) chosen.push(pid);
       }
-      if (profileId) pairs.push({ groupUrl, profileId, autoPicked, pinned });
+      __harvestProfileAttemptByGroup.set(groupUrl, attempt);
+      for (const pid of chosen) pairs.push({ groupUrl, profileId: pid, autoPicked: !memberSet.has(pid) });
     }
     if (!pairs.length) { __harvestNextAt = Date.now() + 300000; return { groups: 0 }; }
     const existingByUrl = new Map(readHarvestedProducts(state).map((r) => [String(r.firstCommentUrl || ""), r]));
     let harvestedNew = 0, skippedSeen = 0, reusedOld = 0;
-    const harvestCount = clampNumber(options.harvestCount || 4, 1, 20, 4);
+    const harvestCount = clampNumber(options.harvestCount || (reserveTarget - reserve), 1, 20, 4); // grab the whole reserve GAP in one harvest (a healthy member loads many tiles per session)
     for (let i = 0; i < pairs.length; i += 4) { // 4-by-4
       const round = pairs.slice(i, i + 4);
       await waitForPostingIdle({ label: "harvest_sources" }).catch(() => {});   // posting always wins
@@ -7657,10 +7663,12 @@ async function harvestContentSourcesAsync(options = {}) {
           // AUTO-LEARN the member profile: a profile that READ the group (returned items) is a proven member
           // -> remember it for next time. An auto-picked profile that read NOTHING (likely not a member) ->
           // rotate to the next profile on the next run until a member is found.
-          if (items.length > 0) { __harvestWorkingProfileByGroup.set(pair.groupUrl, pair.profileId); }
-          else if (!pair.pinned) { // ANY non-pinned profile (auto-picked OR cached-but-now-dry/throttled) -> rotate to the next
-            __harvestProfileAttemptByGroup.set(pair.groupUrl, (__harvestProfileAttemptByGroup.get(pair.groupUrl) || 0) + 1);
-            if (__harvestWorkingProfileByGroup.get(pair.groupUrl) === pair.profileId) __harvestWorkingProfileByGroup.delete(pair.groupUrl);
+          // LEARN members: a profile that READ the group (returned items) is a proven member -> add to the set.
+          // It stays a member even if a later round returns 0 (throttled, just resting); exploration keeps finding new ones.
+          if (items.length > 0) {
+            const set = __harvestWorkingProfilesByGroup.get(pair.groupUrl) || new Set();
+            set.add(pair.profileId);
+            __harvestWorkingProfilesByGroup.set(pair.groupUrl, set);
           }
           logEvent("harvest_group_done", { profileId: pair.profileId, groupUrl: pair.groupUrl, got: items.length, autoPicked: pair.autoPicked });
         } catch (e) { logEvent("harvest_connector_error", { profileId: pair.profileId, error: oneLineField((e && e.message) || String(e), 160) }); }
