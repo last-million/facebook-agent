@@ -16796,7 +16796,17 @@ const server = http.createServer(async (req, res) => {
       imageDeleted: !!r.imageDeleted,
       hasImage: Boolean(r.imageLocalPath && !r.imageDeleted && (() => { try { return fs.existsSync(safeProjectPath(r.imageLocalPath)); } catch { return false; } })()),
     })).reverse(); // newest first
-    return json(res, 200, { harvested: rows, total: rows.length });
+    // RESERVE progress stats for the dashboard progress bar (current ready vs the active day/night target).
+    const csCfg = st.posting?.contentSources || {};
+    const autoR = csCfg.reserveAuto !== false;
+    const ar = autoR ? harvestAutoReserves(st) : null;
+    const windowOpen = autopilotPostingWindowOpen(st);
+    const dayTarget = autoR ? ar.daytime : clampNumber(csCfg.reserveTarget, 1, 5000, 20);
+    const nightTarget = autoR ? ar.overnight : clampNumber(csCfg.overnightReserveTarget, dayTarget, 5000, 200);
+    const target = windowOpen ? dayTarget : nightTarget;
+    const readyCount = rows.filter((r) => !r.posted && r.hasImage).length;
+    const pct = target > 0 ? Math.min(100, Math.round((readyCount / target) * 100)) : 0;
+    return json(res, 200, { harvested: rows, total: rows.length, reserve: { ready: readyCount, target, pct, window: windowOpen ? "day" : "night", dayTarget, nightTarget, full: readyCount >= target } });
   }
   if (req.method === "GET" && url.pathname === "/api/content-sources/harvested-image") {
     const rec = harvestedRecordForKey(url.searchParams.get("key") || "");

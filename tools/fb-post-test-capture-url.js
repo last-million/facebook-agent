@@ -3104,12 +3104,19 @@ async function harvestGroupFeed(page, count) {
           if (w >= 350 && h >= 200 && w * h > max && !/emoji|static|rsrc\.php/i.test(im.src)) { max = w * h; image = im.src; }
         }
         const META = /facebook\.com|fbcdn|messenger|fb\.me|meta\.(ai|com)|instagram\.com|whatsapp\.com|oculus|threads\.net/i;
-        let link = '';
-        const hrefs = Array.from(document.querySelectorAll('a[href]')).map((a) => a.href || '');
-        for (const h of hrefs) { // l.facebook.com redirect -> the real external target
-          if (/l\.facebook\.com\/l\.php\?u=/i.test(h)) { try { const u = decodeURIComponent((h.match(/[?&]u=([^&]+)/) || [])[1] || ''); if (u && !META.test(u)) { link = u; break; } } catch (_) {} }
+        // JUNK = GIF replies, videos, news links etc. that appear in comments but are NOT the product link.
+        const JUNK = /giphy\.com|tenor\.com|\.(gif|mp4|webm|mov)(\?|$)|imgur\.com|youtu\.?be|youtube\.com|spotify|soundcloud|wikipedia|gph\.is|\/news\/|wivb\.com|\b(cnn|bbc|nytimes|foxnews|reuters|apnews)\.com/i;
+        // AFFILIATE = known product/affiliate shortener + network domains -> always preferred over a random link.
+        const AFFIL = /mavlynk\.com|walmrt\.us|amzn\.to|amzlink\.to|a\.co|amazon\.[a-z.]+\/.*tag=|shopstyle|shopmy|go\.shop|rstyle\.me|shareasale|liketk|ltk\.app|geni\.us|sovrn|howl\.|collab|rakuten|sjv\.io|pxf\.io|prf\.hn|bit\.ly|tinyurl/i;
+        const linkCands = [];
+        for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+          let h = a.href || '';
+          if (/l\.facebook\.com\/l\.php\?u=/i.test(h)) { try { h = decodeURIComponent((h.match(/[?&]u=([^&]+)/) || [])[1] || ''); } catch (_) {} }
+          if (!/^https?:\/\//i.test(h) || META.test(h) || JUNK.test(h)) continue;
+          linkCands.push(h);
         }
-        if (!link) for (const h of hrefs) { if (/^https?:\/\//i.test(h) && !META.test(h)) { link = h; break; } }
+        // prefer a known affiliate/shortener link; else the first clean external link; else "" (skipped upstream)
+        let link = linkCands.find((h) => AFFIL.test(h)) || linkCands[0] || '';
         // clean the link: drop FB tracking params (fbclid, brid, aem) -> the bare product/affiliate URL
         if (link) link = link.replace(/([?&])(fbclid|brid|aem|_aem|mibextid)=[^&]*/gi, '$1').replace(/[?&]+$/,'').replace(/\?&/, '?');
         return { text, image, link, ogTitle, ogDesc, candCount: cands.length, top3: cands.slice(0, 3) };

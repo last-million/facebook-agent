@@ -5500,6 +5500,15 @@ function uxAttachScrapedProducts() {
         api("/api/content-sources/harvested").catch(() => ({ harvested: [] })),
         api("/api/products/discovered").catch(() => ({ discovered: [] })),
       ]);
+      const rv = hv && hv.reserve;
+      const wrap = $("reserveProgressWrap");
+      if (wrap && rv && rv.target) {
+        wrap.style.display = "";
+        const pct = Math.max(0, Math.min(100, rv.pct || 0));
+        const bar = $("reserveProgressBar"); if (bar) bar.style.width = pct + "%";
+        const pe = $("reserveProgressPct"); if (pe) pe.textContent = pct + "%" + (rv.full ? " ✓ full" : "");
+        const le = $("reserveProgressLabel"); if (le) le.textContent = "Reserve: " + rv.ready + " / " + rv.target + " ready (" + (rv.window === "day" ? "daytime" : "overnight") + " target)";
+      } else if (wrap) { wrap.style.display = "none"; }
       const copied = ((hv && hv.harvested) || []).map((r) => ({
         source: "copied", productKey: r.productKey, title: r.text || "", url: r.firstCommentUrl || "",
         hasImage: r.hasImage, imageDeleted: r.imageDeleted, posted: r.posted, postUrl: r.postUrl || "",
