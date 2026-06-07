@@ -652,6 +652,7 @@ function defaultState() {
       usedPostTexts: "data/used-post-texts.txt",
       usedCommentLeadIns: "data/used-comment-leadins.txt",
       errors: "data/errors.txt",
+      harvestedProducts: "data/harvested-products.jsonl",
     },
   };
 }
@@ -1873,6 +1874,50 @@ function writeJsonlFile(relativePath, rows) {
   return content ? `${content}\n` : "";
 }
 
+// CONTENT-SOURCE HARVEST tracking (default OFF). Persistent, LOSSLESS dedup by the first-comment URL
+// (each product has a UNIQUE affiliate url). Record: { firstCommentUrl, productKey, text, imageLocalPath,
+// harvestedAt, posted, imageDeleted }. The synthetic productKey is derived from the url, so the same
+// product harvested from two groups maps to ONE key and is never posted twice.
+function harvestSyntheticKey(url) {
+  return "harvested:" + crypto.createHash("sha1").update(String(url || "")).digest("hex").slice(0, 12);
+}
+function readHarvestedProducts(state = readState()) {
+  const file = state.files?.harvestedProducts || "data/harvested-products.jsonl";
+  try { return readJsonlFile(file); } catch { return []; }
+}
+function harvestedRecordForKey(key, state = readState()) {
+  const k = String(key || "");
+  return readHarvestedProducts(state).find((r) => r && (r.productKey === k || harvestSyntheticKey(r.firstCommentUrl) === k)) || null;
+}
+function appendHarvestedProduct(record, state = readState()) {
+  const file = state.files?.harvestedProducts || "data/harvested-products.jsonl";
+  const url = String(record?.firstCommentUrl || "").trim();
+  if (!url) return false;
+  const rows = readHarvestedProducts(state);
+  if (rows.some((r) => String(r.firstCommentUrl || "") === url)) return false; // idempotent dedup by url
+  rows.push({
+    firstCommentUrl: url,
+    productKey: record.productKey || harvestSyntheticKey(url),
+    text: String(record.text || "").slice(0, 4000),
+    imageLocalPath: String(record.imageLocalPath || ""),
+    sourceGroupUrl: String(record.sourceGroupUrl || ""),
+    harvestedAt: new Date().toISOString(),
+    posted: "",
+    imageDeleted: false,
+  });
+  writeJsonlFile(file, rows);
+  return true;
+}
+function updateHarvestedProductRecord(key, patch, state = readState()) {
+  const file = state.files?.harvestedProducts || "data/harvested-products.jsonl";
+  const k = String(key || "");
+  const rows = readHarvestedProducts(state);
+  let changed = false;
+  for (const r of rows) { if (r && (r.productKey === k || harvestSyntheticKey(r.firstCommentUrl) === k)) { Object.assign(r, patch || {}); changed = true; } }
+  if (changed) writeJsonlFile(file, rows);
+  return changed;
+}
+
 function appendJsonlAbsoluteFile(filePath, row) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.appendFileSync(filePath, `${JSON.stringify(row)}\n`);
@@ -1982,6 +2027,13 @@ function titleFromSlug(slug, fallback) {
 }
 
 function canonicalProduct(rawUrl, state) {
+  // HARVESTED products use a synthetic key (harvested:<hash>), not a real retailer URL. Return a stable
+  // pseudo-product so they survive the whole pipeline (the new URL() below would throw + drop them).
+  // Only reachable when the content-source feature is enabled (gated upstream by contentSourcesEnabled).
+  if (String(rawUrl || "").startsWith("harvested:")) {
+    const id = String(rawUrl).slice("harvested:".length);
+    return { store: "harvested", host: "", productId: id, key: String(rawUrl), url: String(rawUrl), title: "" };
+  }
   try {
     const url = new URL(String(rawUrl || "").replace(/\\\//g, "/"));
     if (!["http:", "https:"].includes(url.protocol)) return null;
