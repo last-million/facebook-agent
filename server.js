@@ -7585,8 +7585,8 @@ async function harvestContentSourcesAsync(options = {}) {
       if (profileId) pairs.push({ groupUrl: m[1], profileId });
     }
     if (!pairs.length) { __harvestNextAt = Date.now() + 300000; return { groups: 0 }; }
-    const seenUrls = new Set(readHarvestedProducts(state).map((r) => String(r.firstCommentUrl || "")));
-    let harvestedNew = 0, skippedSeen = 0;
+    const existingByUrl = new Map(readHarvestedProducts(state).map((r) => [String(r.firstCommentUrl || ""), r]));
+    let harvestedNew = 0, skippedSeen = 0, reusedOld = 0;
     const harvestCount = clampNumber(options.harvestCount || 4, 1, 20, 4);
     for (let i = 0; i < pairs.length; i += 4) { // 4-by-4
       const round = pairs.slice(i, i + 4);
@@ -7600,11 +7600,23 @@ async function harvestContentSourcesAsync(options = {}) {
           const items = await runHarvestConnector(pair.groupUrl, pair.profileId, harvestCount);
           for (const it of items) {
             const url = String(it.link || "").trim();
-            if (!url || seenUrls.has(url)) { if (url) skippedSeen++; continue; } // url-dedup: never take the same product twice
+            if (!url) continue;
             let rel = "";
             if (it.imageLocalPath) { try { rel = path.relative(ROOT, it.imageLocalPath).replace(/\\/g, "/"); } catch (_) { rel = ""; } }
+            const existing = existingByUrl.get(url);
+            if (existing) {
+              // Already tracked = duplicate. DEDUP — EXCEPT: if it was POSTED >= 10 days ago AND is re-found
+              // in the source group now, RE-ENABLE it for ONE more post (the connector already re-downloaded
+              // its image). Re-posting will set posted again, restarting the 10-day clock.
+              if (!existing.posted) { skippedSeen++; continue; } // unposted: already pending, skip
+              const ageMs = Date.now() - Date.parse(existing.posted || "");
+              if (!(Number.isFinite(ageMs) && ageMs >= 10 * 86400000)) { skippedSeen++; continue; } // posted < 10 days: skip
+              updateHarvestedProductRecord(existing.productKey, { posted: "", imageDeleted: false, imageLocalPath: rel, text: it.text, harvestedAt: new Date().toISOString(), reusedAt: new Date().toISOString() }, readState());
+              existing.posted = ""; reusedOld++;
+              continue;
+            }
             const persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl }, readState());
-            if (persisted) { seenUrls.add(url); harvestedNew++; }
+            if (persisted) { existingByUrl.set(url, { firstCommentUrl: url, posted: "" }); harvestedNew++; }
           }
           logEvent("harvest_group_done", { profileId: pair.profileId, groupUrl: pair.groupUrl, got: items.length });
         } catch (e) { logEvent("harvest_connector_error", { profileId: pair.profileId, error: oneLineField((e && e.message) || String(e), 160) }); }
@@ -7613,10 +7625,10 @@ async function harvestContentSourcesAsync(options = {}) {
       if (i + 4 < pairs.length) await sleep(clampNumber(options.interRoundGapMs || 25000, 5000, 120000, 25000)); // anti-throttle pacing
     }
     // RE-SCAN cadence: drain fast when producing; re-scan ~every minute when idle; back off when long-exhausted.
-    if (harvestedNew > 0) { __harvestEmptyRounds = 0; __harvestNextAt = Date.now(); }
+    if ((harvestedNew + reusedOld) > 0) { __harvestEmptyRounds = 0; __harvestNextAt = Date.now(); }
     else { __harvestEmptyRounds += 1; __harvestNextAt = Date.now() + (__harvestEmptyRounds >= 30 ? 300000 : 60000); }
-    logEvent("harvest_round", { groups: pairs.length, harvestedNew, skippedSeen, emptyRounds: __harvestEmptyRounds, nextInSec: Math.round((__harvestNextAt - Date.now()) / 1000) });
-    return { groups: pairs.length, harvestedNew, skippedSeen };
+    logEvent("harvest_round", { groups: pairs.length, harvestedNew, reusedOld, skippedSeen, emptyRounds: __harvestEmptyRounds, nextInSec: Math.round((__harvestNextAt - Date.now()) / 1000) });
+    return { groups: pairs.length, harvestedNew, reusedOld, skippedSeen };
   })().catch((e) => { logEvent("harvest_sources_error", { error: oneLineField((e && e.message) || String(e), 200) }); __harvestNextAt = Date.now() + 120000; return { error: true }; })
     .finally(() => { __harvestSourcesInFlight = null; });
   return __harvestSourcesInFlight;
@@ -16644,6 +16656,30 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/api/integrations/health") {
     return json(res, 200, buildIntegrationHealth());
+  }
+  if (req.method === "GET" && url.pathname === "/api/content-sources/harvested") {
+    const st = readState();
+    const rows = readHarvestedProducts(st).map((r) => ({
+      productKey: r.productKey,
+      firstCommentUrl: r.firstCommentUrl,
+      text: r.text || "",
+      sourceGroupUrl: r.sourceGroupUrl || "",
+      harvestedAt: r.harvestedAt || "",
+      posted: r.posted || "",
+      imageDeleted: !!r.imageDeleted,
+      hasImage: Boolean(r.imageLocalPath && !r.imageDeleted && (() => { try { return fs.existsSync(safeProjectPath(r.imageLocalPath)); } catch { return false; } })()),
+    })).reverse(); // newest first
+    return json(res, 200, { harvested: rows, total: rows.length });
+  }
+  if (req.method === "GET" && url.pathname === "/api/content-sources/harvested-image") {
+    const rec = harvestedRecordForKey(url.searchParams.get("key") || "");
+    if (!rec || !rec.imageLocalPath || rec.imageDeleted) { res.writeHead(404); return res.end("no image"); }
+    try {
+      const fp = safeProjectPath(rec.imageLocalPath);
+      if (!fs.existsSync(fp)) { res.writeHead(404); return res.end("image gone (deleted after posting)"); }
+      res.writeHead(200, { "content-type": "image/jpeg", "cache-control": "no-store" });
+      return res.end(fs.readFileSync(fp));
+    } catch (e) { res.writeHead(500); return res.end("error"); }
   }
   if (req.method === "POST" && url.pathname === "/api/security/audit") {
     const report = await runSecurityAudit();

@@ -5475,12 +5475,64 @@ function uxAttachCollapseControls() {
   $("expandAllPanelsBtn")?.addEventListener("click", () => uxSetAllPanels(false));
 }
 
+function uxAttachScrapedProducts() {
+  const list = $("scrapedProductsList");
+  if (!list) return;
+  async function load() {
+    try {
+      const data = await api("/api/content-sources/harvested");
+      const rows = (data && data.harvested) || [];
+      const countEl = $("scrapedProductsCount");
+      if (countEl) countEl.textContent = String(rows.length);
+      if (!rows.length) { list.innerHTML = '<div style="opacity:.6">No scraped products yet.</div>'; return; }
+      list.innerHTML = "";
+      for (const r of rows) {
+        const card = document.createElement("div");
+        card.className = "scrapedCard";
+        const posted = r.posted ? '<span class="sp-badge posted">posted</span>' : '<span class="sp-badge pending">pending</span>';
+        const imgBadge = r.imageDeleted ? '<span class="sp-badge">img deleted</span>' : (r.hasImage ? '<span class="sp-badge">has image</span>' : '<span class="sp-badge">no image</span>');
+        card.innerHTML = '<div class="sp-text"></div><div class="sp-meta">' + posted + imgBadge + '</div>';
+        card.querySelector(".sp-text").textContent = (r.text || "(no text)").slice(0, 160);
+        card.addEventListener("click", () => openModal(r));
+        list.appendChild(card);
+      }
+    } catch (err) { list.innerHTML = '<div style="opacity:.6">Could not load scraped products.</div>'; }
+  }
+  async function openModal(r) {
+    const modal = $("scrapedModal"); if (!modal) return;
+    const img = $("scrapedModalImg");
+    img.removeAttribute("src"); img.style.display = "none";
+    if (r.hasImage && !r.imageDeleted) {
+      try {
+        const res = await fetch("/api/content-sources/harvested-image?key=" + encodeURIComponent(r.productKey), { headers: { "x-dashboard-token": DASHBOARD_TOKEN } });
+        if (res.ok) { img.src = URL.createObjectURL(await res.blob()); img.style.display = ""; }
+      } catch {}
+    }
+    $("scrapedModalText").textContent = r.text || "(no text)";
+    const link = $("scrapedModalLink");
+    link.textContent = r.firstCommentUrl || "(no link)";
+    link.href = r.firstCommentUrl || "#";
+    const status = [r.posted ? ("Posted: " + r.posted) : "Not posted yet"];
+    if (r.imageDeleted) status.push("Image deleted after posting (text + link kept).");
+    if (r.harvestedAt) status.push("Harvested: " + r.harvestedAt);
+    if (r.sourceGroupUrl) status.push("Source: " + r.sourceGroupUrl);
+    $("scrapedModalStatus").textContent = status.join("  •  ");
+    modal.style.display = "flex";
+  }
+  function close() { const m = $("scrapedModal"); if (m) m.style.display = "none"; }
+  $("refreshScrapedBtn")?.addEventListener("click", () => load());
+  $("scrapedModalClose")?.addEventListener("click", close);
+  $("scrapedModal")?.addEventListener("click", (e) => { if (e.target === $("scrapedModal")) close(); });
+  load();
+}
+
 (function bootUxOverhaul() {
   const run = () => {
     try { uxInitCollapsiblePanels(); } catch (err) { console.warn("uxInitCollapsiblePanels failed", err); }
     try { uxAttachCollapseControls(); } catch (err) { console.warn("uxAttachCollapseControls failed", err); }
     try { uxAttachClearFailedProfiles(); } catch (err) { console.warn("uxAttachClearFailedProfiles failed", err); }
     try { uxAttachConfirmGuards(); } catch (err) { console.warn("uxAttachConfirmGuards failed", err); }
+    try { uxAttachScrapedProducts(); } catch (err) { console.warn("uxAttachScrapedProducts failed", err); }
   };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", run);
