@@ -3034,13 +3034,25 @@ async function harvestGroupFeed(page, count) {
   const out = [];
   const seenLinks = new Set(); // dedup harvested PRODUCTS by their first-comment URL (each product = unique url)
   await page.waitForTimeout(3000);
-  // Robustly load the /media grid: wait for photo tiles, then scroll until enough DISTINCT posts are loaded.
   try { await page.waitForSelector('a[href*="fbid="]', { timeout: 25000 }); } catch (_) {}
-  for (let s = 0; s < 14; s++) {
-    const n = await page.evaluate(() => document.querySelectorAll('a[href*="/photo"][href*="fbid="]').length).catch(() => 0);
-    if (n >= Math.max(30, 0)) break;
-    await page.mouse.wheel(0, 2400).catch(() => {});
-    await page.waitForTimeout(1500);
+  // Scroll the LAZY-LOAD CONTAINER (tiles live in a scrollable DIV; scrolling body alone loads only 0-4 —
+  // the documented sparse-grid bug). Stop at >=30 tiles, or no growth for 3 cycles, or 45s. Never throw:
+  // a sparse grid is a valid throttled outcome handled by the server re-scan loop.
+  { const deadline = Date.now() + 45000; let prev = -1, flat = 0;
+    while (Date.now() < deadline) {
+      const n = await page.evaluate(() => {
+        const tiles = document.querySelectorAll('a[href*="/photo"][href*="fbid="]');
+        let el = tiles[0], scroller = null;
+        while (el && el !== document.body) { try { if (el.scrollHeight > el.clientHeight + 60 && /auto|scroll/.test(getComputedStyle(el).overflowY)) { scroller = el; break; } } catch (_) {} el = el.parentElement; }
+        if (scroller) scroller.scrollTop = scroller.scrollHeight;
+        window.scrollTo(0, document.body.scrollHeight);
+        return tiles.length;
+      }).catch(() => 0);
+      if (n >= 30) break;
+      if (n <= prev) { flat++; if (flat >= 3) break; } else { flat = 0; prev = n; }
+      await page.mouse.wheel(0, 2400).catch(() => {});
+      await page.waitForTimeout(1500);
+    }
   }
   const collected = await page.evaluate(() => {
     const items = []; const seen = new Set();
@@ -3061,10 +3073,18 @@ async function harvestGroupFeed(page, count) {
     const item = links[i];
     try {
       await page.goto(item.href, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForTimeout(4000);
-      // expand "See more" so the full caption is in the DOM (best-effort)
-      try { const sm = await page.$x ? null : null; } catch (_) {}
-      try { await page.evaluate(() => { for (const el of Array.from(document.querySelectorAll('div[role="button"],span'))) { if (/^see more$/i.test((el.innerText || '').trim())) { el.click(); break; } } }); await page.waitForTimeout(800); } catch (_) {}
+      await page.waitForTimeout(3500);
+      // Load the COMMENTS (the affiliate link is in the FIRST COMMENT) + expand "See more" captions.
+      try {
+        for (let c = 0; c < 3; c++) { await page.mouse.wheel(0, 1500).catch(() => {}); await page.waitForTimeout(1100); }
+        await page.evaluate(() => {
+          for (const el of Array.from(document.querySelectorAll('div[role="button"],span,a'))) {
+            const t = (el.innerText || '').trim();
+            if (/^see more$/i.test(t) || /view\s+\d+\s*(more\s*)?comment|view all|most relevant/i.test(t)) { try { el.click(); } catch (_) {} }
+          }
+        });
+        await page.waitForTimeout(1500);
+      } catch (_) {}
       const data = await page.evaluate(() => {
         const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
         const isUrl = (s) => /^https?:\/\//i.test(s.trim()) || /^www\./i.test(s.trim());
@@ -3097,8 +3117,29 @@ async function harvestGroupFeed(page, count) {
       const dkey = (data.link || '').split(/[?#]/)[0] || ('post:' + item.postId); // unique PRODUCT key = first-comment URL
       if (seenLinks.has(dkey)) { console.log(JSON.stringify({ step: 'harvest_skip_duplicate', key: dkey })); continue; }
       seenLinks.add(dkey);
-      out.push({ href: item.href, productKey: dkey, ...data });
-      console.log(JSON.stringify({ step: 'harvest_item', n: out.length, textLen: (data.text || '').length, textPreview: (data.text || '').slice(0, 120), hasImage: !!data.image, link: data.link, key: dkey }));
+      // DOWNLOAD the image NOW (authed session; fbcdn urls are signed/short-lived and 403 later from the server).
+      let imageLocalPath = '';
+      if (data.image) {
+        try {
+          const b64 = await page.evaluate(async (url) => {
+            const r = await fetch(url); if (!r.ok) return '';
+            const bytes = new Uint8Array(await r.arrayBuffer());
+            let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+            return btoa(s);
+          }, data.image);
+          if (b64 && b64.length > 2000) {
+            const crypto = require('crypto'); const pathmod = require('path');
+            const sha = crypto.createHash('sha1').update(dkey).digest('hex').slice(0, 16);
+            const dir = pathmod.join(__dirname, '..', 'data', 'harvested-images');
+            fs.mkdirSync(dir, { recursive: true });
+            const fp = pathmod.join(dir, sha + '.jpg');
+            fs.writeFileSync(fp, Buffer.from(b64, 'base64'));
+            imageLocalPath = fp;
+          }
+        } catch (e) { console.log(JSON.stringify({ step: 'harvest_image_download_failed', error: String((e && e.message) || e).slice(0, 140) })); }
+      }
+      out.push({ href: item.href, productKey: dkey, imageLocalPath, ...data });
+      console.log(JSON.stringify({ step: 'harvest_item', n: out.length, textLen: (data.text || '').length, textPreview: (data.text || '').slice(0, 100), imageSaved: !!imageLocalPath, link: data.link, key: dkey }));
     } catch (e) {
       console.log(JSON.stringify({ step: 'harvest_item_error', href: item.href.slice(0, 120), error: String((e && e.message) || e).slice(0, 160) }));
     }
