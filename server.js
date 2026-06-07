@@ -7574,6 +7574,8 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount) {
 let __harvestSourcesInFlight = null;
 let __harvestNextAt = 0;
 let __harvestEmptyRounds = 0;
+let __harvestWorkingProfileByGroup = new Map(); // groupUrl -> a PROVEN member profile (learned automatically)
+let __harvestProfileAttemptByGroup = new Map(); // groupUrl -> rotating index; advances when an auto-pick reads nothing
 // Parallel 4-by-4 harvest across DISTINCT member profiles. Single-flight, posting/CPU-governed, dedups
 // by first-comment URL on disk, persists records + downloaded images. Re-scan cadence via __harvestNextAt.
 async function harvestContentSourcesAsync(options = {}) {
@@ -7583,13 +7585,22 @@ async function harvestContentSourcesAsync(options = {}) {
     if (state.operator?.contentSourcesEnabled !== true) { __harvestNextAt = Date.now() + 300000; return { skipped: "disabled" }; }
     const lines = recordLines(state.posting?.contentSources?.groupsText);
     const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
-    let rr = 0; const pairs = [];
+    const pairs = [];
     for (const line of lines) {
       const m = String(line).match(/(https?:\/\/[^\s|@]*groups\/[^\s|@/]+)/i);
       if (!m) continue;
-      const pidMatch = String(line).match(/[|@]\s*(\d{1,6})/); // optional "url | profileId" (a member profile)
-      const profileId = pidMatch ? Number(pidMatch[1]) : (pool.length ? pool[rr++ % pool.length] : 0);
-      if (profileId) pairs.push({ groupUrl: m[1], profileId });
+      const groupUrl = m[1];
+      const pidMatch = String(line).match(/[|@]\s*(\d{1,6})/); // OPTIONAL "url | profileId" pin; otherwise FULLY AUTOMATIC
+      let profileId = 0, autoPicked = false;
+      if (pidMatch) {
+        profileId = Number(pidMatch[1]);
+      } else if (__harvestWorkingProfileByGroup.has(groupUrl)) {
+        profileId = __harvestWorkingProfileByGroup.get(groupUrl); // reuse the PROVEN member learned earlier
+      } else if (pool.length) {
+        profileId = pool[(__harvestProfileAttemptByGroup.get(groupUrl) || 0) % pool.length]; // rotate across runs to FIND a member
+        autoPicked = true;
+      }
+      if (profileId) pairs.push({ groupUrl, profileId, autoPicked });
     }
     if (!pairs.length) { __harvestNextAt = Date.now() + 300000; return { groups: 0 }; }
     const existingByUrl = new Map(readHarvestedProducts(state).map((r) => [String(r.firstCommentUrl || ""), r]));
@@ -7625,7 +7636,15 @@ async function harvestContentSourcesAsync(options = {}) {
             const persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl }, readState());
             if (persisted) { existingByUrl.set(url, { firstCommentUrl: url, posted: "" }); harvestedNew++; }
           }
-          logEvent("harvest_group_done", { profileId: pair.profileId, groupUrl: pair.groupUrl, got: items.length });
+          // AUTO-LEARN the member profile: a profile that READ the group (returned items) is a proven member
+          // -> remember it for next time. An auto-picked profile that read NOTHING (likely not a member) ->
+          // rotate to the next profile on the next run until a member is found.
+          if (items.length > 0) { __harvestWorkingProfileByGroup.set(pair.groupUrl, pair.profileId); }
+          else if (pair.autoPicked) {
+            __harvestProfileAttemptByGroup.set(pair.groupUrl, (__harvestProfileAttemptByGroup.get(pair.groupUrl) || 0) + 1);
+            if (__harvestWorkingProfileByGroup.get(pair.groupUrl) === pair.profileId) __harvestWorkingProfileByGroup.delete(pair.groupUrl);
+          }
+          logEvent("harvest_group_done", { profileId: pair.profileId, groupUrl: pair.groupUrl, got: items.length, autoPicked: pair.autoPicked });
         } catch (e) { logEvent("harvest_connector_error", { profileId: pair.profileId, error: oneLineField((e && e.message) || String(e), 160) }); }
         finally { try { if (release) release(); } catch (_) {} }
       }));
