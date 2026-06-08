@@ -24,6 +24,10 @@ const AUDIT_DIR = path.join(DATA_DIR, "audit");
 let __auditDateStr = "";
 let __auditFilePath = "";
 let __lastPerPostLogSweep = 0;
+// while a FORCED post-publish comment resweep runs, allow the (comment-only) external action even though a
+// run-limit auto-disarm just set armedForExternalActions=false — otherwise the just-made posts' first comments
+// get locked out ("External actions are locked") and the post stays permanently uncommented.
+let __forcedCommentResweepActive = false;
 const PER_POST_LOG_SWEEP_INTERVAL_MS = 6 * 3600 * 1000;
 const STATE_FILE = path.join(DATA_DIR, "workflow-state.json");
 const LOCAL_DB_DIR = path.join(DATA_DIR, "local-db");
@@ -9429,6 +9433,12 @@ function recordPublishedFacebookPostUrl(body) {
   const postedGroupUrl = facebookGroupUrlFromPostUrl(postUrl);
   const groupUrl = postedGroupUrl || suppliedGroupUrl;
   const state = readState();
+  if (postUrl && planId) {
+    // Fix B (URL-capture race guard): if a DIFFERENT plan already recorded this exact permalink, the capture
+    // grabbed a shared/stale URL -> log it LOUDLY so the bad URL is visible (resweep is now keyed by plan, not URL).
+    const prior = (state.posting.publishedPostUrls || "").split(/\r?\n/).slice(-200).find((l) => l.includes("post_url=" + postUrl) && /plan_id=/.test(l) && !l.includes("plan_id=" + planId));
+    if (prior) logEvent("facebook_post_url_collision_suspected", { postUrl, planId, alreadyRecordedForPlan: ((prior.match(/plan_id=([^|]+)/) || [])[1] || "?").trim() });
+  }
   const line = [
     at,
     "type=facebook_post_published",
@@ -12724,20 +12734,25 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       if (!options.force && !(state.operator?.autopilotEnabled && state.operator?.armedForExternalActions)) {
         return summary;
       }
+      if (options.force) __forcedCommentResweepActive = true; // Fix A: a forced post-publish resweep may comment despite the run-limit auto-disarm
       const windowMs = clampNumber(options.windowHours, 1, 168, 24) * 3600 * 1000;
       const cutoff = Date.now() - windowMs;
       const maxToFix = clampNumber(options.max, 1, 50, 10);
       const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 8000 });
-      const publishedByUrl = new Map();
+      const publishedByPlan = new Map();
       for (const r of rows) {
         if (!r || !r.postUrl) continue;
         const isPublished = /^published/.test(String(r.event || "")) || ["published", "published_with_warning", "published_after_admin_approval"].includes(String(r.status || ""));
         if (!isPublished) continue;
         const at = Date.parse(r.at || "") || 0;
         if (at && at < cutoff) continue;
-        publishedByUrl.set(r.postUrl, r); // keep the latest published row per permalink
+        // key by the UNIQUE plan identity (planId|sequence), NOT the permalink — otherwise two DIFFERENT posts
+        // that share a permalink (via the URL-capture race) collapse to one and the 2nd never gets commented (Fix B).
+        const planKey = r.planId ? String(r.planId) + "|" + String(r.sequence != null ? r.sequence : "") : "url:" + r.postUrl;
+        publishedByPlan.set(planKey, r); // keep the latest ledger row per plan
       }
-      for (const [postUrl, ev] of publishedByUrl) {
+      for (const ev of publishedByPlan.values()) {
+        const postUrl = ev.postUrl;
         // Bound by ATTEMPTS, not just successes: a post that can never be commented (no eligible
         // commenter) must not make every 90s sweep do full-cost recovery work against it.
         if (summary.recommented >= maxToFix || summary.checked >= maxToFix) break;
@@ -12772,6 +12787,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
     } catch (err) {
       summary.errors.push("fatal:" + oneLineField(err.message || String(err), 160));
     } finally {
+      __forcedCommentResweepActive = false;
       __lastCommentResweepAt = Date.now();
       __commentResweepInFlight = null;
     }
@@ -16143,6 +16159,9 @@ function sanitizeIxBrowserProfile(profile = {}) {
 }
 
 function requireExternalArmed() {
+  // a forced post-publish comment resweep is finishing the first-comments of posts ALREADY made this armed
+  // cycle — allow it through even though the run-limit auto-disarm just flipped the flag (see Fix A).
+  if (__forcedCommentResweepActive) return;
   if (!readState().operator.armedForExternalActions) {
     const err = new Error("External actions are locked. Arm external actions first.");
     err.statusCode = 409;
