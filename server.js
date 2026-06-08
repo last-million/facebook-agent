@@ -1473,6 +1473,11 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.harvestProfilesPerGroup = clampNumber(state.posting.contentSources.harvestProfilesPerGroup, 1, 6, 3); // # member profiles to harvest each group with IN PARALLEL (spreads load)
   if (typeof state.posting.contentSources.postCta !== "string") state.posting.contentSources.postCta = ""; // optional CTA line ABOVE the emoji+title+tags signature (blank = clean deal post)
   else state.posting.contentSources.postCta = state.posting.contentSources.postCta.slice(0, 300);
+  // RE-USE ROTATION knobs (dynamic): a posted harvested product becomes eligible again after reuseHours (so
+  // production never stalls when no fresh products); its image is kept for re-posting, then deleted after
+  // imageRetentionDays to free disk (the text+url record stays for dedup).
+  state.posting.contentSources.reuseHours = clampNumber(state.posting.contentSources.reuseHours, 1, 720, 26);
+  state.posting.contentSources.imageRetentionDays = clampNumber(state.posting.contentSources.imageRetentionDays, 1, 90, 7);
   // DISCONNECTED profiles (not logged into Facebook) — auto-parked here + SKIPPED by posting/harvest until
   // the admin re-logs them in and releases them from the Prod-tab "Disconnected profiles" section.
   if (!Array.isArray(state.posting.disconnectedProfiles)) state.posting.disconnectedProfiles = [];
@@ -2725,12 +2730,19 @@ function collectProductUrlsForPosting(state, options = {}) {
     .map((row) => row.url || row.productUrl)
     .filter(Boolean);
   if (latestOnly) return filterBlacklistedProducts(attachStoredProductTitles(uniqueProductUrls(candidates, state), titleMap), state, null, options);
-  // HARVESTED content sources (default OFF): inject UNPOSTED harvested products as synthetic url lines,
-  // FIRST so they post before web-discovery products. canonicalProduct accepts harvested:<hash> keys;
-  // posted ones drop out (their image is deleted). When the feature is off this list is empty.
-  const harvestedKeys = state.operator?.contentSourcesEnabled === true
-    ? readHarvestedProducts(state).filter((r) => r && !r.posted && r.imageLocalPath && r.firstCommentUrl).map((r) => r.productKey)
-    : [];
+  // HARVESTED content sources (default OFF): inject harvested products FIRST. TWO TIERS so production never
+  // stalls: (1) FRESH (never posted) first, then (2) RE-ELIGIBLE (last posted > reuseHours ago), OLDEST first
+  // (rotation order). Image must still be on disk. When the feature is off this list is empty.
+  let harvestedKeys = [];
+  if (state.operator?.contentSourcesEnabled === true) {
+    const recs = readHarvestedProducts(state);
+    const rh = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 26);
+    const onDisk = (r) => r && r.firstCommentUrl && r.imageLocalPath && !r.imageDeleted && fs.existsSync(safeProjectPath(r.imageLocalPath));
+    const lastMs = (r) => { const s = r.lastPostedAt || r.posted || ""; const t = s ? Date.parse(s) : 0; return Number.isFinite(t) ? t : 0; };
+    const fresh = recs.filter((r) => onDisk(r) && !(r.lastPostedAt || r.posted)).map((r) => r.productKey);
+    const reeligible = recs.filter((r) => onDisk(r) && (r.lastPostedAt || r.posted) && lastMs(r) > 0 && (Date.now() - lastMs(r)) >= rh * 3600 * 1000).sort((a, b) => lastMs(a) - lastMs(b)).map((r) => r.productKey);
+    harvestedKeys = [...fresh, ...reeligible];
+  }
   // EXCLUSIVE mode: post ONLY copied products (skip web-discovery products entirely). When off, copied
   // products are mixed in FIRST but web-discovery products still flow.
   const webDiscovery = state.operator?.contentSourcesExclusive === true ? [] : [
@@ -7562,7 +7574,13 @@ function productHasReadyAssets(product, state = readState(), reviewImages = null
   // link, and it has NOT been posted yet. No ShopYourLikes shortlink needed (link = the harvested url).
   if (String(product.key || "").startsWith("harvested:")) {
     const rec = harvestedRecordForKey(product.key, state);
-    if (!(rec && !rec.posted && rec.firstCommentUrl && rec.imageLocalPath && fs.existsSync(safeProjectPath(rec.imageLocalPath)))) return false;
+    if (!rec || !rec.firstCommentUrl || !rec.imageLocalPath || rec.imageDeleted || !fs.existsSync(safeProjectPath(rec.imageLocalPath))) return false;
+    // RE-USE WINDOW: ready if image-on-disk AND (never posted OR last post older than reuseHours). Lets a posted
+    // product rotate back in after reuseHours so production never stalls. (lastPostedAt||posted for back-compat.)
+    const reuseHours = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 26);
+    const lastTimeStr = rec.lastPostedAt || rec.posted || "";
+    const lastMs = lastTimeStr ? Date.parse(lastTimeStr) : 0;
+    if (lastMs && Number.isFinite(lastMs) && (Date.now() - lastMs) < reuseHours * 3600 * 1000) return false;
     // SKIP junk-text products: the extractor sometimes grabbed the comment-sort header ("Most relevant" /
     // "Plus pertinents") instead of the product caption -> don't post those.
     const title = cleanHarvestedPostText(rec.text || "");
@@ -7841,7 +7859,7 @@ async function harvestContentSourcesAsync(options = {}) {
     const a = auto ? harvestAutoReserves(state) : null;
     const reserveTarget = auto ? a.target : clampNumber(cs.reserveTarget, 1, 5000, 20);
     const reserveRefillAt = auto ? a.refillAt : clampNumber(cs.reserveRefillAt, 0, Math.max(0, reserveTarget - 1), 10);
-    const reserve = readHarvestedProducts(state).filter((r) => r && !r.posted && r.imageLocalPath && r.firstCommentUrl).length;
+    const reserve = readHarvestedProducts(state).filter((r) => r && r.productKey && productHasReadyAssets({ key: r.productKey }, state)).length; // FRESH + re-eligible (single source of truth)
     if (reserve >= reserveTarget) __harvestReservePaused = true;
     if (reserve <= reserveRefillAt) __harvestReservePaused = false;
     if (__harvestReservePaused) { __harvestNextAt = Date.now() + 900000; logEvent("harvest_reserve_satisfied", { reserve, target: reserveTarget }); return { reserveSatisfied: reserve }; } // reserve full -> re-check the groups for NEW listings in 15 min
@@ -7898,11 +7916,12 @@ async function harvestContentSourcesAsync(options = {}) {
               // Already tracked = duplicate. DEDUP — EXCEPT: if it was POSTED >= 10 days ago AND is re-found
               // in the source group now, RE-ENABLE it for ONE more post (the connector already re-downloaded
               // its image). Re-posting will set posted again, restarting the 10-day clock.
-              if (!existing.posted) { skippedSeen++; continue; } // unposted: already pending, skip
-              const ageMs = Date.now() - Date.parse(existing.posted || "");
+              const lastT = existing.lastPostedAt || existing.posted || "";
+              if (!lastT) { skippedSeen++; continue; } // unposted: already pending, skip
+              const ageMs = Date.now() - Date.parse(lastT);
               if (!(Number.isFinite(ageMs) && ageMs >= 10 * 86400000)) { skippedSeen++; continue; } // posted < 10 days: skip
-              updateHarvestedProductRecord(existing.productKey, { posted: "", imageDeleted: false, imageLocalPath: rel, text: it.text, harvestedAt: new Date().toISOString(), reusedAt: new Date().toISOString() }, readState());
-              existing.posted = ""; reusedOld++;
+              updateHarvestedProductRecord(existing.productKey, { lastPostedAt: "", posted: "", postedCount: 0, imageDeleted: false, imageLocalPath: rel, text: it.text, harvestedAt: new Date().toISOString(), reusedAt: new Date().toISOString() }, readState());
+              existing.lastPostedAt = ""; existing.posted = ""; reusedOld++;
               continue;
             }
             const persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId }, readState());
@@ -8238,6 +8257,39 @@ let __autopilotLastDecision = null;
 let __autopilotSchedulerTimer = null;
 let __autopilotDiscoveryInFlight = false;
 let __autopilotLastDiscoveryAt = 0;
+let __harvestedImageSweepInFlight = false;
+let __lastHarvestedImageSweepAt = 0;
+// IMAGE RETENTION sweep: delete harvested images older than contentSources.imageRetentionDays to free disk
+// (keeps the text+url record for dedup; the product then drops out of the re-use rotation). Single-flight.
+async function sweepHarvestedImagesAsync() {
+  if (__harvestedImageSweepInFlight) return { skipped: "in_flight" };
+  __harvestedImageSweepInFlight = true;
+  try {
+    const state = readState();
+    const retentionDays = clampNumber(state.posting?.contentSources?.imageRetentionDays, 1, 90, 7);
+    const cutoffMs = retentionDays * 86400 * 1000;
+    const now = Date.now();
+    let deleted = 0, errors = 0;
+    for (const rec of readHarvestedProducts(state)) {
+      if (!rec || !rec.imageLocalPath || rec.imageDeleted) continue;
+      const h = Date.parse(rec.harvestedAt || "");
+      if (!Number.isFinite(h) || (now - h) < cutoffMs) continue; // keys on harvest age, not last-post
+      try {
+        const fp = safeProjectPath(rec.imageLocalPath);
+        if (fs.existsSync(fp)) { fs.unlinkSync(fp); deleted += 1; }
+        updateHarvestedProductRecord(rec.productKey, { imageDeleted: true }, state);
+      } catch (e) { errors += 1; logEvent("harvested_image_cleanup_error", { productKey: rec.productKey, error: oneLineField(e.message || String(e), 140) }); }
+    }
+    if (deleted || errors) logEvent("harvested_images_swept", { deletedCount: deleted, errorCount: errors, retentionDays });
+    return { ok: true, deletedCount: deleted, errorCount: errors };
+  } catch (err) {
+    logEvent("harvested_image_sweep_error", { error: oneLineField(err.message || String(err), 200) });
+    return { ok: false, error: String((err && err.message) || err) };
+  } finally {
+    __harvestedImageSweepInFlight = false;
+    __lastHarvestedImageSweepAt = Date.now();
+  }
+}
 // Keep production posting unblocked by the fresh-discovery / latest-run asserts:
 // refresh candidates with the fast HTTP discovery (no browser) when stale, and
 // re-stamp still-live existing candidates into the latest run. Throttled +
@@ -8359,6 +8411,12 @@ async function autopilotTickAsync(options = {}) {
     if (!dryRun && state.operator?.contentSourcesEnabled === true && state.operator?.armedForExternalActions
         && !__harvestSourcesInFlight && Date.now() >= __harvestNextAt) {
       harvestContentSourcesAsync({}).catch(() => {});
+    }
+    // IMAGE RETENTION sweep: once/hour, single-flight, fire-and-forget — frees disk of harvested images older
+    // than imageRetentionDays. Never overlaps posting (the tick is single-flight).
+    if (!dryRun && state.operator?.contentSourcesEnabled === true && state.operator?.armedForExternalActions
+        && !__harvestedImageSweepInFlight && (Date.now() - __lastHarvestedImageSweepAt) >= 3600000) {
+      sweepHarvestedImagesAsync().catch((err) => logEvent("autopilot_harvested_image_sweep_error", { error: oneLineField(err.message || String(err), 160) }));
     }
     if (!scheduleOpen || capacity.totalRemaining <= 0) {
       decision.action = "prepare_tomorrow";
@@ -9560,13 +9618,15 @@ function recordPublishedFacebookPostUrl(body) {
   // record-post-url endpoint. (Recording the wrong row's product was the duplicate-post bug.)
   const row = (body.row && typeof body.row === "object") ? body.row : postingPlanRowForRecord(body);
   if (row) markLivePostedRegisters(row, postUrl);
-  // HARVESTED product just posted -> DELETE the downloaded image to save HDD, but KEEP its text+url forever
-  // (the record stays with posted set, so the harvester's url-dedup never re-fetches it).
+  // HARVESTED product just posted -> KEEP the image so it can be RE-USED after contentSources.reuseHours
+  // (production never stalls when no fresh products). Record lastPostedAt + bump postedCount; clear the legacy
+  // `posted` flag. The image is freed later by the imageRetentionDays sweep (sweepHarvestedImagesAsync).
   if (row && String(row.productKey || "").startsWith("harvested:")) {
     try {
-      if (row.image) { const ip = safeProjectPath(row.image); if (fs.existsSync(ip)) { fs.unlinkSync(ip); logEvent("harvested_image_deleted", { productKey: row.productKey, image: row.image }); } }
-    } catch (e) { logEvent("harvested_image_deletion_error", { productKey: row.productKey, error: oneLineField(e.message || String(e), 140) }); }
-    try { updateHarvestedProductRecord(row.productKey, { posted: new Date().toISOString(), imageDeleted: true, postUrl: String(postUrl || "") }); } catch (_) {}
+      const __prevRec = harvestedRecordForKey(row.productKey, state) || {};
+      updateHarvestedProductRecord(row.productKey, { lastPostedAt: new Date().toISOString(), postedCount: (Number(__prevRec.postedCount) || 0) + 1, postUrl: String(postUrl || ""), posted: "" });
+      logEvent("harvested_post_recorded_reuse_eligible", { productKey: row.productKey, postedCount: (Number(__prevRec.postedCount) || 0) + 1 });
+    } catch (_) {}
   }
   logEvent("facebook_post_url_recorded", { planId, profile, groupUrl, postUrl });
   return {
@@ -17047,7 +17107,8 @@ const server = http.createServer(async (req, res) => {
       text: r.text || "",
       sourceGroupUrl: r.sourceGroupUrl || "",
       harvestedAt: r.harvestedAt || "",
-      posted: r.posted || "",
+      posted: r.lastPostedAt || r.posted || "",
+      postedCount: Number(r.postedCount) || 0,
       postUrl: r.postUrl || "",
       imageDeleted: !!r.imageDeleted,
       hasImage: Boolean(r.imageLocalPath && !r.imageDeleted && (() => { try { return fs.existsSync(safeProjectPath(r.imageLocalPath)); } catch { return false; } })()),
@@ -17057,7 +17118,8 @@ const server = http.createServer(async (req, res) => {
     const autoR = csCfg.reserveAuto !== false;
     const ar = autoR ? harvestAutoReserves(st) : null;
     const target = autoR ? ar.target : clampNumber(csCfg.reserveTarget, 1, 5000, 20);
-    const readyCount = rows.filter((r) => !r.posted && r.hasImage).length;
+    const reuseH = clampNumber(csCfg.reuseHours, 1, 720, 26);
+    const readyCount = rows.filter((r) => r.hasImage && (!r.posted || (() => { const t = Date.parse(r.posted); return Number.isFinite(t) && (Date.now() - t) >= reuseH * 3600000; })())).length; // FRESH + re-eligible
     const pct = target > 0 ? Math.min(100, Math.round((readyCount / target) * 100)) : 0;
     return json(res, 200, { harvested: rows, total: rows.length, reserve: { ready: readyCount, target, pct, full: readyCount >= target } });
   }

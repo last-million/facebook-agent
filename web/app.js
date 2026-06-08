@@ -1581,6 +1581,8 @@ function renderState(state) {
   setValue("contentSourcesReserveRefillAt", state.posting.contentSources?.reserveRefillAt);
   setValue("contentSourcesProfilesPerGroup", state.posting.contentSources?.harvestProfilesPerGroup);
   setValue("contentSourcesPostCta", state.posting.contentSources?.postCta);
+  setValue("contentSourcesReuseHours", state.posting.contentSources?.reuseHours);
+  setValue("contentSourcesImageRetentionDays", state.posting.contentSources?.imageRetentionDays);
   setValue("contentSourceGroupsText", state.posting.contentSources?.groupsText);
   setValue("contentSourcesNotes", state.posting.contentSources?.notes);
   renderGroupAssignmentBuilder();
@@ -2340,6 +2342,8 @@ function collectState() {
       reserveRefillAt: Number(getValue("contentSourcesReserveRefillAt")) || 10,
       harvestProfilesPerGroup: Number(getValue("contentSourcesProfilesPerGroup")) || 3,
       postCta: getValue("contentSourcesPostCta"),
+      reuseHours: Number(getValue("contentSourcesReuseHours")) || 26,
+      imageRetentionDays: Number(getValue("contentSourcesImageRetentionDays")) || 7,
       groupsText: getValue("contentSourceGroupsText"),
       notes: getValue("contentSourcesNotes"),
     },
