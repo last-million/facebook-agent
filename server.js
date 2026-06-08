@@ -40,7 +40,10 @@ const HERMES_BIN = "/root/.local/bin/hermes";
 const WSL_PROJECT = "/mnt/c/Users/Administrator/Desktop/facbeook agent";
 const MAX_JOB_OUTPUT = 120000;
 const MAX_EVENTS_BYTES = 500000;
-const MAX_CONCURRENT_NORMAL_IX_PROFILES = 4;
+// ADAPTIVE to the machine: cores - 2 (leaves headroom for the OS + node + the Pinterest agent), min 4, max 12.
+// e.g. 9 vCPU -> 7 concurrent posting profiles (was a flat 4). The CPU governor (waitForCpuHeadroom) still
+// self-throttles BELOW this whenever the box is actually busy, so this is a safe ceiling, not a fixed load.
+const MAX_CONCURRENT_NORMAL_IX_PROFILES = Math.max(4, Math.min(12, ((os.cpus() || []).length || 4) - 2));
 const MAX_COMMENT_FALLBACK_PROFILES = 6;
 const FACEBOOK_LIVE_POST_TIMEOUT_MS = 600000;
 const FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS = 360000;
