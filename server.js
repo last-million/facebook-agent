@@ -14874,9 +14874,10 @@ async function reconcileProfilesWithIxBrowser(options = {}) {
       if (streak >= RECONCILE_REMOVAL_STREAK_REQUIRED) {
         const removedFromRoster = reconcileRemoveProfileFromRoster(state, id);
         reconcileClearGoneProfileBlacklist(state, id, label);
-        // profile removed from ixBrowser -> also clear ANY parked entry (suspended / errored / disconnected) so
-        // re-adding a NEW account (even with the SAME name -> new ix id) starts fresh, never inheriting the old block.
-        state.posting.suspendedProfiles = (state.posting.suspendedProfiles || []).filter((p) => String(p.profileId) !== String(id));
+        // profile removed from ixBrowser -> clear the SOFTER parked entries (errored / disconnected) so re-adding
+        // a NEW account (even same name -> new ix id) starts fresh. SUSPENDED is KEPT STICKY: a genuine suspension
+        // must stay visible + blocked until the ADMIN releases it, and a transient reconcile false-GONE (e.g. during
+        // a restart/cleanup) must NEVER silently drop it. The admin uses Release to clear one they actually replaced.
         state.posting.erroredProfiles = (state.posting.erroredProfiles || []).filter((p) => String(p.profileId) !== String(id));
         state.posting.disconnectedProfiles = (state.posting.disconnectedProfiles || []).filter((p) => String(p.profileId) !== String(id));
         dirty = true;
