@@ -1919,6 +1919,7 @@ function appendHarvestedProduct(record, state = readState()) {
     text: String(record.text || "").slice(0, 4000),
     imageLocalPath: String(record.imageLocalPath || ""),
     sourceGroupUrl: String(record.sourceGroupUrl || ""),
+    postId: String(record.postId || ""),
     harvestedAt: new Date().toISOString(),
     posted: "",
     imageDeleted: false,
@@ -7568,12 +7569,12 @@ let __assetBufferFillInFlight = null;
 // prod and test (both consume the same ready buffer).
 // ===== CONTENT-SOURCE HARVEST (default OFF) =====================================================
 // Spawn the connector in READ-ONLY harvestOnly mode for ONE group/profile; return its parsed items[].
-async function runHarvestConnector(groupUrl, profileId, harvestCount) {
+async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {}) {
   const scriptPath = liveFacebookPostingScriptPath();
   const payloadDir = path.join(DATA_DIR, "harvest-requests");
   fs.mkdirSync(payloadDir, { recursive: true });
   const payloadPath = path.join(payloadDir, `harvest-${Date.now()}-${crypto.randomBytes(5).toString("hex")}.json`);
-  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4) }));
+  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4), harvestSeenIds: (opts.seenIds || []).slice(0, 2000), harvestProfileIndex: Number(opts.profileIndex || 0), harvestProfileCount: Number(opts.profileCount || 1) }));
   try {
     const { stdout } = await execFileAsync("node", [scriptPath, payloadPath], { cwd: ROOT, windowsHide: true, timeout: 6 * 60 * 1000, maxBuffer: 24 * 1024 * 1024 });
     const objs = parseJsonLogObjects(stdout);
@@ -7621,7 +7622,7 @@ async function harvestContentSourcesAsync(options = {}) {
     const reserve = readHarvestedProducts(state).filter((r) => r && !r.posted && r.imageLocalPath && r.firstCommentUrl).length;
     if (reserve >= reserveTarget) __harvestReservePaused = true;
     if (reserve <= reserveRefillAt) __harvestReservePaused = false;
-    if (__harvestReservePaused) { __harvestNextAt = Date.now() + 60000; logEvent("harvest_reserve_satisfied", { reserve, target: reserveTarget }); return { reserveSatisfied: reserve }; }
+    if (__harvestReservePaused) { __harvestNextAt = Date.now() + 900000; logEvent("harvest_reserve_satisfied", { reserve, target: reserveTarget }); return { reserveSatisfied: reserve }; } // reserve full -> re-check the groups for NEW listings in 15 min
     const effectiveTarget = reserveTarget;
     const lines = recordLines(state.posting?.contentSources?.groupsText);
     const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
@@ -7632,7 +7633,7 @@ async function harvestContentSourcesAsync(options = {}) {
       if (!m) continue;
       const groupUrl = m[1];
       const pidMatch = String(line).match(/[|@]\s*(\d{1,6})/); // OPTIONAL "url | profileId" pin
-      if (pidMatch) { pairs.push({ groupUrl, profileId: Number(pidMatch[1]), pinned: true }); continue; }
+      if (pidMatch) { pairs.push({ groupUrl, profileId: Number(pidMatch[1]), pinned: true, profileIndex: 0, profileCount: 1 }); continue; }
       // AUTOMATIC + MULTI-PROFILE: known members first (up to perGroup-1), always keep >=1 slot exploring NEW profiles
       // so it keeps discovering members even when all known ones are momentarily throttled.
       const memberSet = __harvestWorkingProfilesByGroup.get(groupUrl) || new Set();
@@ -7645,10 +7646,12 @@ async function harvestContentSourcesAsync(options = {}) {
         if (!chosen.includes(pid)) chosen.push(pid);
       }
       __harvestProfileAttemptByGroup.set(groupUrl, attempt);
-      for (const pid of chosen) pairs.push({ groupUrl, profileId: pid, autoPicked: !memberSet.has(pid) });
+      chosen.forEach((pid, idx) => pairs.push({ groupUrl, profileId: pid, autoPicked: !memberSet.has(pid), profileIndex: idx, profileCount: chosen.length }));
     }
     if (!pairs.length) { __harvestNextAt = Date.now() + 300000; return { groups: 0 }; }
-    const existingByUrl = new Map(readHarvestedProducts(state).map((r) => [String(r.firstCommentUrl || ""), r]));
+    const allRecs = readHarvestedProducts(state);
+    const existingByUrl = new Map(allRecs.map((r) => [String(r.firstCommentUrl || ""), r]));
+    const seenPostIds = allRecs.map((r) => String(r.postId || "")).filter(Boolean); // tiles already scraped -> skip + continue from last
     let harvestedNew = 0, skippedSeen = 0, reusedOld = 0;
     const harvestCount = clampNumber(options.harvestCount || (effectiveTarget - reserve), 1, 20, 4); // grab the GAP toward the (day or night) target in one harvest (capped at 20/session)
     for (let i = 0; i < pairs.length; i += 4) { // 4-by-4
@@ -7662,7 +7665,7 @@ async function harvestContentSourcesAsync(options = {}) {
         try { release = acquireNormalIxProfileUse(pair.profileId, "facebook_harvest"); }
         catch (e) { logEvent("harvest_profile_busy_skipped", { profileId: pair.profileId }); return; } // posting/discovery owns it -> skip
         try {
-          const items = await runHarvestConnector(pair.groupUrl, pair.profileId, harvestCount);
+          const items = await runHarvestConnector(pair.groupUrl, pair.profileId, harvestCount, { seenIds: seenPostIds, profileIndex: pair.profileIndex || 0, profileCount: pair.profileCount || 1 });
           for (const it of items) {
             const url = String(it.link || "").trim();
             if (!url) continue;
@@ -7680,7 +7683,7 @@ async function harvestContentSourcesAsync(options = {}) {
               existing.posted = ""; reusedOld++;
               continue;
             }
-            const persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl }, readState());
+            const persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId }, readState());
             if (persisted) { existingByUrl.set(url, { firstCommentUrl: url, posted: "" }); harvestedNew++; }
           }
           // AUTO-LEARN the member profile: a profile that READ the group (returned items) is a proven member
@@ -7700,8 +7703,8 @@ async function harvestContentSourcesAsync(options = {}) {
       if (i + 4 < pairs.length) await sleep(clampNumber(options.interRoundGapMs || 25000, 5000, 120000, 25000)); // anti-throttle pacing
     }
     // RE-SCAN cadence: drain fast when producing; re-scan ~every minute when idle; back off when long-exhausted.
-    if ((harvestedNew + reusedOld) > 0) { __harvestEmptyRounds = 0; __harvestNextAt = Date.now(); }
-    else { __harvestEmptyRounds += 1; __harvestNextAt = Date.now() + (__harvestEmptyRounds >= 30 ? 300000 : 60000); }
+    if ((harvestedNew + reusedOld) > 0) { __harvestEmptyRounds = 0; __harvestNextAt = Date.now(); } // got new -> immediately keep draining the remaining UNSEEN tiles
+    else { __harvestEmptyRounds += 1; __harvestNextAt = Date.now() + 900000; } // nothing new (all seen) -> re-check the groups for NEW listings in 15 min
     logEvent("harvest_round", { groups: pairs.length, harvestedNew, reusedOld, skippedSeen, emptyRounds: __harvestEmptyRounds, nextInSec: Math.round((__harvestNextAt - Date.now()) / 1000) });
     return { groups: pairs.length, harvestedNew, reusedOld, skippedSeen };
   })().catch((e) => { logEvent("harvest_sources_error", { error: oneLineField((e && e.message) || String(e), 200) }); __harvestNextAt = Date.now() + 120000; return { error: true }; })

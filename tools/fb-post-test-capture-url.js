@@ -3030,7 +3030,7 @@ async function approvePendingPost(page, context, payload, gid, marker) {
 
 // HARVEST: read a SOURCE group's /media grid, open the first N media posts, and extract each post's
 // TEXT + IMAGE + the LINK in its first comment. READ-ONLY (never posts/comments). Returns [{href,text,image,link}].
-async function harvestGroupFeed(page, count) {
+async function harvestGroupFeed(page, count, opts = {}) {
   const out = [];
   const seenLinks = new Set(); // dedup harvested PRODUCTS by their first-comment URL (each product = unique url)
   await page.waitForTimeout(3000);
@@ -3069,8 +3069,15 @@ async function harvestGroupFeed(page, count) {
   });
   console.log(JSON.stringify({ step: 'harvest_media_links', found: collected.found, sample: collected.items.slice(0, 6).map((l) => l.href.slice(0, 90)) }));
   const links = collected.items;
-  for (let i = 0; i < links.length && out.length < count; i++) {
-    const item = links[i];
+  const seenIds = new Set((opts.seenIds || []).map(String));
+  const pIndex = Number(opts.profileIndex || 0), pCount = Math.max(1, Number(opts.profileCount || 1));
+  // skip tiles already scraped (continue from where we left off), then PARTITION the unseen tiles among the
+  // N parallel profiles so each profile takes DIFFERENT products (no overlap, ~Nx faster).
+  let work = links.filter((it) => !seenIds.has(String(it.postId)));
+  if (pCount > 1) work = work.filter((_, idx) => (idx % pCount) === pIndex);
+  console.log(JSON.stringify({ step: 'harvest_partition', total: links.length, mine: work.length, profileIndex: pIndex, profileCount: pCount }));
+  for (let i = 0; i < work.length && out.length < count; i++) {
+    const item = work[i];
     try {
       await page.goto(item.href, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await page.waitForTimeout(3500);
@@ -3145,7 +3152,7 @@ async function harvestGroupFeed(page, count) {
           }
         } catch (e) { console.log(JSON.stringify({ step: 'harvest_image_download_failed', error: String((e && e.message) || e).slice(0, 140) })); }
       }
-      out.push({ href: item.href, productKey: dkey, imageLocalPath, ...data });
+      out.push({ href: item.href, postId: item.postId, productKey: dkey, imageLocalPath, ...data });
       console.log(JSON.stringify({ step: 'harvest_item', n: out.length, textLen: (data.text || '').length, textPreview: (data.text || '').slice(0, 100), imageSaved: !!imageLocalPath, link: data.link, key: dkey }));
     } catch (e) {
       console.log(JSON.stringify({ step: 'harvest_item_error', href: item.href.slice(0, 120), error: String((e && e.message) || e).slice(0, 160) }));
@@ -3328,7 +3335,7 @@ async function main() {
     const harvestCount = Math.max(1, Math.min(20, Number(payload.harvestCount || 4)));
     console.log(JSON.stringify({ step: 'harvest_started', mediaUrl: targetUrl, count: harvestCount }));
     let harvested = [];
-    try { harvested = await harvestGroupFeed(page, harvestCount); }
+    try { harvested = await harvestGroupFeed(page, harvestCount, { seenIds: payload.harvestSeenIds || [], profileIndex: payload.harvestProfileIndex || 0, profileCount: payload.harvestProfileCount || 1 }); }
     catch (e) { console.log(JSON.stringify({ step: 'harvest_error', error: String((e && e.message) || e).slice(0, 300) })); }
     console.log(JSON.stringify({ step: 'harvest_result', count: harvested.length, items: harvested }));
     return; // the finally block closes the browser
