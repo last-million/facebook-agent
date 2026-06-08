@@ -1473,6 +1473,13 @@ function normalizeWorkflowState(state) {
     .filter((p) => p && (p.profileId || p.profile_id))
     .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200) }))
     .slice(0, 1000);
+  // ERRORED profiles (Facebook ACCOUNT error: identity-confirm/checkpoint/restricted/page-identity) —
+  // auto-parked + SKIPPED until the admin fixes the account and releases it from the Prod-tab section.
+  if (!Array.isArray(state.posting.erroredProfiles)) state.posting.erroredProfiles = [];
+  state.posting.erroredProfiles = state.posting.erroredProfiles
+    .filter((p) => p && (p.profileId || p.profile_id))
+    .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200) }))
+    .slice(0, 1000);
   state.operator = state.operator || {};
   state.operator.contentSourcesEnabled = state.posting.contentSources.enabled === true;
   state.operator.contentSourcesExclusive = state.posting.contentSources.enabled === true && state.posting.contentSources.exclusive === true;
@@ -1971,7 +1978,38 @@ function releaseDisconnectedProfile(profileId) {
 }
 // FB "not logged in" / login-wall / session-expired signal (distinct from a group/membership issue).
 function isFacebookNotLoggedInError(message) {
-  return /not logged in|logged out|log in to|login required|session expired|please log in|enter your password|manual login (timed out|required)|facebook login|login wall|logged_out|not_logged_in|checkpoint\/(?:disabled|appeal|blocked)/i.test(String(message || ""));
+  return /not logged in|logged out|log in to|login required|session expired|please log in|enter your password|manual login (timed out|required)|facebook login|login wall|logged_out|not_logged_in/i.test(String(message || ""));
+}
+function erroredProfileIdSet(state = readState()) {
+  return new Set((state.posting?.erroredProfiles || []).map((p) => String(p.profileId || "")));
+}
+function markProfileErrored(profileId, label, reason) {
+  const id = String(profileId || "").replace(/\D+/g, "");
+  if (!id) return false;
+  const state = readState();
+  const list = Array.isArray(state.posting.erroredProfiles) ? state.posting.erroredProfiles : [];
+  if (list.some((p) => String(p.profileId) === id)) return false; // already parked
+  list.push({ profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "Facebook account error").slice(0, 200) });
+  state.posting.erroredProfiles = list;
+  writeState(state);
+  logEvent("profile_account_error_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
+  return true;
+}
+// release a profile from EITHER parked list (login-disconnected OR account-error).
+function releaseParkedProfile(profileId) {
+  const id = String(profileId || "").replace(/\D+/g, "");
+  const state = readState();
+  const d0 = (state.posting.disconnectedProfiles || []).length, e0 = (state.posting.erroredProfiles || []).length;
+  state.posting.disconnectedProfiles = (state.posting.disconnectedProfiles || []).filter((p) => String(p.profileId) !== id);
+  state.posting.erroredProfiles = (state.posting.erroredProfiles || []).filter((p) => String(p.profileId) !== id);
+  if (state.posting.disconnectedProfiles.length !== d0 || state.posting.erroredProfiles.length !== e0) { writeState(state); logEvent("profile_released_reconnected", { profileId: id }); return true; }
+  return false;
+}
+// FB profile needs ADMIN ATTENTION — content/group ACCESS lost ("This content isn't available right now" =
+// not a member anymore / group changed / deleted) OR ACCOUNT error (identity confirm / checkpoint / restricted).
+function isFacebookAccountError(message) {
+  // .? after isn / it / can absorbs the apostrophe (straight ' OR Facebook's curly ’) or none.
+  return /content isn.?t available|this content isn.?t avail|isn.?t available right now|owner only shared|changed who can see|it.?s been deleted|this page isn.?t available|confirm your identity|publish as this page|checkpoint\/(?:disabled|appeal|blocked)|temporarily (blocked|restricted|unavailable)|account (restricted|disabled|locked|review)|verify your (account|identity)|we limit how often|suspicious (activity|login)|community standards|your account has been|action blocked|you can.?t use this feature/i.test(String(message || ""));
 }
 
 function appendJsonlAbsoluteFile(filePath, row) {
@@ -6981,7 +7019,7 @@ function shuffledCopy(items = []) {
 
 function postingSlots(state) {
   const slots = [];
-  const __disconnectedIds = disconnectedProfileIdSet(state); // skip not-logged-into-FB (parked) profiles
+  const __disconnectedIds = disconnectedProfileIdSet(state); const __erroredIds = erroredProfileIdSet(state); // skip parked profiles (not-logged-in OR account/access error)
   const postsPerProfile = clampNumber(state.rules.postsPerProfilePerDay, 1, 20, 5);
   const maxProfilesPerRun = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 1000000, 100000);
   const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
@@ -7023,7 +7061,7 @@ function postingSlots(state) {
         const label = String(profile || "").trim();
         if (!label) continue;
         const profileId = profileIdFromLabel(label);
-        if (__disconnectedIds.has(String(profileId))) continue; // not logged into Facebook -> parked + skipped until the admin releases it
+        if (__disconnectedIds.has(String(profileId)) || __erroredIds.has(String(profileId))) continue; // parked (not logged in / account-access error) -> skipped until the admin releases it
         if (isDedicatedShopYourLikesProfileLabel(label, state)) continue;
         if (isBlockedIxBrowserProfileLabel(label, state)) continue;
         if (isFacebookProfileQuarantinedForFacebook(label, state, groupUrl)) continue;
@@ -8451,7 +8489,9 @@ async function autopilotTickAsync(options = {}) {
     // AUTO-PARK profiles that failed because they're NOT LOGGED INTO FACEBOOK -> skipped until the admin
     // re-logs them in and releases them from the Prod-tab "Disconnected profiles" section.
     for (const oc of decision.outcomes || []) {
-      if (oc && !oc.ok && isFacebookNotLoggedInError(oc.error)) markProfileDisconnected(oc.profileId, oc.profile, oc.error);
+      if (!oc || oc.ok) continue;
+      if (isFacebookNotLoggedInError(oc.error)) markProfileDisconnected(oc.profileId, oc.profile, oc.error); // not logged in
+      else if (isFacebookAccountError(oc.error)) markProfileErrored(oc.profileId, oc.profile, oc.error); // account/access error ("content isn't available", identity, checkpoint...)
     }
     decision.action = "published";
     __autopilotLastDecision = decision;
@@ -16893,10 +16933,14 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/profiles/disconnected") {
     return json(res, 200, { disconnected: (readState().posting?.disconnectedProfiles || []) });
   }
+  if (req.method === "GET" && url.pathname === "/api/profiles/errored") {
+    return json(res, 200, { errored: (readState().posting?.erroredProfiles || []) });
+  }
   if (req.method === "POST" && url.pathname === "/api/profiles/release") {
     const id = url.searchParams.get("profileId") || "";
-    const ok = releaseDisconnectedProfile(id);
-    return json(res, 200, { ok, profileId: id, disconnected: (readState().posting?.disconnectedProfiles || []) });
+    const ok = releaseParkedProfile(id); // clears EITHER parked list (login-disconnected or account/access error)
+    const stx = readState();
+    return json(res, 200, { ok, profileId: id, disconnected: (stx.posting?.disconnectedProfiles || []), errored: (stx.posting?.erroredProfiles || []) });
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/disconnect") {
     const id = url.searchParams.get("profileId") || "";

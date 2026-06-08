@@ -876,6 +876,18 @@
             <div id="disconnectedProfilesList"><div style="opacity:.6">No disconnected profiles — all accounts logged in. ✓</div></div>
           </section>
 
+          <section class="panel wide prodStep" data-view="prod" data-prod-step="2f">
+            <div class="panelHead">
+              <div>
+                <span class="stepBadge">Profiles</span>
+                <h2>Account / access errors <span class="badge" data-tone="muted" id="erroredProfilesCount">0</span></h2>
+                <p>Profiles whose Facebook hit an <b>account / access error</b> — e.g. <i>"This content isn't available right now"</i> (lost group access / group changed or deleted), identity check, or checkpoint — are auto-parked here and <b>skipped</b>. Fix the account (re-join the group / clear the checkpoint), then click <b>Release</b>.</p>
+              </div>
+              <button id="refreshErroredBtn" type="button">Refresh</button>
+            </div>
+            <div id="erroredProfilesList"><div style="opacity:.6">No profiles with account errors. ✓</div></div>
+          </section>
+
           <section class="panel wide prodStep" data-view="prod" data-prod-step="3">
             <div class="panelHead">
               <div>
