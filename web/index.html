@@ -857,6 +857,25 @@
             </div>
           </div>
 
+          <style>
+            .discRow{display:flex;align-items:center;gap:10px;justify-content:space-between;border:1px solid #5b2f2f;background:#1a1414;border-radius:9px;padding:8px 12px;margin-top:6px}
+            .discRow .di-info{font-size:.85rem}
+            .discRow .di-id{color:#ff9b9b;font-weight:600}
+            .discRow .di-meta{opacity:.7;font-size:.74rem}
+            .discRow button{background:#2f5b41;border-color:#3a6b4e}
+          </style>
+          <section class="panel wide prodStep" data-view="prod" data-prod-step="2e">
+            <div class="panelHead">
+              <div>
+                <span class="stepBadge">Profiles</span>
+                <h2>Disconnected profiles <span class="badge" data-tone="muted" id="disconnectedProfilesCount">0</span></h2>
+                <p>Accounts <b>not logged into Facebook</b> are auto-parked here and <b>skipped</b> by posting + harvesting. Log them back in (in ixBrowser), then click <b>Release</b> to put them back in rotation.</p>
+              </div>
+              <button id="refreshDisconnectedBtn" type="button">Refresh</button>
+            </div>
+            <div id="disconnectedProfilesList"><div style="opacity:.6">No disconnected profiles — all accounts logged in. ✓</div></div>
+          </section>
+
           <section class="panel wide prodStep" data-view="prod" data-prod-step="3">
             <div class="panelHead">
               <div>

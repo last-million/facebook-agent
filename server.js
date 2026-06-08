@@ -1466,6 +1466,13 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.harvestProfilesPerGroup = clampNumber(state.posting.contentSources.harvestProfilesPerGroup, 1, 6, 3); // # member profiles to harvest each group with IN PARALLEL (spreads load)
   if (typeof state.posting.contentSources.postCta !== "string") state.posting.contentSources.postCta = ""; // optional CTA line ABOVE the emoji+title+tags signature (blank = clean deal post)
   else state.posting.contentSources.postCta = state.posting.contentSources.postCta.slice(0, 300);
+  // DISCONNECTED profiles (not logged into Facebook) — auto-parked here + SKIPPED by posting/harvest until
+  // the admin re-logs them in and releases them from the Prod-tab "Disconnected profiles" section.
+  if (!Array.isArray(state.posting.disconnectedProfiles)) state.posting.disconnectedProfiles = [];
+  state.posting.disconnectedProfiles = state.posting.disconnectedProfiles
+    .filter((p) => p && (p.profileId || p.profile_id))
+    .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200) }))
+    .slice(0, 1000);
   state.operator = state.operator || {};
   state.operator.contentSourcesEnabled = state.posting.contentSources.enabled === true;
   state.operator.contentSourcesExclusive = state.posting.contentSources.enabled === true && state.posting.contentSources.exclusive === true;
@@ -1932,6 +1939,39 @@ function updateHarvestedProductRecord(key, patch, state = readState()) {
   if (!rec) return false;
   // append the MERGED record (latest-wins on read) — never rewrites the whole file, so nothing can be lost
   return appendHarvestedProductLine(file, Object.assign({}, rec, patch || {}));
+}
+
+// DISCONNECTED (not-logged-into-Facebook) profiles: parked + skipped by posting/harvest until the admin
+// re-logs them in and releases them from the Prod-tab section.
+function disconnectedProfileIdSet(state = readState()) {
+  return new Set((state.posting?.disconnectedProfiles || []).map((p) => String(p.profileId || "")));
+}
+function isProfileDisconnected(profileId, state = readState()) {
+  return disconnectedProfileIdSet(state).has(String(profileId || "").replace(/\D+/g, ""));
+}
+function markProfileDisconnected(profileId, label, reason) {
+  const id = String(profileId || "").replace(/\D+/g, "");
+  if (!id) return false;
+  const state = readState();
+  const list = Array.isArray(state.posting.disconnectedProfiles) ? state.posting.disconnectedProfiles : [];
+  if (list.some((p) => String(p.profileId) === id)) return false; // already parked
+  list.push({ profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "not logged into Facebook").slice(0, 200) });
+  state.posting.disconnectedProfiles = list;
+  writeState(state);
+  logEvent("profile_disconnected_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
+  return true;
+}
+function releaseDisconnectedProfile(profileId) {
+  const id = String(profileId || "").replace(/\D+/g, "");
+  const state = readState();
+  const before = (state.posting.disconnectedProfiles || []).length;
+  state.posting.disconnectedProfiles = (state.posting.disconnectedProfiles || []).filter((p) => String(p.profileId) !== id);
+  if (state.posting.disconnectedProfiles.length !== before) { writeState(state); logEvent("profile_released_reconnected", { profileId: id }); return true; }
+  return false;
+}
+// FB "not logged in" / login-wall / session-expired signal (distinct from a group/membership issue).
+function isFacebookNotLoggedInError(message) {
+  return /not logged in|logged out|log in to|login required|session expired|please log in|enter your password|manual login (timed out|required)|facebook login|login wall|logged_out|not_logged_in|checkpoint\/(?:disabled|appeal|blocked)/i.test(String(message || ""));
 }
 
 function appendJsonlAbsoluteFile(filePath, row) {
@@ -6941,6 +6981,7 @@ function shuffledCopy(items = []) {
 
 function postingSlots(state) {
   const slots = [];
+  const __disconnectedIds = disconnectedProfileIdSet(state); // skip not-logged-into-FB (parked) profiles
   const postsPerProfile = clampNumber(state.rules.postsPerProfilePerDay, 1, 20, 5);
   const maxProfilesPerRun = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 1000000, 100000);
   const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
@@ -6982,6 +7023,7 @@ function postingSlots(state) {
         const label = String(profile || "").trim();
         if (!label) continue;
         const profileId = profileIdFromLabel(label);
+        if (__disconnectedIds.has(String(profileId))) continue; // not logged into Facebook -> parked + skipped until the admin releases it
         if (isDedicatedShopYourLikesProfileLabel(label, state)) continue;
         if (isBlockedIxBrowserProfileLabel(label, state)) continue;
         if (isFacebookProfileQuarantinedForFacebook(label, state, groupUrl)) continue;
@@ -8405,6 +8447,11 @@ async function autopilotTickAsync(options = {}) {
       // auto-stop fires the instant the Nth post lands. Here we ONLY read it back for the decision log —
       // re-incrementing here would double-count and trip auto-disarm at N/2.
       decision.postsThisRun = autopilotPostsThisRunCount(readState());
+    }
+    // AUTO-PARK profiles that failed because they're NOT LOGGED INTO FACEBOOK -> skipped until the admin
+    // re-logs them in and releases them from the Prod-tab "Disconnected profiles" section.
+    for (const oc of decision.outcomes || []) {
+      if (oc && !oc.ok && isFacebookNotLoggedInError(oc.error)) markProfileDisconnected(oc.profileId, oc.profile, oc.error);
     }
     decision.action = "published";
     __autopilotLastDecision = decision;
@@ -16842,6 +16889,19 @@ const server = http.createServer(async (req, res) => {
       });
     }
     return json(res, 200, { discovered: out, total: out.length });
+  }
+  if (req.method === "GET" && url.pathname === "/api/profiles/disconnected") {
+    return json(res, 200, { disconnected: (readState().posting?.disconnectedProfiles || []) });
+  }
+  if (req.method === "POST" && url.pathname === "/api/profiles/release") {
+    const id = url.searchParams.get("profileId") || "";
+    const ok = releaseDisconnectedProfile(id);
+    return json(res, 200, { ok, profileId: id, disconnected: (readState().posting?.disconnectedProfiles || []) });
+  }
+  if (req.method === "POST" && url.pathname === "/api/profiles/disconnect") {
+    const id = url.searchParams.get("profileId") || "";
+    const ok = markProfileDisconnected(id, url.searchParams.get("label") || "", "manually parked by admin");
+    return json(res, 200, { ok, profileId: id, disconnected: (readState().posting?.disconnectedProfiles || []) });
   }
   if (req.method === "POST" && url.pathname === "/api/security/audit") {
     const report = await runSecurityAudit();

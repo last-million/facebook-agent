@@ -5579,6 +5579,30 @@ function uxAttachScrapedProducts() {
   load();
 }
 
+function uxAttachDisconnectedProfiles() {
+  const list = $("disconnectedProfilesList");
+  if (!list) return;
+  async function load() {
+    try {
+      const data = await api("/api/profiles/disconnected");
+      const rows = (data && data.disconnected) || [];
+      const c = $("disconnectedProfilesCount"); if (c) c.textContent = String(rows.length);
+      if (!rows.length) { list.innerHTML = '<div style="opacity:.6">No disconnected profiles — all accounts logged in. ✓</div>'; return; }
+      list.innerHTML = "";
+      for (const r of rows) {
+        const row = document.createElement("div"); row.className = "discRow";
+        const info = document.createElement("div"); info.className = "di-info";
+        info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "not logged in") + (r.at ? ' · ' + r.at : '') + '</div>';
+        const btn = document.createElement("button"); btn.type = "button"; btn.textContent = "Release";
+        btn.addEventListener("click", async () => { btn.disabled = true; try { await api("/api/profiles/release?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
+        row.appendChild(info); row.appendChild(btn); list.appendChild(row);
+      }
+    } catch (e) { list.innerHTML = '<div style="opacity:.6">Could not load disconnected profiles.</div>'; }
+  }
+  $("refreshDisconnectedBtn")?.addEventListener("click", () => load());
+  load();
+}
+
 (function bootUxOverhaul() {
   const run = () => {
     try { uxInitCollapsiblePanels(); } catch (err) { console.warn("uxInitCollapsiblePanels failed", err); }
@@ -5586,6 +5610,7 @@ function uxAttachScrapedProducts() {
     try { uxAttachClearFailedProfiles(); } catch (err) { console.warn("uxAttachClearFailedProfiles failed", err); }
     try { uxAttachConfirmGuards(); } catch (err) { console.warn("uxAttachConfirmGuards failed", err); }
     try { uxAttachScrapedProducts(); } catch (err) { console.warn("uxAttachScrapedProducts failed", err); }
+    try { uxAttachDisconnectedProfiles(); } catch (err) { console.warn("uxAttachDisconnectedProfiles failed", err); }
   };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", run);
