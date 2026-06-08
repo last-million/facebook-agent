@@ -9497,7 +9497,9 @@ function assertPostingRowReadyForLive(row, body = {}) {
   }
   const imagePath = assertProjectFileForPosting(row.image, "Facebook image");
   assertFacebookUploadImageFormat(imagePath);
-  if (!String(row.postText || "").trim()) {
+  if (!String(row.postText || "").trim() && !String(row.productKey || "").startsWith("harvested:")) {
+    // harvested posts intentionally have an empty base post text — their body is the auto "emoji + short
+    // title + hashtags" signature line, built from row.title in livePostPayloadForRow.
     const err = new Error("Posting row is missing post text.");
     err.statusCode = 409;
     throw err;
