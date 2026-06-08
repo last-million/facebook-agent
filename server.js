@@ -7743,6 +7743,50 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
   }
 }
 
+// PRE-FLIGHT PROFILE HEALTH SWEEP: open every prod-eligible profile (resource-guarded, small concurrency),
+// check its Facebook state (logged in / needs-login / suspended — EN/FR/AR + the language-independent
+// password-field+URL fallback) and PARK the bad ones, so the next prod run only uses healthy accounts.
+let __healthSweepInFlight = null;
+async function runProfileHealthSweep(options = {}) {
+  if (__healthSweepInFlight) return __healthSweepInFlight;
+  __healthSweepInFlight = (async () => {
+    const state = readState();
+    const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
+    const profileGroup = new Map(); // profileId -> a group it is a member of (its assigned posting group)
+    for (const g of groups) {
+      const gu = String(g.url || "").trim(); if (!gu) continue;
+      for (const label of (Array.isArray(g.profiles) ? g.profiles : [])) {
+        const pid = profileIdFromLabel(label);
+        if (pid && !profileGroup.has(pid)) profileGroup.set(pid, gu);
+      }
+    }
+    const already = new Set([...disconnectedProfileIdSet(state), ...erroredProfileIdSet(state), ...suspendedProfileIdSet(state)].map(String));
+    const targets = [...profileGroup.entries()].filter(([pid]) => !already.has(String(pid)));
+    const healthy = [], parked = [], unknown = [];
+    const pool = clampNumber(options.concurrency, 1, 4, 3);
+    let idx = 0;
+    async function worker() {
+      while (idx < targets.length) {
+        const [pid, gu] = targets[idx++];
+        try {
+          await waitForCpuHeadroom({ label: "health_sweep" });
+          await runHarvestConnector(gu, pid, 1, { seenIds: [], profileIndex: 0, profileCount: 1 });
+          healthy.push(pid);
+        } catch (e) {
+          const msg = (e && e.message) || String(e);
+          if (e.accountBlocked || isFacebookSuspendedError(msg)) { markProfileSuspended(pid, "health sweep", msg); parked.push({ profileId: pid, kind: "suspended" }); }
+          else if (isFacebookNotLoggedInError(msg)) { markProfileDisconnected(pid, "health sweep", msg); parked.push({ profileId: pid, kind: "needs_login" }); }
+          else { unknown.push({ profileId: pid, error: oneLineField(msg, 120) }); } // scrape/network glitch -> NOT parked
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: pool }, () => worker()));
+    logEvent("profile_health_sweep_done", { checked: targets.length, healthy: healthy.length, parked: parked.length, unknown: unknown.length });
+    return { checked: targets.length, healthy, parked, unknown };
+  })().finally(() => { __healthSweepInFlight = null; });
+  return __healthSweepInFlight;
+}
+
 let __harvestSourcesInFlight = null;
 let __harvestNextAt = 0;
 let __harvestEmptyRounds = 0;
@@ -17043,6 +17087,11 @@ const server = http.createServer(async (req, res) => {
     const id = url.searchParams.get("profileId") || "";
     const ok = markProfileSuspended(id, url.searchParams.get("label") || "", "manually marked suspended by admin");
     return json(res, 200, { ok, profileId: id, suspended: (readState().posting?.suspendedProfiles || []) });
+  }
+  if (req.method === "POST" && url.pathname === "/api/profiles/health-sweep") {
+    // pre-flight: open every prod-eligible profile, check FB state, PARK logged-out/suspended ones.
+    const report = await runProfileHealthSweep({ concurrency: Number(url.searchParams.get("concurrency") || 3) });
+    return json(res, 200, report);
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/release") {
     const id = url.searchParams.get("profileId") || "";
