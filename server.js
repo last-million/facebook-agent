@@ -7443,7 +7443,12 @@ function productHasReadyAssets(product, state = readState(), reviewImages = null
   // link, and it has NOT been posted yet. No ShopYourLikes shortlink needed (link = the harvested url).
   if (String(product.key || "").startsWith("harvested:")) {
     const rec = harvestedRecordForKey(product.key, state);
-    return Boolean(rec && !rec.posted && rec.firstCommentUrl && rec.imageLocalPath && fs.existsSync(safeProjectPath(rec.imageLocalPath)));
+    if (!(rec && !rec.posted && rec.firstCommentUrl && rec.imageLocalPath && fs.existsSync(safeProjectPath(rec.imageLocalPath)))) return false;
+    // SKIP junk-text products: the extractor sometimes grabbed the comment-sort header ("Most relevant" /
+    // "Plus pertinents") instead of the product caption -> don't post those.
+    const title = cleanHarvestedPostText(rec.text || "");
+    if (title.length < 12 || /plus pertinents|most relevant|top fan\b|all comments|be the first to comment|voir plus de comment|see more comment|newest first|la sélection est sur|toutes les réactions/i.test(title)) return false;
+    return true;
   }
   const images = reviewImages || selectedReviewImageLines(state);
   const image = reviewImageForProduct(images, product);
