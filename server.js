@@ -7740,7 +7740,27 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
     return (result && Array.isArray(result.items)) ? result.items : [];
   } finally {
     try { fs.unlinkSync(payloadPath); } catch (_) {}
+    // ALWAYS close the profile server-side (belt-and-suspenders): the connector closes it in its OWN finally,
+    // but if the connector is KILLED by the timeout that finally never runs -> the ixBrowser profile leaks and
+    // piles up (Chromium "application error"). ixBrowserCloseAfterUse is idempotent (already-closed = ok).
+    try { await ixBrowserCloseAfterUse(Number(profileId), "harvest_done"); } catch (_) {}
   }
+}
+
+// Close ALL prod-eligible ixBrowser profiles (cleanup leaked/open windows). Idempotent (already-closed = ok);
+// skips the dedicated ShopYourLikes profile. Run before a fresh start to clear piled-up Chromium windows.
+async function closeAllOpenIxProfiles() {
+  const state = readState();
+  const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
+  const ids = new Set();
+  for (const g of groups) for (const label of (Array.isArray(g.profiles) ? g.profiles : [])) { const pid = profileIdFromLabel(label); if (pid) ids.add(pid); }
+  let closed = 0, alreadyClosed = 0, failed = 0;
+  for (const id of ids) {
+    try { const r = await ixBrowserCloseAfterUse(id, "close_all_cleanup"); if (r.status === "closed") closed += 1; else if (r.status === "already_closed" || r.status === "kept_open_dedicated_shopyourlikes_profile") alreadyClosed += 1; else failed += 1; }
+    catch (_) { failed += 1; }
+  }
+  logEvent("ixbrowser_close_all_done", { total: ids.size, closed, alreadyClosed, failed });
+  return { total: ids.size, closed, alreadyClosed, failed };
 }
 
 // PRE-FLIGHT PROFILE HEALTH SWEEP: open every prod-eligible profile (resource-guarded, small concurrency),
@@ -17091,6 +17111,10 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && url.pathname === "/api/profiles/health-sweep") {
     // pre-flight: open every prod-eligible profile, check FB state, PARK logged-out/suspended ones.
     const report = await runProfileHealthSweep({ concurrency: Number(url.searchParams.get("concurrency") || 3) });
+    return json(res, 200, report);
+  }
+  if (req.method === "POST" && url.pathname === "/api/profiles/close-all") {
+    const report = await closeAllOpenIxProfiles(); // cleanup leaked/open ixBrowser windows
     return json(res, 200, report);
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/release") {
