@@ -3068,10 +3068,11 @@ async function harvestGroupFeed(page, count, opts = {}) {
   const seenLinks = new Set(); // dedup harvested PRODUCTS by their first-comment URL (each product = unique url)
   await page.waitForTimeout(3000);
   try { await page.waitForSelector('a[href*="fbid="]', { timeout: 25000 }); } catch (_) {}
-  // Scroll the LAZY-LOAD CONTAINER (tiles live in a scrollable DIV; scrolling body alone loads only 0-4 —
-  // the documented sparse-grid bug). Stop at >=30 tiles, or no growth for 3 cycles, or 45s. Never throw:
-  // a sparse grid is a valid throttled outcome handled by the server re-scan loop.
-  { const deadline = Date.now() + 45000; let prev = -1, flat = 0;
+  // Scroll the LAZY-LOAD CONTAINER DEEP (tiles live in a scrollable DIV; scrolling body alone loads only 0-4).
+  // Go DEEP into the group's history (target 150 tiles, up to 90s, stop only after 6 flat cycles) so we reach
+  // OLDER products beyond the recent ones already harvested — the seen-set then skips the used ones and grabs
+  // the older-but-unused deals. Never throw: a sparse grid is a valid throttled outcome handled by the re-scan.
+  { const deadline = Date.now() + 90000; let prev = -1, flat = 0;
     while (Date.now() < deadline) {
       const n = await page.evaluate(() => {
         const tiles = document.querySelectorAll('a[href*="/photo"][href*="fbid="]');
@@ -3081,10 +3082,10 @@ async function harvestGroupFeed(page, count, opts = {}) {
         window.scrollTo(0, document.body.scrollHeight);
         return tiles.length;
       }).catch(() => 0);
-      if (n >= 30) break;
-      if (n <= prev) { flat++; if (flat >= 3) break; } else { flat = 0; prev = n; }
+      if (n >= 150) break;
+      if (n <= prev) { flat++; if (flat >= 6) break; } else { flat = 0; prev = n; }
       await page.mouse.wheel(0, 2400).catch(() => {});
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(1800);
     }
   }
   const collected = await page.evaluate(() => {
@@ -3098,7 +3099,7 @@ async function harvestGroupFeed(page, count, opts = {}) {
       if (!postId || seen.has(postId)) continue; seen.add(postId); // ONE entry per distinct post, in grid order (latest first)
       items.push({ href: h, postId });
     }
-    return { found: items.length, items: items.slice(0, 60) };
+    return { found: items.length, items: items.slice(0, 300) }; // collect deep history (was 60) so older unseen products are reachable
   });
   console.log(JSON.stringify({ step: 'harvest_media_links', found: collected.found, sample: collected.items.slice(0, 6).map((l) => l.href.slice(0, 90)) }));
   const links = collected.items;
