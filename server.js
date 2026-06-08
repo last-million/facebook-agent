@@ -1483,6 +1483,14 @@ function normalizeWorkflowState(state) {
     .filter((p) => p && (p.profileId || p.profile_id))
     .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200) }))
     .slice(0, 1000);
+  // SUSPENDED profiles (Facebook SUSPENDED/DISABLED/BANNED the account) — BLOCKED from use. Auto-cleared
+  // ONLY when the ixBrowser profile is removed (reconcile PASS-1 GONE), so deleting+re-adding a new account
+  // (even with the same name -> new ix id) starts fresh. Otherwise stays blocked until manually released.
+  if (!Array.isArray(state.posting.suspendedProfiles)) state.posting.suspendedProfiles = [];
+  state.posting.suspendedProfiles = state.posting.suspendedProfiles
+    .filter((p) => p && (p.profileId || p.profile_id))
+    .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200) }))
+    .slice(0, 1000);
   state.operator = state.operator || {};
   state.operator.contentSourcesEnabled = state.posting.contentSources.enabled === true;
   state.operator.contentSourcesExclusive = state.posting.contentSources.enabled === true && state.posting.contentSources.exclusive === true;
@@ -1998,15 +2006,39 @@ function markProfileErrored(profileId, label, reason) {
   logEvent("profile_account_error_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
   return true;
 }
-// release a profile from EITHER parked list (login-disconnected OR account-error).
+// release a profile from ANY parked list (login-disconnected, account-error, OR suspended).
 function releaseParkedProfile(profileId) {
   const id = String(profileId || "").replace(/\D+/g, "");
   const state = readState();
-  const d0 = (state.posting.disconnectedProfiles || []).length, e0 = (state.posting.erroredProfiles || []).length;
+  const before = (state.posting.disconnectedProfiles || []).length + (state.posting.erroredProfiles || []).length + (state.posting.suspendedProfiles || []).length;
   state.posting.disconnectedProfiles = (state.posting.disconnectedProfiles || []).filter((p) => String(p.profileId) !== id);
   state.posting.erroredProfiles = (state.posting.erroredProfiles || []).filter((p) => String(p.profileId) !== id);
-  if (state.posting.disconnectedProfiles.length !== d0 || state.posting.erroredProfiles.length !== e0) { writeState(state); logEvent("profile_released_reconnected", { profileId: id }); return true; }
+  state.posting.suspendedProfiles = (state.posting.suspendedProfiles || []).filter((p) => String(p.profileId) !== id);
+  const after = state.posting.disconnectedProfiles.length + state.posting.erroredProfiles.length + state.posting.suspendedProfiles.length;
+  if (after !== before) { writeState(state); logEvent("profile_released_reconnected", { profileId: id }); return true; }
   return false;
+}
+function suspendedProfileIdSet(state = readState()) {
+  return new Set((state.posting?.suspendedProfiles || []).map((p) => String(p.profileId || "")));
+}
+function markProfileSuspended(profileId, label, reason) {
+  const id = String(profileId || "").replace(/\D+/g, "");
+  if (!id) return false;
+  const state = readState();
+  const list = Array.isArray(state.posting.suspendedProfiles) ? state.posting.suspendedProfiles : [];
+  if (list.some((p) => String(p.profileId) === id)) return false; // already parked
+  // a suspended account is also no longer usable — drop any softer parked entry for the same id
+  state.posting.disconnectedProfiles = (state.posting.disconnectedProfiles || []).filter((p) => String(p.profileId) !== id);
+  state.posting.erroredProfiles = (state.posting.erroredProfiles || []).filter((p) => String(p.profileId) !== id);
+  list.push({ profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "Facebook suspended/disabled this account").slice(0, 200) });
+  state.posting.suspendedProfiles = list;
+  writeState(state);
+  logEvent("profile_suspended_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
+  return true;
+}
+// FB SUSPENDED / DISABLED / BANNED the account (account is dead until the admin swaps it).
+function isFacebookSuspendedError(message) {
+  return /account (has been|was|is) (suspended|disabled|deactivated|banned)|we('ve| have)? (suspended|disabled|banned) your account|your account is (suspended|disabled|banned)|permanently disabled|account suspension|account disabled|you can.?t use (facebook|your account)|no longer have access to your account/i.test(String(message || ""));
 }
 // FB profile needs ADMIN ATTENTION — content/group ACCESS lost ("This content isn't available right now" =
 // not a member anymore / group changed / deleted) OR ACCOUNT error (identity confirm / checkpoint / restricted).
@@ -7022,7 +7054,7 @@ function shuffledCopy(items = []) {
 
 function postingSlots(state) {
   const slots = [];
-  const __disconnectedIds = disconnectedProfileIdSet(state); const __erroredIds = erroredProfileIdSet(state); // skip parked profiles (not-logged-in OR account/access error)
+  const __disconnectedIds = disconnectedProfileIdSet(state); const __erroredIds = erroredProfileIdSet(state); const __suspendedIds = suspendedProfileIdSet(state); // skip parked profiles (not-logged-in / account error / suspended)
   const postsPerProfile = clampNumber(state.rules.postsPerProfilePerDay, 1, 20, 5);
   const maxProfilesPerRun = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 1000000, 100000);
   const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
@@ -7064,7 +7096,7 @@ function postingSlots(state) {
         const label = String(profile || "").trim();
         if (!label) continue;
         const profileId = profileIdFromLabel(label);
-        if (__disconnectedIds.has(String(profileId)) || __erroredIds.has(String(profileId))) continue; // parked (not logged in / account-access error) -> skipped until the admin releases it
+        if (__disconnectedIds.has(String(profileId)) || __erroredIds.has(String(profileId)) || __suspendedIds.has(String(profileId))) continue; // parked (not logged in / account error / suspended) -> skipped until released
         if (isDedicatedShopYourLikesProfileLabel(label, state)) continue;
         if (isBlockedIxBrowserProfileLabel(label, state)) continue;
         if (isFacebookProfileQuarantinedForFacebook(label, state, groupUrl)) continue;
@@ -8493,7 +8525,8 @@ async function autopilotTickAsync(options = {}) {
     // re-logs them in and releases them from the Prod-tab "Disconnected profiles" section.
     for (const oc of decision.outcomes || []) {
       if (!oc || oc.ok) continue;
-      if (isFacebookNotLoggedInError(oc.error)) markProfileDisconnected(oc.profileId, oc.profile, oc.error); // not logged in
+      if (isFacebookSuspendedError(oc.error)) markProfileSuspended(oc.profileId, oc.profile, oc.error); // SUSPENDED / disabled / banned (most severe)
+      else if (isFacebookNotLoggedInError(oc.error)) markProfileDisconnected(oc.profileId, oc.profile, oc.error); // not logged in
       else if (isFacebookAccountError(oc.error)) markProfileErrored(oc.profileId, oc.profile, oc.error); // account/access error ("content isn't available", identity, checkpoint...)
     }
     decision.action = "published";
