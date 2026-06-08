@@ -1993,7 +1993,7 @@ function releaseDisconnectedProfile(profileId) {
 }
 // FB "not logged in" / login-wall / session-expired signal (distinct from a group/membership issue).
 function isFacebookNotLoggedInError(message) {
-  return /not logged in|logged out|log in to|login required|session expired|please log in|enter your password|manual login (timed out|required)|facebook login|login wall|logged_out|not_logged_in/i.test(String(message || ""));
+  return /not logged in|logged out|log in to|login required|session expired|please log in|enter your password|manual login (timed out|required)|facebook login|login wall|logged_out|not_logged_in|needs_login|facebook_needs_login|facebook_login_required_for_profile/i.test(String(message || ""));
 }
 function erroredProfileIdSet(state = readState()) {
   return new Set((state.posting?.erroredProfiles || []).map((p) => String(p.profileId || "")));
@@ -7640,6 +7640,24 @@ async function currentCpuLoadPercent(sampleMs = 240) {
   if (totalDelta <= 0) return 0;
   return Math.max(0, Math.min(100, Math.round((1 - idleDelta / totalDelta) * 100)));
 }
+// Free RAM % (sync, free) — RAM/handle exhaustion (NOT cpu) is what crashed Chrome ("application error")
+// when too many ixBrowser profiles opened at once. This is the real constraint to back-pressure on.
+function currentFreeRamPercent() {
+  const total = os.totalmem() || 1;
+  return Math.max(0, Math.min(100, Math.round((os.freemem() / total) * 100)));
+}
+// Running chrome process count. Cached ~5s + FAIL-OPEN (any error => 0 => never blocks) so the concurrent
+// launchers don't each spawn a process-list and a count failure can NEVER deadlock the pipeline.
+let __lastChromeCountAt = 0, __lastChromeCount = 0;
+async function currentChromeProcessCount() {
+  if (Date.now() - __lastChromeCountAt < 5000) return __lastChromeCount;
+  try {
+    const { stdout } = await execFileAsync("powershell", ["-NoProfile", "-Command", "(Get-Process chrome -ErrorAction SilentlyContinue | Measure-Object).Count"], { windowsHide: true, timeout: 3000 });
+    __lastChromeCount = Number(String(stdout).trim()) || 0;
+  } catch { __lastChromeCount = 0; }
+  __lastChromeCountAt = Date.now();
+  return __lastChromeCount;
+}
 // Block until total system CPU drops below the configured ceiling, so a new heavy browser
 // render is never piled onto a saturated box (which would hang it AND fight Pinterest).
 // Polls briefly; after maxWaitMs it proceeds anyway so a persistently-busy box can't
@@ -7648,17 +7666,25 @@ async function waitForCpuHeadroom(options = {}) {
   const st = readState();
   if (st.operator?.cpuGovernorEnabled === false) return { load: 0, waitedMs: 0, proceeded: true, disabled: true };
   const maxPercent = clampNumber(options.maxPercent != null ? options.maxPercent : st.operator?.cpuGovernorMaxPercent, 50, 99, 85);
+  const minFreeRam = clampNumber(options.minFreeRamPercent != null ? options.minFreeRamPercent : st.operator?.resourceGuardMinFreeRamPercent, 5, 50, 15);
+  const maxChrome = clampNumber(options.maxChromeProcs != null ? options.maxChromeProcs : st.operator?.resourceGuardMaxChromeProcesses, 40, 600, 220);
   const maxWaitMs = clampNumber(options.maxWaitMs != null ? options.maxWaitMs : (st.operator?.cpuGovernorMaxWaitSeconds || 0) * 1000, 0, 600000, 120000);
   const startedAt = Date.now();
   let load = await currentCpuLoadPercent();
+  let freeRam = currentFreeRamPercent();
+  let chrome = await currentChromeProcessCount();
   let logged = false;
-  while (load >= maxPercent && (Date.now() - startedAt) < maxWaitMs) {
-    if (!logged) { logEvent("cpu_governor_waiting", { load, maxPercent, label: options.label || "" }); logged = true; }
+  // back-pressure on CPU, FREE-RAM, AND chrome-process count. RAM/process exhaustion (not CPU) is what crashed
+  // Chrome when too many ixBrowser profiles opened. Bounded by maxWaitMs so it can NEVER deadlock the pipeline.
+  while ((load >= maxPercent || freeRam <= minFreeRam || chrome >= maxChrome) && (Date.now() - startedAt) < maxWaitMs) {
+    if (!logged) { logEvent("cpu_governor_waiting", { load, freeRam, chrome, maxPercent, minFreeRam, maxChrome, label: options.label || "" }); logged = true; }
     await sleep(3000);
     load = await currentCpuLoadPercent();
+    freeRam = currentFreeRamPercent();
+    chrome = await currentChromeProcessCount();
   }
-  if (logged) logEvent("cpu_governor_resumed", { load, maxPercent, waitedMs: Date.now() - startedAt, label: options.label || "" });
-  return { load, waitedMs: Date.now() - startedAt, proceeded: true };
+  if (logged) logEvent("cpu_governor_resumed", { load, freeRam, chrome, waitedMs: Date.now() - startedAt, label: options.label || "" });
+  return { load, freeRamPercent: freeRam, chromeProcs: chrome, waitedMs: Date.now() - startedAt, proceeded: true };
 }
 
 // ── POSTING PRIORITY ─────────────────────────────────────────────────────────
@@ -7702,6 +7728,14 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
   try {
     const { stdout } = await execFileAsync("node", [scriptPath, payloadPath], { cwd: ROOT, windowsHide: true, timeout: 6 * 60 * 1000, maxBuffer: 24 * 1024 * 1024 });
     const objs = parseJsonLogObjects(stdout);
+    // the connector emits harvest_login_required (instead of scraping) when the profile is logged out / blocked
+    // -> throw a TYPED error so the worker parks it (needs-login or suspended) instead of silently getting [].
+    const loginReq = objs.filter((o) => o && o.step === "harvest_login_required").pop();
+    if (loginReq) {
+      const e = new Error(loginReq.accountBlocked ? ("facebook_account_suspended_or_disabled " + (loginReq.reason || "")) : ("facebook_login_required_for_profile (needs_login) " + (loginReq.reason || "")));
+      e.accountBlocked = !!loginReq.accountBlocked;
+      throw e;
+    }
     const result = objs.filter((o) => o && o.step === "harvest_result").pop();
     return (result && Array.isArray(result.items)) ? result.items : [];
   } finally {
@@ -7821,7 +7855,13 @@ async function harvestContentSourcesAsync(options = {}) {
             __harvestWorkingProfilesByGroup.set(pair.groupUrl, set);
           }
           logEvent("harvest_group_done", { profileId: pair.profileId, groupUrl: pair.groupUrl, got: items.length, autoPicked: pair.autoPicked });
-        } catch (e) { logEvent("harvest_connector_error", { profileId: pair.profileId, error: oneLineField((e && e.message) || String(e), 160) }); }
+        } catch (e) {
+          const msg = (e && e.message) || String(e);
+          // PARK a harvest profile that is logged out / blocked (so it's skipped + the operator can re-login it)
+          if (isFacebookSuspendedError(msg)) { markProfileSuspended(pair.profileId, "harvest", msg); logEvent("harvest_profile_suspended_parked", { profileId: pair.profileId }); }
+          else if (isFacebookNotLoggedInError(msg)) { markProfileDisconnected(pair.profileId, "harvest needs login", msg); logEvent("harvest_profile_needs_login_parked", { profileId: pair.profileId }); }
+          else logEvent("harvest_connector_error", { profileId: pair.profileId, error: oneLineField(msg, 160) });
+        }
         finally { try { if (release) release(); } catch (_) {} }
       }));
       if (i + 4 < pairs.length) await sleep(clampNumber(options.interRoundGapMs || 25000, 5000, 120000, 25000)); // anti-throttle pacing

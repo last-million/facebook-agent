@@ -241,7 +241,7 @@ async function facebookLoginSnapshot(page) {
     const lower = text.toLowerCase();
     const href = location.href;
     const loginFields = document.querySelectorAll('input[type="password"], input[name="email"], input[name="pass"]').length;
-    const loginText = /log in|login|sign in|email or phone|password|forgot password|checkpoint|two-factor|two factor|enter code/.test(lower);
+    const loginText = /log in|login|sign in|email or phone|password|forgot password|checkpoint|two-factor|two factor|enter code|connexion|se connecter|mot de passe|connectez-?vous|entrez votre mot de passe|identifiez-?vous|تسجيل الدخول|كلمة السر|كلمة المرور|أدخل كلمة|سجل الدخول/.test(lower);
     const loginUrl = /facebook\.com\/(?:login|checkpoint|recover|two_factor|confirmemail)/i.test(href);
     const accountChecks = [
       ['account_suspended', /\b(we suspended your account|your account (?:has been )?suspended|account suspended|suspended your facebook account)\b/],
@@ -355,6 +355,9 @@ async function waitForManualFacebookLogin(page, stage = 'facebook', options = {}
 }
 
 async function ensureFacebookLoggedIn(page, payload, stage = 'facebook') {
+  // accept cookie/continue interstitials BEFORE the login assertion (EN/FR/AR) — a cookie banner can hide the
+  // real page and trip a FALSE login wall, which would wrongly park a healthy profile. Best-effort, never throws.
+  await dismissFacebookInterstitials(page).catch(() => {});
   if (payload.waitForManualLogin === false) return await assertFacebookLoggedIn(page, stage);
   return await waitForManualFacebookLogin(page, stage, {
     timeoutMs: payload.manualLoginTimeoutMs || payload.manual_login_timeout_ms || 300000,
@@ -466,6 +469,34 @@ function shouldRetryComposerOpen(result) {
   const hasComposerBox = boxes.some((b) => composerLabelRegex.test(String(b?.label || '')));
   if (dialogOpened && dialogPromptsCreate && !hasComposerBox) return true;
   return false;
+}
+
+// COOKIE-CONSENT + "Continue" interstitials (EN / FR / AR). Accept-all-cookies FIRST, then Continue; NEVER
+// clicks decline/essential-only, and never "continue with google / continue as <name>" (those are login
+// buttons). Best-effort, NEVER throws. MUST run BEFORE any login assertion (a cookie banner can hide the real
+// page and trip a FALSE login wall, which would wrongly park a healthy profile).
+async function dismissFacebookInterstitials(page) {
+  let clickedAny = false;
+  for (let pass = 0; pass < 2; pass += 1) { // cookies, then a follow-up Continue dialog
+    let r;
+    try {
+      r = await page.evaluate(() => {
+        const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const DENY = ['decline optional cookies', 'only allow essential', 'essential cookies', 'reject', 'manage cookies', 'refuser', 'cookies essentiels uniquement', 'autoriser uniquement les cookies essentiels', 'رفض', 'الأساسية فقط'].map(norm);
+        const ACCEPT = ['allow all cookies', 'accept all cookies', 'accept all', 'allow all', 'autoriser tous les cookies', 'tout accepter', 'accepter tout', 'السماح بجميع ملفات تعريف الارتباط', 'السماح بالكل', 'قبول الكل'].map(norm);
+        const CONT = ['continue', 'continuer', 'متابعة'].map(norm);
+        const nodes = [...document.querySelectorAll('[role="button"], button, a[role="link"], div[role="button"], [aria-label]')];
+        const lab = (el) => norm(el.innerText || el.textContent || el.getAttribute('aria-label') || '');
+        const deny = (l) => DENY.some((d) => d && l.includes(d));
+        for (const el of nodes) { const l = lab(el); if (!l || deny(l)) continue; if (ACCEPT.some((a) => a && l.includes(a))) { el.click(); return { clicked: true, kind: 'cookies', label: l.slice(0, 40) }; } }
+        for (const el of nodes) { const l = lab(el); if (!l || deny(l)) continue; if (l.includes('log in') || l.includes('password') || l.includes('continue with') || l.includes('continue as') || l.includes('connexion')) continue; if (CONT.some((c) => c && (l === c || (l.length <= 18 && l.includes(c))))) { el.click(); return { clicked: true, kind: 'continue', label: l.slice(0, 40) }; } }
+        return { clicked: false };
+      });
+    } catch (_) { break; }
+    if (r && r.clicked) { clickedAny = true; console.log(JSON.stringify({ step: 'interstitial_dismissed', kind: r.kind, label: r.label })); await humanPause(1000, 1800); }
+    else break;
+  }
+  return { clicked: clickedAny };
 }
 
 async function openComposerWithRecovery(page, groupUrl) {
@@ -3343,6 +3374,14 @@ async function main() {
   if (payload.harvestOnly) {
     const harvestCount = Math.max(1, Math.min(20, Number(payload.harvestCount || 4)));
     console.log(JSON.stringify({ step: 'harvest_started', mediaUrl: targetUrl, count: harvestCount }));
+    // accept cookie/continue interstitials FIRST (a banner can masquerade as a login wall), THEN check login —
+    // a logged-out/blocked profile must NOT be scraped; emit a signal so the server PARKS it (no 5-min hang).
+    await dismissFacebookInterstitials(page).catch(() => {});
+    const snap = await facebookLoginSnapshot(page);
+    if (snap && (snap.loginRequired || snap.accountBlocked)) {
+      console.log(JSON.stringify({ step: 'harvest_login_required', profileId: payload.profileId, accountBlocked: !!snap.accountBlocked, reason: snap.accountBlockReason || 'needs_login' }));
+      return; // finally closes the browser; server parks this profile from the signal above
+    }
     let harvested = [];
     try { harvested = await harvestGroupFeed(page, harvestCount, { seenIds: payload.harvestSeenIds || [], profileIndex: payload.harvestProfileIndex || 0, profileCount: payload.harvestProfileCount || 1 }); }
     catch (e) { console.log(JSON.stringify({ step: 'harvest_error', error: String((e && e.message) || e).slice(0, 300) })); }
