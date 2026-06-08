@@ -44,10 +44,10 @@ const HERMES_BIN = "/root/.local/bin/hermes";
 const WSL_PROJECT = "/mnt/c/Users/Administrator/Desktop/facbeook agent";
 const MAX_JOB_OUTPUT = 120000;
 const MAX_EVENTS_BYTES = 500000;
-// ADAPTIVE to the machine: cores - 2 (leaves headroom for the OS + node + the Pinterest agent), min 4, max 12.
-// e.g. 9 vCPU -> 7 concurrent posting profiles (was a flat 4). The CPU governor (waitForCpuHeadroom) still
-// self-throttles BELOW this whenever the box is actually busy, so this is a safe ceiling, not a fixed load.
-const MAX_CONCURRENT_NORMAL_IX_PROFILES = Math.max(4, Math.min(12, ((os.cpus() || []).length || 4) - 2));
+// ADAPTIVE but CONSERVATIVE: ~half the cores (capped 3..6). cores-2 (=7 on the 9-vCPU VM) OVERLOADED it —
+// each ixBrowser profile spawns ~10-20 chrome procs, so 7 posting + 3 harvest = ~150+ chrome processes at once,
+// and with the Pinterest agent sharing the box Chrome crashed ("application error"). Half-cores is stable. 9 vCPU -> 4.
+const MAX_CONCURRENT_NORMAL_IX_PROFILES = Math.max(3, Math.min(6, Math.floor(((os.cpus() || []).length || 4) / 2)));
 const MAX_COMMENT_FALLBACK_PROFILES = 6;
 const FACEBOOK_LIVE_POST_TIMEOUT_MS = 600000;
 const FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS = 360000;
