@@ -3080,17 +3080,26 @@ async function harvestGroupFeed(page, count, opts = {}) {
     const item = work[i];
     try {
       await page.goto(item.href, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      await page.waitForTimeout(3500);
+      // proceed as soon as the post content (article or its image) renders, capped at 3500ms — faster than a
+      // flat 3.5s wait on fast loads, and just as safe on slow ones (still waits up to the cap).
+      await page.waitForSelector('div[role="article"], img[src*="fbcdn"]', { timeout: 3500 }).catch(() => {});
+      await page.waitForTimeout(600);
       // Load the COMMENTS (the affiliate link is in the FIRST COMMENT) + expand "See more" captions.
       try {
-        for (let c = 0; c < 3; c++) { await page.mouse.wheel(0, 1500).catch(() => {}); await page.waitForTimeout(1100); }
+        for (let c = 0; c < 4; c++) {
+          await page.mouse.wheel(0, 1500).catch(() => {});
+          await page.waitForTimeout(800); // up to 4*800=3200ms (~= old fixed 3300ms) for slow comments...
+          // ...but STOP scrolling the instant the first-comment external link is loaded (most posts: 1 scroll).
+          const linkLoaded = await page.evaluate(() => Array.from(document.querySelectorAll('a[href]')).some((a) => /l\.facebook\.com\/l\.php|mavlynk\.com|walmrt\.us|amzn|a\.co|bit\.ly|tinyurl|geni\.us|shareasale|liketk|rstyle/i.test(a.href || ''))).catch(() => false);
+          if (linkLoaded) break;
+        }
         await page.evaluate(() => {
           for (const el of Array.from(document.querySelectorAll('div[role="button"],span,a'))) {
             const t = (el.innerText || '').trim();
             if (/^see more$/i.test(t) || /view\s+\d+\s*(more\s*)?comment|view all|most relevant/i.test(t)) { try { el.click(); } catch (_) {} }
           }
         });
-        await page.waitForTimeout(1500);
+        await page.waitForTimeout(700);
       } catch (_) {}
       const data = await page.evaluate(() => {
         const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
