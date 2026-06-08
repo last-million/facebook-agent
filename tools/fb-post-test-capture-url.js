@@ -246,6 +246,8 @@ async function facebookLoginSnapshot(page) {
     const accountChecks = [
       ['account_suspended', /\b(we suspended your account|your account (?:has been )?suspended|account suspended|suspended your facebook account)\b/],
       ['account_disabled', /\b(your account (?:has been )?disabled|account (?:has been )?disabled|we disabled your account|facebook account (?:has been )?disabled)\b/],
+      // FR / AR suspended/disabled (NO \b — Arabic script has no word boundaries; tested against lower-cased text).
+      ['account_blocked_intl', /votre compte a été (suspendu|désactivé)|nous avons désactivé votre compte|compte (suspendu|désactivé|bloqué)|تم (تعطيل|إيقاف|حظر|تعليق) حسابك|حساب(ك)? (معطل|موقوف|محظور|معلق)|تعطيل الحساب/],
       ['account_deactivated', /\b(your account (?:has been )?deactivated|account deactivated)\b/],
       ['account_locked', /\b(your account (?:has been )?locked|account locked|temporarily locked)\b/],
       ['identity_review_required', /\b(confirm your identity|identity confirmation required|request a review|disagree with decision|we need to review your account)\b/],

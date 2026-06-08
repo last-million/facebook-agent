@@ -5595,7 +5595,10 @@ function uxAttachDisconnectedProfiles() {
         info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "not logged in") + (r.at ? ' · ' + r.at : '') + '</div>';
         const btn = document.createElement("button"); btn.type = "button"; btn.textContent = "Release";
         btn.addEventListener("click", async () => { btn.disabled = true; try { await api("/api/profiles/release?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
-        row.appendChild(info); row.appendChild(btn); list.appendChild(row);
+        const sus = document.createElement("button"); sus.type = "button"; sus.textContent = "→ Suspended"; sus.title = "This account is suspended/banned — move it to the Suspended list & keep it blocked"; sus.style.background = "#5b2f2f"; sus.style.borderColor = "#6b3a3a";
+        sus.addEventListener("click", async () => { sus.disabled = true; try { await api("/api/profiles/suspend?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); if (typeof uxAttachSuspendedProfiles === "function") uxAttachSuspendedProfiles(); } catch (e) { sus.disabled = false; if (typeof showToast === "function") showToast("Failed"); } });
+        const wrap = document.createElement("div"); wrap.style.display = "flex"; wrap.style.gap = "6px"; wrap.appendChild(sus); wrap.appendChild(btn);
+        row.appendChild(info); row.appendChild(wrap); list.appendChild(row);
       }
     } catch (e) { list.innerHTML = '<div style="opacity:.6">Could not load disconnected profiles.</div>'; }
   }
@@ -5619,7 +5622,10 @@ function uxAttachErroredProfiles() {
         info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "account error") + (r.at ? ' · ' + r.at : '') + '</div>';
         const btn = document.createElement("button"); btn.type = "button"; btn.textContent = "Release";
         btn.addEventListener("click", async () => { btn.disabled = true; try { await api("/api/profiles/release?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
-        row.appendChild(info); row.appendChild(btn); list.appendChild(row);
+        const sus = document.createElement("button"); sus.type = "button"; sus.textContent = "→ Suspended"; sus.title = "This account is suspended/banned — move it to the Suspended list & keep it blocked"; sus.style.background = "#5b2f2f"; sus.style.borderColor = "#6b3a3a";
+        sus.addEventListener("click", async () => { sus.disabled = true; try { await api("/api/profiles/suspend?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); if (typeof uxAttachSuspendedProfiles === "function") uxAttachSuspendedProfiles(); } catch (e) { sus.disabled = false; if (typeof showToast === "function") showToast("Failed"); } });
+        const wrap = document.createElement("div"); wrap.style.display = "flex"; wrap.style.gap = "6px"; wrap.appendChild(sus); wrap.appendChild(btn);
+        row.appendChild(info); row.appendChild(wrap); list.appendChild(row);
       }
     } catch (e) { list.innerHTML = '<div style="opacity:.6">Could not load account-error profiles.</div>'; }
   }

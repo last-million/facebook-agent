@@ -2042,7 +2042,7 @@ function markProfileSuspended(profileId, label, reason) {
 }
 // FB SUSPENDED / DISABLED / BANNED the account (account is dead until the admin swaps it).
 function isFacebookSuspendedError(message) {
-  return /account (has been|was|is) (suspended|disabled|deactivated|banned)|we('ve| have)? (suspended|disabled|banned) your account|your account is (suspended|disabled|banned)|permanently disabled|account suspension|account disabled|you can.?t use (facebook|your account)|no longer have access to your account/i.test(String(message || ""));
+  return /account (has been|was|is) (suspended|disabled|deactivated|banned)|we('ve| have)? (suspended|disabled|banned) your account|your account is (suspended|disabled|banned)|permanently disabled|account suspension|account disabled|you can.?t use (facebook|your account)|no longer have access to your account|compte (a été |est )?(suspendu|désactivé|desactive|bloqué)|nous avons désactivé votre compte|votre compte a été (suspendu|désactivé)|تم (تعطيل|إيقاف|حظر|تعليق) حسابك|حساب(ك)? (معطل|موقوف|محظور|معلق)|تعطيل الحساب|account_suspended|account_disabled/i.test(String(message || ""));
 }
 // FB profile needs ADMIN ATTENTION — content/group ACCESS lost ("This content isn't available right now" =
 // not a member anymore / group changed / deleted) OR ACCOUNT error (identity confirm / checkpoint / restricted).
