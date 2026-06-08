@@ -14754,6 +14754,11 @@ async function reconcileProfilesWithIxBrowser(options = {}) {
       if (streak >= RECONCILE_REMOVAL_STREAK_REQUIRED) {
         const removedFromRoster = reconcileRemoveProfileFromRoster(state, id);
         reconcileClearGoneProfileBlacklist(state, id, label);
+        // profile removed from ixBrowser -> also clear ANY parked entry (suspended / errored / disconnected) so
+        // re-adding a NEW account (even with the SAME name -> new ix id) starts fresh, never inheriting the old block.
+        state.posting.suspendedProfiles = (state.posting.suspendedProfiles || []).filter((p) => String(p.profileId) !== String(id));
+        state.posting.erroredProfiles = (state.posting.erroredProfiles || []).filter((p) => String(p.profileId) !== String(id));
+        state.posting.disconnectedProfiles = (state.posting.disconnectedProfiles || []).filter((p) => String(p.profileId) !== String(id));
         dirty = true;
         summary.removed.push({ profileId: id, label, removedFromRoster, missStreak: streak });
         // streak satisfied + acted on -> drop the counter (do not carry into nextMissStreak)
@@ -16972,11 +16977,19 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/profiles/errored") {
     return json(res, 200, { errored: (readState().posting?.erroredProfiles || []) });
   }
+  if (req.method === "GET" && url.pathname === "/api/profiles/suspended") {
+    return json(res, 200, { suspended: (readState().posting?.suspendedProfiles || []) });
+  }
+  if (req.method === "POST" && url.pathname === "/api/profiles/suspend") {
+    const id = url.searchParams.get("profileId") || "";
+    const ok = markProfileSuspended(id, url.searchParams.get("label") || "", "manually marked suspended by admin");
+    return json(res, 200, { ok, profileId: id, suspended: (readState().posting?.suspendedProfiles || []) });
+  }
   if (req.method === "POST" && url.pathname === "/api/profiles/release") {
     const id = url.searchParams.get("profileId") || "";
-    const ok = releaseParkedProfile(id); // clears EITHER parked list (login-disconnected or account/access error)
+    const ok = releaseParkedProfile(id); // clears ANY parked list (disconnected / account error / suspended)
     const stx = readState();
-    return json(res, 200, { ok, profileId: id, disconnected: (stx.posting?.disconnectedProfiles || []), errored: (stx.posting?.erroredProfiles || []) });
+    return json(res, 200, { ok, profileId: id, disconnected: (stx.posting?.disconnectedProfiles || []), errored: (stx.posting?.erroredProfiles || []), suspended: (stx.posting?.suspendedProfiles || []) });
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/disconnect") {
     const id = url.searchParams.get("profileId") || "";
