@@ -8758,6 +8758,10 @@ function cleanHarvestedPostText(raw, maxLen = 180) {
   t = t.replace(/\b(en voir plus|voir plus|see more)\b/gi, "");
   t = t.replace(/#[\p{L}\p{N}_]+/gu, "");
   t = t.replace(/https?:\/\/\S+/gi, "");
+  // URL belongs in the COMMENT, never the post body (operator). Strip www.* and BARE domains
+  // (e.g. "Walmart.com", "amzn.to/x") that have no http(s):// prefix — these leak from the harvested caption.
+  t = t.replace(/\bwww\.[^\s]+/gi, "");
+  t = t.replace(/\b[a-z0-9][a-z0-9-]{0,62}\.(?:com|net|org|io|co|shop|store|app|me|us|ca|uk|to|ly|link|info|biz|online|site|xyz|deal|deals)\b(?:\/[^\s]*)?/gi, "");
   t = t.replace(/\b(shop please|check link|link in (the )?(bio|comment[s]?)|peek at affiliate[^.\n]*|to receive a message[^.\n]*\.?|order (here|now)|dm me(\s+for[^.\n]*)?|comment[^.\n]*below)\b/gi, "");
   // tidy orphaned punctuation left by the removed phrases (e.g. ",, ." -> ".")
   t = t.replace(/,\s*,+/g, ",").replace(/,\s*\./g, ".").replace(/\.\s*\.+/g, ".").replace(/\s+,/g, ",").replace(/^[\s,.;:!?-]+/, "");
@@ -8787,7 +8791,7 @@ function harvestedShortTitle(raw) {
 // title/description, PLUS one deterministic #fb<4hex> fingerprint (seeded from the productKey) so two products
 // with the SAME title still get distinct tags -> a unique post marker -> reliable, unambiguous permalink capture.
 const HASHTAG_STOPWORDS = new Set(["the","a","an","and","or","but","for","of","to","in","on","at","by","as","it","is","with","from","your","you","our","new","set","pack","piece","pieces","pcs","size","color","colour","inch","inches","count","free","sale","deal","deals","off","buy","shop","now","best","great","super","plus","more","get"]);
-function harvestedHashtags(title, description = "", productKey = "", maxTags = 8) {
+function harvestedHashtags(title, description = "", productKey = "", maxTags = 8, uniqueSeed = "") {
   const src = `${String(title || "")} ${String(description || "")}`.slice(0, 240);
   const tags = []; const seen = new Set();
   const add = (tag) => { const k = String(tag).toLowerCase(); if (tag.length >= 4 && tag.length <= 26 && !seen.has(k) && tags.length < maxTags) { seen.add(k); tags.push(tag); } };
@@ -8803,7 +8807,10 @@ function harvestedHashtags(title, description = "", productKey = "", maxTags = 8
     if (HASHTAG_STOPWORDS.has(m[1].toLowerCase())) continue;
     add("#" + m[1].charAt(0).toUpperCase() + m[1].slice(1).slice(0, 23));
   }
-  tags.push("#fb" + crypto.createHash("sha1").update(String(productKey || title || src || "harvested")).digest("hex").slice(0, 4)); // deterministic uniqueness fingerprint
+  // PER-POST uniqueness fingerprint: seed from uniqueSeed (the per-post trackingSeed = planId|productKey|sequence|link)
+  // when supplied, so the SAME product RE-POSTED (reuse rotation) still yields a DISTINCT tag -> unique caption ->
+  // unique permalink. Falls back to productKey (per-product) only when no per-post seed is given. 6 hex = negligible collision.
+  tags.push("#fb" + crypto.createHash("sha1").update(String(uniqueSeed || productKey || title || src || "harvested")).digest("hex").slice(0, 6));
   return tags;
 }
 
@@ -10511,7 +10518,7 @@ function livePostPayloadForRow(row, groupUrl, imagePath, profileId, options = {}
   // HARVESTED rows: up to 8 UNIQUE #tags from the product title/description + a deterministic #fb fingerprint
   // (so same-title products never collide). Web rows: the existing 2 rotating static tags. The tag string is in
   // BOTH the posted signature AND the marker, so the marker is a verbatim substring of the post -> unique permalink.
-  const titleTags = row.harvested ? harvestedHashtags(row.title, basePostText, row.productKey) : null;
+  const titleTags = row.harvested ? harvestedHashtags(row.title, basePostText, row.productKey, 8, trackingSeed) : null;
   const sigTags = titleTags
     ? titleTags.join(" ")
     : (() => { const sigT1 = POST_SIG_TAGS[sigHash[2] % POST_SIG_TAGS.length]; let sigT2 = POST_SIG_TAGS[sigHash[3] % POST_SIG_TAGS.length]; if (sigT2 === sigT1) sigT2 = POST_SIG_TAGS[(sigHash[3] + 1) % POST_SIG_TAGS.length]; return `${sigT1} ${sigT2}`; })();
