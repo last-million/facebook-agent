@@ -1970,10 +1970,14 @@ function appendHarvestedProduct(record, state = readState()) {
   return appendHarvestedProductLine(file, {
     firstCommentUrl: url,
     productKey: record.productKey || harvestSyntheticKey(url),
-    text: String(record.text || "").slice(0, 4000),
+    text: String(record.text || "").slice(0, 60000), // exact caption, effectively uncapped (operator: no character limit)
     imageLocalPath: String(record.imageLocalPath || ""),
     sourceGroupUrl: String(record.sourceGroupUrl || ""),
     postId: String(record.postId || ""),
+    // real product name/description from the link's og: tags, fetched IN the harvest browser
+    ogTitle: String(record.ogTitle || "").slice(0, 200),
+    ogDescription: String(record.ogDescription || "").slice(0, 500),
+    ogTriedAt: (record.ogTitle || record.ogDescription) ? new Date().toISOString() : "",
     harvestedAt: new Date().toISOString(),
     posted: "",
     imageDeleted: false,
@@ -1986,6 +1990,76 @@ function updateHarvestedProductRecord(key, patch, state = readState()) {
   if (!rec) return false;
   // append the MERGED record (latest-wins on read) — never rewrites the whole file, so nothing can be lost
   return appendHarvestedProductLine(file, Object.assign({}, rec, patch || {}));
+}
+
+// OPEN-GRAPH ENRICHMENT (operator design): the harvested link (the first-comment url, ALREADY
+// shortened — used verbatim, never re-shortened) is fetched once in the background to pull the
+// REAL product name + description from its og: tags. These feed the posting #tags. Fail-soft:
+// when og is missing/bot-walled, tags fall back to the harvested caption text.
+async function fetchOpenGraphForHarvestedLink(url) {
+  const out = { ogTitle: "", ogDescription: "" };
+  try {
+    const target = String(url || "").trim();
+    if (!/^https?:\/\//i.test(target)) return out;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 9000);
+    let html = "";
+    try {
+      const res = await fetch(target, {
+        redirect: "follow",
+        signal: ctrl.signal,
+        headers: {
+          "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+          "accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+          "accept-language": "en-US,en;q=0.9",
+        },
+      });
+      html = String(await res.text()).slice(0, 500000);
+    } finally { clearTimeout(timer); }
+    const meta = (prop) => {
+      const m = html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${prop}["'][^>]*content=["']([^"']+)["']`, "i"))
+        || html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]*(?:property|name)=["']${prop}["']`, "i"));
+      return m ? m[1] : "";
+    };
+    const decode = (s) => String(s || "")
+      .replace(/&amp;/gi, "&").replace(/&#0?39;|&apos;/gi, "'").replace(/&quot;/gi, '"').replace(/&nbsp;/gi, " ")
+      .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCodePoint(Number(d)); } catch { return " "; } })
+      .replace(/\s+/g, " ").trim();
+    // junk guard: bot walls AND storefront/profile pages ("Kelly's Amazon Page") must NEVER beat
+    // the caption-derived product name at plan time.
+    const junk = /just a moment|are you a human|verify you are|captcha|access denied|robot or human|attention required|enable javascript|'s amazon page$|amazon page$|storefront|idea list|shop recommended products|amazon\.com\s*$|^walmart\.com/i;
+    let t = decode(meta("og:title")).replace(/\s*[-|–—:]\s*Walmart(\.com)?\s*$/i, "").replace(/\s*[-|]\s*Amazon\.com.*$/i, "").replace(/^Amazon\.com\s*[:\-]\s*/i, "");
+    if (t && (t.length < 8 || junk.test(t))) t = "";
+    let d = decode(meta("og:description"));
+    if (d && junk.test(d)) d = "";
+    out.ogTitle = t.slice(0, 200);
+    out.ogDescription = d.slice(0, 500);
+  } catch (_e) { /* fail-soft: caller falls back to the harvested caption */ }
+  return out;
+}
+
+let __ogBackfillInFlight = false;
+async function backfillHarvestedOpenGraphAsync(maxPerRound = 5) {
+  if (__ogBackfillInFlight) return { skipped: "in_flight" };
+  __ogBackfillInFlight = true;
+  try {
+    const recs = readHarvestedProducts().filter((r) => r && r.firstCommentUrl && !r.ogTriedAt).slice(0, maxPerRound);
+    let enriched = 0;
+    for (const rec of recs) {
+      const og = await fetchOpenGraphForHarvestedLink(rec.firstCommentUrl);
+      updateHarvestedProductRecord(rec.productKey || harvestSyntheticKey(rec.firstCommentUrl), {
+        ogTitle: og.ogTitle,
+        ogDescription: og.ogDescription,
+        ogTriedAt: new Date().toISOString(),
+      });
+      if (og.ogTitle || og.ogDescription) enriched += 1;
+    }
+    if (recs.length) logEvent("harvested_opengraph_backfill", { tried: recs.length, enriched });
+    return { tried: recs.length, enriched };
+  } catch (err) {
+    logEvent("harvested_opengraph_backfill_error", { error: oneLineField(err.message || String(err), 160) });
+    return { error: true };
+  } finally { __ogBackfillInFlight = false; }
 }
 
 // DISCONNECTED (not-logged-into-Facebook) profiles: parked + skipped by posting/harvest until the admin
@@ -7944,7 +8018,7 @@ async function harvestContentSourcesAsync(options = {}) {
               existing.lastPostedAt = ""; existing.posted = ""; reusedOld++;
               continue;
             }
-            const persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId }, readState());
+            const persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId, ogTitle: it.ogTitle, ogDescription: it.ogDescription }, readState());
             if (persisted) { existingByUrl.set(url, { firstCommentUrl: url, posted: "" }); harvestedNew++; }
           }
           // AUTO-LEARN the member profile: a profile that READ the group (returned items) is a proven member
@@ -8437,6 +8511,11 @@ async function autopilotTickAsync(options = {}) {
     if (!dryRun && state.operator?.contentSourcesEnabled === true && state.operator?.armedForExternalActions
         && !__harvestedImageSweepInFlight && (Date.now() - __lastHarvestedImageSweepAt) >= 3600000) {
       sweepHarvestedImagesAsync().catch((err) => logEvent("autopilot_harvested_image_sweep_error", { error: oneLineField(err.message || String(err), 160) }));
+    }
+    // OPEN-GRAPH enrichment: pull the real product name/description from each harvested link's og:
+    // tags (feeds the posting #tags). Fire-and-forget, single-flight, a few records per tick.
+    if (!dryRun && state.operator?.contentSourcesEnabled === true && !__ogBackfillInFlight) {
+      backfillHarvestedOpenGraphAsync(5).catch(() => {});
     }
     if (!scheduleOpen || capacity.totalRemaining <= 0) {
       decision.action = "prepare_tomorrow";
@@ -8956,11 +9035,12 @@ function preparePostingPlan(options = {}) {
     // post-text, the review-image channel, and ShopYourLikes link-gen.
     const harvestedRec = String(product.key || "").startsWith("harvested:") ? harvestedRecordForKey(product.key, state) : null;
     const postCta = String(state.posting?.contentSources?.postCta || "").trim();
-    // HARVESTED post body = the EXACT harvested caption (the seller's real product description), cleaned of
-    // THEIR junk (their #hashtags / urls / dropship CTAs / see-more leak) but kept up to ~600 chars. The unique
-    // "emoji + title + 8 tracking #tags + #fb-fingerprint" signature line is appended by livePostPayloadForRow.
+    // HARVESTED post body = the EXACT harvested caption with NO length cut (operator: exact match,
+    // no character limit). Only their junk is removed (their #hashtags / urls / dropship CTAs /
+    // see-more leak — urls because the link lives in the COMMENT). The unique tag signature line
+    // is appended by livePostPayloadForRow.
     const postText = harvestedRec
-      ? cleanHarvestedPostText(harvestedRec.text, 600)
+      ? cleanHarvestedPostText(harvestedRec.text, 60000)
       : rotationValue(postTexts, state.contentRotation.postTextCursor, index, state.contentRotation.avoidPostTextReuse);
     const commentLeadIn = rotationValue(commentLeadIns, state.contentRotation.commentLeadInCursor, index, state.contentRotation.avoidCommentLeadInReuse);
     const affiliateLink = affiliateShortlinkForProduct(product, state);
@@ -8972,11 +9052,15 @@ function preparePostingPlan(options = {}) {
       : clampNumber(state.rules.minutesBetweenPosts, 1, 1440, 12);
     delayCursor += delay;
     const linkForPreview = shortlink || (state.affiliate?.enabled !== false ? "" : product.url);
-    const commentText = String(state.posting.commentTemplate || "{lead_in} {link}")
-      .replace("{lead_in}", commentLeadIn)
-      .replace("{link}", linkForPreview)
-      .replace(/\s{2,}/g, " ")
-      .trim();
+    // HARVESTED rows (operator): the comment is the harvested first-comment URL EXACTLY as captured —
+    // already shortened at the source; no lead-in phrase, no template, never re-shortened/modified.
+    const commentText = harvestedRec
+      ? String(harvestedRec.firstCommentUrl || "").trim()
+      : String(state.posting.commentTemplate || "{lead_in} {link}")
+          .replace("{lead_in}", commentLeadIn)
+          .replace("{link}", linkForPreview)
+          .replace(/\s{2,}/g, " ")
+          .trim();
     const missingAssets = [];
     if (!shortlink) missingAssets.push(state.affiliate?.enabled !== false ? "shopyourlikes_mavlynk_shortlink" : "mavlynk_shortlink");
     if (harvestedRec) { if (!image) missingAssets.push("harvested_image"); } // harvested image is the downloaded local file, not a review-image record
@@ -9011,7 +9095,8 @@ function preparePostingPlan(options = {}) {
       harvested: Boolean(harvestedRec), // harvested rows -> exact-text body + 8 unique tracking #tags + #fb fingerprint marker
       productId: product.productId,
       retailer: product.store,
-      title: harvestedRec ? (harvestedShortTitle(harvestedRec.text) || product.title) : (product.storedTitle || product.title), // harvested: a CLEAN short product title -> feeds the emoji+title+tags signature; else the discovered title
+      title: harvestedRec ? (String(harvestedRec.ogTitle || "").trim() || harvestedShortTitle(harvestedRec.text) || product.title) : (product.storedTitle || product.title), // harvested: REAL product name from the link's og:title (fallback: caption-derived) -> feeds the #tags
+      ogDescription: harvestedRec ? String(harvestedRec.ogDescription || "").trim() : "", // og:description of the harvested link — second source for the #tags
       productDiscoveryAt: runType === "full_posting_plan" ? (state.productDiscovery?.lastSuccessfulRunAt || "") : "",
       productDiscoveryStatus: runType === "full_posting_plan" ? (state.productDiscovery?.lastRunStatus || "") : "",
       postText,
@@ -10574,7 +10659,7 @@ function livePostPayloadForRow(row, groupUrl, imagePath, profileId, options = {}
   // HARVESTED rows: up to 8 UNIQUE #tags from the product title/description + a deterministic #fb fingerprint
   // (so same-title products never collide). Web rows: the existing 2 rotating static tags. The tag string is in
   // BOTH the posted signature AND the marker, so the marker is a verbatim substring of the post -> unique permalink.
-  const titleTags = row.harvested ? harvestedHashtags(row.title, basePostText, row.productKey, 8, trackingSeed) : null;
+  const titleTags = row.harvested ? harvestedHashtags(row.title, String(row.ogDescription || "") || basePostText, row.productKey, 8, trackingSeed) : null;
   const sigTags = titleTags
     ? titleTags.join(" ")
     : (() => { const sigT1 = POST_SIG_TAGS[sigHash[2] % POST_SIG_TAGS.length]; let sigT2 = POST_SIG_TAGS[sigHash[3] % POST_SIG_TAGS.length]; if (sigT2 === sigT1) sigT2 = POST_SIG_TAGS[(sigHash[3] + 1) % POST_SIG_TAGS.length]; return `${sigT1} ${sigT2}`; })();
@@ -17997,6 +18082,12 @@ const server = http.createServer(async (req, res) => {
     const body = await readJson(req);
     const result = await reconcileProfilesWithIxBrowser({ force: body.force !== false });
     return json(res, 200, { ok: !result.skipped, result });
+  }
+  if (req.method === "POST" && url.pathname === "/api/content-sources/og-backfill") {
+    // manual trigger for the harvested-link OpenGraph enrichment (normally runs per tick)
+    const body = await readJson(req);
+    const result = await backfillHarvestedOpenGraphAsync(clampNumber(body.max, 1, 25, 5));
+    return json(res, 200, { ok: !result.error, ...result });
   }
   if (req.method === "POST" && url.pathname === "/api/posting/record-post-url") {
     const body = await readJson(req);

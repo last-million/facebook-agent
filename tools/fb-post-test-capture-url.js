@@ -3110,6 +3110,7 @@ async function harvestGroupFeed(page, count, opts = {}) {
   let work = links.filter((it) => !seenIds.has(String(it.postId)));
   if (pCount > 1) work = work.filter((_, idx) => (idx % pCount) === pIndex);
   console.log(JSON.stringify({ step: 'harvest_partition', total: links.length, mine: work.length, profileIndex: pIndex, profileCount: pCount }));
+  let ogFetched = 0; // per-round cap on product-page og fetches so harvest never crawls
   for (let i = 0; i < work.length && out.length < count; i++) {
     const item = work[i];
     try {
@@ -3195,7 +3196,36 @@ async function harvestGroupFeed(page, count, opts = {}) {
           }
         } catch (e) { console.log(JSON.stringify({ step: 'harvest_image_download_failed', error: String((e && e.message) || e).slice(0, 140) })); }
       }
-      out.push({ href: item.href, postId: item.postId, productKey: dkey, imageLocalPath, ...data });
+      // PRODUCT OPEN-GRAPH (operator design): open the harvested link in THIS logged-in browser
+      // (real Chrome fingerprint -> retail sites serve the real page, no bot wall) and read the
+      // REAL product name + description from its og: tags — these feed the posting #tags.
+      // Fail-soft + capped (10/round, 20s each) so harvest never stalls on a slow product page.
+      let productOgTitle = '', productOgDescription = '';
+      if (data.link && ogFetched < 10) {
+        ogFetched++;
+        let p2 = null;
+        try {
+          p2 = await page.context().newPage();
+          await p2.goto(data.link, { waitUntil: 'domcontentloaded', timeout: 20000 });
+          await p2.waitForTimeout(1500);
+          const og = await p2.evaluate(() => {
+            const meta = (k) => (((document.querySelector('meta[property="' + k + '"]') || document.querySelector('meta[name="' + k + '"]') || {}).content) || '').trim();
+            return { t: meta('og:title') || (document.title || '').trim(), d: meta('og:description') || meta('description') };
+          });
+          // junk guard: bot walls + storefront/profile pages must NEVER beat the caption-derived name
+          const junk = /just a moment|are you a human|verify you are|captcha|access denied|robot or human|attention required|enable javascript|'s amazon page$|amazon page$|storefront|idea list|shop recommended products|amazon\.com\s*$|^walmart\.com/i;
+          let t = String(og.t || '').replace(/\s*[-|–—:]\s*Walmart(\.com)?\s*$/i, '').replace(/\s*[-|]\s*Amazon\.com.*$/i, '').replace(/^Amazon\.com\s*[:\-]\s*/i, '').trim();
+          if (t.length < 8 || junk.test(t)) t = '';
+          let d = String(og.d || '').trim();
+          if (junk.test(d)) d = '';
+          productOgTitle = t.slice(0, 200);
+          productOgDescription = d.slice(0, 500);
+          console.log(JSON.stringify({ step: 'harvest_og_fetched', key: dkey, ogTitle: productOgTitle.slice(0, 80), hasDesc: !!productOgDescription }));
+        } catch (e) {
+          console.log(JSON.stringify({ step: 'harvest_og_fetch_failed', key: dkey, error: String((e && e.message) || e).slice(0, 120) }));
+        } finally { try { if (p2) await p2.close(); } catch (_) {} }
+      }
+      out.push({ href: item.href, postId: item.postId, productKey: dkey, imageLocalPath, ...data, ogTitle: productOgTitle, ogDescription: productOgDescription });
       console.log(JSON.stringify({ step: 'harvest_item', n: out.length, textLen: (data.text || '').length, textPreview: (data.text || '').slice(0, 100), imageSaved: !!imageLocalPath, link: data.link, key: dkey }));
     } catch (e) {
       console.log(JSON.stringify({ step: 'harvest_item_error', href: item.href.slice(0, 120), error: String((e && e.message) || e).slice(0, 160) }));
