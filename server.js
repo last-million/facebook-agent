@@ -8790,29 +8790,20 @@ const HASHTAG_STOPWORDS = new Set(["the","a","an","and","or","but","for","of","t
 function harvestedHashtags(title, description = "", productKey = "", maxTags = 8) {
   const src = `${String(title || "")} ${String(description || "")}`.slice(0, 240);
   const tags = []; const seen = new Set();
-  const phraseRe = /\b([A-Z][a-zA-Z]+(?:\s+(?:and|&|of|the)?\s*[A-Z0-9][a-zA-Z0-9]+){1,2})\b/g;
-  let m;
-  while ((m = phraseRe.exec(src)) && tags.length < maxTags) {
-    const words = m[1].split(/\s+/).filter((w) => w && !/^(and|&|of|the)$/i.test(w));
-    const tag = "#" + words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join("").replace(/[^A-Za-z0-9]/g, "").slice(0, 24);
-    const k = tag.toLowerCase();
-    if (tag.length >= 4 && tag.length <= 25 && !seen.has(k)) { seen.add(k); tags.push(tag); }
-  }
-  const tokenRe = /\b([A-Za-z][A-Za-z0-9]{2,})\b/g;
-  while ((m = tokenRe.exec(src)) && tags.length < maxTags) {
-    const w = m[1];
-    if (HASHTAG_STOPWORDS.has(w.toLowerCase()) || w.length < 4) continue;
-    const tag = "#" + w.charAt(0).toUpperCase() + w.slice(1).slice(0, 23);
-    const k = tag.toLowerCase();
-    if (!seen.has(k)) { seen.add(k); tags.push(tag); }
-  }
+  const add = (tag) => { const k = String(tag).toLowerCase(); if (tag.length >= 4 && tag.length <= 26 && !seen.has(k) && tags.length < maxTags) { seen.add(k); tags.push(tag); } };
   const pieceM = src.match(/\b(\d{1,3})\s*[- ]?\s*(piece|pcs|pack|pc)\b/i);
-  if (pieceM && tags.length < maxTags) {
-    const tag = "#" + pieceM[1] + "Piece";
-    if (!seen.has(tag.toLowerCase())) { seen.add(tag.toLowerCase()); tags.unshift(tag); if (tags.length > maxTags) tags.length = maxTags; }
+  if (pieceM) add("#" + pieceM[1] + "Piece"); // high-signal product dimension FIRST
+  let m;
+  const phraseRe = /\b([A-Z][a-z]{2,}(?:\s+(?:and|&|of|the|with)?\s*[A-Z][a-z]{2,}){1,2})\b/g; // multi-word, letters only
+  while ((m = phraseRe.exec(src)) && tags.length < maxTags) {
+    add("#" + m[1].split(/\s+/).map((w) => /^(and|&|of|the|with)$/i.test(w) ? (w === "&" ? "And" : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()) : w.charAt(0).toUpperCase() + w.slice(1)).join("").replace(/[^A-Za-z0-9]/g, "").slice(0, 24));
   }
-  const seed = String(productKey || title || src || "harvested");
-  tags.push("#fb" + crypto.createHash("sha1").update(seed).digest("hex").slice(0, 4)); // deterministic uniqueness fingerprint
+  const tokenRe = /\b([A-Za-z][A-Za-z]{3,})\b/g; // single significant words (letters, >=4 chars)
+  while ((m = tokenRe.exec(src)) && tags.length < maxTags) {
+    if (HASHTAG_STOPWORDS.has(m[1].toLowerCase())) continue;
+    add("#" + m[1].charAt(0).toUpperCase() + m[1].slice(1).slice(0, 23));
+  }
+  tags.push("#fb" + crypto.createHash("sha1").update(String(productKey || title || src || "harvested")).digest("hex").slice(0, 4)); // deterministic uniqueness fingerprint
   return tags;
 }
 
