@@ -1539,6 +1539,7 @@ function renderState(state) {
   setValue("autopilotEnabledRail", state.operator.autopilotEnabled);
   renderOperatorToggleLabels();
   renderSafetySnapshot();
+  renderIncompleteRunBanner(state);
   setValue("scheduleEnabled", state.operator.scheduleEnabled);
   setValue("scheduleTimezone", state.operator.scheduleTimezone);
   setValue("runDays", state.operator.runDays);
@@ -4529,6 +4530,15 @@ async function saveProdRoles() {
   const mod = $("prodModeratorProfileSelect");
   const exc = $("prodExcludedProfileSelect");
   const syl = $("prodSylProfileSelect");
+  // CLOBBER GUARD: until the live profile list has loaded, the checklists show only a placeholder
+  // (zero inputs) — saving in that state would silently ERASE every saved moderator/excluded/SYL
+  // selection (this is how selections "disappeared" after a server restart). Refuse to save.
+  const rolesLoaded = Array.isArray(integrationProfiles) && integrationProfiles.length > 0
+    && ((mod && mod.querySelector("input")) || (exc && exc.querySelector("input")) || (syl && syl.querySelector("input")));
+  if (!rolesLoaded) {
+    if (typeof showToast === "function") showToast("Profiles not loaded yet — roles NOT saved. Click Load Profiles first.");
+    return;
+  }
   const ix = workflowState.ixbrowser || {};
   const modIds = checkedIds(mod), excIds = checkedIds(exc);
   const modLines = prodRoleKeepNonId(ix.moderatorProfiles).concat(modIds.map(prodRoleLabelFor));
@@ -5661,6 +5671,50 @@ function uxAttachSuspendedProfiles() {
   load();
 }
 
+// ── INTERRUPTED-RUN BANNER (Prod tab) ──────────────────────────────────────
+// Shown when the server recorded operator.lastIncompleteRun at boot (a restart cut a live
+// run short). Continue = arm for the remaining posts; Relaunch = arm for the full count
+// again; Dismiss = clear the banner and stay disarmed.
+function renderIncompleteRunBanner(state) {
+  const banner = $("incompleteRunBanner");
+  if (!banner) return;
+  const run = state?.operator?.lastIncompleteRun;
+  const pending = run && run.status === "pending";
+  banner.style.display = pending ? "" : "none";
+  if (!pending) return;
+  const max = Number(run.max) || 0;
+  const posted = Number(run.posted) || 0;
+  const remaining = Math.max(0, max - posted);
+  const when = run.at ? new Date(run.at).toLocaleString() : "";
+  const txt = $("incompleteRunText");
+  if (txt) txt.textContent = max > 0
+    ? `The server restarted during a run: ${posted} of ${max} posts were published — ${remaining} remaining. (detected ${when})`
+    : `The server restarted during an unlimited run (${posted} posts published so far). (detected ${when})`;
+  const cont = $("incompleteRunContinueBtn");
+  if (cont) cont.textContent = max > 0 ? `▶ Continue (${Math.max(1, remaining)} left)` : "▶ Continue";
+}
+
+function uxAttachIncompleteRunBanner() {
+  const wire = (id, action, label) => {
+    const btn = $(id);
+    if (!btn) return;
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        await api("/api/autopilot/resume", { method: "POST", body: JSON.stringify({ action }) });
+        const data = await api("/api/state");
+        renderState(data.state);
+        if (typeof showToast === "function") showToast(label);
+      } catch (e) {
+        if (typeof showToast === "function") showToast("Action failed: " + (e?.payload?.error || e.message || e));
+      } finally { btn.disabled = false; }
+    });
+  };
+  wire("incompleteRunContinueBtn", "continue", "Continuing the interrupted run ▶");
+  wire("incompleteRunRelaunchBtn", "relaunch", "Relaunching the full run 🔄");
+  wire("incompleteRunDismissBtn", "dismiss", "Interrupted run dismissed");
+}
+
 (function bootUxOverhaul() {
   const run = () => {
     try { uxInitCollapsiblePanels(); } catch (err) { console.warn("uxInitCollapsiblePanels failed", err); }
@@ -5671,6 +5725,7 @@ function uxAttachSuspendedProfiles() {
     try { uxAttachDisconnectedProfiles(); } catch (err) { console.warn("uxAttachDisconnectedProfiles failed", err); }
     try { uxAttachErroredProfiles(); } catch (err) { console.warn("uxAttachErroredProfiles failed", err); }
     try { uxAttachSuspendedProfiles(); } catch (err) { console.warn("uxAttachSuspendedProfiles failed", err); }
+    try { uxAttachIncompleteRunBanner(); } catch (err) { console.warn("uxAttachIncompleteRunBanner failed", err); }
   };
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", run);

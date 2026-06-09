@@ -729,13 +729,26 @@ function defaultSecrets() {
   };
 }
 
+// FAIL-SAFE state read: a transient file-read failure (EBUSY/EPERM race with the half-hourly git
+// auto-sync, antivirus scan, etc.) must NEVER surface as pure defaults — callers do read-modify-WRITE,
+// so a defaults read would silently wipe every saved dashboard selection (this exactly happened on
+// 2026-06-08, proven via the auto-sync git history). Keep the last successfully-parsed snapshot and
+// fall back to it; defaults are returned only if the file has never been readable in this process.
+let __lastGoodStateRaw = null;
 function readState() {
   try {
-    const state = deepMerge(defaultState(), parseJsonFile(STATE_FILE));
+    const parsed = parseJsonFile(STATE_FILE);
+    __lastGoodStateRaw = JSON.stringify(parsed);
+    const state = deepMerge(defaultState(), parsed);
     normalizeWorkflowState(state);
     return state;
   } catch (err) {
-    logEvent("workflow_state_read_failed", { error: String(err) });
+    logEvent("workflow_state_read_failed", { error: String(err), usingLastGood: Boolean(__lastGoodStateRaw) });
+    if (__lastGoodStateRaw) {
+      const state = deepMerge(defaultState(), JSON.parse(__lastGoodStateRaw));
+      normalizeWorkflowState(state);
+      return state;
+    }
     return defaultState();
   }
 }
@@ -888,7 +901,12 @@ function maskHost(value) {
 
 function writeState(state, opts = {}) {
   const existing = readState();
-  const clean = deepMerge(defaultState(), state);
+  // MERGE OVER EXISTING, NOT OVER DEFAULTS: a caller that passes a PARTIAL state (dashboard
+  // auto-save omitting uncollected fields, a background task holding a sparse snapshot, a raw
+  // PUT body) must never reset the omitted fields to factory defaults — omitted keys keep their
+  // freshest on-disk value; only keys EXPLICITLY present in the incoming object are applied.
+  // (Root cause of the 2026-06-08 selections wipe: deepMerge(defaultState(), sparseIncoming).)
+  const clean = deepMerge(deepMerge(defaultState(), existing), state);
   // CONTROL-FLAG CLOBBER GUARD: an in-flight autopilot tick (or any background task) holds a
   // STALE state snapshot and may call writeState minutes later. Without this, that stale write
   // resurrects operator control flags the operator just changed (e.g. re-arming after a disarm),
@@ -8718,6 +8736,42 @@ async function autopilotTickAsync(options = {}) {
     return decision;
   } finally {
     __autopilotTickInFlight = false;
+  }
+}
+
+// BOOT-TIME INCOMPLETE-RUN DETECTION (operator feature): if the process restarted while a
+// production run was ACTIVE (armed/enabled) or mid-count (0 < posted < max), record it in
+// operator.lastIncompleteRun so the dashboard Prod tab can offer Continue / Relaunch / Dismiss,
+// and DISARM — a restart must never silently resume live posting without the operator choosing.
+function detectIncompleteRunAtBoot() {
+  try {
+    const state = readState();
+    const op = state.operator || {};
+    const posted = Number(op.autopilotPostsThisRun) || 0;
+    const max = Number(op.autopilotMaxPostsPerRun) || 0;
+    const wasActive = op.autopilotEnabled === true || op.armedForExternalActions === true;
+    const midCount = max > 0 && posted > 0 && posted < max;
+    if (!wasActive && !midCount) return;
+    // Don't resurrect a banner the operator already resolved: if the run was NOT active at this
+    // restart and the existing record for the SAME counters was dismissed/continued/relaunched,
+    // leave it resolved (otherwise every later restart re-nags about the same old counters).
+    const prior = op.lastIncompleteRun;
+    if (!wasActive && prior && prior.status && prior.status !== "pending"
+        && Number(prior.posted) === posted && Number(prior.max) === max) return;
+    state.operator.lastIncompleteRun = {
+      at: new Date().toISOString(),
+      posted,
+      max,
+      reason: wasActive ? "run_active_at_restart" : "run_counter_incomplete_at_restart",
+      status: "pending",
+    };
+    state.operator.autopilotEnabled = false;
+    state.operator.armedForExternalActions = false;
+    // controlWrite: the clobber guard would otherwise resurrect the pre-restart armed flags.
+    writeState(state, { controlWrite: true });
+    logEvent("incomplete_run_detected_at_boot", { posted, max, reason: state.operator.lastIncompleteRun.reason });
+  } catch (err) {
+    logEvent("incomplete_run_boot_check_error", { error: oneLineField(err.message || String(err), 200) });
   }
 }
 
@@ -17610,6 +17664,39 @@ const server = http.createServer(async (req, res) => {
     const decision = await autopilotTickAsync({ manual: true });
     return json(res, 200, { ok: true, decision, autopilot: autopilotStatus() });
   }
+  if (req.method === "POST" && url.pathname === "/api/autopilot/resume") {
+    // Resolve the incomplete run recorded by detectIncompleteRunAtBoot (Prod-tab banner buttons).
+    //   continue  -> arm for the REMAINING posts (max - posted)
+    //   relaunch  -> arm for the FULL original count again
+    //   dismiss   -> just clear the banner, stay disarmed
+    const body = await readJson(req);
+    const action = String(body.action || "").toLowerCase();
+    if (!["continue", "relaunch", "dismiss"].includes(action)) {
+      return json(res, 400, { error: "action_must_be_continue_relaunch_or_dismiss" });
+    }
+    const state = readState();
+    const run = state.operator?.lastIncompleteRun || null;
+    if (!run || run.status !== "pending") return json(res, 404, { error: "no_incomplete_run_pending" });
+    if (action === "dismiss") {
+      state.operator.lastIncompleteRun = { ...run, status: "dismissed", resolvedAt: new Date().toISOString() };
+      const next = writeState(state, { controlWrite: true });
+      logEvent("incomplete_run_dismissed", { posted: run.posted, max: run.max });
+      return json(res, 200, { ok: true, action, state: next });
+    }
+    const origMax = Number(run.max) || 0;
+    const newMax = action === "continue" && origMax > 0
+      ? Math.max(1, origMax - (Number(run.posted) || 0))
+      : origMax; // relaunch keeps the original count; max=0 stays unlimited either way
+    state.operator.autopilotMaxPostsPerRun = newMax;
+    state.operator.autopilotPostsThisRun = 0;
+    state.operator.autopilotEnabled = true;
+    state.operator.armedForExternalActions = true;
+    state.operator.autopilotDryRun = false;
+    state.operator.lastIncompleteRun = { ...run, status: action === "continue" ? "continued" : "relaunched", resolvedAt: new Date().toISOString() };
+    const next = writeState(state, { controlWrite: true });
+    logEvent(`incomplete_run_${action === "continue" ? "continued" : "relaunched"}`, { posted: run.posted, max: run.max, newMax });
+    return json(res, 200, { ok: true, action, newMax, state: next });
+  }
   if (req.method === "GET" && url.pathname === "/api/prod/health") {
     // Box health for the Prod tab: total CPU (incl. Pinterest), whether the SEPARATE
     // Pinterest agent (port 59812) is still up (safety), and the no-photo-mark count.
@@ -18021,6 +18108,9 @@ server.listen(PORT, HOST, () => {
   // ensureImageSelectorServiceRunning().catch((err) => {
   //   logEvent("image_selector_service_warmup_error", { error: oneLineField(err.message || String(err), 240) });
   // });
+  // If a prod run was interrupted by this restart, record it for the Prod-tab banner and
+  // disarm BEFORE the scheduler starts — the operator chooses Continue / Relaunch / Dismiss.
+  detectIncompleteRunAtBoot();
   // Stage 3 autonomous publisher. Dormant unless operator.autopilotEnabled +
   // armed; dry-run by default (logs decisions, never posts) until
   // operator.autopilotDryRun is set false.

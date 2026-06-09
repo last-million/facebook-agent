@@ -581,6 +581,20 @@
             </ol>
           </section>
 
+          <section class="panel prodStep" data-view="prod" id="incompleteRunBanner" style="display:none; border:1px solid #8a6d3b; background:linear-gradient(180deg, rgba(138,109,59,.14), transparent);">
+            <div class="panelHead" style="align-items:center; gap:12px; flex-wrap:wrap;">
+              <div>
+                <h2>⏸ Interrupted production run</h2>
+                <p id="incompleteRunText">The server restarted while a run was in progress.</p>
+              </div>
+              <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                <button type="button" id="incompleteRunContinueBtn">▶ Continue remaining</button>
+                <button type="button" id="incompleteRunRelaunchBtn">🔄 Relaunch full run</button>
+                <button type="button" id="incompleteRunDismissBtn" style="opacity:.8;">✖ Dismiss</button>
+              </div>
+            </div>
+          </section>
+
           <section class="panel prodStep" data-view="prod" data-prod-step="1">
             <div class="panelHead">
               <div>
