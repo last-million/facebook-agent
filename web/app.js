@@ -6016,9 +6016,9 @@ function uxAttachIncompleteRunBanner() {
   let autoTried = false;
   let liveSyncBusy = false;
   const setState = (id, text, cls) => { const el = document.getElementById(id); if (el) { el.textContent = text; el.className = "setupState " + (cls || ""); } };
-  // LIVE SYNC: profiles auto-load on tab open AND refresh every 60s — adding/removing profiles in
-  // ixBrowser shows up here without clicking "Load Profiles" (server caches the ix call 45s, so
-  // this costs at most ~1 real ixBrowser request per 45s no matter how many tabs poll).
+  // LIVE SYNC: profiles auto-load on tab open AND refresh every 5 minutes (operator setting) —
+  // adding/removing profiles in ixBrowser shows up here without clicking "Load Profiles"
+  // (server caches the ix call 45s, so polling can never hammer ixBrowser).
   async function autoLoadProfiles() {
     if (liveSyncBusy || typeof loadIxProfilesQuiet !== "function") return;
     const builder = document.getElementById("groupAssignmentBuilder");
@@ -6048,7 +6048,7 @@ function uxAttachIncompleteRunBanner() {
   window.setInterval(() => {
     if (document.visibilityState !== "visible") return;
     onView();
-  }, 60000);
+  }, 300000); // 5 minutes (operator: sync each 5 min, not each 1 min)
   const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener("click", fn); };
   on("setupStepTestIx", async () => { setState("setupState1", "checking…", "warn"); try { await testIxBrowser(); setState("setupState1", "connected", "ok"); } catch (e) { setState("setupState1", "not reachable", "bad"); } });
   on("setupStepLoadProfiles", async () => { setState("setupState2", "loading…", "warn"); try { await loadIxProfilesQuiet(); autoTried = true; setState("setupState2", (integrationProfiles.length || 0) + " profiles loaded", "ok"); } catch (e) { setState("setupState2", "not reachable", "bad"); } });
