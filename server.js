@@ -10515,11 +10515,12 @@ function livePostPayloadForRow(row, groupUrl, imagePath, profileId, options = {}
   const sigTags = titleTags
     ? titleTags.join(" ")
     : (() => { const sigT1 = POST_SIG_TAGS[sigHash[2] % POST_SIG_TAGS.length]; let sigT2 = POST_SIG_TAGS[sigHash[3] % POST_SIG_TAGS.length]; if (sigT2 === sigT1) sigT2 = POST_SIG_TAGS[(sigHash[3] + 1) % POST_SIG_TAGS.length]; return `${sigT1} ${sigT2}`; })();
-  const signatureLine = `${sigE1} ${phrase} ${sigE2} ${sigTags}`;
+  // harvested (Option B): signature = JUST the unique tags (no emoji/title header). Web: emoji + phrase + tags.
+  const signatureLine = titleTags ? sigTags : `${sigE1} ${phrase} ${sigE2} ${sigTags}`;
   const postText = basePostText ? `${basePostText}\n\n${signatureLine}` : signatureLine;
-  // marker = phrase (+ the unique tags for harvested) — posted VERBATIM, located by exact match. The #fb
-  // fingerprint guarantees a unique permalink even for same-title / same-body products (no collision).
-  const marker = titleTags ? oneLineField(`${phrase} ${titleTags.join(" ")}`, 280) : oneLineField(phrase, 200);
+  // marker = the unique tags (incl the #fb fingerprint) for harvested — posted VERBATIM, located by exact
+  // match; the fingerprint guarantees a unique permalink even for same-title / same-body products. Web: phrase.
+  const marker = titleTags ? oneLineField(titleTags.join(" "), 280) : oneLineField(phrase, 200);
   return {
     profileId,
     groupUrl,
