@@ -432,6 +432,7 @@ function defaultState() {
       groupAssignmentMode: "percentage_manual_review",
       groupProfileAssignments: "",
       groupAssignmentData: [],
+      equalSplitAssignments: false, // Step-3 toggle: dispatch profiles equally, one group per profile
       // CONTENT SOURCE GROUPS (default OFF): harvest recent posts (text + image + the link in the first
       // comment) from these source FB groups and re-use them as ready-to-post content. enabled=false =>
       // byte-for-byte current behavior (nothing reads groupsText). One facebook.com/groups/… URL per line.
@@ -1456,6 +1457,7 @@ function normalizeWorkflowState(state) {
   })();
   state.posting.groupAssignmentMode = "percentage_manual_review";
   state.posting.groupProfileAssignments = String(state.posting.groupProfileAssignments || "").slice(0, 200000);
+  state.posting.equalSplitAssignments = state.posting.equalSplitAssignments === true; // Step-3 toggle: equal dispatch, each profile in exactly one group
   state.posting.groupFallbackPolicy = String(state.posting.groupFallbackPolicy || defaultState().posting.groupFallbackPolicy).slice(0, 600);
   state.posting.profileGroupIssueLogEndpoint = "/api/posting/profile-group-issue";
   state.posting.publishedPostUrls = String(state.posting.publishedPostUrls || "").slice(0, 200000);

@@ -1567,6 +1567,8 @@ function renderState(state) {
   setValue("groups", state.posting.groups);
   setValue("groupProfileAssignments", state.posting.groupProfileAssignments || "");
   groupAssignmentDraft = Array.isArray(state.posting.groupAssignmentData) ? structuredClone(state.posting.groupAssignmentData) : [];
+  setValue("equalSplitAssignments", state.posting.equalSplitAssignments === true);
+  $("groupAssignmentBuilder")?.classList.toggle("equalSplitOn", state.posting.equalSplitAssignments === true);
   setValue("sourceUrls", state.posting.sourceUrls);
   setValue("shortlinks", state.posting.shortlinks);
   setValue("readyDescriptionsPath", state.posting.readyDescriptionsPath);
@@ -2324,6 +2326,7 @@ function collectState() {
     groupAssignmentMode: "percentage_manual_review",
     groupProfileAssignments: getValue("groupProfileAssignments"),
     groupAssignmentData: collectGroupAssignmentData(),
+    equalSplitAssignments: ($("equalSplitAssignments") ? Boolean(getValue("equalSplitAssignments")) : (workflowState?.posting?.equalSplitAssignments === true)),
     groupFallbackPolicy: workflowState?.posting?.groupFallbackPolicy || "if a profile cannot post in its selected group, try the next available group URL from this run; if no group works, skip that profile and record the issue with profile id/name",
     profileGroupIssueLogEndpoint: "/api/posting/profile-group-issue",
     publishedPostUrls: workflowState?.posting?.publishedPostUrls || "",
@@ -2900,7 +2903,32 @@ function syncGroupAssignmentOutput() {
   $("groupProfileAssignments").value = lines.join("\n").trim() + (entries.length ? "\n" : "");
 }
 
+// EQUAL-SPLIT TOGGLE (operator option): when ON, profiles are dispatched EQUALLY between all
+// groups and each profile lives in EXACTLY ONE group (assignProfilesByPercent partitions by
+// slicing — it can never duplicate a profile across groups, unlike the per-card share slider).
+function equalSplitEnabled() {
+  const el = $("equalSplitAssignments");
+  return el ? Boolean(el.checked) : (workflowState?.posting?.equalSplitAssignments === true);
+}
+
+function applyEqualUniqueSplit() {
+  const groups = groupUrlsForAssignments();
+  if (!groups.length) return showToast("Add group URLs first.");
+  initializeGroupAssignmentDraft();
+  if (!groupAssignmentDraft.length) return;
+  const base = Math.floor(100 / groupAssignmentDraft.length);
+  let remainder = 100 - (base * groupAssignmentDraft.length);
+  groupAssignmentDraft.forEach((entry) => { entry.sharePercent = base + (remainder-- > 0 ? 1 : 0); });
+  const profiles = profileCandidatesForAssignments().map((profile) => profile.label);
+  if (!profiles.length) return showToast("Load or type profiles first.");
+  assignProfilesByPercent(profiles); // partitions: each profile in exactly ONE group
+  renderGroupAssignmentBuilder();
+  markDirty();
+  showToast("Profiles split equally — each profile in exactly one group ✓");
+}
+
 function applyEvenGroupSplit() {
+  if (equalSplitEnabled()) return applyEqualUniqueSplit();
   const groups = groupUrlsForAssignments();
   if (!groups.length) return showToast("Add group URLs first.");
   initializeGroupAssignmentDraft();
@@ -2928,6 +2956,7 @@ function normalizedGroupShares(entries) {
 }
 
 function applyPercentGroupSplit() {
+  if (equalSplitEnabled()) return applyEqualUniqueSplit();
   collectGroupAssignmentData();
   if (!groupAssignmentDraft.length) return showToast("Add group URLs first.");
   const cards = document.querySelectorAll("[data-assignment-card]");
@@ -5253,6 +5282,7 @@ $("moderatorProfiles")?.addEventListener("input", renderGroupAssignmentBuilder);
 
 $("groupAssignmentBuilder")?.addEventListener("input", (event) => {
   if (!event.target.matches("[data-assignment-share]")) return;
+  if (equalSplitEnabled()) return; // equal-split mode: shares are managed automatically
   applyShareSliderToCard(event.target.closest("[data-assignment-card]"));
 });
 
@@ -5260,6 +5290,7 @@ $("groupAssignmentBuilder")?.addEventListener("click", (event) => {
   const quick = event.target.closest("[data-share-quick]");
   if (quick) {
     event.preventDefault();
+    if (equalSplitEnabled()) return; // equal-split mode: shares are managed automatically
     const card = quick.closest("[data-assignment-card]");
     const slider = card && card.querySelector("[data-assignment-share]");
     if (slider) { slider.value = quick.getAttribute("data-share-quick"); applyShareSliderToCard(card); }
@@ -5273,7 +5304,26 @@ $("groupAssignmentBuilder")?.addEventListener("click", (event) => {
 
 $("groupAssignmentBuilder")?.addEventListener("change", (event) => {
   if (!event.target.matches("[data-assignment-profile]")) return;
+  // EQUAL-SPLIT uniqueness: a profile may live in only ONE group — checking it here unchecks it
+  // in every other group card.
+  if (equalSplitEnabled() && event.target.checked) {
+    const value = event.target.value;
+    document.querySelectorAll("[data-assignment-card]").forEach((card) => {
+      if (card.contains(event.target)) return;
+      card.querySelectorAll("[data-assignment-profile]").forEach((box) => {
+        if (box.value === value && box.checked) box.checked = false;
+      });
+    });
+  }
   syncGroupAssignmentOutput();
+  markDirty();
+});
+
+$("equalSplitAssignments")?.addEventListener("change", () => {
+  const on = Boolean(getValue("equalSplitAssignments"));
+  $("groupAssignmentBuilder")?.classList.toggle("equalSplitOn", on);
+  if (on) applyEqualUniqueSplit();
+  else showToast("Equal split OFF — manual sliders re-enabled.");
   markDirty();
 });
 
@@ -5964,20 +6014,41 @@ function uxAttachIncompleteRunBanner() {
 // ── Integrations: auto-load LIVE IXBrowser profiles + step-by-step wiring ─────────────────────
 (function integrationSetup() {
   let autoTried = false;
+  let liveSyncBusy = false;
   const setState = (id, text, cls) => { const el = document.getElementById(id); if (el) { el.textContent = text; el.className = "setupState " + (cls || ""); } };
+  // LIVE SYNC: profiles auto-load on tab open AND refresh every 60s — adding/removing profiles in
+  // ixBrowser shows up here without clicking "Load Profiles" (server caches the ix call 45s, so
+  // this costs at most ~1 real ixBrowser request per 45s no matter how many tabs poll).
   async function autoLoadProfiles() {
-    if (Array.isArray(integrationProfiles) && integrationProfiles.length) { setState("setupState2", integrationProfiles.length + " profiles loaded", "ok"); return; }
-    if (autoTried || typeof loadIxProfiles !== "function") return;
-    autoTried = true;
-    setState("setupState2", "loading from IXBrowser…", "warn");
-    try { await loadIxProfilesQuiet(); setState("setupState2", (integrationProfiles.length || 0) + " profiles loaded", "ok"); }
-    catch (e) { autoTried = false; setState("setupState2", "IXBrowser not reachable — click Load Profiles", "bad"); }
+    if (liveSyncBusy || typeof loadIxProfilesQuiet !== "function") return;
+    const builder = document.getElementById("groupAssignmentBuilder");
+    if (builder && builder.contains(document.activeElement)) return; // never clobber an edit in progress
+    liveSyncBusy = true;
+    const fingerprint = () => JSON.stringify((integrationProfiles || []).map((p) => String(p.profile_id || p.id) + "|" + (p.name || p.title || "")));
+    const hadProfiles = Array.isArray(integrationProfiles) && integrationProfiles.length > 0;
+    if (!hadProfiles) setState("setupState2", "loading from IXBrowser…", "warn");
+    try {
+      const before = fingerprint();
+      await loadIxProfilesQuiet();
+      setState("setupState2", (integrationProfiles.length || 0) + " profiles loaded", "ok");
+      if (before !== fingerprint()) {
+        if (typeof renderProdRoleSelects === "function") renderProdRoleSelects();
+        const s = document.getElementById("prodRolesStatus");
+        if (s) { s.className = "inlineNotice ok"; s.textContent = "Profiles live-synced from IXBrowser ✓ " + new Date().toLocaleTimeString(); }
+      }
+    } catch (e) {
+      if (!hadProfiles) setState("setupState2", "IXBrowser not reachable — will keep retrying", "bad");
+    } finally { liveSyncBusy = false; }
   }
   const onView = () => {
     const v = document.body.dataset.activeView;
     if (v === "integrations" || v === "prod") autoLoadProfiles();
   };
   document.querySelectorAll("[data-view-target]").forEach((b) => b.addEventListener("click", () => setTimeout(onView, 90)));
+  window.setInterval(() => {
+    if (document.visibilityState !== "visible") return;
+    onView();
+  }, 60000);
   const on = (id, fn) => { const el = document.getElementById(id); if (el) el.addEventListener("click", fn); };
   on("setupStepTestIx", async () => { setState("setupState1", "checking…", "warn"); try { await testIxBrowser(); setState("setupState1", "connected", "ok"); } catch (e) { setState("setupState1", "not reachable", "bad"); } });
   on("setupStepLoadProfiles", async () => { setState("setupState2", "loading…", "warn"); try { await loadIxProfilesQuiet(); autoTried = true; setState("setupState2", (integrationProfiles.length || 0) + " profiles loaded", "ok"); } catch (e) { setState("setupState2", "not reachable", "bad"); } });
