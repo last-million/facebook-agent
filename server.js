@@ -8752,7 +8752,7 @@ function startAutopilotScheduler() {
 
 // Turn a harvested caption into a tidy post body: drop "see more" leakage, hashtags, urls, and common
 // dropship CTAs, collapse whitespace, then truncate to a sane length at a sentence/word boundary.
-function cleanHarvestedPostText(raw) {
+function cleanHarvestedPostText(raw, maxLen = 180) {
   let t = String(raw || "").replace(/\r/g, "");
   t = t.replace(/…\s*$/,"").replace(/\s*(en voir plus|voir plus|see more|see translation|mehr ansehen|ver m[aá]s|altro)\s*$/i, "");
   t = t.replace(/\b(en voir plus|voir plus|see more)\b/gi, "");
@@ -8762,11 +8762,12 @@ function cleanHarvestedPostText(raw) {
   // tidy orphaned punctuation left by the removed phrases (e.g. ",, ." -> ".")
   t = t.replace(/,\s*,+/g, ",").replace(/,\s*\./g, ".").replace(/\.\s*\.+/g, ".").replace(/\s+,/g, ",").replace(/^[\s,.;:!?-]+/, "");
   t = t.replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").replace(/\s+([.,!?])/g, "$1").replace(/[ \t]+\n/g, "\n").trim();
-  if (t.length > 180) {
-    let cut = t.slice(0, 180);
+  if (t.length > maxLen) {
+    let cut = t.slice(0, maxLen);
     const stop = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("! "), cut.lastIndexOf("? "));
-    if (stop > 90) cut = cut.slice(0, stop + 1);
-    else { const sp = cut.lastIndexOf(" "); if (sp > 90) cut = cut.slice(0, sp); }
+    const half = Math.floor(maxLen / 2);
+    if (stop > half) cut = cut.slice(0, stop + 1);
+    else { const sp = cut.lastIndexOf(" "); if (sp > half) cut = cut.slice(0, sp); }
     t = cut.trim();
   }
   t = t.replace(/\s*…+\s*$/, "").replace(/[\s,;:•\-]+$/, "").trim(); // drop any trailing orphan ellipsis/punctuation
@@ -8780,6 +8781,39 @@ function harvestedShortTitle(raw) {
   t = (t.split(/(?<=[.!?])\s+|\n/)[0] || t).trim();
   if (t.length > 95) { t = t.slice(0, 95); const sp = t.lastIndexOf(" "); if (sp > 45) t = t.slice(0, sp); t = t.trim(); }
   return t;
+}
+
+// UNIQUE tracking hashtags for a harvested post: up to <maxTags> #CamelCase tags distilled from the product
+// title/description, PLUS one deterministic #fb<4hex> fingerprint (seeded from the productKey) so two products
+// with the SAME title still get distinct tags -> a unique post marker -> reliable, unambiguous permalink capture.
+const HASHTAG_STOPWORDS = new Set(["the","a","an","and","or","but","for","of","to","in","on","at","by","as","it","is","with","from","your","you","our","new","set","pack","piece","pieces","pcs","size","color","colour","inch","inches","count","free","sale","deal","deals","off","buy","shop","now","best","great","super","plus","more","get"]);
+function harvestedHashtags(title, description = "", productKey = "", maxTags = 8) {
+  const src = `${String(title || "")} ${String(description || "")}`.slice(0, 240);
+  const tags = []; const seen = new Set();
+  const phraseRe = /\b([A-Z][a-zA-Z]+(?:\s+(?:and|&|of|the)?\s*[A-Z0-9][a-zA-Z0-9]+){1,2})\b/g;
+  let m;
+  while ((m = phraseRe.exec(src)) && tags.length < maxTags) {
+    const words = m[1].split(/\s+/).filter((w) => w && !/^(and|&|of|the)$/i.test(w));
+    const tag = "#" + words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join("").replace(/[^A-Za-z0-9]/g, "").slice(0, 24);
+    const k = tag.toLowerCase();
+    if (tag.length >= 4 && tag.length <= 25 && !seen.has(k)) { seen.add(k); tags.push(tag); }
+  }
+  const tokenRe = /\b([A-Za-z][A-Za-z0-9]{2,})\b/g;
+  while ((m = tokenRe.exec(src)) && tags.length < maxTags) {
+    const w = m[1];
+    if (HASHTAG_STOPWORDS.has(w.toLowerCase()) || w.length < 4) continue;
+    const tag = "#" + w.charAt(0).toUpperCase() + w.slice(1).slice(0, 23);
+    const k = tag.toLowerCase();
+    if (!seen.has(k)) { seen.add(k); tags.push(tag); }
+  }
+  const pieceM = src.match(/\b(\d{1,3})\s*[- ]?\s*(piece|pcs|pack|pc)\b/i);
+  if (pieceM && tags.length < maxTags) {
+    const tag = "#" + pieceM[1] + "Piece";
+    if (!seen.has(tag.toLowerCase())) { seen.add(tag.toLowerCase()); tags.unshift(tag); if (tags.length > maxTags) tags.length = maxTags; }
+  }
+  const seed = String(productKey || title || src || "harvested");
+  tags.push("#fb" + crypto.createHash("sha1").update(seed).digest("hex").slice(0, 4)); // deterministic uniqueness fingerprint
+  return tags;
 }
 
 function preparePostingPlan(options = {}) {
@@ -8868,11 +8902,11 @@ function preparePostingPlan(options = {}) {
     // post-text, the review-image channel, and ShopYourLikes link-gen.
     const harvestedRec = String(product.key || "").startsWith("harvested:") ? harvestedRecordForKey(product.key, state) : null;
     const postCta = String(state.posting?.contentSources?.postCta || "").trim();
-    // HARVESTED post body = the optional CTA only; the unique "emoji + SHORT product title + hashtags"
-    // signature line is auto-appended by livePostPayloadForRow (clean deal post, NOT the seller's caption).
-    // The clean short title flows via row.title -> computePostMarkerPhrase below.
+    // HARVESTED post body = the EXACT harvested caption (the seller's real product description), cleaned of
+    // THEIR junk (their #hashtags / urls / dropship CTAs / see-more leak) but kept up to ~600 chars. The unique
+    // "emoji + title + 8 tracking #tags + #fb-fingerprint" signature line is appended by livePostPayloadForRow.
     const postText = harvestedRec
-      ? postCta
+      ? cleanHarvestedPostText(harvestedRec.text, 600)
       : rotationValue(postTexts, state.contentRotation.postTextCursor, index, state.contentRotation.avoidPostTextReuse);
     const commentLeadIn = rotationValue(commentLeadIns, state.contentRotation.commentLeadInCursor, index, state.contentRotation.avoidCommentLeadInReuse);
     const affiliateLink = affiliateShortlinkForProduct(product, state);
@@ -8920,6 +8954,7 @@ function preparePostingPlan(options = {}) {
       profileGroupIssueLogEndpoint: state.posting.profileGroupIssueLogEndpoint,
       productUrl: product.url,
       productKey: product.key,
+      harvested: Boolean(harvestedRec), // harvested rows -> exact-text body + 8 unique tracking #tags + #fb fingerprint marker
       productId: product.productId,
       retailer: product.store,
       title: harvestedRec ? (harvestedShortTitle(harvestedRec.text) || product.title) : (product.storedTitle || product.title), // harvested: a CLEAN short product title -> feeds the emoji+title+tags signature; else the discovered title
@@ -10482,14 +10517,18 @@ function livePostPayloadForRow(row, groupUrl, imagePath, profileId, options = {}
   const sigE1 = POST_SIG_EMOJIS[sigHash[0] % POST_SIG_EMOJIS.length];
   let sigE2 = POST_SIG_EMOJIS[sigHash[1] % POST_SIG_EMOJIS.length];
   if (sigE2 === sigE1) sigE2 = POST_SIG_EMOJIS[(sigHash[1] + 1) % POST_SIG_EMOJIS.length];
-  const sigT1 = POST_SIG_TAGS[sigHash[2] % POST_SIG_TAGS.length];
-  let sigT2 = POST_SIG_TAGS[sigHash[3] % POST_SIG_TAGS.length];
-  if (sigT2 === sigT1) sigT2 = POST_SIG_TAGS[(sigHash[3] + 1) % POST_SIG_TAGS.length];
-  const signatureLine = `${sigE1} ${phrase} ${sigE2} ${sigT1} ${sigT2}`;
+  // HARVESTED rows: up to 8 UNIQUE #tags from the product title/description + a deterministic #fb fingerprint
+  // (so same-title products never collide). Web rows: the existing 2 rotating static tags. The tag string is in
+  // BOTH the posted signature AND the marker, so the marker is a verbatim substring of the post -> unique permalink.
+  const titleTags = row.harvested ? harvestedHashtags(row.title, basePostText, row.productKey) : null;
+  const sigTags = titleTags
+    ? titleTags.join(" ")
+    : (() => { const sigT1 = POST_SIG_TAGS[sigHash[2] % POST_SIG_TAGS.length]; let sigT2 = POST_SIG_TAGS[sigHash[3] % POST_SIG_TAGS.length]; if (sigT2 === sigT1) sigT2 = POST_SIG_TAGS[(sigHash[3] + 1) % POST_SIG_TAGS.length]; return `${sigT1} ${sigT2}`; })();
+  const signatureLine = `${sigE1} ${phrase} ${sigE2} ${sigTags}`;
   const postText = basePostText ? `${basePostText}\n\n${signatureLine}` : signatureLine;
-  // marker = the unique full title phrase (posted verbatim). Located by EXACT match. The
-  // post-capture lock + the 7-day product-reuse window mean no OTHER recent post shares it.
-  const marker = oneLineField(phrase, 200);
+  // marker = phrase (+ the unique tags for harvested) — posted VERBATIM, located by exact match. The #fb
+  // fingerprint guarantees a unique permalink even for same-title / same-body products (no collision).
+  const marker = titleTags ? oneLineField(`${phrase} ${titleTags.join(" ")}`, 280) : oneLineField(phrase, 200);
   return {
     profileId,
     groupUrl,
