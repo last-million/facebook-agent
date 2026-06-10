@@ -5277,6 +5277,11 @@ function updateContentSourceBranch() {
   const cp = $("sourceCopyFields"), sc = $("sourceScrapeFields");
   if (cp) cp.style.display = copy ? "" : "none";
   if (sc) sc.style.display = copy ? "none" : ""; // scrape branch holds ALL manual-scraping inputs (urls + comment + post texts)
+  // COPY MODE always runs only-copied-products + auto-sized reserve — force both ON (the checkboxes are hidden).
+  if (copy) {
+    const ex = $("contentSourcesExclusive"); if (ex && !ex.checked) ex.checked = true;
+    const ra = $("contentSourcesReserveAuto"); if (ra && !ra.checked) ra.checked = true;
+  }
   // reflect the prominent method switch (Manual scraping <-> Easy copy from group)
   document.querySelectorAll(".methodOpt").forEach((b) => b.classList.toggle("active", (b.dataset.method === "copy") === copy));
 }

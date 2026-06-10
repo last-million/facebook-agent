@@ -801,10 +801,14 @@
                   <button id="addSourceGroupUrlBtn">Add Source Group</button>
                 </div>
                 <label class="span2">Source group URLs — one per line. A member profile is picked &amp; learned <b>automatically</b> (optionally pin one with <code>| profileId</code>). <textarea id="contentSourceGroupsText" spellcheck="false" placeholder="https://www.facebook.com/groups/your-source-group"></textarea></label>
-                <label class="span2"><input type="checkbox" id="contentSourcesExclusive"> Use <b>ONLY</b> copied products — skip web scraping entirely <span style="opacity:.7">(off = copied products post first, then web scraping fills in)</span></label>
-                <label class="span2"><input type="checkbox" id="contentSourcesReserveAuto"> <b>Auto-size reserve</b> from your daily posting capacity <span style="opacity:.7">(recommended — a steady working buffer kept topped up by continuous harvesting; the number below is computed automatically)</span></label>
-                <label>Reserve target <span style="opacity:.7">(manual; used when auto is off)</span> <input type="number" id="contentSourcesReserveTarget" min="1" max="5000" step="1" placeholder="20"></label>
-                <label>Refill when reserve drops to <input type="number" id="contentSourcesReserveRefillAt" min="0" max="999" step="1" placeholder="10"></label>
+                <!-- Copy-mode ALWAYS uses only-copied-products + auto-sized reserve. Forced ON + hidden (operator):
+                     no need to show these; the JS keeps both checked whenever copy mode is selected. -->
+                <div id="copyForcedSettings" style="display:none" aria-hidden="true">
+                  <label><input type="checkbox" id="contentSourcesExclusive"> use only copied products</label>
+                  <label><input type="checkbox" id="contentSourcesReserveAuto"> auto-size reserve</label>
+                  <label><input type="number" id="contentSourcesReserveTarget" min="1" max="5000" step="1" placeholder="20"></label>
+                  <label><input type="number" id="contentSourcesReserveRefillAt" min="0" max="999" step="1" placeholder="10"></label>
+                </div>
                 <label>Profiles per group <span style="opacity:.7">(parallel harvest)</span> <input type="number" id="contentSourcesProfilesPerGroup" min="1" max="6" step="1" placeholder="3"></label>
                 <label>Re-use copied products after <input type="number" id="contentSourcesReuseHours" min="1" max="720" step="1" placeholder="26"> hours <span style="opacity:.7">(eligible to re-post after this; never stalls)</span></label>
                 <label>Delete copied images older than <input type="number" id="contentSourcesImageRetentionDays" min="1" max="90" step="1" placeholder="7"> days <span style="opacity:.7">(frees disk; record kept)</span></label>
