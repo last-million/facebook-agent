@@ -7837,7 +7837,7 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
   const payloadDir = path.join(DATA_DIR, "harvest-requests");
   fs.mkdirSync(payloadDir, { recursive: true });
   const payloadPath = path.join(payloadDir, `harvest-${Date.now()}-${crypto.randomBytes(5).toString("hex")}.json`);
-  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4), harvestSeenIds: (opts.seenIds || []).slice(0, 2000), harvestProfileIndex: Number(opts.profileIndex || 0), harvestProfileCount: Number(opts.profileCount || 1), harvestResumeFbid: String(opts.resumeFromFbid || "") }));
+  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4), harvestSeenIds: (opts.seenIds || []).slice(0, 2000), harvestProfileIndex: Number(opts.profileIndex || 0), harvestProfileCount: Number(opts.profileCount || 1), harvestResumeFbid: String(opts.resumeFromFbid || ""), harvestClaimsDir: String(opts.claimsDir || "") }));
   try {
     const { stdout } = await execFileAsync("node", [scriptPath, payloadPath], { cwd: ROOT, windowsHide: true, timeout: 6 * 60 * 1000, maxBuffer: 24 * 1024 * 1024 });
     const objs = parseJsonLogObjects(stdout);
@@ -7994,6 +7994,11 @@ async function harvestContentSourcesAsync(options = {}) {
     const resumeUpdates = {};
     let harvestedNew = 0, skippedSeen = 0, reusedOld = 0;
     const harvestCount = clampNumber(options.harvestCount || (effectiveTarget - reserve), 1, 20, 4); // grab the GAP toward the (day or night) target in one harvest (capped at 20/session)
+    // SHARED CLAIMS DIR (the pilot's tracker): all profiles harvesting in PARALLEL this round point at the
+    // SAME dir; the atomic per-product claim file guarantees no two profiles ever take the same product.
+    const harvestRunId = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+    const claimsDir = path.join(DATA_DIR, "harvest-claims", harvestRunId);
+    try { fs.mkdirSync(claimsDir, { recursive: true }); } catch (_) {}
     for (let i = 0; i < pairs.length; i += 4) { // 4-by-4
       const round = pairs.slice(i, i + 4);
       // NO waitForPostingIdle: harvesting (low-risk browsing) runs CONCURRENTLY with posting so the reserve
@@ -8005,9 +8010,10 @@ async function harvestContentSourcesAsync(options = {}) {
         try { release = acquireNormalIxProfileUse(pair.profileId, "facebook_harvest"); }
         catch (e) { logEvent("harvest_profile_busy_skipped", { profileId: pair.profileId }); return; } // posting/discovery owns it -> skip
         try {
-          const harvestRes = await runHarvestConnector(pair.groupUrl, pair.profileId, harvestCount, { seenIds: seenPostIds, profileIndex: pair.profileIndex || 0, profileCount: pair.profileCount || 1, resumeFromFbid: String(resumeMap[pair.groupUrl] || "") });
+          const harvestRes = await runHarvestConnector(pair.groupUrl, pair.profileId, harvestCount, { seenIds: seenPostIds, profileIndex: pair.profileIndex || 0, profileCount: pair.profileCount || 1, resumeFromFbid: String(resumeMap[pair.groupUrl] || ""), claimsDir });
           const items = harvestRes.items || [];
           if (harvestRes.lastFbid) resumeUpdates[pair.groupUrl] = harvestRes.lastFbid; // remember the deepest photo reached -> next round resumes older
+          if (items.length) logEvent("harvest_profile_took", { profileId: pair.profileId, groupUrl: pair.groupUrl, count: items.length, products: items.map((it) => oneLineField(String(it.link || ""), 80)).slice(0, 8) }); // TRACKING: which profile claimed which products (parallel dedup proof)
           for (const it of items) {
             const url = String(it.link || "").trim();
             if (!url) continue;
@@ -8051,6 +8057,7 @@ async function harvestContentSourcesAsync(options = {}) {
       }));
       if (i + 4 < pairs.length) await sleep(clampNumber(options.interRoundGapMs || 25000, 5000, 120000, 25000)); // anti-throttle pacing
     }
+    try { fs.rmSync(claimsDir, { recursive: true, force: true }); } catch (_) {} // round done -> drop the claims tracker
     // PERSIST the per-group resume positions (deepest photo reached) so the next round digs OLDER.
     if (Object.keys(resumeUpdates).length) {
       try {

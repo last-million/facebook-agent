@@ -3067,6 +3067,26 @@ async function approvePendingPost(page, context, payload, gid, marker) {
 // emoji-safe, so no UTF mangling end-to-end) — the product image, and the first-comment product link,
 // downloads the image in the authed session, and fetches the link's product OpenGraph (real name/desc for
 // the #tags). Returns the harvest record, or null (no product link, or a duplicate already taken this round).
+// ATOMIC CROSS-PROFILE CLAIM: when several profiles harvest the SAME group in parallel, this guarantees
+// no two ever take the same product. The claim is an exclusive file create (flag 'wx' is atomic on the
+// filesystem) keyed by the product url — the FIRST profile to create it wins; everyone else gets EEXIST
+// and skips. The Python/Node pilot points all profiles of a round at the SAME claims dir.
+function claimProduct(claimsDir, productKey, profileId) {
+  if (!claimsDir) return true; // no coordination (single profile) -> always take it
+  try {
+    const crypto = require('crypto'); const pathmod = require('path');
+    fs.mkdirSync(claimsDir, { recursive: true });
+    const lock = pathmod.join(claimsDir, crypto.createHash('sha1').update(String(productKey)).digest('hex').slice(0, 24) + '.claim');
+    const fd = fs.openSync(lock, 'wx'); // exclusive create — atomic winner-takes-it
+    fs.writeSync(fd, JSON.stringify({ profileId, productKey, at: new Date().toISOString() }));
+    fs.closeSync(fd);
+    return true;
+  } catch (e) {
+    if (e && e.code === 'EEXIST') return false; // another profile already claimed this product
+    return true; // any other fs error -> don't block harvesting
+  }
+}
+
 async function harvestExtractPhoto(page, ctx) {
   const seenLinks = ctx.seenLinks; const ogState = ctx.ogState || { n: 0 };
   try {
@@ -3119,6 +3139,11 @@ async function harvestExtractPhoto(page, ctx) {
   const dkey = (data.link || '').split(/[?#]/)[0];
   if (!data.link || !dkey || seenLinks.has(dkey)) return null; // PRODUCTS only: no first-comment product link => skip (recipes/news never enter the buffer)
   seenLinks.add(dkey);
+  // PARALLEL DEDUP: another profile in this round may have already taken this exact product — skip it.
+  if (ctx.claimsDir && !claimProduct(ctx.claimsDir, dkey, ctx.profileId)) {
+    console.log(JSON.stringify({ step: 'harvest_claimed_by_other', key: dkey }));
+    return null;
+  }
   let imageLocalPath = '';
   if (data.image) {
     try {
@@ -3235,14 +3260,29 @@ async function harvestGroupFeed(page, count, opts = {}) {
     return { items: grid, lastFbid: '' };
   }
   console.log(JSON.stringify({ step: 'harvest_walk_start', groupId, startFbid: curFbid, startMode, profileIndex: pIndex, profileCount: pCount }));
-  await page.goto(`https://www.facebook.com/photo/?fbid=${curFbid}&set=g.${groupId}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(2500);
+  // OPEN THE THEATER BY CLICKING A TILE: a direct goto to /photo/?fbid does NOT open the keyboard-
+  // navigable lightbox (FB renders a static photo page), but an in-page CLICK on a tile does. So we
+  // navigate to /media and CLICK the matching (or first) tile to get the real, arrow-navigable theater.
+  const mediaUrl = `https://www.facebook.com/groups/${groupId}/media`;
+  if (!/\/media/i.test(page.url())) { await page.goto(mediaUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {}); await page.waitForTimeout(2500); }
   await dismissFacebookInterstitials(page).catch(() => {});
+  let opened = false;
+  try {
+    const sel = `a[href*="/photo"][href*="fbid=${curFbid}"]`;
+    let tile = page.locator(sel).first();
+    if (!(await tile.count().catch(() => 0))) tile = page.locator('a[href*="/photo"][href*="fbid="]').first();
+    if (await tile.count().catch(() => 0)) { await tile.scrollIntoViewIfNeeded().catch(() => {}); await tile.click({ timeout: 8000 }); opened = true; }
+  } catch (e) { console.log(JSON.stringify({ step: 'harvest_theater_click_failed', error: String((e && e.message) || e).slice(0, 120) })); }
+  await page.waitForTimeout(2800);
+  await dismissFacebookInterstitials(page).catch(() => {});
+  const afterClick = await photoViewerFbid(page);
+  console.log(JSON.stringify({ step: 'harvest_theater_opened', opened, afterClickFbid: afterClick }));
+  if (afterClick) curFbid = afterClick;
   // resume_older => step ONE past the saved photo; parallel profiles stagger by profileIndex (no overlap)
   const initialSkips = (startMode === 'resume_older' ? 1 : 0) + pIndex;
   for (let s = 0; s < initialSkips; s++) { const nf = await advanceToNextPhoto(page); if (!nf) break; curFbid = nf; }
   let lastFbid = curFbid;
-  const maxSteps = count * pCount * 8 + 25;       // bounded deep walk
+  const maxSteps = Math.max(60, count * pCount * 10 + 200); // walk deep past SEEN photos (skips are cheap); the deadline is the real bound
   const deadline = Date.now() + 210000;           // 3.5 min wall-clock cap (stays UNDER the 6-min connector kill)
   let steps = 0;
   while (out.length < count && steps < maxSteps && Date.now() < deadline) {
@@ -3251,7 +3291,7 @@ async function harvestGroupFeed(page, count, opts = {}) {
     lastFbid = curFbid || lastFbid;
     if (curFbid && !seenIds.has(curFbid)) {
       try {
-        const rec = await harvestExtractPhoto(page, { href: `https://www.facebook.com/photo/?fbid=${curFbid}&set=g.${groupId}`, postId: curFbid, seenLinks, ogState });
+        const rec = await harvestExtractPhoto(page, { href: `https://www.facebook.com/photo/?fbid=${curFbid}&set=g.${groupId}`, postId: curFbid, seenLinks, ogState, claimsDir: opts.claimsDir, profileId: opts.profileId });
         if (rec) { out.push(rec); console.log(JSON.stringify({ step: 'harvest_item', n: out.length, fbid: curFbid, textLen: (rec.text || '').length, textPreview: (rec.text || '').slice(0, 90), imageSaved: !!rec.imageLocalPath, link: rec.link })); }
         else { console.log(JSON.stringify({ step: 'harvest_walk_skip', fbid: curFbid, reason: 'no_product_link_or_dup' })); }
       } catch (e) { console.log(JSON.stringify({ step: 'harvest_walk_item_error', fbid: curFbid, error: String((e && e.message) || e).slice(0, 140) })); }
@@ -3345,7 +3385,7 @@ async function harvestGroupFeedGrid(page, count, opts = {}) {
       await page.goto(item.href, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await page.waitForSelector('div[role="article"], img[src*="fbcdn"]', { timeout: 3500 }).catch(() => {});
       await page.waitForTimeout(600);
-      const rec = await harvestExtractPhoto(page, { href: item.href, postId: item.postId, seenLinks, ogState });
+      const rec = await harvestExtractPhoto(page, { href: item.href, postId: item.postId, seenLinks, ogState, claimsDir: opts.claimsDir, profileId: opts.profileId });
       if (rec) { out.push(rec); console.log(JSON.stringify({ step: 'harvest_item', n: out.length, textLen: (rec.text || '').length, textPreview: (rec.text || '').slice(0, 100), imageSaved: !!rec.imageLocalPath, link: rec.link, key: rec.productKey })); }
     } catch (e) {
       console.log(JSON.stringify({ step: 'harvest_item_error', href: item.href.slice(0, 120), error: String((e && e.message) || e).slice(0, 160) }));
@@ -3537,7 +3577,7 @@ async function main() {
     }
     let harvested = [], harvestLastFbid = '';
     try {
-      const r = await harvestGroupFeed(page, harvestCount, { seenIds: payload.harvestSeenIds || [], profileIndex: payload.harvestProfileIndex || 0, profileCount: payload.harvestProfileCount || 1, resumeFromFbid: payload.harvestResumeFbid || '' });
+      const r = await harvestGroupFeed(page, harvestCount, { seenIds: payload.harvestSeenIds || [], profileIndex: payload.harvestProfileIndex || 0, profileCount: payload.harvestProfileCount || 1, resumeFromFbid: payload.harvestResumeFbid || '', claimsDir: payload.harvestClaimsDir || '', profileId: payload.profileId });
       if (Array.isArray(r)) { harvested = r; } else { harvested = (r && r.items) || []; harvestLastFbid = (r && r.lastFbid) || ''; }
     }
     catch (e) { console.log(JSON.stringify({ step: 'harvest_error', error: String((e && e.message) || e).slice(0, 300) })); }
