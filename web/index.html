@@ -581,20 +581,6 @@
             </ol>
           </section>
 
-          <section class="panel prodStep" data-view="prod" id="incompleteRunBanner" style="display:none; border:1px solid #8a6d3b; background:linear-gradient(180deg, rgba(138,109,59,.14), transparent);">
-            <div class="panelHead" style="align-items:center; gap:12px; flex-wrap:wrap;">
-              <div>
-                <h2>⏸ Interrupted production run</h2>
-                <p id="incompleteRunText">The server restarted while a run was in progress.</p>
-              </div>
-              <div style="display:flex; gap:8px; flex-wrap:wrap;">
-                <button type="button" id="incompleteRunContinueBtn">▶ Continue remaining</button>
-                <button type="button" id="incompleteRunRelaunchBtn">🔄 Relaunch full run</button>
-                <button type="button" id="incompleteRunDismissBtn" style="opacity:.8;">✖ Dismiss</button>
-              </div>
-            </div>
-          </section>
-
           <section class="panel prodStep" data-view="prod" data-prod-step="1">
             <div class="panelHead">
               <div>
@@ -651,6 +637,19 @@
               <p class="muted">Live autonomous posting — status, safety, controls, and the pipeline steps. Cross-account comments and the no-photo skip are always on. The CPU governor keeps the box from starving the separate Pinterest agent.</p>
             </div>
             <div class="panelBody">
+              <div id="incompleteRunBanner" style="display:none; border:1px solid #8a6d3b; border-radius:10px; background:linear-gradient(180deg, rgba(138,109,59,.14), transparent); padding:12px 14px; margin-bottom:14px;">
+                <div class="panelHead" style="align-items:center; gap:12px; flex-wrap:wrap; margin:0;">
+                  <div>
+                    <h2 style="margin:0;">⏸ Interrupted production run</h2>
+                    <p id="incompleteRunText" style="margin:4px 0 0;">The server restarted while a run was in progress.</p>
+                  </div>
+                  <div style="display:flex; gap:8px; flex-wrap:wrap;">
+                    <button type="button" id="incompleteRunContinueBtn">▶ Continue remaining</button>
+                    <button type="button" id="incompleteRunRelaunchBtn">🔄 Relaunch full run</button>
+                    <button type="button" id="incompleteRunDismissBtn" style="opacity:.8;">✖ Dismiss</button>
+                  </div>
+                </div>
+              </div>
               <div id="prodHeadline" class="prodHeadline">Loading production status…</div>
               <div id="prodStatusGrid" class="prodStatusGrid"></div>
               <h3 class="prodSectionTitle">Launch</h3>
