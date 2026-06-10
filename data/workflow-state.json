@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-10T20:23:42.759Z",
+  "updatedAt": "2026-06-10T20:32:40.264Z",
   "testRun": {
     "status": "ready",
     "active": false,
@@ -84,7 +84,7 @@
     "updatedAt": ""
   },
   "operator": {
-    "armedForExternalActions": false,
+    "armedForExternalActions": true,
     "autopilotEnabled": false,
     "autopilotTickSeconds": 120,
     "autopilotDryRun": false,
@@ -192,7 +192,7 @@
       "reuseHours": 6,
       "imageRetentionDays": 30,
       "overnightReserveTarget": 200,
-      "harvestResume": "{}",
+      "harvestResume": "{\"https://www.facebook.com/groups/o38679876833911\":\"122108053070437013\"}",
       "harvestMembers": "{\"https://www.facebook.com/groups/o38679876833911\":[65,67,69]}"
     },
     "groupFallbackPolicy": "if a profile cannot post in its selected group, try the next available group URL from this run; if no group works, skip that profile and record the issue with profile id/name",
