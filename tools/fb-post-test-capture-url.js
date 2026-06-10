@@ -3176,19 +3176,27 @@ async function photoViewerFbid(page) {
 // aria-labelled Next button. Returns the new fbid, or '' when there are no more photos (end of group).
 async function advanceToNextPhoto(page) {
   const before = await photoViewerFbid(page);
-  try { const vp = page.viewportSize() || { width: 1280, height: 800 }; await page.mouse.move(Math.floor(vp.width * 0.42), Math.floor(vp.height * 0.5)); } catch (_) {}
+  // 1) FOCUS the theater (click the big photo) so the right-arrow key is captured, then press it.
+  try {
+    const vp = page.viewportSize() || { width: 1280, height: 800 };
+    await page.mouse.click(Math.floor(vp.width * 0.45), Math.floor(vp.height * 0.45));
+  } catch (_) {}
   await page.keyboard.press('ArrowRight').catch(() => {});
-  for (let i = 0; i < 24; i++) {
-    await page.waitForTimeout(250);
-    const now = await photoViewerFbid(page);
-    if (now && now !== before) return now;
-  }
+  for (let i = 0; i < 16; i++) { await page.waitForTimeout(250); const now = await photoViewerFbid(page); if (now && now !== before) return now; }
+  // 2) CLICK a Next control: aria-labelled next button (any language), else a forward /photo link to a
+  //    DIFFERENT fbid (the theater's right chevron is one of these).
   const clicked = await page.evaluate(() => {
-    const re = /next photo|next image|^next$|suivant|photo suivante|الصورة التالية|التالي/i;
-    const b = [...document.querySelectorAll('[aria-label],[aria-labelledby]')].find((e) => re.test(e.getAttribute('aria-label') || ''));
-    if (b) { try { b.click(); return true; } catch (_) {} } return false;
-  }).catch(() => false);
+    const cur = (location.href.match(/fbid=(\d+)/) || [])[1] || '';
+    const re = /next photo|next image|^next$|view next|next media|suivant|photo suivante|image suivante|الصورة التالية|التالي|الصوره التاليه/i;
+    let b = [...document.querySelectorAll('[aria-label]')].find((e) => re.test(e.getAttribute('aria-label') || ''));
+    if (!b) b = [...document.querySelectorAll('a[href*="/photo"][href*="fbid="]')].find((a) => { const m = (a.href.match(/fbid=(\d+)/) || [])[1]; return m && m !== cur; });
+    if (b) { try { b.click(); return (b.getAttribute && b.getAttribute('aria-label')) || (b.href || 'next-link'); } catch (_) {} }
+    return '';
+  }).catch(() => '');
   if (clicked) { for (let i = 0; i < 16; i++) { await page.waitForTimeout(250); const now = await photoViewerFbid(page); if (now && now !== before) return now; } }
+  // 3) diagnostic so we can see WHY it won't advance (theater chrome differs by surface/language)
+  const diag = await page.evaluate(() => ({ url: location.href.slice(0, 110), labels: [...new Set([...document.querySelectorAll('[aria-label]')].map((e) => e.getAttribute('aria-label')).filter(Boolean))].slice(0, 24), photoLinks: document.querySelectorAll('a[href*="/photo"][href*="fbid="]').length })).catch(() => ({}));
+  console.log(JSON.stringify({ step: 'harvest_advance_failed', triedClick: clicked, diag }));
   return '';
 }
 
@@ -3234,9 +3242,10 @@ async function harvestGroupFeed(page, count, opts = {}) {
   const initialSkips = (startMode === 'resume_older' ? 1 : 0) + pIndex;
   for (let s = 0; s < initialSkips; s++) { const nf = await advanceToNextPhoto(page); if (!nf) break; curFbid = nf; }
   let lastFbid = curFbid;
-  const maxSteps = count * pCount * 14 + 40; // bounded deep walk
+  const maxSteps = count * pCount * 8 + 25;       // bounded deep walk
+  const deadline = Date.now() + 210000;           // 3.5 min wall-clock cap (stays UNDER the 6-min connector kill)
   let steps = 0;
-  while (out.length < count && steps < maxSteps) {
+  while (out.length < count && steps < maxSteps && Date.now() < deadline) {
     steps++;
     curFbid = (await photoViewerFbid(page)) || curFbid;
     lastFbid = curFbid || lastFbid;
@@ -3253,7 +3262,15 @@ async function harvestGroupFeed(page, count, opts = {}) {
     if (!moved) { console.log(JSON.stringify({ step: 'harvest_walk_end', reason: 'no_more_photos', steps, collected: out.length })); break; }
     curFbid = moved; lastFbid = moved;
   }
-  console.log(JSON.stringify({ step: 'harvest_walk_done', collected: out.length, lastFbid, steps }));
+  console.log(JSON.stringify({ step: 'harvest_walk_done', collected: out.length, lastFbid, steps, timedOut: Date.now() >= deadline }));
+  // SAFETY NET: if the photo theater wouldn't navigate at all (advance failed on the first step), the
+  // walk is useless on this surface — fall back to the proven /media grid scroll so harvest never regresses.
+  if (out.length === 0 && steps <= 2) {
+    console.log(JSON.stringify({ step: 'harvest_walk_fallback_grid', reason: 'theater_not_navigable' }));
+    try { await page.goto(`https://www.facebook.com/groups/${groupId}/media`, { waitUntil: 'domcontentloaded', timeout: 60000 }); await page.waitForTimeout(2500); } catch (_) {}
+    const grid = await harvestGroupFeedGrid(page, count, opts);
+    return { items: grid, lastFbid };
+  }
   return { items: out, lastFbid };
 }
 

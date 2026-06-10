@@ -1498,6 +1498,7 @@ function normalizeWorkflowState(state) {
   // imageRetentionDays to free disk (the text+url record stays for dedup).
   state.posting.contentSources.reuseHours = clampNumber(state.posting.contentSources.reuseHours, 1, 720, 26);
   state.posting.contentSources.imageRetentionDays = clampNumber(state.posting.contentSources.imageRetentionDays, 1, 90, 7);
+  state.posting.contentSources.harvestResume = String(state.posting.contentSources.harvestResume || "").slice(0, 20000); // per-group photo-viewer resume positions {groupUrl: lastFbid}
   // DISCONNECTED profiles (not logged into Facebook) — auto-parked here + SKIPPED by posting/harvest until
   // the admin re-logs them in and releases them from the Prod-tab "Disconnected profiles" section.
   if (!Array.isArray(state.posting.disconnectedProfiles)) state.posting.disconnectedProfiles = [];

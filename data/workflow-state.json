@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-10T00:56:51.814Z",
+  "updatedAt": "2026-06-10T01:58:36.276Z",
   "testRun": {
     "status": "ready",
     "active": false,
@@ -203,7 +203,8 @@
       "postCta": "",
       "reuseHours": 6,
       "imageRetentionDays": 30,
-      "overnightReserveTarget": 200
+      "overnightReserveTarget": 200,
+      "harvestResume": "{\"https://www.facebook.com/groups/o38679876833911\":\"122180073854865367\"}"
     },
     "groupFallbackPolicy": "if a profile cannot post in its selected group, try the next available group URL from this run; if no group works, skip that profile and record the issue with profile id/name",
     "profileGroupIssueLogEndpoint": "/api/posting/profile-group-issue",
