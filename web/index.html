@@ -629,18 +629,12 @@
           <section class="panel prodStep" data-view="prod" data-prod-step="2">
             <div class="panelHead">
               <div>
-                <span class="stepBadge">Step 2</span>
+                <span class="stepBadge">Step 2 · extras</span>
                 <h2>Inputs</h2>
-                <p>Groups, source URLs, shortlinks, and the first-comment template.</p>
+                <p>Shortlinks and the first-comment template. <b>Where products come from</b> is set in <b>Content Source</b> below; <b>posting groups</b> are added in <b>Step 3</b>.</p>
               </div>
             </div>
             <div class="formGrid">
-              <div class="inlineAction span2">
-                <input id="groupUrlInput" placeholder="Paste one Facebook group URL">
-                <button id="addGroupUrlBtn">Add Group URL</button>
-              </div>
-              <label class="span2">Groups URLs <textarea id="groups" spellcheck="false"></textarea></label>
-              <label>Source URLs <textarea id="sourceUrls" spellcheck="false"></textarea></label>
               <label>Shortlinks <textarea id="shortlinks" spellcheck="false"></textarea></label>
               <label class="span2">First comment template <textarea id="commentTemplate"></textarea></label>
               <label data-ux-tier="advanced">Moderator approval notes <textarea id="moderatorAccountNotes" placeholder="Optional group-specific rules. Moderator accounts are configured in Profiles and are used only to approve pending posts."></textarea></label>
@@ -796,23 +790,36 @@
           <section class="panel prodStep" data-view="prod" data-prod-step="2b">
             <div class="panelHead">
               <div>
-                <span class="stepBadge">Step 2b</span>
-                <h2>Content Source — where products come from <span class="badge" data-tone="muted">optional · default off</span></h2>
-                <p>Choose your product source. <b>OFF</b> = your normal web scraping (Walmart/Amazon discovery). <b>ON</b> = copy products (text + image + the first-comment link) from the Facebook groups below.</p>
+                <span class="stepBadge">Step 2 · Source</span>
+                <h2>Content Source — where products come FROM</h2>
+                <p>Pick how products are sourced, then add the source below. <b>(This is the harvest/copy source — NOT where you post; posting groups are Step 3.)</b></p>
               </div>
             </div>
             <div class="formGrid">
-              <label class="span2"><input type="checkbox" id="contentSourcesEnabled"> <b>Copy products from Facebook source groups</b> (when off, uses your normal web scraping)</label>
-              <label class="span2"><input type="checkbox" id="contentSourcesExclusive"> Use <b>ONLY</b> copied products — skip web scraping entirely <span style="opacity:.7">(off = copied products post first, then web scraping fills in)</span></label>
-              <label class="span2">Source group URLs — one per line. A member profile is picked &amp; learned <b>automatically</b> (optionally pin one with <code>| profileId</code>). <textarea id="contentSourceGroupsText" spellcheck="false" placeholder="https://www.facebook.com/groups/your-source-group"></textarea></label>
-              <label class="span2"><input type="checkbox" id="contentSourcesReserveAuto"> <b>Auto-size reserve</b> from your daily posting capacity <span style="opacity:.7">(recommended — a steady working buffer kept topped up by continuous harvesting; the number below is computed automatically)</span></label>
-              <label>Reserve target <span style="opacity:.7">(manual; used when auto is off)</span> <input type="number" id="contentSourcesReserveTarget" min="1" max="5000" step="1" placeholder="20"></label>
-              <label>Refill when reserve drops to <input type="number" id="contentSourcesReserveRefillAt" min="0" max="999" step="1" placeholder="10"></label>
-              <label>Profiles per group <span style="opacity:.7">(parallel harvest)</span> <input type="number" id="contentSourcesProfilesPerGroup" min="1" max="6" step="1" placeholder="3"></label>
-              <label>Re-use copied products after <input type="number" id="contentSourcesReuseHours" min="1" max="720" step="1" placeholder="26"> hours <span style="opacity:.7">(eligible to re-post after this; never stalls)</span></label>
-              <label>Delete copied images older than <input type="number" id="contentSourcesImageRetentionDays" min="1" max="90" step="1" placeholder="7"> days <span style="opacity:.7">(frees disk; record kept)</span></label>
-              <label class="span2">Post call-to-action <span style="opacity:.7">(appended under copied posts; blank = none)</span> <input type="text" id="contentSourcesPostCta" placeholder="🛒 Deal link in the first comment 👇"></label>
-              <label class="span2" data-ux-tier="advanced">Content source notes <textarea id="contentSourcesNotes" spellcheck="false" placeholder="Optional notes (e.g. which posts to prefer)."></textarea></label>
+              <label class="span2 sourceMethodPick"><input type="checkbox" id="contentSourcesEnabled"> <b>Copy products from a Facebook group</b> <span style="opacity:.7">— turn OFF to use traditional web scraping instead</span></label>
+
+              <!-- COPY-FROM-GROUP branch -->
+              <div id="sourceCopyFields" class="span2 formGrid sourceBranch">
+                <div class="inlineAction span2">
+                  <input id="sourceGroupUrlInput" placeholder="Paste a Facebook SOURCE group URL (to copy products FROM)">
+                  <button id="addSourceGroupUrlBtn">Add Source Group</button>
+                </div>
+                <label class="span2">Source group URLs — one per line. A member profile is picked &amp; learned <b>automatically</b> (optionally pin one with <code>| profileId</code>). <textarea id="contentSourceGroupsText" spellcheck="false" placeholder="https://www.facebook.com/groups/your-source-group"></textarea></label>
+                <label class="span2"><input type="checkbox" id="contentSourcesExclusive"> Use <b>ONLY</b> copied products — skip web scraping entirely <span style="opacity:.7">(off = copied products post first, then web scraping fills in)</span></label>
+                <label class="span2"><input type="checkbox" id="contentSourcesReserveAuto"> <b>Auto-size reserve</b> from your daily posting capacity <span style="opacity:.7">(recommended — a steady working buffer kept topped up by continuous harvesting; the number below is computed automatically)</span></label>
+                <label>Reserve target <span style="opacity:.7">(manual; used when auto is off)</span> <input type="number" id="contentSourcesReserveTarget" min="1" max="5000" step="1" placeholder="20"></label>
+                <label>Refill when reserve drops to <input type="number" id="contentSourcesReserveRefillAt" min="0" max="999" step="1" placeholder="10"></label>
+                <label>Profiles per group <span style="opacity:.7">(parallel harvest)</span> <input type="number" id="contentSourcesProfilesPerGroup" min="1" max="6" step="1" placeholder="3"></label>
+                <label>Re-use copied products after <input type="number" id="contentSourcesReuseHours" min="1" max="720" step="1" placeholder="26"> hours <span style="opacity:.7">(eligible to re-post after this; never stalls)</span></label>
+                <label>Delete copied images older than <input type="number" id="contentSourcesImageRetentionDays" min="1" max="90" step="1" placeholder="7"> days <span style="opacity:.7">(frees disk; record kept)</span></label>
+                <label class="span2">Post call-to-action <span style="opacity:.7">(appended under copied posts; blank = none)</span> <input type="text" id="contentSourcesPostCta" placeholder="🛒 Deal link in the first comment 👇"></label>
+                <label class="span2" data-ux-tier="advanced">Content source notes <textarea id="contentSourcesNotes" spellcheck="false" placeholder="Optional notes (e.g. which posts to prefer)."></textarea></label>
+              </div>
+
+              <!-- TRADITIONAL WEB-SCRAPING branch -->
+              <div id="sourceScrapeFields" class="span2 formGrid sourceBranch">
+                <label class="span2">Product / Source URLs <span style="opacity:.7">(traditional scraping — Walmart, Amazon, etc., one per line)</span> <textarea id="sourceUrls" spellcheck="false"></textarea></label>
+              </div>
             </div>
           </section>
 
@@ -920,14 +927,21 @@
             <div class="panelHead">
               <div>
                 <span class="stepBadge">Step 3</span>
-                <h2>Assign Profiles to Groups</h2>
-                <p>Build the matrix, then either split evenly or by percentage.</p>
+                <h2>Posting Groups &amp; Profiles — where products POST TO</h2>
+                <p>Add the group(s) you post to here, then build the matrix and split profiles.</p>
               </div>
               <div class="miniActions">
                 <button id="buildGroupAssignmentsBtn">Build Matrix</button>
                 <button id="evenGroupSplitBtn">Even Split</button>
                 <button id="percentGroupSplitBtn" class="primary">Apply % Split</button>
               </div>
+            </div>
+            <div class="formGrid" style="margin-bottom:10px">
+              <div class="inlineAction span2">
+                <input id="groupUrlInput" placeholder="Paste a Facebook group URL to POST TO">
+                <button id="addGroupUrlBtn">Add Posting Group</button>
+              </div>
+              <label class="span2">Posting group URLs <span style="opacity:.7">(where products get posted — the only place to add them)</span> <textarea id="groups" spellcheck="false"></textarea></label>
             </div>
             <div id="groupAssignmentSummary" class="inlineNotice neutral">Add group URLs and profiles, then build the assignment matrix.</div>
             <div class="equalSplitRow">

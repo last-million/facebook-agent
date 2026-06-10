@@ -1588,6 +1588,7 @@ function renderState(state) {
   setValue("contentSourcesImageRetentionDays", state.posting.contentSources?.imageRetentionDays);
   setValue("contentSourceGroupsText", state.posting.contentSources?.groupsText);
   setValue("contentSourcesNotes", state.posting.contentSources?.notes);
+  if (typeof updateContentSourceBranch === "function") updateContentSourceBranch(); // show copy vs scrape branch per saved method
   renderGroupAssignmentBuilder();
 
   setValue("productAssetsEnabled", state.productAssets.enabled);
@@ -5266,6 +5267,23 @@ $("addGroupUrlBtn").addEventListener("click", () => {
 $("groups")?.addEventListener("input", () => {
   groupAssignmentDraft = [];
   renderGroupAssignmentBuilder();
+});
+
+// STEP 2 SOURCE METHOD: copy-from-group vs traditional web scraping — show only the active branch.
+function updateContentSourceBranch() {
+  const copy = !!($("contentSourcesEnabled") && $("contentSourcesEnabled").checked);
+  const cp = $("sourceCopyFields"), sc = $("sourceScrapeFields");
+  if (cp) cp.style.display = copy ? "" : "none";
+  if (sc) sc.style.display = copy ? "none" : "";
+}
+$("contentSourcesEnabled")?.addEventListener("change", updateContentSourceBranch);
+// Quick-add a SOURCE group (to copy products FROM) — mirrors the posting-group adder.
+$("addSourceGroupUrlBtn")?.addEventListener("click", () => {
+  const el = $("sourceGroupUrlInput");
+  const value = (el && el.value || "").trim();
+  if (!value) return;
+  appendLine("contentSourceGroupsText", value);
+  if (el) el.value = "";
 });
 
 $("assignmentGroupUrlInput")?.addEventListener("keydown", (event) => {
