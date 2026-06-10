@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-10T00:31:11.233Z",
+  "updatedAt": "2026-06-10T00:35:26.401Z",
   "testRun": {
     "status": "ready",
     "active": false,
@@ -84,7 +84,7 @@
     "updatedAt": ""
   },
   "operator": {
-    "armedForExternalActions": false,
+    "armedForExternalActions": true,
     "autopilotEnabled": false,
     "autopilotTickSeconds": 120,
     "autopilotDryRun": false,
