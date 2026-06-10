@@ -18089,6 +18089,15 @@ const server = http.createServer(async (req, res) => {
     const result = await backfillHarvestedOpenGraphAsync(clampNumber(body.max, 1, 25, 5));
     return json(res, 200, { ok: !result.error, ...result });
   }
+  if (req.method === "POST" && url.pathname === "/api/content-sources/harvest-now") {
+    // manual harvest trigger (operator/live-test): fire-and-forget — progress lands in the audit
+    // log (harvest_round / harvest_og_fetched / harvest_item) and data/harvested-products.jsonl.
+    requireExternalArmed();
+    const body = await readJson(req);
+    const count = clampNumber(body.count, 1, 20, 3);
+    harvestContentSourcesAsync({ harvestCount: count }).catch((err) => logEvent("manual_harvest_error", { error: oneLineField(err.message || String(err), 160) }));
+    return json(res, 200, { ok: true, started: true, harvestCount: count });
+  }
   if (req.method === "POST" && url.pathname === "/api/posting/record-post-url") {
     const body = await readJson(req);
     const result = recordPublishedFacebookPostUrl(body);
