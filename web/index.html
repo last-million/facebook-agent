@@ -970,33 +970,9 @@
             </label>
           </section>
 
-          <section class="panel wide prodStep prodRunStep" data-view="prod" data-prod-step="4">
-            <div class="panelHead">
-              <div>
-                <span class="stepBadge">Step 4</span>
-                <h2>Run Production</h2>
-                <p>Prep refreshes data. Start Live Full Run posts to all assigned groups end-to-end.</p>
-              </div>
-              <div class="miniActions">
-                <button id="runFullPrepPipelineBtn" class="ghostButton">Run Full Prep Pipeline</button>
-                <button id="preparePostingPlanBtn">Prepare Full Posting Plan</button>
-                <button id="runLiveFullPostingPlanBtn" class="danger">Start Live Full Run</button>
-              </div>
-            </div>
-            <div class="prodRunSwitches">
-              <label class="switch line hasTooltip" data-tooltip="When OFF, the base review JPG is used directly for posting. Saves 4-6 minutes per product. When ON, ChatGPT browser regenerates each image in HD/upright (slow).">
-                <input id="chatgptHdEnabledRail" data-mirror-of="chatgptHdEnabled" type="checkbox">
-                <span><strong id="chatgptHdEnabledRailLabel">ChatGPT HD image step: OFF (fast)</strong><small>Applies to test &amp; prod. Off = use base review image directly.</small></span>
-              </label>
-            </div>
-            <div class="prodRunChecklist" aria-label="Live run sequence">
-              <div><b>1</b><strong>Open profile</strong><span>IXBrowser launches the assigned posting profile.</span></div>
-              <div><b>2</b><strong>Compose &amp; post</strong><span>Types text, uploads selected image, clicks Post.</span></div>
-              <div><b>3</b><strong>Verify permalink</strong><span>Captures the newest post ID from the FB response.</span></div>
-              <div><b>4</b><strong>Approve if pending</strong><span>Moderator profile only if the post needs approval.</span></div>
-              <div><b>5</b><strong>Comment &amp; pin</strong><span>Same profile adds the Mavlynk shortlink comment.</span></div>
-            </div>
-          </section>
+          <!-- Step 4 "Run Production" removed: Start/Stop at the top of the Production control center
+               replace it. The ChatGPT HD image step lives with the traditional web-scraping config
+               (Content tab → Product Page Assets), since copy-from-group already has the product image. -->
 
           <section class="panel wide sourceBuilderPanel tabLead" data-view="content">
             <div class="panelHead">
@@ -1043,8 +1019,8 @@
           <section class="panel wide" data-view="content">
             <div class="panelHead">
               <div>
-                <h2>Product Page Assets</h2>
-              <p>Hermes should inspect each product page, collect five positive customer review image candidates, select the best one, send it to ChatGPT HD for upright rotation if needed, and use the downloaded HD image for the Facebook plan.</p>
+                <h2>Product Page Assets &amp; ChatGPT HD <span class="badge" data-tone="muted">traditional web-scraping only</span></h2>
+              <p><b>Used only by the traditional web-scraping method</b> (copy-from-group already brings the product's own image, so it needs no HD generation). Hermes inspects each product page, collects five positive customer review image candidates, selects the best one, sends it to ChatGPT HD for upright rotation if needed, and uses the downloaded HD image for the Facebook plan.</p>
               </div>
               <div class="miniActions">
                 <button id="prepareProductAssetsBtn" class="primary">Prepare Asset Checks</button>
