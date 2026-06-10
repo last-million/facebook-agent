@@ -859,6 +859,55 @@
             .scrapedModalMeta a{color:#f0a93b;word-break:break-all;font-size:.85rem}
             .scrapedModalStatus{margin-top:10px;font-size:.78rem;color:#9fb0c3}
           </style>
+
+          <section class="panel wide prodStep" data-view="prod" data-prod-step="3">
+            <div class="panelHead">
+              <div>
+                <span class="stepBadge">Step 3</span>
+                <h2>Posting Groups &amp; Profiles — where products POST TO</h2>
+                <p>Add the group(s) you post to here, then build the matrix and split profiles.</p>
+              </div>
+              <div class="miniActions">
+                <button id="buildGroupAssignmentsBtn">Build Matrix</button>
+                <button id="evenGroupSplitBtn">Even Split</button>
+                <button id="percentGroupSplitBtn" class="primary">Apply % Split</button>
+              </div>
+            </div>
+            <div class="formGrid" style="margin-bottom:10px">
+              <div class="inlineAction span2">
+                <input id="groupUrlInput" placeholder="Paste a Facebook group URL to POST TO">
+                <button id="addGroupUrlBtn">Add Posting Group</button>
+              </div>
+              <label class="span2">Posting group URLs <span style="opacity:.7">(where products get posted — the only place to add them)</span> <textarea id="groups" spellcheck="false"></textarea></label>
+            </div>
+            <div id="groupAssignmentSummary" class="inlineNotice neutral">Add group URLs and profiles, then build the assignment matrix.</div>
+            <div class="equalSplitRow">
+              <label class="pillSwitch" title="Dispatch profiles equally between all groups — each profile is used in exactly ONE group, never two.">
+                <input id="equalSplitAssignments" type="checkbox">
+                <span class="pillTrack"><span class="pillKnob"></span></span>
+                <span class="pillText"><strong>Equal split &middot; unique profiles</strong><small>Dispatch profiles equally between groups &mdash; never the same profile in two groups</small></span>
+              </label>
+            </div>
+            <div class="assignmentPolicy" data-ux-tier="advanced">
+              <div><strong>Add groups anytime</strong><span>Use Posting Inputs or the Add Group field here. The matrix rebuilds from every saved group URL.</span></div>
+              <div><strong>Dispatch by percentage</strong><span>Set each group share, then Apply % Split to distribute profiles across the group URLs.</span></div>
+              <div><strong>Blocked group fallback</strong><span>If a profile cannot post in one group, the run should try another saved group. If no group works, skip that profile and log the profile name as an issue.</span></div>
+            </div>
+            <div class="assignmentTools">
+              <div class="inlineAction">
+                <input id="assignmentGroupUrlInput" placeholder="Add another Facebook group URL">
+                <button id="addAssignmentGroupUrlBtn">Add Group</button>
+              </div>
+              <button id="copyLoadedProfilesBtn">Use Loaded IX Profiles</button>
+              <button id="selectAllProfilesBtn" data-ux-tier="advanced">Select All Visible</button>
+              <button id="clearVisibleProfilesBtn" data-ux-tier="advanced">Clear Visible</button>
+            </div>
+            <div id="groupAssignmentBuilder" class="assignmentBuilder"></div>
+            <label class="assignmentOutput" data-ux-tier="advanced">Saved assignment plan
+              <textarea id="groupProfileAssignments" spellcheck="false" placeholder="The generated group/profile plan is saved here."></textarea>
+            </label>
+          </section>
+
           <section class="panel wide prodStep" data-view="prod" data-prod-step="2c">
             <div class="panelHead">
               <div>
@@ -937,53 +986,7 @@
             <div id="suspendedProfilesList"><div style="opacity:.6">No suspended accounts. ✓</div></div>
           </section>
 
-          <section class="panel wide prodStep" data-view="prod" data-prod-step="3">
-            <div class="panelHead">
-              <div>
-                <span class="stepBadge">Step 3</span>
-                <h2>Posting Groups &amp; Profiles — where products POST TO</h2>
-                <p>Add the group(s) you post to here, then build the matrix and split profiles.</p>
-              </div>
-              <div class="miniActions">
-                <button id="buildGroupAssignmentsBtn">Build Matrix</button>
-                <button id="evenGroupSplitBtn">Even Split</button>
-                <button id="percentGroupSplitBtn" class="primary">Apply % Split</button>
-              </div>
-            </div>
-            <div class="formGrid" style="margin-bottom:10px">
-              <div class="inlineAction span2">
-                <input id="groupUrlInput" placeholder="Paste a Facebook group URL to POST TO">
-                <button id="addGroupUrlBtn">Add Posting Group</button>
-              </div>
-              <label class="span2">Posting group URLs <span style="opacity:.7">(where products get posted — the only place to add them)</span> <textarea id="groups" spellcheck="false"></textarea></label>
-            </div>
-            <div id="groupAssignmentSummary" class="inlineNotice neutral">Add group URLs and profiles, then build the assignment matrix.</div>
-            <div class="equalSplitRow">
-              <label class="pillSwitch" title="Dispatch profiles equally between all groups — each profile is used in exactly ONE group, never two.">
-                <input id="equalSplitAssignments" type="checkbox">
-                <span class="pillTrack"><span class="pillKnob"></span></span>
-                <span class="pillText"><strong>Equal split &middot; unique profiles</strong><small>Dispatch profiles equally between groups &mdash; never the same profile in two groups</small></span>
-              </label>
-            </div>
-            <div class="assignmentPolicy" data-ux-tier="advanced">
-              <div><strong>Add groups anytime</strong><span>Use Posting Inputs or the Add Group field here. The matrix rebuilds from every saved group URL.</span></div>
-              <div><strong>Dispatch by percentage</strong><span>Set each group share, then Apply % Split to distribute profiles across the group URLs.</span></div>
-              <div><strong>Blocked group fallback</strong><span>If a profile cannot post in one group, the run should try another saved group. If no group works, skip that profile and log the profile name as an issue.</span></div>
-            </div>
-            <div class="assignmentTools">
-              <div class="inlineAction">
-                <input id="assignmentGroupUrlInput" placeholder="Add another Facebook group URL">
-                <button id="addAssignmentGroupUrlBtn">Add Group</button>
-              </div>
-              <button id="copyLoadedProfilesBtn">Use Loaded IX Profiles</button>
-              <button id="selectAllProfilesBtn" data-ux-tier="advanced">Select All Visible</button>
-              <button id="clearVisibleProfilesBtn" data-ux-tier="advanced">Clear Visible</button>
-            </div>
-            <div id="groupAssignmentBuilder" class="assignmentBuilder"></div>
-            <label class="assignmentOutput" data-ux-tier="advanced">Saved assignment plan
-              <textarea id="groupProfileAssignments" spellcheck="false" placeholder="The generated group/profile plan is saved here."></textarea>
-            </label>
-          </section>
+          <!-- Step 3 moved up to sit directly under Step 1 & 2 (after Step 2 · Source). -->
 
           <!-- Step 4 "Run Production" removed: Start/Stop at the top of the Production control center
                replace it. The ChatGPT HD image step lives with the traditional web-scraping config
