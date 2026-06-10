@@ -7875,6 +7875,31 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
   }
 }
 
+// REAL STOP: a flag flip alone does NOT halt work already in flight — the comment-recovery / harvest /
+// live-post connectors run as SEPARATE node child processes that outlive a disarm and keep opening
+// profiles. So "Stop" must: (1) disarm, (2) raise an abort flag in-flight loops check + bail, (3) KILL the
+// connector child processes, (4) close open ixBrowser windows. Used by the dashboard Stop controls.
+let __externalStopRequested = 0;
+async function stopAllExternalWork(reason) {
+  __externalStopRequested = Date.now(); // in-flight loops compare their start time to this and abort
+  try { if (typeof __forcedCommentResweepActive !== "undefined") __forcedCommentResweepActive = false; } catch (_) {}
+  try {
+    const s = readState();
+    s.operator.armedForExternalActions = false;
+    s.operator.autopilotEnabled = false;
+    writeState(s, { controlWrite: true });
+  } catch (_) {}
+  // Kill every connector child process (they run `node tools/fb-post-test-capture-url.js`). execFile with an
+  // args array avoids shell-quoting issues. Pinterest uses a different script + msedge, so it's untouched.
+  try {
+    const psKill = "Get-CimInstance Win32_Process -Filter \"name='node.exe'\" | Where-Object { $_.CommandLine -match 'fb-post-test-capture-url' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }";
+    require("child_process").execFile("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psKill], () => {});
+  } catch (_) {}
+  try { await closeAllOpenIxProfiles(); } catch (_) {}
+  logEvent("external_work_stop_all", { reason: reason || "operator_stop" });
+  return { stopped: true, at: new Date().toISOString() };
+}
+
 // Close ALL prod-eligible ixBrowser profiles (cleanup leaked/open windows). Idempotent (already-closed = ok);
 // skips the dedicated ShopYourLikes profile. Run before a fresh start to clear piled-up Chromium windows.
 async function closeAllOpenIxProfiles() {
@@ -8030,7 +8055,9 @@ async function harvestContentSourcesAsync(options = {}) {
     try { fs.mkdirSync(claimsDir, { recursive: true }); } catch (_) {}
     // ORPHAN SWEEP: drop any claims dir from a prior crashed/killed round (>1h old) so they never pile up.
     try { for (const d of fs.readdirSync(claimsRoot)) { const p = path.join(claimsRoot, d); try { if (Date.now() - fs.statSync(p).mtimeMs > 3600000) fs.rmSync(p, { recursive: true, force: true }); } catch (_) {} } } catch (_) {}
+    const harvestStartedAt = Date.now(); // operator STOP after this aborts the remaining rounds
     for (let i = 0; i < pairs.length; i += 4) { // 4-by-4
+      if (__externalStopRequested > harvestStartedAt) { logEvent("harvest_aborted_by_stop", { roundsLeft: pairs.length - i }); break; }
       const round = pairs.slice(i, i + 4);
       // NO waitForPostingIdle: harvesting (low-risk browsing) runs CONCURRENTLY with posting so the reserve
       // NEVER empties mid-production. Contention is handled safely by the per-profile lock (posting's profiles
@@ -13138,6 +13165,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         return summary;
       }
       if (options.force) __forcedCommentResweepActive = true; // Fix A: a forced post-publish resweep may comment despite the run-limit auto-disarm
+      const resweepStartedAt = Date.now(); // if the operator hits STOP after this, abort the loop (real stop)
       const windowMs = clampNumber(options.windowHours, 1, 168, 24) * 3600 * 1000;
       const cutoff = Date.now() - windowMs;
       const maxToFix = clampNumber(options.max, 1, 50, 10);
@@ -13155,6 +13183,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         publishedByPlan.set(planKey, r); // keep the latest ledger row per plan
       }
       for (const ev of publishedByPlan.values()) {
+        if (__externalStopRequested > resweepStartedAt) { logEvent("comment_resweep_aborted_by_stop", { checked: summary.checked }); break; } // operator hit STOP -> halt now
         const postUrl = ev.postUrl;
         // Bound by ATTEMPTS, not just successes: a post that can never be commented (no eligible
         // commenter) must not make every 90s sweep do full-cost recovery work against it.
@@ -17482,12 +17511,16 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "PUT" && url.pathname === "/api/state") {
     const body = await readJson(req);
     const incoming = body.state || {};
+    let __disarmTransition = false; // operator just turned a run OFF -> trigger a real STOP (kill in-flight work)
     // ARM = a fresh run: when the operator transitions autopilotEnabled false->true, reset the
     // per-run post counter so the hard limiter (autopilotMaxPostsPerRun) counts THIS run only.
     try {
       const before = readState();
       const wasEnabled = before.operator?.autopilotEnabled === true;
       const nowEnabled = incoming.operator?.autopilotEnabled === true;
+      const wasArmed = before.operator?.armedForExternalActions === true;
+      // a disarm = armed true->false OR autopilot true->false (the dashboard Stop sends both)
+      if ((wasArmed && incoming.operator?.armedForExternalActions === false) || (wasEnabled && incoming.operator?.autopilotEnabled === false)) __disarmTransition = true;
       incoming.operator = incoming.operator || {};
       if (!wasEnabled && nowEnabled) {
         incoming.operator.autopilotPostsThisRun = 0; // fresh arm => count THIS run only
@@ -17504,7 +17537,15 @@ const server = http.createServer(async (req, res) => {
     // controlWrite:true => the operator's explicit values for the protected control flags win.
     const state = writeState(incoming, { controlWrite: true });
     logEvent("workflow_state_saved");
+    // REAL STOP: if this PUT turned a run OFF, kill in-flight connectors + recovery + close profiles now
+    // (fire-and-forget so the dashboard Stop returns instantly). A flag flip alone would let work grind on.
+    if (__disarmTransition) { stopAllExternalWork("dashboard_disarm").catch(() => {}); }
     return json(res, 200, { state });
+  }
+  // Explicit STOP-ALL endpoint (dashboard Stop buttons can call this directly for an instant hard stop).
+  if (req.method === "POST" && url.pathname === "/api/operator/stop-all") {
+    const r = await stopAllExternalWork("operator_stop_all").catch((e) => ({ stopped: false, error: String((e && e.message) || e) }));
+    return json(res, 200, r);
   }
   if (req.method === "POST" && url.pathname === "/api/test-progress") {
     const body = await readJson(req);

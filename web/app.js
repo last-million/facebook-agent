@@ -5091,7 +5091,7 @@ function bindAsync(id, handler) {
 }
 
 bindAsync("startBtn", () => control("start-next"));
-bindAsync("stopBtn", () => control("stop-active"));
+bindAsync("stopBtn", async () => { try { await api("/api/operator/stop-all", { method: "POST", body: JSON.stringify({}) }); } catch (_) {} return control("stop-active"); }); // STOP = kill in-flight posting/harvest/comment work too, not just the job
 bindAsync("clearBtn", () => control("clear-done"));
 bindAsync("clearBtnMonitor", () => control("clear-done"));
 bindAsync("refreshMonitorBtn", () => refresh({ force: true }));
@@ -5963,7 +5963,7 @@ function uxAttachIncompleteRunBanner() {
       prodRunModeTouched = false;
       renderProdTab();
     });
-    prodOn("prodStopAllBtn", async function () { prodResult("Stopping…"); prodSyncFormAndCache({ armedForExternalActions: false, autopilotEnabled: false }); await prodPatchState({ operator: { armedForExternalActions: false, autopilotEnabled: false } }); prodResult("Stopped — disarmed and autopilot off."); renderProdTab(); });
+    prodOn("prodStopAllBtn", async function () { prodResult("Stopping everything…"); prodSyncFormAndCache({ armedForExternalActions: false, autopilotEnabled: false }); try { await api("/api/operator/stop-all", { method: "POST", body: JSON.stringify({}) }); } catch (_) {} await prodPatchState({ operator: { armedForExternalActions: false, autopilotEnabled: false } }); prodResult("Stopped — disarmed, in-flight posting/harvest/comment work killed, profiles closing."); renderProdTab(); });
     prodOn("prodLoadProfilesBtn", async function () { prodResult("Loading IXBrowser profiles…"); await loadIxProfilesQuiet(); renderProdRoleSelects(); const s = $("prodRolesStatus"); if (s) { s.className = "inlineNotice ok"; s.textContent = "Profiles loaded — choose roles (saves automatically)."; } });
     ["prodModeratorProfileSelect", "prodSylProfileSelect", "prodExcludedProfileSelect"].forEach(function (id) { const el = $(id); if (el) el.addEventListener("change", function () { if (typeof saveProdRoles === "function") saveProdRoles(); }); });
     prodOn("prodSaveRolesBtn", async function () { await saveProdRoles(); });
