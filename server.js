@@ -7664,6 +7664,10 @@ function assetBufferTargetCount(state = readState()) {
   return Math.max(9, Math.min(200, profiles * perProfile));
 }
 
+// NON-PRODUCT link denylist (news / media / blog / press) — a harvested post whose first-comment link
+// points here is NOT a product (e.g. the gas-station "free fuel" news article) and must NEVER post.
+const HARVEST_NONPRODUCT_LINK = /theguardian\.|nytimes\.com|nyti\.ms|washingtonpost\.|usatoday\.|reuters\.com|apnews\.|\bbbc\.(com|co)|cnn\.com|foxnews\.|nbcnews\.|abcnews\.|cbsnews\.|npr\.org|kptv\.|kgw\.com|kxan\.|wivb\.|wfla\.|wsvn\.|supercarblondie\.|buzzfeed\.|huffpost\.|dailymail\.|mirror\.co\.uk|people\.com|\/news\/|\/article\//i;
+
 function productHasReadyAssets(product, state = readState(), reviewImages = null) {
   if (!product) return false;
   // HARVESTED products: ready when the record has its downloaded image (still on disk) + the first-comment
@@ -7671,6 +7675,7 @@ function productHasReadyAssets(product, state = readState(), reviewImages = null
   if (String(product.key || "").startsWith("harvested:")) {
     const rec = harvestedRecordForKey(product.key, state);
     if (!rec || !rec.firstCommentUrl || !rec.imageLocalPath || rec.imageDeleted || !fs.existsSync(safeProjectPath(rec.imageLocalPath))) return false;
+    if (HARVEST_NONPRODUCT_LINK.test(String(rec.firstCommentUrl))) return false; // junk (news/blog) link -> never post
     // RE-USE WINDOW: ready if image-on-disk AND (never posted OR last post older than reuseHours). Lets a posted
     // product rotate back in after reuseHours so production never stalls. (lastPostedAt||posted for back-compat.)
     const reuseHours = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 26);

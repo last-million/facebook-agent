@@ -3123,7 +3123,7 @@ async function harvestExtractPhoto(page, ctx) {
       if (w >= 350 && h >= 200 && w * h > max && !/emoji|static|rsrc\.php/i.test(im.src)) { max = w * h; image = im.src; }
     }
     const META = /facebook\.com|fbcdn|messenger|fb\.me|meta\.(ai|com)|instagram\.com|whatsapp\.com|oculus|threads\.net/i;
-    const JUNK = /giphy\.com|tenor\.com|\.(gif|mp4|webm|mov)(\?|$)|imgur\.com|youtu\.?be|youtube\.com|spotify|soundcloud|wikipedia|gph\.is|\/news\/|wivb\.com|\b(cnn|bbc|nytimes|foxnews|reuters|apnews|kptv|kgw|kxan)\.com/i;
+    const JUNK = /giphy\.com|tenor\.com|\.(gif|mp4|webm|mov)(\?|$)|imgur\.com|youtu\.?be|youtube\.com|spotify|soundcloud|wikipedia|gph\.is|\/news\/|\/article\/|theguardian\.|nyti\.ms|nytimes\.com|washingtonpost\.|usatoday\.|npr\.org|supercarblondie\.|buzzfeed\.|huffpost\.|dailymail\.|people\.com|wivb\.com|\b(cnn|bbc|foxnews|reuters|apnews|kptv|kgw|kxan|nbcnews|abcnews|cbsnews)\.com/i;
     const AFFIL = /mavlynk\.com|walmrt\.us|amzn\.to|amzlink\.to|a\.co|amazon\.[a-z.]+\/.*tag=|shopstyle|shopmy|go\.shop|rstyle\.me|shareasale|liketk|ltk\.app|geni\.us|sovrn|howl\.|collab|rakuten|sjv\.io|pxf\.io|prf\.hn|bit\.ly|tinyurl/i;
     const linkCands = [];
     for (const a of Array.from(document.querySelectorAll('a[href]'))) {
@@ -3259,9 +3259,9 @@ async function harvestGroupFeed(page, count, opts = {}) {
   else if (resumeFbid) { curFbid = resumeFbid; startMode = 'resume_older'; }
   else { curFbid = newestFbid; startMode = 'top'; }
   if (!groupId || !curFbid) {
-    console.log(JSON.stringify({ step: 'harvest_walk_unavailable', groupId, curFbid, note: 'falling back to grid scroll' }));
-    const grid = await harvestGroupFeedGrid(page, count, { ...opts, budgetEnd });
-    return { items: grid, lastFbid: '' };
+    // NO FALLBACK (operator): the group page didn't load this round -> return empty and retry next round.
+    console.log(JSON.stringify({ step: 'harvest_walk_unavailable', groupId, curFbid, note: 'group page not ready - no fallback, retry next round' }));
+    return { items: [], lastFbid: '' };
   }
   console.log(JSON.stringify({ step: 'harvest_walk_start', groupId, startFbid: curFbid, startMode, profileIndex: pIndex, profileCount: pCount }));
   // OPEN THE THEATER BY CLICKING A TILE: a direct goto to /photo/?fbid does NOT open the keyboard-
@@ -3306,14 +3306,8 @@ async function harvestGroupFeed(page, count, opts = {}) {
     curFbid = moved; lastFbid = moved;
   }
   console.log(JSON.stringify({ step: 'harvest_walk_done', collected: out.length, lastFbid, steps, timedOut: Date.now() >= budgetEnd }));
-  // SAFETY NET: if the photo theater wouldn't navigate at all (advance failed on the first step), the
-  // walk is useless on this surface — fall back to the proven /media grid scroll so harvest never regresses.
-  if (out.length === 0 && steps <= 2) {
-    console.log(JSON.stringify({ step: 'harvest_walk_fallback_grid', reason: 'theater_not_navigable' }));
-    try { await page.goto(`https://www.facebook.com/groups/${groupId}/media`, { waitUntil: 'domcontentloaded', timeout: 60000 }); await page.waitForTimeout(2500); } catch (_) {}
-    const grid = await harvestGroupFeedGrid(page, count, { ...opts, budgetEnd });
-    return { items: grid, lastFbid };
-  }
+  // NO FALLBACK (operator): the photo-theater click-and-arrow walk is the ONLY method. If the theater didn't
+  // open this round, return what we have (often empty) and retry next round — never the grid-scroll workaround.
   return { items: out, lastFbid };
 }
 
