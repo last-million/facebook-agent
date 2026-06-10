@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-10T22:37:22.915Z",
+  "updatedAt": "2026-06-10T23:01:08.910Z",
   "testRun": {
     "status": "ready",
     "active": false,
@@ -142,9 +142,9 @@
     "pauseOnLimitedAccount": true
   },
   "posting": {
-    "groups": "https://www.facebook.com/groups/o1498765421290862\n",
+    "groups": "https://www.facebook.com/groups/o1498765421290862\nhttps://www.facebook.com/groups/4854972804605257/",
     "groupAssignmentMode": "percentage_manual_review",
-    "groupProfileAssignments": "# Facebook group/profile assignment plan\n# Generated locally from group URLs, profile checklists, and percentage split.\n\nGROUP 1 | share=50% | url=https://www.facebook.com/groups/o1498765421290862\n- 87 - 53\n- 86 - 52\n- 85 - 51\n- 84 - 50\n- 83 - 49\n- 82 - 48\n- 81 - 47\n- 80 - 46\n- 79 - 45\n- 78 - 44\n- 77 - 43\n- 76 - 42\n- 75 - 41\n- 74 - 40\n- 73 - 39\n- 72 - 38\n- 71 - 37\n- 70 - 36\n- 69 - 35\n- 68 - 34\n- 67 - 33\n- 66 - 32\n- 65 - 31\n- 64 - 30\n",
+    "groupProfileAssignments": "# Facebook group/profile assignment plan\n# Generated locally from group URLs, profile checklists, and percentage split.\n\nGROUP 1 | share=50% | url=https://www.facebook.com/groups/o1498765421290862\n- 87 - 53\n- 86 - 52\n- 85 - 51\n- 84 - 50\n- 83 - 49\n- 82 - 48\n- 81 - 47\n- 80 - 46\n- 79 - 45\n- 78 - 44\n- 77 - 43\n- 76 - 42\n- 75 - 41\n- 74 - 40\n- 73 - 39\n- 72 - 38\n- 71 - 37\n- 70 - 36\n- 69 - 35\n- 68 - 34\n- 67 - 33\n- 66 - 32\n- 65 - 31\n- 64 - 30\n\nGROUP 2 | share=50% | url=https://www.facebook.com/groups/4854972804605257/\n- no profiles selected\n",
     "groupAssignmentData": [
       {
         "url": "https://www.facebook.com/groups/o1498765421290862",
@@ -176,9 +176,15 @@
           "65 - 31",
           "64 - 30"
         ]
+      },
+      {
+        "url": "https://www.facebook.com/groups/4854972804605257/",
+        "sharePercent": 50,
+        "requiresAdminApproval": false,
+        "profiles": []
       }
     ],
-    "equalSplitAssignments": true,
+    "equalSplitAssignments": false,
     "contentSources": {
       "enabled": true,
       "groupsText": "https://www.facebook.com/groups/o38679876833911",
