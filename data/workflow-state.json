@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-10T19:54:47.600Z",
+  "updatedAt": "2026-06-10T20:06:19.469Z",
   "testRun": {
     "status": "ready",
     "active": false,
@@ -142,42 +142,73 @@
     "pauseOnLimitedAccount": true
   },
   "posting": {
-    "groups": "https://www.facebook.com/groups/o1498765421290862\n",
+    "groups": "https://www.facebook.com/groups/o1498765421290862\nhttps://www.facebook.com/groups/4854972804605257",
     "groupAssignmentMode": "percentage_manual_review",
-    "groupProfileAssignments": "# Facebook group/profile assignment plan\n# Generated locally from group URLs, profile checklists, and percentage split.\n\nGROUP 1 | share=0% | url=https://www.facebook.com/groups/o1498765421290862\n- 87 - 53\n- 86 - 52\n- 84 - 50\n- 83 - 49\n- 81 - 47\n- 80 - 46\n- 78 - 44\n- 77 - 43\n- 75 - 41\n- 74 - 40\n- 72 - 38\n- 71 - 37\n- 69 - 35\n- 68 - 34\n- 66 - 32\n- 63 - 29\n- 60 - 26\n- 55 - 21\n- 51 - 15\n- 48 - 9\n- 45 - 5\n- 14 - 12\n- 8 - 8\n",
+    "groupProfileAssignments": "# Facebook group/profile assignment plan\n# Generated locally from group URLs, profile checklists, and percentage split.\n\nGROUP 1 | share=50% | url=https://www.facebook.com/groups/o1498765421290862\n- 87 - 53\n- 86 - 52\n- 85 - 51\n- 84 - 50\n- 83 - 49\n- 82 - 48\n- 81 - 47\n- 80 - 46\n- 79 - 45\n- 78 - 44\n- 77 - 43\n- 76 - 42\n- 75 - 41\n- 74 - 40\n- 73 - 39\n- 72 - 38\n- 71 - 37\n- 70 - 36\n- 69 - 35\n- 68 - 34\n- 67 - 33\n- 66 - 32\n- 65 - 31\n- 64 - 30\n\nGROUP 2 | share=50% | url=https://www.facebook.com/groups/4854972804605257\n- 63 - 29\n- 62 - 28\n- 61 - 27\n- 60 - 26\n- 58 - 24\n- 56 - 22\n- 55 - 21\n- 54 - 20\n- 52 - 17\n- 51 - 15\n- 50 - 14\n- 49 - 13\n- 48 - 9\n- 47 - 7\n- 46 - 6\n- 45 - 5\n- 44 - 4\n- 16 - 14\n- 14 - 12\n- 12 - 11\n- 10 - 10\n- 8 - 8\n- 1 - 1\n",
     "groupAssignmentData": [
       {
         "url": "https://www.facebook.com/groups/o1498765421290862",
-        "sharePercent": 0,
+        "sharePercent": 50,
         "requiresAdminApproval": true,
         "profiles": [
           "87 - 53",
           "86 - 52",
+          "85 - 51",
           "84 - 50",
           "83 - 49",
+          "82 - 48",
           "81 - 47",
           "80 - 46",
+          "79 - 45",
           "78 - 44",
           "77 - 43",
+          "76 - 42",
           "75 - 41",
           "74 - 40",
+          "73 - 39",
           "72 - 38",
           "71 - 37",
+          "70 - 36",
           "69 - 35",
           "68 - 34",
+          "67 - 33",
           "66 - 32",
+          "65 - 31",
+          "64 - 30"
+        ]
+      },
+      {
+        "url": "https://www.facebook.com/groups/4854972804605257",
+        "sharePercent": 50,
+        "requiresAdminApproval": false,
+        "profiles": [
           "63 - 29",
+          "62 - 28",
+          "61 - 27",
           "60 - 26",
+          "58 - 24",
+          "56 - 22",
           "55 - 21",
+          "54 - 20",
+          "52 - 17",
           "51 - 15",
+          "50 - 14",
+          "49 - 13",
           "48 - 9",
+          "47 - 7",
+          "46 - 6",
           "45 - 5",
+          "44 - 4",
+          "16 - 14",
           "14 - 12",
-          "8 - 8"
+          "12 - 11",
+          "10 - 10",
+          "8 - 8",
+          "1 - 1"
         ]
       }
     ],
-    "equalSplitAssignments": false,
+    "equalSplitAssignments": true,
     "contentSources": {
       "enabled": true,
       "groupsText": "https://www.facebook.com/groups/o38679876833911",
@@ -276,10 +307,10 @@
     "generatedSourceUrls": "https://www.walmart.com/shop/savings/toys?povid=GlobalNav_rWeb_BabyKidsToys_ToysGames_deals&facet=special_offers%3AClearance%7C%7Cspecial_offers%3AReduced+Price%7C%7Cspecial_offers%3ARollback%7C%7Cretailer_type%3APro+Sellers\nhttps://www.walmart.com/browse/womens-plus/5438_133195?facet=special_offers%3AClearance%7C%7Cspecial_offers%3AReduced+Price%7C%7Cspecial_offers%3ARollback%7C%7Cretailer_type%3APro+Sellers\nhttps://www.walmart.com/search?q=garden&facet=special_offers%3AClearance%7C%7Cspecial_offers%3AReduced+Price%7C%7Cspecial_offers%3ARollback%7C%7Cretailer_type%3APro+Sellers\nhttps://www.walmart.com/search?q=summer&facet=special_offers%3AClearance%7C%7Cspecial_offers%3AReduced+Price%7C%7Cspecial_offers%3ARollback%7C%7Cretailer_type%3APro+Sellers",
     "minActivitySignal": "10+ bought since yesterday",
     "targetMode": "assigned_profiles_x_posts_per_day",
-    "assignedProfileCount": 23,
-    "dailyPostTarget": 115,
+    "assignedProfileCount": 47,
+    "dailyPostTarget": 235,
     "candidateBufferPercent": 20,
-    "targetCandidateCount": 138,
+    "targetCandidateCount": 282,
     "rankingRules": "Prioritize fresh reduced-price products with clear deal signal, strong positive reviews, safe product images, affiliate compatibility, and no prior use in the posted-product register.",
     "notes": "Generated source URLs are discovery pages/searches, not final product URLs. Hermes should inspect these with a browser, rank candidates, reject products already posted, then move unique chosen product pages into Product URLs."
   },
