@@ -3242,16 +3242,18 @@ async function harvestGroupFeed(page, count, opts = {}) {
   const budgetEnd = Date.now() + 240000;
   await page.waitForTimeout(2500);
   try { await page.waitForSelector('a[href*="fbid="]', { timeout: 25000 }); } catch (_) {}
-  // numeric group id — the set=g.{id} theater walks EVERY group photo (vanity slug resolves to it here)
-  let groupId = await resolveNumericGroupIdFromPage(page).catch(() => '');
-  if (!groupId) groupId = await page.evaluate(() => {
-    const a = document.querySelector('a[href*="set=g."]'); const m = a && a.href.match(/set=g\.(\d+)/); if (m) return m[1];
-    const b = document.querySelector('a[href*="/groups/"][href*="fbid="]'); const m2 = b && b.href.match(/groups\/(\d{6,})/); return m2 ? m2[1] : '';
-  }).catch(() => '');
-  // newest media tile (top of the grid)
-  const newestFbid = await page.evaluate(() => {
-    const a = document.querySelector('a[href*="/photo"][href*="fbid="]'); const m = a && a.href.match(/fbid=(\d+)/); return m ? m[1] : '';
-  }).catch(() => '');
+  // GROUP ID + newest photo from the GRID'S OWN group-stream tiles (set=g.{groupId}) — language-independent
+  // and ALWAYS the group actually being viewed. resolveNumericGroupIdFromPage can grab a WRONG sidebar/
+  // suggested group (observed: it returned a removed group's id and Facebook then opened a non-navigable
+  // set=p. single photo, so ArrowRight had nothing to move to). We also SKIP set=p. tiles (single photos).
+  const tile = await page.evaluate(() => {
+    const tiles = [...document.querySelectorAll('a[href*="/photo"][href*="fbid="]')];
+    for (const a of tiles) { const h = a.href || ''; if (/set=p\./i.test(h)) continue; const g = (h.match(/set=g\.(\d+)/) || [])[1] || ''; const fbid = (h.match(/fbid=(\d+)/) || [])[1] || ''; if (g && fbid) return { groupId: g, fbid }; }
+    for (const a of tiles) { const h = a.href || ''; if (/set=p\./i.test(h)) continue; const fbid = (h.match(/fbid=(\d+)/) || [])[1] || ''; if (fbid) return { groupId: '', fbid }; }
+    return { groupId: '', fbid: '' };
+  }).catch(() => ({ groupId: '', fbid: '' }));
+  let groupId = tile.groupId || await resolveNumericGroupIdFromPage(page).catch(() => '');
+  const newestFbid = tile.fbid;
   // START smart: if the NEWEST post is UNSEEN, scan from the TOP (catch new posts first); otherwise the top
   // is already harvested, so JUMP to the saved resume position and keep digging OLDER. Best of both.
   let curFbid, startMode;
@@ -3272,15 +3274,17 @@ async function harvestGroupFeed(page, count, opts = {}) {
   await dismissFacebookInterstitials(page).catch(() => {});
   let opened = false;
   try {
-    const sel = `a[href*="/photo"][href*="fbid=${curFbid}"]`;
-    let tile = page.locator(sel).first();
-    if (!(await tile.count().catch(() => 0))) tile = page.locator('a[href*="/photo"][href*="fbid="]').first();
+    // Click a GROUP-STREAM tile (never a set=p. single photo) so the theater opens NAVIGABLE for ArrowRight.
+    let tile = page.locator(`a[href*="/photo"][href*="fbid=${curFbid}"]:not([href*="set=p."])`).first();
+    if (!(await tile.count().catch(() => 0))) tile = page.locator('a[href*="/photo"][href*="set=g."][href*="fbid="]').first();
+    if (!(await tile.count().catch(() => 0))) tile = page.locator('a[href*="/photo"][href*="fbid="]:not([href*="set=p."])').first();
     if (await tile.count().catch(() => 0)) { await tile.scrollIntoViewIfNeeded().catch(() => {}); await tile.click({ timeout: 8000 }); opened = true; }
   } catch (e) { console.log(JSON.stringify({ step: 'harvest_theater_click_failed', error: String((e && e.message) || e).slice(0, 120) })); }
   await page.waitForTimeout(2800);
   await dismissFacebookInterstitials(page).catch(() => {});
   const afterClick = await photoViewerFbid(page);
-  console.log(JSON.stringify({ step: 'harvest_theater_opened', opened, afterClickFbid: afterClick }));
+  const afterSet = await page.evaluate(() => (location.href.match(/set=([a-z]+)\./i) || [])[1] || '').catch(() => '');
+  console.log(JSON.stringify({ step: 'harvest_theater_opened', opened, afterClickFbid: afterClick, set: afterSet, navigable: afterSet !== 'p' }));
   if (afterClick) curFbid = afterClick;
   // resume_older => step ONE past the saved photo; parallel profiles stagger by profileIndex (no overlap)
   const initialSkips = (startMode === 'resume_older' ? 1 : 0) + pIndex;
