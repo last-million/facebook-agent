@@ -3061,9 +3061,206 @@ async function approvePendingPost(page, context, payload, gid, marker) {
   }, null, 2));
 }
 
-// HARVEST: read a SOURCE group's /media grid, open the first N media posts, and extract each post's
-// TEXT + IMAGE + the LINK in its first comment. READ-ONLY (never posts/comments). Returns [{href,text,image,link}].
+// SHARED per-photo extractor (used by BOTH the photo-viewer WALK and the grid fallback). With the post/
+// photo already open, it loads the comments (the product link lives in the FIRST comment), reads the EXACT
+// caption text — EMOJIS PRESERVED (innerText keeps them; JSON transport + JSON.stringify storage are
+// emoji-safe, so no UTF mangling end-to-end) — the product image, and the first-comment product link,
+// downloads the image in the authed session, and fetches the link's product OpenGraph (real name/desc for
+// the #tags). Returns the harvest record, or null (no product link, or a duplicate already taken this round).
+async function harvestExtractPhoto(page, ctx) {
+  const seenLinks = ctx.seenLinks; const ogState = ctx.ogState || { n: 0 };
+  try {
+    for (let c = 0; c < 4; c++) {
+      await page.mouse.wheel(0, 1500).catch(() => {});
+      await page.waitForTimeout(800);
+      const linkLoaded = await page.evaluate(() => Array.from(document.querySelectorAll('a[href]')).some((a) => /l\.facebook\.com\/l\.php|mavlynk\.com|walmrt\.us|amzn|a\.co|bit\.ly|tinyurl|geni\.us|shareasale|liketk|rstyle/i.test(a.href || ''))).catch(() => false);
+      if (linkLoaded) break;
+    }
+    await page.evaluate(() => {
+      for (const el of Array.from(document.querySelectorAll('div[role="button"],span,a'))) {
+        const t = (el.innerText || '').trim();
+        if (/^see more$/i.test(t) || /view\s+\d+\s*(more\s*)?comment|view all|most relevant/i.test(t) || /voir plus|عرض المزيد|المزيد/i.test(t)) { try { el.click(); } catch (_) {} }
+      }
+    });
+    await page.waitForTimeout(700);
+  } catch (_) {}
+  const data = await page.evaluate(() => {
+    const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim(); // \s+ collapse keeps emojis intact
+    const isUrl = (s) => /^https?:\/\//i.test(s.trim()) || /^www\./i.test(s.trim());
+    const isChrome = (s) => /^(Like|Comment|Share|Reply|See more|See less|All reactions|Active|Write a comment|See translation|Most relevant|Top fan|Author|Follow|Send|Share to|Sponsored|·)\b/i.test(s) || /^\d+\s*(comment|share|reaction|like)/i.test(s);
+    const cands = [];
+    for (const el of Array.from(document.querySelectorAll('div[dir="auto"], span[dir="auto"]'))) {
+      const t = clean(el.innerText);
+      if (t.length >= 12 && t.length <= 6000 && !isUrl(t) && !isChrome(t)) cands.push(t);
+    }
+    cands.sort((a, b) => b.length - a.length);
+    const ogTitle = clean((document.querySelector('meta[property="og:title"]') || {}).content);
+    const ogDesc = clean((document.querySelector('meta[property="og:description"]') || {}).content);
+    let text = cands[0] || ogDesc || ogTitle || '';
+    let image = '', max = 0;
+    for (const im of Array.from(document.querySelectorAll('img'))) {
+      const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
+      if (w >= 350 && h >= 200 && w * h > max && !/emoji|static|rsrc\.php/i.test(im.src)) { max = w * h; image = im.src; }
+    }
+    const META = /facebook\.com|fbcdn|messenger|fb\.me|meta\.(ai|com)|instagram\.com|whatsapp\.com|oculus|threads\.net/i;
+    const JUNK = /giphy\.com|tenor\.com|\.(gif|mp4|webm|mov)(\?|$)|imgur\.com|youtu\.?be|youtube\.com|spotify|soundcloud|wikipedia|gph\.is|\/news\/|wivb\.com|\b(cnn|bbc|nytimes|foxnews|reuters|apnews|kptv|kgw|kxan)\.com/i;
+    const AFFIL = /mavlynk\.com|walmrt\.us|amzn\.to|amzlink\.to|a\.co|amazon\.[a-z.]+\/.*tag=|shopstyle|shopmy|go\.shop|rstyle\.me|shareasale|liketk|ltk\.app|geni\.us|sovrn|howl\.|collab|rakuten|sjv\.io|pxf\.io|prf\.hn|bit\.ly|tinyurl/i;
+    const linkCands = [];
+    for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+      let h = a.href || '';
+      if (/l\.facebook\.com\/l\.php\?u=/i.test(h)) { try { h = decodeURIComponent((h.match(/[?&]u=([^&]+)/) || [])[1] || ''); } catch (_) {} }
+      if (!/^https?:\/\//i.test(h) || META.test(h) || JUNK.test(h)) continue;
+      linkCands.push(h);
+    }
+    let link = linkCands.find((h) => AFFIL.test(h)) || linkCands[0] || '';
+    if (link) link = link.replace(/([?&])(fbclid|brid|aem|_aem|mibextid)=[^&]*/gi, '$1').replace(/[?&]+$/, '').replace(/\?&/, '?');
+    return { text, image, link, ogTitle, ogDesc, candCount: cands.length };
+  });
+  const dkey = (data.link || '').split(/[?#]/)[0];
+  if (!data.link || !dkey || seenLinks.has(dkey)) return null; // PRODUCTS only: no first-comment product link => skip (recipes/news never enter the buffer)
+  seenLinks.add(dkey);
+  let imageLocalPath = '';
+  if (data.image) {
+    try {
+      const b64 = await page.evaluate(async (url) => {
+        const r = await fetch(url); if (!r.ok) return '';
+        const bytes = new Uint8Array(await r.arrayBuffer());
+        let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+        return btoa(s);
+      }, data.image);
+      if (b64 && b64.length > 2000) {
+        const crypto = require('crypto'); const pathmod = require('path');
+        const sha = crypto.createHash('sha1').update(dkey).digest('hex').slice(0, 16);
+        const dir = pathmod.join(__dirname, '..', 'data', 'harvested-images');
+        fs.mkdirSync(dir, { recursive: true });
+        const fp = pathmod.join(dir, sha + '.jpg');
+        fs.writeFileSync(fp, Buffer.from(b64, 'base64'));
+        imageLocalPath = fp;
+      }
+    } catch (e) { console.log(JSON.stringify({ step: 'harvest_image_download_failed', error: String((e && e.message) || e).slice(0, 140) })); }
+  }
+  let productOgTitle = '', productOgDescription = '';
+  if (data.link && ogState.n < 10) {
+    ogState.n++;
+    let p2 = null;
+    try {
+      p2 = await page.context().newPage();
+      await p2.goto(data.link, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await p2.waitForTimeout(1500);
+      const og = await p2.evaluate(() => {
+        const meta = (k) => (((document.querySelector('meta[property="' + k + '"]') || document.querySelector('meta[name="' + k + '"]') || {}).content) || '').trim();
+        return { t: meta('og:title') || (document.title || '').trim(), d: meta('og:description') || meta('description') };
+      });
+      const junk = /just a moment|are you a human|verify you are|captcha|access denied|robot or human|attention required|enable javascript|'s amazon page$|amazon page$|storefront|idea list|shop recommended products|amazon\.com\s*$|^walmart\.com/i;
+      let t = String(og.t || '').replace(/\s*[-|–—:]\s*Walmart(\.com)?\s*$/i, '').replace(/\s*[-|]\s*Amazon\.com.*$/i, '').replace(/^Amazon\.com\s*[:\-]\s*/i, '').trim();
+      if (t.length < 8 || junk.test(t)) t = '';
+      let d = String(og.d || '').trim();
+      if (junk.test(d)) d = '';
+      productOgTitle = t.slice(0, 200);
+      productOgDescription = d.slice(0, 500);
+      console.log(JSON.stringify({ step: 'harvest_og_fetched', key: dkey, ogTitle: productOgTitle.slice(0, 80), hasDesc: !!productOgDescription }));
+    } catch (e) {
+      console.log(JSON.stringify({ step: 'harvest_og_fetch_failed', key: dkey, error: String((e && e.message) || e).slice(0, 120) }));
+    } finally { try { if (p2) await p2.close(); } catch (_) {} }
+  }
+  return { href: ctx.href, postId: ctx.postId, productKey: dkey, imageLocalPath, ...data, ogTitle: productOgTitle, ogDescription: productOgDescription };
+}
+
+// The fbid currently shown in the photo theater (the unique per-photo id, from the address bar).
+async function photoViewerFbid(page) {
+  return await page.evaluate(() => (location.href.match(/[?&]fbid=(\d+)/) || [])[1] || '').catch(() => '');
+}
+
+// Advance to the NEXT (older) photo in the group's theater by pressing the Right arrow — language-
+// independent (works EN/FR/AR), exactly like clicking the right chevron. Falls back to clicking an
+// aria-labelled Next button. Returns the new fbid, or '' when there are no more photos (end of group).
+async function advanceToNextPhoto(page) {
+  const before = await photoViewerFbid(page);
+  try { const vp = page.viewportSize() || { width: 1280, height: 800 }; await page.mouse.move(Math.floor(vp.width * 0.42), Math.floor(vp.height * 0.5)); } catch (_) {}
+  await page.keyboard.press('ArrowRight').catch(() => {});
+  for (let i = 0; i < 24; i++) {
+    await page.waitForTimeout(250);
+    const now = await photoViewerFbid(page);
+    if (now && now !== before) return now;
+  }
+  const clicked = await page.evaluate(() => {
+    const re = /next photo|next image|^next$|suivant|photo suivante|الصورة التالية|التالي/i;
+    const b = [...document.querySelectorAll('[aria-label],[aria-labelledby]')].find((e) => re.test(e.getAttribute('aria-label') || ''));
+    if (b) { try { b.click(); return true; } catch (_) {} } return false;
+  }).catch(() => false);
+  if (clicked) { for (let i = 0; i < 16; i++) { await page.waitForTimeout(250); const now = await photoViewerFbid(page); if (now && now !== before) return now; } }
+  return '';
+}
+
+// HARVEST (photo-viewer WALK — operator method): open the group's photo theater (set=g.{groupId}) and
+// press the Right arrow to step NEWEST -> OLDER through every group photo one-by-one, reading each post's
+// text + image + first-comment link. Tracks the last fbid so the NEXT run RESUMES from there and keeps
+// going DEEPER into history — no fragile grid-scroll, works for ANY group. Returns {items, lastFbid}.
 async function harvestGroupFeed(page, count, opts = {}) {
+  const out = [];
+  const seenLinks = new Set();
+  const ogState = { n: 0 };
+  const seenIds = new Set((opts.seenIds || []).map(String));
+  const pIndex = Number(opts.profileIndex || 0), pCount = Math.max(1, Number(opts.profileCount || 1));
+  const resumeFbid = String(opts.resumeFromFbid || '').replace(/\D+/g, '');
+  await page.waitForTimeout(2500);
+  try { await page.waitForSelector('a[href*="fbid="]', { timeout: 25000 }); } catch (_) {}
+  // numeric group id — the set=g.{id} theater walks EVERY group photo (vanity slug resolves to it here)
+  let groupId = await resolveNumericGroupIdFromPage(page).catch(() => '');
+  if (!groupId) groupId = await page.evaluate(() => {
+    const a = document.querySelector('a[href*="set=g."]'); const m = a && a.href.match(/set=g\.(\d+)/); if (m) return m[1];
+    const b = document.querySelector('a[href*="/groups/"][href*="fbid="]'); const m2 = b && b.href.match(/groups\/(\d{6,})/); return m2 ? m2[1] : '';
+  }).catch(() => '');
+  // newest media tile (top of the grid)
+  const newestFbid = await page.evaluate(() => {
+    const a = document.querySelector('a[href*="/photo"][href*="fbid="]'); const m = a && a.href.match(/fbid=(\d+)/); return m ? m[1] : '';
+  }).catch(() => '');
+  // START smart: if the NEWEST post is UNSEEN, scan from the TOP (catch new posts first); otherwise the top
+  // is already harvested, so JUMP to the saved resume position and keep digging OLDER. Best of both.
+  let curFbid, startMode;
+  if (newestFbid && !seenIds.has(newestFbid)) { curFbid = newestFbid; startMode = 'top_new_posts'; }
+  else if (resumeFbid) { curFbid = resumeFbid; startMode = 'resume_older'; }
+  else { curFbid = newestFbid; startMode = 'top'; }
+  if (!groupId || !curFbid) {
+    console.log(JSON.stringify({ step: 'harvest_walk_unavailable', groupId, curFbid, note: 'falling back to grid scroll' }));
+    const grid = await harvestGroupFeedGrid(page, count, opts);
+    return { items: grid, lastFbid: '' };
+  }
+  console.log(JSON.stringify({ step: 'harvest_walk_start', groupId, startFbid: curFbid, startMode, profileIndex: pIndex, profileCount: pCount }));
+  await page.goto(`https://www.facebook.com/photo/?fbid=${curFbid}&set=g.${groupId}`, { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await page.waitForTimeout(2500);
+  await dismissFacebookInterstitials(page).catch(() => {});
+  // resume_older => step ONE past the saved photo; parallel profiles stagger by profileIndex (no overlap)
+  const initialSkips = (startMode === 'resume_older' ? 1 : 0) + pIndex;
+  for (let s = 0; s < initialSkips; s++) { const nf = await advanceToNextPhoto(page); if (!nf) break; curFbid = nf; }
+  let lastFbid = curFbid;
+  const maxSteps = count * pCount * 14 + 40; // bounded deep walk
+  let steps = 0;
+  while (out.length < count && steps < maxSteps) {
+    steps++;
+    curFbid = (await photoViewerFbid(page)) || curFbid;
+    lastFbid = curFbid || lastFbid;
+    if (curFbid && !seenIds.has(curFbid)) {
+      try {
+        const rec = await harvestExtractPhoto(page, { href: `https://www.facebook.com/photo/?fbid=${curFbid}&set=g.${groupId}`, postId: curFbid, seenLinks, ogState });
+        if (rec) { out.push(rec); console.log(JSON.stringify({ step: 'harvest_item', n: out.length, fbid: curFbid, textLen: (rec.text || '').length, textPreview: (rec.text || '').slice(0, 90), imageSaved: !!rec.imageLocalPath, link: rec.link })); }
+        else { console.log(JSON.stringify({ step: 'harvest_walk_skip', fbid: curFbid, reason: 'no_product_link_or_dup' })); }
+      } catch (e) { console.log(JSON.stringify({ step: 'harvest_walk_item_error', fbid: curFbid, error: String((e && e.message) || e).slice(0, 140) })); }
+    }
+    if (out.length >= count) break;
+    let moved = '';
+    for (let k = 0; k < pCount; k++) { const nf = await advanceToNextPhoto(page); if (!nf) { moved = ''; break; } moved = nf; }
+    if (!moved) { console.log(JSON.stringify({ step: 'harvest_walk_end', reason: 'no_more_photos', steps, collected: out.length })); break; }
+    curFbid = moved; lastFbid = moved;
+  }
+  console.log(JSON.stringify({ step: 'harvest_walk_done', collected: out.length, lastFbid, steps }));
+  return { items: out, lastFbid };
+}
+
+// HARVEST (grid fallback): read a SOURCE group's /media grid, open the first N media posts, and extract each
+// post's TEXT + IMAGE + first-comment LINK. READ-ONLY. Used only when the photo-viewer walk can't resolve a
+// group id / start photo. Returns an array (the walk wraps it into {items}).
+async function harvestGroupFeedGrid(page, count, opts = {}) {
   const out = [];
   const seenLinks = new Set(); // dedup harvested PRODUCTS by their first-comment URL (each product = unique url)
   await page.waitForTimeout(3000);
@@ -3124,123 +3321,15 @@ async function harvestGroupFeed(page, count, opts = {}) {
   let work = links.filter((it) => !seenIds.has(String(it.postId)));
   if (pCount > 1) work = work.filter((_, idx) => (idx % pCount) === pIndex);
   console.log(JSON.stringify({ step: 'harvest_partition', total: links.length, mine: work.length, profileIndex: pIndex, profileCount: pCount }));
-  let ogFetched = 0; // per-round cap on product-page og fetches so harvest never crawls
+  const ogState = { n: 0 }; // per-round cap on product-page og fetches so harvest never crawls
   for (let i = 0; i < work.length && out.length < count; i++) {
     const item = work[i];
     try {
       await page.goto(item.href, { waitUntil: 'domcontentloaded', timeout: 60000 });
-      // proceed as soon as the post content (article or its image) renders, capped at 3500ms — faster than a
-      // flat 3.5s wait on fast loads, and just as safe on slow ones (still waits up to the cap).
       await page.waitForSelector('div[role="article"], img[src*="fbcdn"]', { timeout: 3500 }).catch(() => {});
       await page.waitForTimeout(600);
-      // Load the COMMENTS (the affiliate link is in the FIRST COMMENT) + expand "See more" captions.
-      try {
-        for (let c = 0; c < 4; c++) {
-          await page.mouse.wheel(0, 1500).catch(() => {});
-          await page.waitForTimeout(800); // up to 4*800=3200ms (~= old fixed 3300ms) for slow comments...
-          // ...but STOP scrolling the instant the first-comment external link is loaded (most posts: 1 scroll).
-          const linkLoaded = await page.evaluate(() => Array.from(document.querySelectorAll('a[href]')).some((a) => /l\.facebook\.com\/l\.php|mavlynk\.com|walmrt\.us|amzn|a\.co|bit\.ly|tinyurl|geni\.us|shareasale|liketk|rstyle/i.test(a.href || ''))).catch(() => false);
-          if (linkLoaded) break;
-        }
-        await page.evaluate(() => {
-          for (const el of Array.from(document.querySelectorAll('div[role="button"],span,a'))) {
-            const t = (el.innerText || '').trim();
-            if (/^see more$/i.test(t) || /view\s+\d+\s*(more\s*)?comment|view all|most relevant/i.test(t)) { try { el.click(); } catch (_) {} }
-          }
-        });
-        await page.waitForTimeout(700);
-      } catch (_) {}
-      const data = await page.evaluate(() => {
-        const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim();
-        const isUrl = (s) => /^https?:\/\//i.test(s.trim()) || /^www\./i.test(s.trim());
-        const isChrome = (s) => /^(Like|Comment|Share|Reply|See more|See less|All reactions|Active|Write a comment|See translation|Most relevant|Top fan|Author|Follow|Send|Share to|Sponsored|·)\b/i.test(s) || /^\d+\s*(comment|share|reaction|like)/i.test(s);
-        const cands = [];
-        for (const el of Array.from(document.querySelectorAll('div[dir="auto"], span[dir="auto"]'))) {
-          const t = clean(el.innerText);
-          if (t.length >= 12 && t.length <= 6000 && !isUrl(t) && !isChrome(t)) cands.push(t);
-        }
-        cands.sort((a, b) => b.length - a.length);
-        const ogTitle = clean((document.querySelector('meta[property="og:title"]') || {}).content);
-        const ogDesc = clean((document.querySelector('meta[property="og:description"]') || {}).content);
-        let text = cands[0] || ogDesc || ogTitle || '';
-        let image = '', max = 0;
-        for (const im of Array.from(document.querySelectorAll('img'))) {
-          const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
-          if (w >= 350 && h >= 200 && w * h > max && !/emoji|static|rsrc\.php/i.test(im.src)) { max = w * h; image = im.src; }
-        }
-        const META = /facebook\.com|fbcdn|messenger|fb\.me|meta\.(ai|com)|instagram\.com|whatsapp\.com|oculus|threads\.net/i;
-        // JUNK = GIF replies, videos, news links etc. that appear in comments but are NOT the product link.
-        const JUNK = /giphy\.com|tenor\.com|\.(gif|mp4|webm|mov)(\?|$)|imgur\.com|youtu\.?be|youtube\.com|spotify|soundcloud|wikipedia|gph\.is|\/news\/|wivb\.com|\b(cnn|bbc|nytimes|foxnews|reuters|apnews)\.com/i;
-        // AFFILIATE = known product/affiliate shortener + network domains -> always preferred over a random link.
-        const AFFIL = /mavlynk\.com|walmrt\.us|amzn\.to|amzlink\.to|a\.co|amazon\.[a-z.]+\/.*tag=|shopstyle|shopmy|go\.shop|rstyle\.me|shareasale|liketk|ltk\.app|geni\.us|sovrn|howl\.|collab|rakuten|sjv\.io|pxf\.io|prf\.hn|bit\.ly|tinyurl/i;
-        const linkCands = [];
-        for (const a of Array.from(document.querySelectorAll('a[href]'))) {
-          let h = a.href || '';
-          if (/l\.facebook\.com\/l\.php\?u=/i.test(h)) { try { h = decodeURIComponent((h.match(/[?&]u=([^&]+)/) || [])[1] || ''); } catch (_) {} }
-          if (!/^https?:\/\//i.test(h) || META.test(h) || JUNK.test(h)) continue;
-          linkCands.push(h);
-        }
-        // prefer a known affiliate/shortener link; else the first clean external link; else "" (skipped upstream)
-        let link = linkCands.find((h) => AFFIL.test(h)) || linkCands[0] || '';
-        // clean the link: drop FB tracking params (fbclid, brid, aem) -> the bare product/affiliate URL
-        if (link) link = link.replace(/([?&])(fbclid|brid|aem|_aem|mibextid)=[^&]*/gi, '$1').replace(/[?&]+$/,'').replace(/\?&/, '?');
-        return { text, image, link, ogTitle, ogDesc, candCount: cands.length, top3: cands.slice(0, 3) };
-      });
-      const dkey = (data.link || '').split(/[?#]/)[0] || ('post:' + item.postId); // unique PRODUCT key = first-comment URL
-      if (seenLinks.has(dkey)) { console.log(JSON.stringify({ step: 'harvest_skip_duplicate', key: dkey })); continue; }
-      seenLinks.add(dkey);
-      // DOWNLOAD the image NOW (authed session; fbcdn urls are signed/short-lived and 403 later from the server).
-      let imageLocalPath = '';
-      if (data.image) {
-        try {
-          const b64 = await page.evaluate(async (url) => {
-            const r = await fetch(url); if (!r.ok) return '';
-            const bytes = new Uint8Array(await r.arrayBuffer());
-            let s = ''; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-            return btoa(s);
-          }, data.image);
-          if (b64 && b64.length > 2000) {
-            const crypto = require('crypto'); const pathmod = require('path');
-            const sha = crypto.createHash('sha1').update(dkey).digest('hex').slice(0, 16);
-            const dir = pathmod.join(__dirname, '..', 'data', 'harvested-images');
-            fs.mkdirSync(dir, { recursive: true });
-            const fp = pathmod.join(dir, sha + '.jpg');
-            fs.writeFileSync(fp, Buffer.from(b64, 'base64'));
-            imageLocalPath = fp;
-          }
-        } catch (e) { console.log(JSON.stringify({ step: 'harvest_image_download_failed', error: String((e && e.message) || e).slice(0, 140) })); }
-      }
-      // PRODUCT OPEN-GRAPH (operator design): open the harvested link in THIS logged-in browser
-      // (real Chrome fingerprint -> retail sites serve the real page, no bot wall) and read the
-      // REAL product name + description from its og: tags — these feed the posting #tags.
-      // Fail-soft + capped (10/round, 20s each) so harvest never stalls on a slow product page.
-      let productOgTitle = '', productOgDescription = '';
-      if (data.link && ogFetched < 10) {
-        ogFetched++;
-        let p2 = null;
-        try {
-          p2 = await page.context().newPage();
-          await p2.goto(data.link, { waitUntil: 'domcontentloaded', timeout: 20000 });
-          await p2.waitForTimeout(1500);
-          const og = await p2.evaluate(() => {
-            const meta = (k) => (((document.querySelector('meta[property="' + k + '"]') || document.querySelector('meta[name="' + k + '"]') || {}).content) || '').trim();
-            return { t: meta('og:title') || (document.title || '').trim(), d: meta('og:description') || meta('description') };
-          });
-          // junk guard: bot walls + storefront/profile pages must NEVER beat the caption-derived name
-          const junk = /just a moment|are you a human|verify you are|captcha|access denied|robot or human|attention required|enable javascript|'s amazon page$|amazon page$|storefront|idea list|shop recommended products|amazon\.com\s*$|^walmart\.com/i;
-          let t = String(og.t || '').replace(/\s*[-|–—:]\s*Walmart(\.com)?\s*$/i, '').replace(/\s*[-|]\s*Amazon\.com.*$/i, '').replace(/^Amazon\.com\s*[:\-]\s*/i, '').trim();
-          if (t.length < 8 || junk.test(t)) t = '';
-          let d = String(og.d || '').trim();
-          if (junk.test(d)) d = '';
-          productOgTitle = t.slice(0, 200);
-          productOgDescription = d.slice(0, 500);
-          console.log(JSON.stringify({ step: 'harvest_og_fetched', key: dkey, ogTitle: productOgTitle.slice(0, 80), hasDesc: !!productOgDescription }));
-        } catch (e) {
-          console.log(JSON.stringify({ step: 'harvest_og_fetch_failed', key: dkey, error: String((e && e.message) || e).slice(0, 120) }));
-        } finally { try { if (p2) await p2.close(); } catch (_) {} }
-      }
-      out.push({ href: item.href, postId: item.postId, productKey: dkey, imageLocalPath, ...data, ogTitle: productOgTitle, ogDescription: productOgDescription });
-      console.log(JSON.stringify({ step: 'harvest_item', n: out.length, textLen: (data.text || '').length, textPreview: (data.text || '').slice(0, 100), imageSaved: !!imageLocalPath, link: data.link, key: dkey }));
+      const rec = await harvestExtractPhoto(page, { href: item.href, postId: item.postId, seenLinks, ogState });
+      if (rec) { out.push(rec); console.log(JSON.stringify({ step: 'harvest_item', n: out.length, textLen: (rec.text || '').length, textPreview: (rec.text || '').slice(0, 100), imageSaved: !!rec.imageLocalPath, link: rec.link, key: rec.productKey })); }
     } catch (e) {
       console.log(JSON.stringify({ step: 'harvest_item_error', href: item.href.slice(0, 120), error: String((e && e.message) || e).slice(0, 160) }));
     }
@@ -3429,10 +3518,13 @@ async function main() {
       console.log(JSON.stringify({ step: 'harvest_login_required', profileId: payload.profileId, accountBlocked: !!snap.accountBlocked, reason: snap.accountBlockReason || 'needs_login' }));
       return; // finally closes the browser; server parks this profile from the signal above
     }
-    let harvested = [];
-    try { harvested = await harvestGroupFeed(page, harvestCount, { seenIds: payload.harvestSeenIds || [], profileIndex: payload.harvestProfileIndex || 0, profileCount: payload.harvestProfileCount || 1 }); }
+    let harvested = [], harvestLastFbid = '';
+    try {
+      const r = await harvestGroupFeed(page, harvestCount, { seenIds: payload.harvestSeenIds || [], profileIndex: payload.harvestProfileIndex || 0, profileCount: payload.harvestProfileCount || 1, resumeFromFbid: payload.harvestResumeFbid || '' });
+      if (Array.isArray(r)) { harvested = r; } else { harvested = (r && r.items) || []; harvestLastFbid = (r && r.lastFbid) || ''; }
+    }
     catch (e) { console.log(JSON.stringify({ step: 'harvest_error', error: String((e && e.message) || e).slice(0, 300) })); }
-    console.log(JSON.stringify({ step: 'harvest_result', count: harvested.length, items: harvested }));
+    console.log(JSON.stringify({ step: 'harvest_result', count: harvested.length, items: harvested, lastFbid: harvestLastFbid }));
     return; // the finally block closes the browser
   }
 

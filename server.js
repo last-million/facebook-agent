@@ -7836,7 +7836,7 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
   const payloadDir = path.join(DATA_DIR, "harvest-requests");
   fs.mkdirSync(payloadDir, { recursive: true });
   const payloadPath = path.join(payloadDir, `harvest-${Date.now()}-${crypto.randomBytes(5).toString("hex")}.json`);
-  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4), harvestSeenIds: (opts.seenIds || []).slice(0, 2000), harvestProfileIndex: Number(opts.profileIndex || 0), harvestProfileCount: Number(opts.profileCount || 1) }));
+  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4), harvestSeenIds: (opts.seenIds || []).slice(0, 2000), harvestProfileIndex: Number(opts.profileIndex || 0), harvestProfileCount: Number(opts.profileCount || 1), harvestResumeFbid: String(opts.resumeFromFbid || "") }));
   try {
     const { stdout } = await execFileAsync("node", [scriptPath, payloadPath], { cwd: ROOT, windowsHide: true, timeout: 6 * 60 * 1000, maxBuffer: 24 * 1024 * 1024 });
     const objs = parseJsonLogObjects(stdout);
@@ -7849,7 +7849,7 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
       throw e;
     }
     const result = objs.filter((o) => o && o.step === "harvest_result").pop();
-    return (result && Array.isArray(result.items)) ? result.items : [];
+    return { items: (result && Array.isArray(result.items)) ? result.items : [], lastFbid: String((result && result.lastFbid) || "") };
   } finally {
     try { fs.unlinkSync(payloadPath); } catch (_) {}
     // ALWAYS close the profile server-side (belt-and-suspenders): the connector closes it in its OWN finally,
@@ -7986,6 +7986,11 @@ async function harvestContentSourcesAsync(options = {}) {
     const allRecs = readHarvestedProducts(state);
     const existingByUrl = new Map(allRecs.map((r) => [String(r.firstCommentUrl || ""), r]));
     const seenPostIds = allRecs.map((r) => String(r.postId || "")).filter(Boolean); // tiles already scraped -> skip + continue from last
+    // RESUME POSITION: the deepest photo fbid reached per source group last round — the photo-viewer walk
+    // jumps straight there and keeps going OLDER, so we never re-scroll from the top.
+    let resumeMap = {};
+    try { resumeMap = JSON.parse(String(cs.harvestResume || "{}")) || {}; } catch (_) { resumeMap = {}; }
+    const resumeUpdates = {};
     let harvestedNew = 0, skippedSeen = 0, reusedOld = 0;
     const harvestCount = clampNumber(options.harvestCount || (effectiveTarget - reserve), 1, 20, 4); // grab the GAP toward the (day or night) target in one harvest (capped at 20/session)
     for (let i = 0; i < pairs.length; i += 4) { // 4-by-4
@@ -7999,7 +8004,9 @@ async function harvestContentSourcesAsync(options = {}) {
         try { release = acquireNormalIxProfileUse(pair.profileId, "facebook_harvest"); }
         catch (e) { logEvent("harvest_profile_busy_skipped", { profileId: pair.profileId }); return; } // posting/discovery owns it -> skip
         try {
-          const items = await runHarvestConnector(pair.groupUrl, pair.profileId, harvestCount, { seenIds: seenPostIds, profileIndex: pair.profileIndex || 0, profileCount: pair.profileCount || 1 });
+          const harvestRes = await runHarvestConnector(pair.groupUrl, pair.profileId, harvestCount, { seenIds: seenPostIds, profileIndex: pair.profileIndex || 0, profileCount: pair.profileCount || 1, resumeFromFbid: String(resumeMap[pair.groupUrl] || "") });
+          const items = harvestRes.items || [];
+          if (harvestRes.lastFbid) resumeUpdates[pair.groupUrl] = harvestRes.lastFbid; // remember the deepest photo reached -> next round resumes older
           for (const it of items) {
             const url = String(it.link || "").trim();
             if (!url) continue;
@@ -8042,6 +8049,16 @@ async function harvestContentSourcesAsync(options = {}) {
         finally { try { if (release) release(); } catch (_) {} }
       }));
       if (i + 4 < pairs.length) await sleep(clampNumber(options.interRoundGapMs || 25000, 5000, 120000, 25000)); // anti-throttle pacing
+    }
+    // PERSIST the per-group resume positions (deepest photo reached) so the next round digs OLDER.
+    if (Object.keys(resumeUpdates).length) {
+      try {
+        const st2 = readState();
+        st2.posting = st2.posting || {}; st2.posting.contentSources = st2.posting.contentSources || {};
+        let prev = {}; try { prev = JSON.parse(String(st2.posting.contentSources.harvestResume || "{}")) || {}; } catch (_) { prev = {}; }
+        st2.posting.contentSources.harvestResume = JSON.stringify(Object.assign(prev, resumeUpdates));
+        writeState(st2);
+      } catch (_) {}
     }
     // RE-SCAN cadence: drain fast when producing; re-scan ~every minute when idle; back off when long-exhausted.
     if ((harvestedNew + reusedOld) > 0) { __harvestEmptyRounds = 0; __harvestNextAt = Date.now(); } // got new -> immediately keep draining the remaining UNSEEN tiles
