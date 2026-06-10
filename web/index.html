@@ -612,28 +612,17 @@
             </div>
           </section>
 
-          <section class="panel prodStep" data-view="prod" data-prod-step="2" id="oldMethodInputs">
-            <div class="panelHead">
-              <div>
-                <span class="stepBadge">Step 2 · old method</span>
-                <h2>Web-scraping inputs</h2>
-                <p>Only for the <b>traditional web-scraping</b> method (which does its own product research, review-image capture and link creation). <b>Copy-from-group brings the text, image &amp; link automatically</b>, so this panel is hidden when copy mode is on.</p>
-              </div>
-            </div>
-            <div class="formGrid">
-              <label class="span2">First comment template <textarea id="commentTemplate"></textarea></label>
-              <label class="span2">Post texts <span style="opacity:.7">— one caption per line; each line is used as the text for one post</span> <textarea id="postTextsList" spellcheck="false" placeholder="One post caption per line"></textarea></label>
-            </div>
-            <!-- Legacy/auto fields kept in the DOM (hidden) so their saved values round-trip and never get wiped; not used by the copy-from-group method. facebookProfileStatus is an AUTO-written failure log. -->
-            <div style="display:none" aria-hidden="true">
-              <textarea id="shortlinks"></textarea>
-              <textarea id="moderatorAccountNotes"></textarea>
-              <textarea id="ownedGroupsByProfile"></textarea>
-              <textarea id="facebookProfileStatus"></textarea>
-              <input id="readyDescriptionsPath">
-              <input id="readyImagesPath">
-            </div>
-          </section>
+          <!-- Hidden binding-only container: legacy/auto fields kept in the DOM so their saved values round-trip
+               and never get wiped (facebookProfileStatus is an AUTO-written failure log). All visible scraping
+               inputs now live in Step 2 · Source (scrape branch), so there is no separate old-method panel. -->
+          <div style="display:none" aria-hidden="true" id="oldMethodInputs">
+            <textarea id="shortlinks"></textarea>
+            <textarea id="moderatorAccountNotes"></textarea>
+            <textarea id="ownedGroupsByProfile"></textarea>
+            <textarea id="facebookProfileStatus"></textarea>
+            <input id="readyDescriptionsPath">
+            <input id="readyImagesPath">
+          </div>
 
           <section class="panel wide tabLead" data-view="prod">
             <div class="panelHead">
@@ -823,9 +812,11 @@
                 <label class="span2" data-ux-tier="advanced">Content source notes <textarea id="contentSourcesNotes" spellcheck="false" placeholder="Optional notes (e.g. which posts to prefer)."></textarea></label>
               </div>
 
-              <!-- TRADITIONAL WEB-SCRAPING branch -->
+              <!-- TRADITIONAL WEB-SCRAPING branch — everything for manual scraping lives here, in THIS section -->
               <div id="sourceScrapeFields" class="span2 formGrid sourceBranch">
-                <label class="span2">Product / Source URLs <span style="opacity:.7">(traditional scraping — Walmart, Amazon, etc., one per line)</span> <textarea id="sourceUrls" spellcheck="false"></textarea></label>
+                <label class="span2">Product / Source URLs <span style="opacity:.7">(Walmart, Amazon, etc. — one per line; product research, review images &amp; links are built from these)</span> <textarea id="sourceUrls" spellcheck="false"></textarea></label>
+                <label class="span2">First comment template <textarea id="commentTemplate"></textarea></label>
+                <label class="span2">Post texts <span style="opacity:.7">— one caption per line; each line is used as the text for one post</span> <textarea id="postTextsList" spellcheck="false" placeholder="One post caption per line"></textarea></label>
               </div>
             </div>
           </section>

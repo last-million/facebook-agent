@@ -5276,10 +5276,7 @@ function updateContentSourceBranch() {
   const copy = !!($("contentSourcesEnabled") && $("contentSourcesEnabled").checked);
   const cp = $("sourceCopyFields"), sc = $("sourceScrapeFields");
   if (cp) cp.style.display = copy ? "" : "none";
-  if (sc) sc.style.display = copy ? "none" : "";
-  // Step 2 "old method" inputs (comment template + post texts) are ONLY for web scraping — hide in copy mode.
-  const old = $("oldMethodInputs");
-  if (old) old.style.display = copy ? "none" : "";
+  if (sc) sc.style.display = copy ? "none" : ""; // scrape branch holds ALL manual-scraping inputs (urls + comment + post texts)
   // reflect the prominent method switch (Manual scraping <-> Easy copy from group)
   document.querySelectorAll(".methodOpt").forEach((b) => b.classList.toggle("active", (b.dataset.method === "copy") === copy));
 }
