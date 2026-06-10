@@ -5280,8 +5280,18 @@ function updateContentSourceBranch() {
   // Step 2 "old method" inputs (comment template + post texts) are ONLY for web scraping — hide in copy mode.
   const old = $("oldMethodInputs");
   if (old) old.style.display = copy ? "none" : "";
+  // reflect the prominent method switch (Manual scraping <-> Easy copy from group)
+  document.querySelectorAll(".methodOpt").forEach((b) => b.classList.toggle("active", (b.dataset.method === "copy") === copy));
 }
 $("contentSourcesEnabled")?.addEventListener("change", updateContentSourceBranch);
+// PROMINENT METHOD SWITCH: the two big buttons drive the contentSourcesEnabled state (copy vs scrape).
+document.querySelectorAll(".methodOpt").forEach((btn) => btn.addEventListener("click", () => {
+  const cb = $("contentSourcesEnabled");
+  if (!cb) return;
+  cb.checked = btn.dataset.method === "copy";
+  cb.dispatchEvent(new Event("change", { bubbles: true })); // updates branches + triggers the dashboard auto-save
+  cb.dispatchEvent(new Event("input", { bubbles: true }));
+}));
 // Quick-add a SOURCE group (to copy products FROM) — mirrors the posting-group adder.
 $("addSourceGroupUrlBtn")?.addEventListener("click", () => {
   const el = $("sourceGroupUrlInput");
