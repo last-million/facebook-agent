@@ -1460,6 +1460,7 @@ function normalizeWorkflowState(state) {
   state.posting.groupProfileAssignments = String(state.posting.groupProfileAssignments || "").slice(0, 200000);
   state.posting.equalSplitAssignments = state.posting.equalSplitAssignments === true; // Step-3 toggle: equal dispatch, each profile in exactly one group
   state.posting.groupPostFailCounts = String(state.posting.groupPostFailCounts || "{}").slice(0, 20000); // per-(group,profile) post-fail tally for auto-unassign
+  state.posting.postTextsList = String(state.posting.postTextsList || "").slice(0, 100000); // old-method (web-scraping) post captions, one per line
   state.posting.groupFallbackPolicy = String(state.posting.groupFallbackPolicy || defaultState().posting.groupFallbackPolicy).slice(0, 600);
   state.posting.profileGroupIssueLogEndpoint = "/api/posting/profile-group-issue";
   state.posting.publishedPostUrls = String(state.posting.publishedPostUrls || "").slice(0, 200000);

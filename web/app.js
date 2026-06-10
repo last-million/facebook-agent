@@ -1575,6 +1575,7 @@ function renderState(state) {
   setValue("readyImagesPath", state.posting.readyImagesPath);
   setValue("moderatorAccountNotes", state.posting.moderatorAccountNotes);
   setValue("commentTemplate", state.posting.commentTemplate);
+  setValue("postTextsList", state.posting.postTextsList);
   setValue("ownedGroupsByProfile", state.posting.ownedGroupsByProfile);
   setValue("facebookProfileStatus", state.posting.facebookProfileStatus);
   setValue("contentSourcesEnabled", state.posting.contentSources?.enabled);
@@ -2337,6 +2338,7 @@ function collectState() {
     readyImagesPath: getValue("readyImagesPath"),
     moderatorAccountNotes: getValue("moderatorAccountNotes"),
     commentTemplate: getValue("commentTemplate"),
+    postTextsList: getValue("postTextsList"),
     ownedGroupsByProfile: getValue("ownedGroupsByProfile"),
     facebookProfileStatus: getValue("facebookProfileStatus"),
     contentSources: {
@@ -5275,6 +5277,9 @@ function updateContentSourceBranch() {
   const cp = $("sourceCopyFields"), sc = $("sourceScrapeFields");
   if (cp) cp.style.display = copy ? "" : "none";
   if (sc) sc.style.display = copy ? "none" : "";
+  // Step 2 "old method" inputs (comment template + post texts) are ONLY for web scraping — hide in copy mode.
+  const old = $("oldMethodInputs");
+  if (old) old.style.display = copy ? "none" : "";
 }
 $("contentSourcesEnabled")?.addEventListener("change", updateContentSourceBranch);
 // Quick-add a SOURCE group (to copy products FROM) — mirrors the posting-group adder.
