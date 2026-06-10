@@ -1430,6 +1430,7 @@ function normalizeWorkflowState(state) {
   state.operator = state.operator || {};
   state.operator.autopilotMaxPostsPerRun = clampNumber(state.operator.autopilotMaxPostsPerRun, 0, 1000000, 0);
   state.operator.autopilotPostsThisRun = clampNumber(state.operator.autopilotPostsThisRun, 0, 1000000, 0);
+  state.operator.autopilotRunId = String(state.operator.autopilotRunId || "").slice(0, 40); // per-run product-claim namespace
   state.operator.commentCooldownHours = clampNumber(state.operator.commentCooldownHours, 1, 720, 48);
   const blockedProfileLines = normalizedProfileListLines(state.ixbrowser?.blockedProfiles);
   const movedModeratorLines = blockedProfileLines.filter(isModeratorApprovalProfileLine);
@@ -7900,6 +7901,27 @@ async function stopAllExternalWork(reason) {
   return { stopped: true, at: new Date().toISOString() };
 }
 
+// PER-RUN PRODUCT CLAIM (parallel double-post fix): the per-tick usedProductKeys dedup stops same-batch
+// repeats, but a product posted in tick N can still look "ready" in tick N+1 before its posted-status
+// propagates -> double-post. An atomic fs claim keyed by the run survives across ticks AND concurrent
+// workers (exclusive create = first wins). Released on a FAILED post so it can be retried in the same run.
+function postClaimDirForRun(state) {
+  const runId = String(state.operator?.autopilotRunId || "default").replace(/[^a-z0-9_-]/gi, "");
+  return path.join(DATA_DIR, "post-claims", runId || "default");
+}
+function claimPostProductForRun(state, productKey) {
+  try {
+    if (!productKey) return true;
+    const dir = postClaimDirForRun(state);
+    fs.mkdirSync(dir, { recursive: true });
+    const f = path.join(dir, crypto.createHash("sha1").update(String(productKey).toLowerCase()).digest("hex") + ".claim");
+    try { fs.openSync(f, "wx"); return true; } catch (e) { if (e && e.code === "EEXIST") return false; return true; }
+  } catch (_) { return true; } // fail-open: never block posting on a claim-fs error
+}
+function releasePostProductForRun(state, productKey) {
+  try { if (!productKey) return; const f = path.join(postClaimDirForRun(state), crypto.createHash("sha1").update(String(productKey).toLowerCase()).digest("hex") + ".claim"); fs.rmSync(f, { force: true }); } catch (_) {}
+}
+
 // Close ALL prod-eligible ixBrowser profiles (cleanup leaked/open windows). Idempotent (already-closed = ok);
 // skips the dedicated ShopYourLikes profile. Run before a fresh start to clear piled-up Chromium windows.
 async function closeAllOpenIxProfiles() {
@@ -8814,8 +8836,16 @@ async function autopilotTickAsync(options = {}) {
         logEvent("autopilot_worker_skipped", { profileId: Number(r.profileId || 0), reason: gate.reason });
         return { profileId: Number(r.profileId || 0), ok: false, postUrl: "", error: `skipped_${gate.reason}` };
       }
+      // PER-RUN PRODUCT CLAIM: reserve this product for the whole run BEFORE posting so no later tick or
+      // concurrent worker can post the same product twice (the parallel double-post fix). Skip if taken.
+      const __prodKey = String(r.productKey || r.productUrl || r.link || "").toLowerCase();
+      if (!claimPostProductForRun(state, __prodKey)) {
+        logEvent("autopilot_worker_skipped_product_already_used_this_run", { profileId: Number(r.profileId || 0), productKey: __prodKey.slice(0, 80) });
+        return { profileId: Number(r.profileId || 0), ok: false, postUrl: "", error: "product_already_used_this_run" };
+      }
       try {
         const v = await runLiveFacebookPostFromPlan({ fullRun: true, autopilot: true, planId: r.planId, sequence: r.sequence, countTowardRun: true });
+        if (!(v && v.ok)) releasePostProductForRun(state, __prodKey); // post did not land -> free the product for retry
         autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", errorText: (v && (v.error || v.reason)) || "", validation: v && v.validation, source: "autopilot" });
         // The per-run counter is now bumped at the RECORD moment inside completeVerifiedFacebookPostWithComment
         // (gated by ready.__autopilotRunPost = body.countTowardRun), so a post that LANDS but whose comment/
@@ -8823,6 +8853,7 @@ async function autopilotTickAsync(options = {}) {
         // "stop at N" could overshoot by 1 (e.g. p48: posted, but its worker threw right after landing).
         return { profileId: Number(r.profileId || 0), ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", error: "" };
       } catch (err) {
+        releasePostProductForRun(state, __prodKey); // post threw -> free the product so the run can retry it
         autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: false, postUrl: "", errorText: oneLineField((err && (err.profileFailureReason || err.message)) || String(err), 240), profileRetryable: !!(err && err.profileRetryable), validation: err && err.livePostValidation, source: "autopilot" });
         return { profileId: Number(r.profileId || 0), ok: false, postUrl: "", error: oneLineField((err && err.message) || String(err), 200) };
       }
@@ -17524,7 +17555,9 @@ const server = http.createServer(async (req, res) => {
       incoming.operator = incoming.operator || {};
       if (!wasEnabled && nowEnabled) {
         incoming.operator.autopilotPostsThisRun = 0; // fresh arm => count THIS run only
-        logEvent("autopilot_run_armed_counter_reset", { maxPostsPerRun: incoming.operator.autopilotMaxPostsPerRun });
+        incoming.operator.autopilotRunId = String(Date.now()); // fresh per-run product-claim namespace (no cross-run carryover)
+        try { const cr = path.join(DATA_DIR, "post-claims"); for (const d of (fs.existsSync(cr) ? fs.readdirSync(cr) : [])) { try { fs.rmSync(path.join(cr, d), { recursive: true, force: true }); } catch (_) {} } } catch (_) {} // drop stale claim dirs
+        logEvent("autopilot_run_armed_counter_reset", { maxPostsPerRun: incoming.operator.autopilotMaxPostsPerRun, runId: incoming.operator.autopilotRunId });
       } else if (incoming.operator.autopilotPostsThisRun === undefined || incoming.operator.autopilotPostsThisRun === null) {
         // controlWrite skips the protected-preserve, so a PUT that omits the counter must NOT reset
         // it (that would orphan the hard limit). Preserve the running count unless explicitly set.
