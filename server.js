@@ -1458,6 +1458,7 @@ function normalizeWorkflowState(state) {
   state.posting.groupAssignmentMode = "percentage_manual_review";
   state.posting.groupProfileAssignments = String(state.posting.groupProfileAssignments || "").slice(0, 200000);
   state.posting.equalSplitAssignments = state.posting.equalSplitAssignments === true; // Step-3 toggle: equal dispatch, each profile in exactly one group
+  state.posting.groupPostFailCounts = String(state.posting.groupPostFailCounts || "{}").slice(0, 20000); // per-(group,profile) post-fail tally for auto-unassign
   state.posting.groupFallbackPolicy = String(state.posting.groupFallbackPolicy || defaultState().posting.groupFallbackPolicy).slice(0, 600);
   state.posting.profileGroupIssueLogEndpoint = "/api/posting/profile-group-issue";
   state.posting.publishedPostUrls = String(state.posting.publishedPostUrls || "").slice(0, 200000);
@@ -14454,8 +14455,9 @@ async function runLiveFacebookPostFromPlan(body = {}) {
       profile: row.profile || "",
       groupUrl: ready.groupUrl,
       attempts: groupErrors.length,
-      message: "Account is NOT a member of this group — add it on Facebook OR assign it a group it already belongs to. Profile NOT benched.",
+      message: "Account is NOT a member of this group — auto-removing it from THIS group's roster (kept for any group it belongs to). Profile NOT globally benched.",
     });
+    recordGroupPostFailureAndMaybeUnassign(ready.profileId, ready.groupUrl, true); // confirmed non-member -> unassign from this group now
   } else if (allGroupRenderUnavailable) {
     logEvent("posting_group_render_unavailable_profile_not_benched", {
       profileId: ready.profileId,
@@ -14464,6 +14466,11 @@ async function runLiveFacebookPostFromPlan(body = {}) {
       attempts: groupErrors.length,
       reason: oneLineField(lastError?.message || "", 160),
     });
+    // transient group-render issue -> do NOT unassign (the profile is fine, the group just didn't render)
+  } else if (!dontBenchProfile) {
+    // ambiguous post failure (composer not found, etc.) that ISN'T a transient render issue -> unassign
+    // this profile from THIS group after 2 such failures (self-cleaning, per-group, language-independent).
+    recordGroupPostFailureAndMaybeUnassign(ready.profileId, ready.groupUrl, false);
   }
   const groupErrorSummary = groupErrors.length
     ? groupErrors.map((item, index) => `attempt ${index + 1} ${item.groupUrl}: ${item.error}`).join("; ")
@@ -14802,6 +14809,38 @@ async function runLiveFacebookFullPostingPlan(body = {}) {
     state: readState(),
     registers: readRegisters(),
   };
+}
+
+// WISE AUTO-UNASSIGN (operator: automatic, any group): when a profile can't post to a specific group,
+// remove it from THAT group's roster only (keep it for any group it DOES belong to) — instead of globally
+// benching a healthy-but-mis-assigned profile or wasting turns retrying it forever. `definitive` (a detected
+// not-a-member wall) unassigns on the FIRST failure; an ambiguous failure unassigns after 2 (transient guard).
+// Per-group, persisted, language-independent (keys on the post OUTCOME, not page text).
+function recordGroupPostFailureAndMaybeUnassign(profileId, groupUrl, definitive) {
+  try {
+    const pid = Number(profileId) || 0; const gu = String(groupUrl || "").trim();
+    if (!pid || !gu) return;
+    const state = readState();
+    let counts = {}; try { counts = JSON.parse(String(state.posting.groupPostFailCounts || "{}")) || {}; } catch (_) { counts = {}; }
+    const key = `${normalizedFacebookGroupKey(gu)}|${pid}`;
+    counts[key] = (Number(counts[key]) || 0) + 1;
+    if (counts[key] >= (definitive ? 1 : 2)) {
+      let removed = false;
+      for (const entry of (Array.isArray(state.posting.groupAssignmentData) ? state.posting.groupAssignmentData : [])) {
+        if (normalizedFacebookGroupKey(entry.url) !== normalizedFacebookGroupKey(gu)) continue;
+        const kept = (Array.isArray(entry.profiles) ? entry.profiles : []).filter((p) => profileIdFromLabel(p) !== pid);
+        if (kept.length !== (entry.profiles || []).length) { entry.profiles = kept; removed = true; }
+      }
+      // also strip it from the text plan for THIS group's block (keep other groups intact)
+      delete counts[key];
+      state.posting.groupPostFailCounts = JSON.stringify(counts);
+      writeState(state);
+      if (removed) logEvent("posting_profile_auto_unassigned_from_group", { profileId: pid, groupUrl: gu, definitive: !!definitive, reason: "cannot post to this group (auto-detected) — removed from this group's roster, kept for any group it belongs to" });
+    } else {
+      state.posting.groupPostFailCounts = JSON.stringify(counts);
+      writeState(state);
+    }
+  } catch (_) {}
 }
 
 function recordPostingProfileGroupIssue(body) {
