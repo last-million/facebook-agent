@@ -3069,21 +3069,35 @@ async function harvestGroupFeed(page, count, opts = {}) {
   await page.waitForTimeout(3000);
   try { await page.waitForSelector('a[href*="fbid="]', { timeout: 25000 }); } catch (_) {}
   // Scroll the LAZY-LOAD CONTAINER DEEP (tiles live in a scrollable DIV; scrolling body alone loads only 0-4).
-  // Go DEEP into the group's history (target 150 tiles, up to 90s, stop only after 6 flat cycles) so we reach
-  // OLDER products beyond the recent ones already harvested — the seen-set then skips the used ones and grabs
-  // the older-but-unused deals. Never throw: a sparse grid is a valid throttled outcome handled by the re-scan.
-  { const deadline = Date.now() + 90000; let prev = -1, flat = 0;
+  // NEWEST -> OLDEST (operator design): the grid lists newest first; we keep scrolling INTO OLDER HISTORY
+  // until we can see enough UNSEEN tiles (not merely enough tiles) — so when every recent post is already
+  // harvested, the scroll automatically digs deeper to the OLDEST unharvested posts instead of giving up.
+  // Hard caps: 600 tiles / 180s / 8 flat cycles (a flat grid = the group's true end or a throttle; the
+  // 15-min re-scan handles it). Never throw: a sparse grid is a valid throttled outcome.
+  { const seenForScroll = (opts.seenIds || []).map(String);
+    const unseenTarget = Math.max(12, Number(count || 3) * 4);
+    const deadline = Date.now() + 180000; let prevTiles = -1, flat = 0;
     while (Date.now() < deadline) {
-      const n = await page.evaluate(() => {
+      const stat = await page.evaluate((seenArr) => {
+        const seenSet = new Set(seenArr);
         const tiles = document.querySelectorAll('a[href*="/photo"][href*="fbid="]');
+        let unseen = 0;
+        for (const a of tiles) {
+          const h = a.href || '';
+          if (/set=p\./i.test(h)) continue;
+          const fbid = (h.match(/fbid=(\d+)/) || [])[1] || '';
+          const postId = (h.match(/set=gm?\.(\d+)/) || [])[1] || fbid;
+          if (postId && !seenSet.has(postId)) unseen++;
+        }
         let el = tiles[0], scroller = null;
         while (el && el !== document.body) { try { if (el.scrollHeight > el.clientHeight + 60 && /auto|scroll/.test(getComputedStyle(el).overflowY)) { scroller = el; break; } } catch (_) {} el = el.parentElement; }
         if (scroller) scroller.scrollTop = scroller.scrollHeight;
         window.scrollTo(0, document.body.scrollHeight);
-        return tiles.length;
-      }).catch(() => 0);
-      if (n >= 150) break;
-      if (n <= prev) { flat++; if (flat >= 6) break; } else { flat = 0; prev = n; }
+        return { tiles: tiles.length, unseen };
+      }, seenForScroll).catch(() => ({ tiles: 0, unseen: 0 }));
+      if (stat.unseen >= unseenTarget) { console.log(JSON.stringify({ step: 'harvest_scroll_depth', tiles: stat.tiles, unseen: stat.unseen, reason: 'enough_unseen' })); break; }
+      if (stat.tiles >= 600) { console.log(JSON.stringify({ step: 'harvest_scroll_depth', tiles: stat.tiles, unseen: stat.unseen, reason: 'tile_cap' })); break; }
+      if (stat.tiles <= prevTiles) { flat++; if (flat >= 8) { console.log(JSON.stringify({ step: 'harvest_scroll_depth', tiles: stat.tiles, unseen: stat.unseen, reason: 'grid_end_or_throttle' })); break; } } else { flat = 0; prevTiles = stat.tiles; }
       await page.mouse.wheel(0, 2400).catch(() => {});
       await page.waitForTimeout(1800);
     }
@@ -3099,7 +3113,7 @@ async function harvestGroupFeed(page, count, opts = {}) {
       if (!postId || seen.has(postId)) continue; seen.add(postId); // ONE entry per distinct post, in grid order (latest first)
       items.push({ href: h, postId });
     }
-    return { found: items.length, items: items.slice(0, 300) }; // collect deep history (was 60) so older unseen products are reachable
+    return { found: items.length, items: items.slice(0, 1000) }; // collect the FULL deep-scrolled history so the oldest unseen products are reachable
   });
   console.log(JSON.stringify({ step: 'harvest_media_links', found: collected.found, sample: collected.items.slice(0, 6).map((l) => l.href.slice(0, 90)) }));
   const links = collected.items;
