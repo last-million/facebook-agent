@@ -3165,12 +3165,12 @@ async function harvestExtractPhoto(page, ctx) {
     } catch (e) { console.log(JSON.stringify({ step: 'harvest_image_download_failed', error: String((e && e.message) || e).slice(0, 140) })); }
   }
   let productOgTitle = '', productOgDescription = '';
-  if (data.link && ogState.n < 10) {
+  if (data.link && ogState.n < 4 && (!ctx.budgetEnd || Date.now() < ctx.budgetEnd - 25000)) { // budget-aware: cap 4 og fetches, skip in the last 25s
     ogState.n++;
     let p2 = null;
     try {
       p2 = await page.context().newPage();
-      await p2.goto(data.link, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      await p2.goto(data.link, { waitUntil: 'domcontentloaded', timeout: 8000 });
       await p2.waitForTimeout(1500);
       const og = await p2.evaluate(() => {
         const meta = (k) => (((document.querySelector('meta[property="' + k + '"]') || document.querySelector('meta[name="' + k + '"]') || {}).content) || '').trim();
@@ -3236,6 +3236,10 @@ async function harvestGroupFeed(page, count, opts = {}) {
   const seenIds = new Set((opts.seenIds || []).map(String));
   const pIndex = Number(opts.profileIndex || 0), pCount = Math.max(1, Number(opts.profileCount || 1));
   const resumeFbid = String(opts.resumeFromFbid || '').replace(/\D+/g, '');
+  // ONE connector-wide budget: the WALK and any GRID-fallback share it so their deadlines can NEVER
+  // stack past the server's 6-min execFileAsync kill (the cause of the leaked/hung profile). 4 min
+  // leaves >=1.5 min headroom for the start path (goto/click/waits) + a clean profile close.
+  const budgetEnd = Date.now() + 240000;
   await page.waitForTimeout(2500);
   try { await page.waitForSelector('a[href*="fbid="]', { timeout: 25000 }); } catch (_) {}
   // numeric group id — the set=g.{id} theater walks EVERY group photo (vanity slug resolves to it here)
@@ -3256,7 +3260,7 @@ async function harvestGroupFeed(page, count, opts = {}) {
   else { curFbid = newestFbid; startMode = 'top'; }
   if (!groupId || !curFbid) {
     console.log(JSON.stringify({ step: 'harvest_walk_unavailable', groupId, curFbid, note: 'falling back to grid scroll' }));
-    const grid = await harvestGroupFeedGrid(page, count, opts);
+    const grid = await harvestGroupFeedGrid(page, count, { ...opts, budgetEnd });
     return { items: grid, lastFbid: '' };
   }
   console.log(JSON.stringify({ step: 'harvest_walk_start', groupId, startFbid: curFbid, startMode, profileIndex: pIndex, profileCount: pCount }));
@@ -3282,16 +3286,15 @@ async function harvestGroupFeed(page, count, opts = {}) {
   const initialSkips = (startMode === 'resume_older' ? 1 : 0) + pIndex;
   for (let s = 0; s < initialSkips; s++) { const nf = await advanceToNextPhoto(page); if (!nf) break; curFbid = nf; }
   let lastFbid = curFbid;
-  const maxSteps = Math.max(60, count * pCount * 10 + 200); // walk deep past SEEN photos (skips are cheap); the deadline is the real bound
-  const deadline = Date.now() + 210000;           // 3.5 min wall-clock cap (stays UNDER the 6-min connector kill)
+  const maxSteps = Math.max(60, count * pCount * 10 + 200); // walk deep past SEEN photos (skips are cheap); the budget is the real bound
   let steps = 0;
-  while (out.length < count && steps < maxSteps && Date.now() < deadline) {
+  while (out.length < count && steps < maxSteps && Date.now() < budgetEnd) {
     steps++;
     curFbid = (await photoViewerFbid(page)) || curFbid;
     lastFbid = curFbid || lastFbid;
     if (curFbid && !seenIds.has(curFbid)) {
       try {
-        const rec = await harvestExtractPhoto(page, { href: `https://www.facebook.com/photo/?fbid=${curFbid}&set=g.${groupId}`, postId: curFbid, seenLinks, ogState, claimsDir: opts.claimsDir, profileId: opts.profileId });
+        const rec = await harvestExtractPhoto(page, { href: `https://www.facebook.com/photo/?fbid=${curFbid}&set=g.${groupId}`, postId: curFbid, seenLinks, ogState, claimsDir: opts.claimsDir, profileId: opts.profileId, budgetEnd });
         if (rec) { out.push(rec); console.log(JSON.stringify({ step: 'harvest_item', n: out.length, fbid: curFbid, textLen: (rec.text || '').length, textPreview: (rec.text || '').slice(0, 90), imageSaved: !!rec.imageLocalPath, link: rec.link })); }
         else { console.log(JSON.stringify({ step: 'harvest_walk_skip', fbid: curFbid, reason: 'no_product_link_or_dup' })); }
       } catch (e) { console.log(JSON.stringify({ step: 'harvest_walk_item_error', fbid: curFbid, error: String((e && e.message) || e).slice(0, 140) })); }
@@ -3302,13 +3305,13 @@ async function harvestGroupFeed(page, count, opts = {}) {
     if (!moved) { console.log(JSON.stringify({ step: 'harvest_walk_end', reason: 'no_more_photos', steps, collected: out.length })); break; }
     curFbid = moved; lastFbid = moved;
   }
-  console.log(JSON.stringify({ step: 'harvest_walk_done', collected: out.length, lastFbid, steps, timedOut: Date.now() >= deadline }));
+  console.log(JSON.stringify({ step: 'harvest_walk_done', collected: out.length, lastFbid, steps, timedOut: Date.now() >= budgetEnd }));
   // SAFETY NET: if the photo theater wouldn't navigate at all (advance failed on the first step), the
   // walk is useless on this surface — fall back to the proven /media grid scroll so harvest never regresses.
   if (out.length === 0 && steps <= 2) {
     console.log(JSON.stringify({ step: 'harvest_walk_fallback_grid', reason: 'theater_not_navigable' }));
     try { await page.goto(`https://www.facebook.com/groups/${groupId}/media`, { waitUntil: 'domcontentloaded', timeout: 60000 }); await page.waitForTimeout(2500); } catch (_) {}
-    const grid = await harvestGroupFeedGrid(page, count, opts);
+    const grid = await harvestGroupFeedGrid(page, count, { ...opts, budgetEnd });
     return { items: grid, lastFbid };
   }
   return { items: out, lastFbid };
@@ -3330,7 +3333,7 @@ async function harvestGroupFeedGrid(page, count, opts = {}) {
   // 15-min re-scan handles it). Never throw: a sparse grid is a valid throttled outcome.
   { const seenForScroll = (opts.seenIds || []).map(String);
     const unseenTarget = Math.max(12, Number(count || 3) * 4);
-    const deadline = Date.now() + 180000; let prevTiles = -1, flat = 0;
+    const deadline = opts.budgetEnd || (Date.now() + 180000); let prevTiles = -1, flat = 0;
     while (Date.now() < deadline) {
       const stat = await page.evaluate((seenArr) => {
         const seenSet = new Set(seenArr);
@@ -3340,7 +3343,7 @@ async function harvestGroupFeedGrid(page, count, opts = {}) {
           const h = a.href || '';
           if (/set=p\./i.test(h)) continue;
           const fbid = (h.match(/fbid=(\d+)/) || [])[1] || '';
-          const postId = (h.match(/set=gm?\.(\d+)/) || [])[1] || fbid;
+          const postId = fbid; // KEY BY FBID (same as the walk) so cross-method dedup + resume actually match
           if (postId && !seenSet.has(postId)) unseen++;
         }
         let el = tiles[0], scroller = null;
@@ -3363,7 +3366,7 @@ async function harvestGroupFeedGrid(page, count, opts = {}) {
       if (!/\/photo/i.test(h) || !/fbid=/i.test(h)) continue;   // ONLY photo-viewer links (clean post; /posts/ pages carry sidebar ADS)
       if (/set=p\./i.test(h)) continue;                          // skip profile/cover photos
       const fbid = (h.match(/fbid=(\d+)/) || [])[1] || '';
-      const postId = (h.match(/set=gm?\.(\d+)/) || [])[1] || fbid;
+      const postId = fbid; // KEY BY FBID (same as the walk) so cross-method dedup + resume actually match
       if (!postId || seen.has(postId)) continue; seen.add(postId); // ONE entry per distinct post, in grid order (latest first)
       items.push({ href: h, postId });
     }
@@ -3379,13 +3382,14 @@ async function harvestGroupFeedGrid(page, count, opts = {}) {
   if (pCount > 1) work = work.filter((_, idx) => (idx % pCount) === pIndex);
   console.log(JSON.stringify({ step: 'harvest_partition', total: links.length, mine: work.length, profileIndex: pIndex, profileCount: pCount }));
   const ogState = { n: 0 }; // per-round cap on product-page og fetches so harvest never crawls
-  for (let i = 0; i < work.length && out.length < count; i++) {
+  const itemBudget = opts.budgetEnd || (Date.now() + 200000);
+  for (let i = 0; i < work.length && out.length < count && Date.now() < itemBudget; i++) {
     const item = work[i];
     try {
       await page.goto(item.href, { waitUntil: 'domcontentloaded', timeout: 60000 });
       await page.waitForSelector('div[role="article"], img[src*="fbcdn"]', { timeout: 3500 }).catch(() => {});
       await page.waitForTimeout(600);
-      const rec = await harvestExtractPhoto(page, { href: item.href, postId: item.postId, seenLinks, ogState, claimsDir: opts.claimsDir, profileId: opts.profileId });
+      const rec = await harvestExtractPhoto(page, { href: item.href, postId: item.postId, seenLinks, ogState, claimsDir: opts.claimsDir, profileId: opts.profileId, budgetEnd: opts.budgetEnd });
       if (rec) { out.push(rec); console.log(JSON.stringify({ step: 'harvest_item', n: out.length, textLen: (rec.text || '').length, textPreview: (rec.text || '').slice(0, 100), imageSaved: !!rec.imageLocalPath, link: rec.link, key: rec.productKey })); }
     } catch (e) {
       console.log(JSON.stringify({ step: 'harvest_item_error', href: item.href.slice(0, 120), error: String((e && e.message) || e).slice(0, 160) }));
@@ -4821,4 +4825,15 @@ async function main() {
   }
 }
 
+// HARVEST SELF-KILL WATCHDOG: a Playwright call that hangs WITHOUT throwing would otherwise only be
+// stopped by the server's 360s SIGKILL (which can leave the daemon's Chrome behind). For harvest runs we
+// self-exit at 330s (> the 240s walk budget + ~100s start path, < the 360s kill) so the connector is
+// deterministic and the server's execFileAsync resolves promptly — unblocking the parallel round.
+try {
+  const __p = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8'));
+  if (__p && __p.harvestOnly) {
+    const __wd = setTimeout(() => { try { console.log(JSON.stringify({ step: 'harvest_self_kill', reason: 'watchdog_330s' })); } catch (_) {} process.exit(7); }, 330000);
+    if (__wd.unref) __wd.unref();
+  }
+} catch (_) {}
 main().catch(e => { console.error(JSON.stringify({ step: 'error', message: e.message, stack: e.stack })); process.exit(1); });

@@ -1499,6 +1499,7 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.reuseHours = clampNumber(state.posting.contentSources.reuseHours, 1, 720, 26);
   state.posting.contentSources.imageRetentionDays = clampNumber(state.posting.contentSources.imageRetentionDays, 1, 90, 7);
   state.posting.contentSources.harvestResume = String(state.posting.contentSources.harvestResume || "").slice(0, 20000); // per-group photo-viewer resume positions {groupUrl: lastFbid}
+  state.posting.contentSources.harvestMembers = String(state.posting.contentSources.harvestMembers || "").slice(0, 40000); // per-group proven-member profile ids {groupUrl:[ids]} — survives restarts
   // DISCONNECTED profiles (not logged into Facebook) — auto-parked here + SKIPPED by posting/harvest until
   // the admin re-logs them in and releases them from the Prod-tab "Disconnected profiles" section.
   if (!Array.isArray(state.posting.disconnectedProfiles)) state.posting.disconnectedProfiles = [];
@@ -7856,7 +7857,15 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
     // ALWAYS close the profile server-side (belt-and-suspenders): the connector closes it in its OWN finally,
     // but if the connector is KILLED by the timeout that finally never runs -> the ixBrowser profile leaks and
     // piles up (Chromium "application error"). ixBrowserCloseAfterUse is idempotent (already-closed = ok).
-    try { await ixBrowserCloseAfterUse(Number(profileId), "harvest_done"); } catch (_) {}
+    // HARDENED CLOSE: a single swallowed close can leak the profile if the ixBrowser daemon momentarily
+    // wedges (the observed piled-up Chromium). Retry up to 3x, then ESCALATE to a force-close.
+    let __cr = null;
+    for (let a = 0; a < 3; a++) {
+      try { __cr = await ixBrowserCloseAfterUse(Number(profileId), "harvest_done"); } catch (_) { __cr = null; }
+      if (__cr && ["closed", "already_closed", "kept_open_dedicated_shopyourlikes_profile"].includes(__cr.status)) break;
+      await new Promise((res) => setTimeout(res, 1500 * (a + 1)));
+    }
+    if (!__cr || __cr.status === "close_failed") { try { await ixBrowserForceCloseForRecovery(Number(profileId), "harvest_close_failed_escalation"); } catch (_) {} }
   }
 }
 
@@ -7962,6 +7971,17 @@ async function harvestContentSourcesAsync(options = {}) {
     const lines = recordLines(state.posting?.contentSources?.groupsText);
     const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
     const perGroup = clampNumber(cs.harvestProfilesPerGroup, 1, 6, 3); // MULTI-PROFILE: harvest each group with N profiles in PARALLEL so load is spread (no single account hammered) + resilient if one is throttled
+    // HYDRATE per-group member knowledge from persisted state: __harvestWorkingProfilesByGroup is in-memory
+    // only, so a server restart used to forget every proven member and pick blind (the #1 cause of "0 products
+    // on a fresh process while a single proven profile works"). Reload it here so harvest is warm immediately.
+    try {
+      const persistedMembers = JSON.parse(String(cs.harvestMembers || "{}")) || {};
+      for (const [gu, ids] of Object.entries(persistedMembers)) {
+        const set = __harvestWorkingProfilesByGroup.get(gu) || new Set();
+        for (const id of (Array.isArray(ids) ? ids : [])) if (Number(id)) set.add(Number(id));
+        if (set.size) __harvestWorkingProfilesByGroup.set(gu, set);
+      }
+    } catch (_) {}
     const pairs = [];
     for (const line of lines) {
       const m = String(line).match(/(https?:\/\/[^\s|@]*groups\/[^\s|@/]+)/i);
@@ -7973,7 +7993,9 @@ async function harvestContentSourcesAsync(options = {}) {
       // so it keeps discovering members even when all known ones are momentarily throttled.
       const memberSet = __harvestWorkingProfilesByGroup.get(groupUrl) || new Set();
       const chosen = [];
-      const memberCap = Math.max(1, perGroup - 1);
+      // WARM group (>= perGroup proven members) -> fill EVERY slot from members so a round can't be all-explorers
+      // (which read 0). COLD/unknown group -> keep 1 exploration slot to discover members.
+      const memberCap = (memberSet.size >= perGroup) ? perGroup : Math.max(1, perGroup - 1);
       for (const pid of memberSet) { if (chosen.length >= memberCap) break; if (!chosen.includes(pid)) chosen.push(pid); }
       let attempt = __harvestProfileAttemptByGroup.get(groupUrl) || 0, guard = 0;
       while (chosen.length < perGroup && pool.length && guard < pool.length * 2) {
@@ -7997,8 +8019,11 @@ async function harvestContentSourcesAsync(options = {}) {
     // SHARED CLAIMS DIR (the pilot's tracker): all profiles harvesting in PARALLEL this round point at the
     // SAME dir; the atomic per-product claim file guarantees no two profiles ever take the same product.
     const harvestRunId = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
-    const claimsDir = path.join(DATA_DIR, "harvest-claims", harvestRunId);
+    const claimsRoot = path.join(DATA_DIR, "harvest-claims");
+    const claimsDir = path.join(claimsRoot, harvestRunId);
     try { fs.mkdirSync(claimsDir, { recursive: true }); } catch (_) {}
+    // ORPHAN SWEEP: drop any claims dir from a prior crashed/killed round (>1h old) so they never pile up.
+    try { for (const d of fs.readdirSync(claimsRoot)) { const p = path.join(claimsRoot, d); try { if (Date.now() - fs.statSync(p).mtimeMs > 3600000) fs.rmSync(p, { recursive: true, force: true }); } catch (_) {} } } catch (_) {}
     for (let i = 0; i < pairs.length; i += 4) { // 4-by-4
       const round = pairs.slice(i, i + 4);
       // NO waitForPostingIdle: harvesting (low-risk browsing) runs CONCURRENTLY with posting so the reserve
@@ -8058,16 +8083,20 @@ async function harvestContentSourcesAsync(options = {}) {
       if (i + 4 < pairs.length) await sleep(clampNumber(options.interRoundGapMs || 25000, 5000, 120000, 25000)); // anti-throttle pacing
     }
     try { fs.rmSync(claimsDir, { recursive: true, force: true }); } catch (_) {} // round done -> drop the claims tracker
-    // PERSIST the per-group resume positions (deepest photo reached) so the next round digs OLDER.
-    if (Object.keys(resumeUpdates).length) {
-      try {
-        const st2 = readState();
-        st2.posting = st2.posting || {}; st2.posting.contentSources = st2.posting.contentSources || {};
+    // PERSIST resume positions (deepest photo reached) AND the learned member set (which profiles proved
+    // they can read each group) so harvest is warm immediately after a restart and never picks blind.
+    try {
+      const st2 = readState();
+      st2.posting = st2.posting || {}; st2.posting.contentSources = st2.posting.contentSources || {};
+      if (Object.keys(resumeUpdates).length) {
         let prev = {}; try { prev = JSON.parse(String(st2.posting.contentSources.harvestResume || "{}")) || {}; } catch (_) { prev = {}; }
         st2.posting.contentSources.harvestResume = JSON.stringify(Object.assign(prev, resumeUpdates));
-        writeState(st2);
-      } catch (_) {}
-    }
+      }
+      const membersOut = {};
+      for (const [gu, set] of __harvestWorkingProfilesByGroup.entries()) membersOut[gu] = [...set].slice(0, 50);
+      if (Object.keys(membersOut).length) st2.posting.contentSources.harvestMembers = JSON.stringify(membersOut);
+      writeState(st2);
+    } catch (_) {}
     // RE-SCAN cadence: drain fast when producing; re-scan ~every minute when idle; back off when long-exhausted.
     if ((harvestedNew + reusedOld) > 0) { __harvestEmptyRounds = 0; __harvestNextAt = Date.now(); } // got new -> immediately keep draining the remaining UNSEEN tiles
     else { __harvestEmptyRounds += 1; __harvestNextAt = Date.now() + 900000; } // nothing new (all seen) -> re-check the groups for NEW listings in 15 min
