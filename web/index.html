@@ -586,7 +586,24 @@
               <div>
                 <span class="stepBadge">Step 1</span>
                 <h2>Posting Rules</h2>
-                <p>Cadence, link placement, and when the workflow pauses itself.</p>
+                <p>Run mode, cadence, link placement, and when the workflow pauses itself.</p>
+              </div>
+            </div>
+            <div class="prodRunMode" id="prodRunMode" style="margin-bottom:12px">
+              <div class="prodModeRow">
+                <span class="prodModeTitle">Run mode</span>
+                <label class="prodModePick"><input type="radio" name="prodRunMode" value="count"><span>&#128290; Stop after N posts</span></label>
+                <label class="prodModePick"><input type="radio" name="prodRunMode" value="time"><span>&#9200; Run between start &amp; end time</span></label>
+              </div>
+              <div class="prodModeFields" data-mode-fields="count">
+                <label>Posts this run <input id="prodMaxPosts" type="number" min="1" max="500" step="1" placeholder="20"></label>
+                <span class="prodModeHint muted">Posts exactly this many, then stops automatically.</span>
+              </div>
+              <div class="prodModeFields" data-mode-fields="time" hidden>
+                <label>Start time <input id="prodStartTime" type="time"></label>
+                <label>End time <input id="prodStopTime" type="time"></label>
+                <label>Timezone <input id="prodScheduleTimezone" type="text" placeholder="America/New_York"></label>
+                <span class="prodModeHint muted">Posts continuously while the clock is inside this window — no post-count limit.</span>
               </div>
             </div>
             <div class="formGrid">
@@ -650,24 +667,7 @@
               <div id="prodHeadline" class="prodHeadline">Loading production status…</div>
               <div id="prodStatusGrid" class="prodStatusGrid"></div>
               <div id="prodParallelInfo" style="margin:8px 0;padding:7px 12px;border:1px solid #2a3344;border-radius:9px;background:#141a24;font-size:.9em;">&#9889; <b>Parallel posting:</b> <b id="ccCapPosting">&ndash;</b> profiles at once &middot; <b>harvest:</b> <b id="ccCapHarvest">&ndash;</b>/group <span id="ccCapMeta" style="opacity:.65"></span> <span style="opacity:.6">&mdash; auto, machine-synced (every 24&nbsp;h)</span></div>
-              <h3 class="prodSectionTitle">Launch</h3>
-              <div class="prodRunMode" id="prodRunMode">
-                <div class="prodModeRow">
-                  <span class="prodModeTitle">Run mode</span>
-                  <label class="prodModePick"><input type="radio" name="prodRunMode" value="count"><span>&#128290; Stop after N posts</span></label>
-                  <label class="prodModePick"><input type="radio" name="prodRunMode" value="time"><span>&#9200; Run between start &amp; end time</span></label>
-                </div>
-                <div class="prodModeFields" data-mode-fields="count">
-                  <label>Posts this run <input id="prodMaxPosts" type="number" min="1" max="500" step="1" placeholder="20"></label>
-                  <span class="prodModeHint muted">Posts exactly this many, then stops automatically.</span>
-                </div>
-                <div class="prodModeFields" data-mode-fields="time" hidden>
-                  <label>Start time <input id="prodStartTime" type="time"></label>
-                  <label>End time <input id="prodStopTime" type="time"></label>
-                  <label>Timezone <input id="prodScheduleTimezone" type="text" placeholder="America/New_York"></label>
-                  <span class="prodModeHint muted">Posts continuously while the clock is inside this window — no post-count limit.</span>
-                </div>
-              </div>
+              <h3 class="prodSectionTitle">Launch <span style="opacity:.6;font-weight:400;font-size:.8em">(run mode is set in Step 1)</span></h3>
               <div class="prodLaunch">
                 <button id="prodLaunchAllBtn" class="primary prodLaunchBtn" type="button">&#9654; Start</button>
                 <button id="prodStopAllBtn" class="danger prodLaunchBtn" type="button">&#9632; Stop</button>

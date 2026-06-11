@@ -17442,7 +17442,13 @@ function serveIndex(res) {
       res.end("Not found");
       return;
     }
-    const html = data.replace("__DASHBOARD_TOKEN__", SESSION_TOKEN);
+    // Auto cache-bust the JS/CSS on every server restart (SESSION_TOKEN changes per process) so the browser
+    // can NEVER show a stale dashboard after a deploy — the #1 cause of "I don't see my change".
+    const v = encodeURIComponent(String(SESSION_TOKEN).slice(0, 16));
+    const html = data
+      .replace("__DASHBOARD_TOKEN__", SESSION_TOKEN)
+      .replace('src="/app.js"', `src="/app.js?v=${v}"`)
+      .replace('href="/app.css"', `href="/app.css?v=${v}"`);
     res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
     res.end(html);
   });
