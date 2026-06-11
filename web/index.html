@@ -607,9 +607,11 @@
               </div>
             </div>
             <div class="formGrid">
-              <label>Peak timezone <input id="peakHoursTimezone"></label>
-              <label>Peak start <input id="peakStartTime" type="time"></label>
-              <label>Peak stop <input id="peakStopTime" type="time"></label>
+              <!-- Peak window = the Run-mode time window above (run-mode writes rules.peakStartTime/StopTime
+                   itself). Hidden to avoid showing the same setting twice; kept in the DOM for binding round-trip. -->
+              <label style="display:none">Peak timezone <input id="peakHoursTimezone"></label>
+              <label style="display:none">Peak start <input id="peakStartTime" type="time"></label>
+              <label style="display:none">Peak stop <input id="peakStopTime" type="time"></label>
               <label>Posts per profile/day <input id="postsPerProfilePerDay" type="number" min="1" max="100"></label>
               <label>Move account after comments <input id="commentsBeforeAccountMove" type="number" min="1" max="100"></label>
               <label>Link placement <input id="linkPlacement"></label>
