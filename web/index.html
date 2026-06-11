@@ -618,10 +618,12 @@
               <label style="display:none">Posts per profile/day <input id="postsPerProfilePerDay" type="number" min="1" max="100"></label>
               <label style="display:none">Move account after comments <input id="commentsBeforeAccountMove" type="number" min="1" max="100"></label>
               <label>Link placement <input id="linkPlacement"></label>
-              <label data-ux-tier="advanced" class="switch line"><input id="randomMinutesBetweenPosts" type="checkbox"><span>Randomize minutes between posts</span></label>
-              <label data-ux-tier="advanced">Fallback fixed minutes <input id="minutesBetweenPosts" type="number" min="1" max="1440"></label>
-              <label data-ux-tier="advanced">Minimum minutes <input id="minMinutesBetweenPosts" type="number" min="1" max="1440"></label>
-              <label data-ux-tier="advanced">Maximum minutes <input id="maxMinutesBetweenPosts" type="number" min="1" max="1440"></label>
+              <!-- Minutes-between-posts pacing REMOVED (operator: many profiles rotate naturally, no spacing
+                   needed). Fields kept hidden in the DOM for binding round-trip only — server no longer reads them. -->
+              <label style="display:none" class="switch line"><input id="randomMinutesBetweenPosts" type="checkbox"><span>Randomize minutes between posts</span></label>
+              <label style="display:none">Fallback fixed minutes <input id="minutesBetweenPosts" type="number" min="1" max="1440"></label>
+              <label style="display:none">Minimum minutes <input id="minMinutesBetweenPosts" type="number" min="1" max="1440"></label>
+              <label style="display:none">Maximum minutes <input id="maxMinutesBetweenPosts" type="number" min="1" max="1440"></label>
               <label data-ux-tier="advanced">Save account after comments <input id="maxCommentsBeforeAccountSave" type="number" min="1" max="500"></label>
               <label data-ux-tier="advanced">Required deal signal <input id="requireDealSignal"></label>
             </div>

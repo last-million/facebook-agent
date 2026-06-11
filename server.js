@@ -8709,14 +8709,14 @@ async function autopilotTickAsync(options = {}) {
     // OWN per-profile spacing. Concurrency = up to maxConcurrentProfiles workers,
     // each a DIFFERENT profile (mirrors the proven full-plan batching).
     const now = Date.now();
-    // Per-profile spacing gap. If a SECONDS window is configured (secondsBetweenPostsMax>0),
-    // use a RANDOM gap in [min,max] SECONDS (anti-bot jitter, sub-minute capable); otherwise
-    // fall back to the minutes-based spacing.
+    // NO per-profile spacing (operator, 2026-06-10): with many profiles, randomized minutes-between-posts
+    // is unnecessary — profiles rotate naturally. Only an EXPLICIT seconds window (secondsBetweenPostsMax>0)
+    // still applies; otherwise gap = 0 (a profile is eligible again immediately).
     const __secMax = clampNumber(state.rules?.secondsBetweenPostsMax, 0, 3600, 0);
     const __secMin = clampNumber(state.rules?.secondsBetweenPostsMin, 0, 3600, 0);
     const minGapMs = __secMax > 0
       ? randomInt(Math.min(__secMin, __secMax), Math.max(__secMin, __secMax)) * 1000
-      : clampNumber(state.rules?.minMinutesBetweenPosts || state.rules?.minutesBetweenPosts, 1, 1440, 5) * 60 * 1000;
+      : 0;
     const __postCap = machineParallelCap(state); // auto machine ceiling (cpu+ram, reserves OS+Pinterest); operator may run FEWER, never more
     const maxWorkers = clampNumber(state.ixbrowser?.maxConcurrentProfiles, 1, __postCap, __postCap);
     decision.maxWorkers = maxWorkers;
@@ -9224,9 +9224,7 @@ function preparePostingPlan(options = {}) {
     const shortlink = harvestedRec ? String(harvestedRec.firstCommentUrl || "") : linkForProductAtIndex(product, originalProductIndex, products, state);
     const imageRecord = harvestedRec ? null : reviewImageForProduct(reviewImages, product);
     const image = harvestedRec ? String(harvestedRec.imageLocalPath || "") : (imageRecord?.approved ? imageRecord.raw : "");
-    const delay = state.rules.randomMinutesBetweenPosts
-      ? randomInt(state.rules.minMinutesBetweenPosts || 5, state.rules.maxMinutesBetweenPosts || 16)
-      : clampNumber(state.rules.minutesBetweenPosts, 1, 1440, 12);
+    const delay = 0; // NO minutes-between-posts pacing (operator) — plan rows carry no scheduled delay
     delayCursor += delay;
     const linkForPreview = shortlink || (state.affiliate?.enabled !== false ? "" : product.url);
     // HARVESTED rows (operator): the comment carries TEXT + the link (not just the bare url). If the SOURCE
