@@ -5949,6 +5949,15 @@ function uxAttachIncompleteRunBanner() {
 // ============ PROD TAB — production control center ============
 (function () {
   let prodPollTimer = null;
+  // Show the correct run-control buttons across EVERY mirrored bar (control center + Step 1 + Step 3):
+  //   stopped  -> Start only ;  running -> Pause + Stop ;  paused -> Resume + Stop.
+  function setProdCtlButtons(running, paused) {
+    const show = function (cls, on) { document.querySelectorAll(cls).forEach(function (el) { el.style.display = on ? "" : "none"; }); };
+    show(".prodCtl-start", !running);
+    show(".prodCtl-pause", running && !paused);
+    show(".prodCtl-resume", running && paused);
+    show(".prodCtl-stop", running);
+  }
   async function renderProdTab() {
     try {
       populateProdRunMode((workflowState && workflowState.operator) || {}); // snappy + survives a failed status fetch
@@ -5967,22 +5976,21 @@ function uxAttachIncompleteRunBanner() {
       const enabled = ap.enabled != null ? ap.enabled : op.autopilotEnabled;
       const dryRun = op.autopilotDryRun !== false;
       const live = Boolean(enabled) && !dryRun;
-      // RUN GUARD: once a run is active (armed OR autopilot on), HIDE Start and show only Stop so a second
-      // click can't launch an overlapping run. Driven by real server state, so it's correct on reload + in
-      // every open tab (each tab's poll re-renders this).
+      // RUN GUARD + smart states: drive every mirrored control bar from real server state (correct on reload
+      // + across tabs). stopped -> Start only ; running -> Pause+Stop ; paused -> Resume+Stop. No way to
+      // double-launch (Start is gone while a run is active).
       const runActive = Boolean(op.armedForExternalActions) || Boolean(enabled);
-      const startBtnEl = $("prodLaunchAllBtn");
-      const stopBtnEl = $("prodStopAllBtn");
-      if (startBtnEl) startBtnEl.style.display = runActive ? "none" : "";
-      if (stopBtnEl) stopBtnEl.style.display = runActive ? "" : "none";
+      setProdCtlButtons(runActive, Boolean(op.paused));
       const buf = ap.buffer || {};
       const cap = ap.capacity || {};
       const hl = $("prodHeadline");
+      const isPaused = Boolean(op.paused) && (Boolean(op.armedForExternalActions) || Boolean(enabled));
       if (hl) {
-        hl.textContent = live ? "● LIVE — autopilot is posting autonomously"
+        hl.textContent = isPaused ? "⏸ PAUSED — armed, holding posts (click Resume)"
+          : live ? "● LIVE — autopilot is posting autonomously"
           : enabled ? "❚❚ ENABLED but DRY-RUN (not posting) — click Go Live"
           : "○ DISABLED — autopilot is off";
-        hl.className = "prodHeadline " + (live ? "isLive" : enabled ? "isDry" : "isOff");
+        hl.className = "prodHeadline " + (isPaused ? "isDry" : live ? "isLive" : enabled ? "isDry" : "isOff");
       }
       const cells = [
         ["Mode", live ? "LIVE" : (enabled ? "dry-run" : "off")],
@@ -6109,35 +6117,67 @@ function uxAttachIncompleteRunBanner() {
     const prodMaxEl = $("prodMaxPosts");
     if (prodMaxEl) prodMaxEl.addEventListener("input", function () { prodRunModeTouched = true; const n = parseInt(prodMaxEl.value, 10); if (workflowState && workflowState.operator && n > 0) workflowState.operator.autopilotMaxPostsPerRun = n; });
     ["prodStartTime", "prodStopTime", "prodScheduleTimezone"].forEach(function (id) { const el = $(id); if (el) el.addEventListener("input", function () { prodRunModeTouched = true; }); });
-    prodOn("prodLaunchAllBtn", async function () {
+    // RUN CONTROLS — Start / Pause / Resume / Stop. Mirrored bars live in the control center + Step 1 + Step 3,
+    // all driven by ONE delegated listener so every copy works and stays in sync. setProdCtlButtons (above
+    // renderProdTab) shows the right buttons for the state everywhere at once.
+    async function doProdStart() {
       const mode = prodRunModeValue();
-      const base = { autopilotEnabled: true, autopilotDryRun: false, armedForExternalActions: true };
+      const base = { autopilotEnabled: true, autopilotDryRun: false, armedForExternalActions: true, paused: false };
       let patch, msg;
       if (mode === "time") {
         const startT = (($("prodStartTime") || {}).value || "").trim();
         const stopT = (($("prodStopTime") || {}).value || "").trim();
         const tz = ((($("prodScheduleTimezone") || {}).value || "").trim()) || "America/New_York";
         if (!startT || !stopT) { prodResult("⚠ Set both a start and end time first."); return; }
-        patch = { operator: Object.assign({}, base, { scheduleEnabled: true, startTime: startT, stopTime: stopT, scheduleTimezone: tz, autopilotMaxPostsPerRun: 0 }), ixbrowser: { maxConcurrentProfiles: 999 } }; // 999 = "machine max" — the server clamps to the auto machine cap
+        patch = { operator: Object.assign({}, base, { scheduleEnabled: true, startTime: startT, stopTime: stopT, scheduleTimezone: tz, autopilotMaxPostsPerRun: 0 }), ixbrowser: { maxConcurrentProfiles: 999 } };
         msg = "● LIVE — posting between " + startT + " and " + stopT + " (" + tz + "); no post-count limit.";
       } else {
         const n = Math.max(0, Math.min(500, parseInt((($("prodMaxPosts") || {}).value || ""), 10) || 0));
         if (!n) { prodResult("⚠ Enter how many posts (1–500) first."); return; }
-        patch = { operator: Object.assign({}, base, { scheduleEnabled: false, autopilotMaxPostsPerRun: n, autopilotPostsThisRun: 0 }), rules: { peakStartTime: "", peakStopTime: "" }, ixbrowser: { maxConcurrentProfiles: 999 } }; // 999 = "machine max" — the server clamps to the auto machine cap
+        patch = { operator: Object.assign({}, base, { scheduleEnabled: false, autopilotMaxPostsPerRun: n, autopilotPostsThisRun: 0 }), rules: { peakStartTime: "", peakStopTime: "" }, ixbrowser: { maxConcurrentProfiles: 999 } };
         msg = "● LIVE — will post " + n + " then auto-stop.";
       }
       prodResult("Launching…");
-      // OPTIMISTIC: hide Start / show Stop the instant we commit, so a fast double-click can't start a 2nd run
-      // before the re-render. renderProdTab (driven by real state) corrects this if the launch fails.
-      const _sb = $("prodLaunchAllBtn"); if (_sb) _sb.style.display = "none";
-      const _xb = $("prodStopAllBtn"); if (_xb) _xb.style.display = "";
-      prodSyncFormAndCache(patch.operator, patch.rules); // sync BEFORE the await so a concurrent auto-save is already consistent
+      setProdCtlButtons(true, false); // optimistic running view — no double-start window before the re-render
+      prodSyncFormAndCache(patch.operator, patch.rules);
       await prodPatchState(patch);
       prodResult(msg);
       prodRunModeTouched = false;
       renderProdTab();
+    }
+    async function doProdStop() {
+      prodResult("Stopping everything…");
+      setProdCtlButtons(false, false);
+      prodSyncFormAndCache({ armedForExternalActions: false, autopilotEnabled: false, paused: false });
+      try { await api("/api/operator/stop-all", { method: "POST", body: JSON.stringify({}) }); } catch (_) {}
+      await prodPatchState({ operator: { armedForExternalActions: false, autopilotEnabled: false, paused: false } });
+      prodResult("Stopped — disarmed, in-flight posting/harvest/comment work killed, profiles closing.");
+      renderProdTab();
+    }
+    async function doProdPause() {
+      prodResult("Pausing…");
+      setProdCtlButtons(true, true);
+      prodSyncFormAndCache({ paused: true });
+      await prodPatchState({ operator: { paused: true } });
+      prodResult("⏸ Paused — no NEW posts until you Resume (any in-flight post finishes). The run stays armed.");
+      renderProdTab();
+    }
+    async function doProdResume() {
+      prodResult("Resuming…");
+      setProdCtlButtons(true, false);
+      prodSyncFormAndCache({ paused: false });
+      await prodPatchState({ operator: { paused: false } });
+      prodResult("▶ Resumed — posting continues.");
+      renderProdTab();
+    }
+    document.addEventListener("click", function (e) {
+      const btn = e.target && e.target.closest ? e.target.closest(".prodCtl") : null;
+      if (!btn) return;
+      if (btn.classList.contains("prodCtl-start")) doProdStart();
+      else if (btn.classList.contains("prodCtl-stop")) doProdStop();
+      else if (btn.classList.contains("prodCtl-pause")) doProdPause();
+      else if (btn.classList.contains("prodCtl-resume")) doProdResume();
     });
-    prodOn("prodStopAllBtn", async function () { prodResult("Stopping everything…"); prodSyncFormAndCache({ armedForExternalActions: false, autopilotEnabled: false }); try { await api("/api/operator/stop-all", { method: "POST", body: JSON.stringify({}) }); } catch (_) {} await prodPatchState({ operator: { armedForExternalActions: false, autopilotEnabled: false } }); prodResult("Stopped — disarmed, in-flight posting/harvest/comment work killed, profiles closing."); renderProdTab(); });
     prodOn("prodLoadProfilesBtn", async function () { prodResult("Loading IXBrowser profiles…"); await loadIxProfilesQuiet(); renderProdRoleSelects(); const s = $("prodRolesStatus"); if (s) { s.className = "inlineNotice ok"; s.textContent = "Profiles loaded — choose roles (saves automatically)."; } });
     ["prodModeratorProfileSelect", "prodSylProfileSelect", "prodExcludedProfileSelect"].forEach(function (id) { const el = $(id); if (el) el.addEventListener("change", function () { if (typeof saveProdRoles === "function") saveProdRoles(); }); });
     prodOn("prodSaveRolesBtn", async function () { await saveProdRoles(); });

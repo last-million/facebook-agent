@@ -390,6 +390,7 @@ function defaultState() {
     operator: {
       armedForExternalActions: false,
       autopilotEnabled: false,
+      paused: false, // PAUSE: run stays armed/enabled but stops making NEW posts until resumed (Resume clears it)
       autopilotTickSeconds: 120,
       autopilotDryRun: true,
       autopilotProfileAllowlist: "",
@@ -8703,6 +8704,7 @@ function autopilotMayPostNow() {
   const s = readState();
   if (s.operator?.autopilotEnabled !== true) return { ok: false, reason: "disabled" };
   if (s.operator?.armedForExternalActions !== true) return { ok: false, reason: "disarmed" };
+  if (s.operator?.paused === true) return { ok: false, reason: "paused" }; // PAUSED: stay armed, make no NEW posts until resumed
   const lim = autopilotRunLimit(s);
   if (lim > 0 && autopilotPostsThisRunCount(s) >= lim) return { ok: false, reason: "run_limit_reached" };
   return { ok: true };

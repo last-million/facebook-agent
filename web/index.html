@@ -589,6 +589,12 @@
                 <p>Run mode, cadence, link placement, and when the workflow pauses itself.</p>
               </div>
             </div>
+            <div class="prodCtlBar">
+              <button type="button" class="primary prodCtl prodCtl-start">&#9654; Start</button>
+              <button type="button" class="prodCtl prodCtl-pause">&#10074;&#10074; Pause</button>
+              <button type="button" class="primary prodCtl prodCtl-resume">&#9654; Resume</button>
+              <button type="button" class="danger prodCtl prodCtl-stop">&#9632; Stop</button>
+            </div>
             <div class="prodRunMode" id="prodRunMode" style="margin-bottom:12px">
               <div class="prodModeRow">
                 <span class="prodModeTitle">Run mode</span>
@@ -690,11 +696,13 @@
               <div id="prodStatusGrid" class="prodStatusGrid"></div>
               <div id="prodParallelInfo" style="margin:8px 0;padding:7px 12px;border:1px solid #2a3344;border-radius:9px;background:#141a24;font-size:.9em;">&#9889; <b>Parallel posting:</b> <b id="ccCapPosting">&ndash;</b> profiles at once &middot; <b>harvest:</b> <b id="ccCapHarvest">&ndash;</b>/group <span id="ccCapMeta" style="opacity:.65"></span> <span style="opacity:.6">&mdash; auto, machine-synced (every 24&nbsp;h)</span></div>
               <h3 class="prodSectionTitle">Launch <span style="opacity:.6;font-weight:400;font-size:.8em">(run mode is set in Step 1)</span></h3>
-              <div class="prodLaunch">
-                <button id="prodLaunchAllBtn" class="primary prodLaunchBtn" type="button">&#9654; Start</button>
-                <button id="prodStopAllBtn" class="danger prodLaunchBtn" type="button">&#9632; Stop</button>
-                <span class="muted prodLaunchHint"><b>Start</b> turns everything ON (arms external actions, enables autopilot, 3-by-3, goes live). <b>Stop</b> turns everything OFF.</span>
+              <div class="prodCtlBar">
+                <button type="button" class="primary prodCtl prodCtl-start">&#9654; Start</button>
+                <button type="button" class="prodCtl prodCtl-pause">&#10074;&#10074; Pause</button>
+                <button type="button" class="primary prodCtl prodCtl-resume">&#9654; Resume</button>
+                <button type="button" class="danger prodCtl prodCtl-stop">&#9632; Stop</button>
               </div>
+              <span class="muted prodLaunchHint"><b>Start</b> arms + goes live · <b>Pause</b> holds posting (stays armed) · <b>Resume</b> continues · <b>Stop</b> turns everything OFF. These controls mirror in Step 1 &amp; Step 3.</span>
               <details class="prodAdvanced">
                 <summary>Manual controls</summary>
                 <div class="miniActions">
@@ -913,6 +921,11 @@
             .scrapedModalText{font-size:.92rem;line-height:1.45;white-space:pre-wrap;margin-bottom:12px}
             .scrapedModalMeta a{color:#f0a93b;word-break:break-all;font-size:.85rem}
             .scrapedModalStatus{margin-top:10px;font-size:.78rem;color:#9fb0c3}
+            /* Synced run-control bars (Start/Pause/Resume/Stop) — appear in the control center, Step 1 & Step 3 */
+            .prodCtlBar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:10px 0;padding:9px 12px;border:1px solid #2a3344;border-radius:11px;background:#141a24}
+            .prodCtlBarTitle{font-weight:700;opacity:.75;margin-right:2px}
+            .prodCtl{min-width:104px}
+            .prodCtl-pause{background:#7a5b1e;border-color:#a07a2a;color:#fff}
           </style>
 
           <section class="panel wide prodStep" data-view="prod" data-prod-step="3">
@@ -961,6 +974,13 @@
             <label class="assignmentOutput" data-ux-tier="advanced">Saved assignment plan
               <textarea id="groupProfileAssignments" spellcheck="false" placeholder="The generated group/profile plan is saved here."></textarea>
             </label>
+            <div class="prodCtlBar" style="margin-top:14px">
+              <span class="prodCtlBarTitle">&#9654; Run:</span>
+              <button type="button" class="primary prodCtl prodCtl-start">&#9654; Start</button>
+              <button type="button" class="prodCtl prodCtl-pause">&#10074;&#10074; Pause</button>
+              <button type="button" class="primary prodCtl prodCtl-resume">&#9654; Resume</button>
+              <button type="button" class="danger prodCtl prodCtl-stop">&#9632; Stop</button>
+            </div>
           </section>
 
           <section class="panel wide prodStep" data-view="prod" data-prod-step="2c">
