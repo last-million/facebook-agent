@@ -1558,10 +1558,16 @@ function renderState(state) {
     const __mc = Number(state.operator?.machineParallelCap);
     const __mp = Number(state.ixbrowser?.maxConcurrentProfiles);
     const __mh = Number(state.posting?.contentSources?.harvestProfilesPerGroup);
-    setText("machineCapPosting", __mc ? (Math.min(__mc, isFinite(__mp) && __mp ? __mp : __mc) + " of " + __mc + " max") : "–");
-    setText("machineCapHarvest", __mc ? (Math.min(Math.min(6, __mc), isFinite(__mh) && __mh ? __mh : __mc) + " of " + Math.min(6, __mc) + " max") : "–");
+    const __postNow = __mc ? Math.min(__mc, isFinite(__mp) && __mp ? __mp : __mc) : null;
+    const __harvNow = __mc ? Math.min(Math.min(6, __mc), isFinite(__mh) && __mh ? __mh : __mc) : null;
+    setText("machineCapPosting", __mc ? (__postNow + " of " + __mc + " max") : "–");
+    setText("machineCapHarvest", __mc ? (__harvNow + " of " + Math.min(6, __mc) + " max") : "–");
     const __cm = state.operator?.machineParallelCapMeta;
     setText("machineCapMeta", __cm ? ("(" + __cm.cores + " vCPU, " + __cm.totalGB + "GB)") : "");
+    // same numbers, surfaced prominently in the Production control center
+    setText("ccCapPosting", __mc ? String(__postNow) : "–");
+    setText("ccCapHarvest", __mc ? String(__harvNow) : "–");
+    setText("ccCapMeta", __cm ? ("(" + __cm.cores + " vCPU, " + __cm.totalGB + "GB)") : "");
   }
   setValue("peakHoursTimezone", state.rules.peakHoursTimezone);
   setValue("peakStartTime", state.rules.peakStartTime);
