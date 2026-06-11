@@ -13635,7 +13635,10 @@ async function completeVerifiedFacebookPostWithComment({
       logEvent("facebook_live_post_publisher_lock_released_for_different_profile_comment", { profileId: ready.profileId });
     }
     if (approvalResult?.ok) {
-      const POST_APPROVAL_PROPAGATION_WAIT_MS_PRE = 45000;
+      // After a moderator approves, FB needs time to flip the post from PENDING to publicly LIVE before a
+      // DIFFERENT profile can see it to add the first comment. 45s was sometimes too short (the comment ran
+      // while the post was still propagating and failed). 80s gives propagation room; the resweep is the backstop.
+      const POST_APPROVAL_PROPAGATION_WAIT_MS_PRE = 80000;
       logEvent("facebook_live_post_waiting_for_fb_approval_propagation", { profileId: ready.profileId, waitMs: POST_APPROVAL_PROPAGATION_WAIT_MS_PRE });
       await sleep(POST_APPROVAL_PROPAGATION_WAIT_MS_PRE);
     }
