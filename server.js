@@ -8140,8 +8140,15 @@ async function harvestContentSourcesAsync(options = {}) {
     const allRecs = readHarvestedProducts(state);
     const existingByUrl = new Map(allRecs.map((r) => [String(r.firstCommentUrl || ""), r]));
     const seenPostIds = allRecs.map((r) => String(r.postId || "")).filter(Boolean); // tiles already scraped -> skip + continue from last
+    // MEDIA RE-SCAN (single-group recovery): when the reserve is at/below the refill threshold — products were
+    // deleted, the single source has no NEW posts, OR the walk had reached the oldest media and got stuck — re-walk
+    // the media FROM THE NEWEST (reset resume) so deleted/uncollected media products are re-collected. Still-tracked
+    // products are skipped fast by postId (no re-download). Self-limits: once the reserve recovers above refillAt,
+    // the normal resume-deeper walk returns. This is what keeps the reserve fed from ONE group's media indefinitely.
+    const rescanMedia = reserve <= reserveRefillAt;
+    if (rescanMedia) logEvent("harvest_rescan_media", { reserve, refillAt: reserveRefillAt });
     // RESUME POSITION: the deepest photo fbid reached per source group last round — the photo-viewer walk
-    // jumps straight there and keeps going OLDER, so we never re-scroll from the top.
+    // jumps straight there and keeps going OLDER, so we never re-scroll from the top (unless rescanMedia).
     let resumeMap = {};
     try { resumeMap = JSON.parse(String(cs.harvestResume || "{}")) || {}; } catch (_) { resumeMap = {}; }
     const resumeUpdates = {};
@@ -8174,7 +8181,7 @@ async function harvestContentSourcesAsync(options = {}) {
         try { release = acquireNormalIxProfileUse(pair.profileId, "facebook_harvest"); }
         catch (e) { logEvent("harvest_profile_busy_skipped", { profileId: pair.profileId }); return; } // posting/discovery owns it -> skip
         try {
-          const harvestRes = await runHarvestConnector(pair.groupUrl, pair.profileId, harvestCount, { seenIds: seenPostIds, profileIndex: pair.profileIndex || 0, profileCount: pair.profileCount || 1, resumeFromFbid: String(resumeMap[pair.groupUrl] || ""), claimsDir });
+          const harvestRes = await runHarvestConnector(pair.groupUrl, pair.profileId, harvestCount, { seenIds: seenPostIds, profileIndex: pair.profileIndex || 0, profileCount: pair.profileCount || 1, resumeFromFbid: rescanMedia ? "" : String(resumeMap[pair.groupUrl] || ""), claimsDir });
           const items = harvestRes.items || [];
           if (harvestRes.lastFbid) resumeUpdates[pair.groupUrl] = harvestRes.lastFbid; // remember the deepest photo reached -> next round resumes older
           if (items.length) logEvent("harvest_profile_took", { profileId: pair.profileId, groupUrl: pair.groupUrl, count: items.length, products: items.map((it) => oneLineField(String(it.link || ""), 80)).slice(0, 8) }); // TRACKING: which profile claimed which products (parallel dedup proof)
@@ -18371,6 +18378,32 @@ const server = http.createServer(async (req, res) => {
     const count = clampNumber(body.count, 1, 20, 3);
     harvestContentSourcesAsync({ harvestCount: count }).catch((err) => logEvent("manual_harvest_error", { error: oneLineField(err.message || String(err), 160) }));
     return json(res, 200, { ok: true, started: true, harvestCount: count });
+  }
+  if (req.method === "POST" && url.pathname === "/api/content-sources/saved-product/delete") {
+    // OPERATOR delete: remove ONE saved product from the dashboard (copied/harvested OR web/discovered).
+    // Physically rewrites the jsonl without the record (atomic) + deletes the local harvested image.
+    const body = await readJson(req);
+    const key = String(body.productKey || body.key || "").trim();
+    const fcu = String(body.firstCommentUrl || "").trim();
+    const source = String(body.source || "copied");
+    if (!key && !fcu) return json(res, 400, { error: "productKey or firstCommentUrl required" });
+    const st = readState();
+    if (source === "web") {
+      const file = st.files?.productCandidates || "data/product-candidates.jsonl";
+      const all = readJsonlAbsoluteFile(safeProjectPath(file));
+      const kept = all.filter((r) => String(r.productKey || "") !== key);
+      writeJsonlFile(file, kept);
+      logEvent("saved_product_deleted", { source: "web", key, removed: all.length - kept.length });
+      return json(res, 200, { ok: true, removed: all.length - kept.length, remaining: kept.length });
+    }
+    const file = st.files?.harvestedProducts || "data/harvested-products.jsonl";
+    const all = readJsonlAbsoluteFile(safeProjectPath(file));
+    const match = (r) => { const k = r.productKey || harvestSyntheticKey(r.firstCommentUrl); return (key && k === key) || (fcu && String(r.firstCommentUrl || "") === fcu); };
+    const kept = all.filter((r) => !match(r));
+    for (const r of all) { if (match(r) && r.imageLocalPath) { try { fs.unlinkSync(safeProjectPath(r.imageLocalPath)); } catch (_) {} } } // free the image file too
+    writeJsonlFile(file, kept);
+    logEvent("saved_product_deleted", { source: "copied", key: key || fcu, removed: all.length - kept.length });
+    return json(res, 200, { ok: true, removed: all.length - kept.length, remaining: kept.length });
   }
   if (req.method === "POST" && url.pathname === "/api/posting/record-post-url") {
     const body = await readJson(req);

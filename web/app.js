@@ -5702,11 +5702,21 @@ function uxAttachScrapedProducts() {
       const srcBadge = '<span class="sp-card-src ' + it.source + '">' + (it.source === "copied" ? "copied" : "web") + '</span>';
       const statusCls = (it.status === "posted" || it.status === "used") ? "posted" : "pending";
       const statusBadge = '<span class="sp-badge ' + statusCls + '">' + it.status + '</span>';
-      card.innerHTML = '<div class="sp-text"></div><div class="sp-meta">' + srcBadge + statusBadge + '</div>';
+      card.innerHTML = '<button class="sp-del" type="button" title="Remove from dashboard" aria-label="Remove">&times;</button><div class="sp-text"></div><div class="sp-meta">' + srcBadge + statusBadge + '</div>';
       card.querySelector(".sp-text").textContent = (it.title || "(no text)").slice(0, 160);
+      card.querySelector(".sp-del").addEventListener("click", (e) => { e.stopPropagation(); deleteItem(it); });
       card.addEventListener("click", () => openModal(it));
       list.appendChild(card);
     }
+  }
+  async function deleteItem(it) {
+    const label = String(it.title || it.url || "this product").slice(0, 60);
+    if (!confirm('Remove "' + label + '" from saved products?' + (it.source === "copied" ? "\n(deletes the saved record + its image)" : "\n(deletes the saved record)"))) return;
+    try {
+      await api("/api/content-sources/saved-product/delete", { method: "POST", body: JSON.stringify({ productKey: it.productKey, firstCommentUrl: it.url, source: it.source }) });
+      close();
+      await load();
+    } catch (e) { alert("Could not remove: " + ((e && e.message) || e)); }
   }
   async function openModal(it) {
     const modal = $("scrapedModal"); if (!modal) return;
@@ -5733,6 +5743,7 @@ function uxAttachScrapedProducts() {
     const st = $("scrapedModalStatus");
     st.textContent = status.join("  •  ");
     if (it.postUrl) { const a = document.createElement("a"); a.href = it.postUrl; a.target = "_blank"; a.rel = "noopener"; a.style.color = "#f0a93b"; a.style.display = "block"; a.style.marginTop = "6px"; a.textContent = "View live post ↗"; st.appendChild(a); }
+    const delBtn = $("scrapedModalDelete"); if (delBtn) delBtn.onclick = () => deleteItem(it);
     modal.style.display = "flex";
   }
   function close() { const m = $("scrapedModal"); if (m) m.style.display = "none"; }
