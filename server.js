@@ -1493,7 +1493,8 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.reserveTarget = clampNumber(state.posting.contentSources.reserveTarget, 1, 5000, 20); // DAYTIME working buffer (manual override when auto is OFF)
   state.posting.contentSources.reserveRefillAt = clampNumber(state.posting.contentSources.reserveRefillAt, 0, Math.max(0, state.posting.contentSources.reserveTarget - 1), 10); // daytime: resume harvesting when reserve drops to this
   state.posting.contentSources.overnightReserveTarget = clampNumber(state.posting.contentSources.overnightReserveTarget, state.posting.contentSources.reserveTarget, 5000, Math.max(state.posting.contentSources.reserveTarget, 200)); // OVERNIGHT: stock up to this many for the whole next day
-  state.posting.contentSources.harvestProfilesPerGroup = clampNumber(state.posting.contentSources.harvestProfilesPerGroup, 1, 6, 3); // # member profiles to harvest each group with IN PARALLEL (spreads load)
+  const __hpgCap = Math.min(6, Number(state.operator?.machineParallelCap) || 6); // never above the machine auto-cap (read off state to avoid normalize recursion)
+  state.posting.contentSources.harvestProfilesPerGroup = clampNumber(state.posting.contentSources.harvestProfilesPerGroup, 1, __hpgCap, Math.min(3, __hpgCap)); // # member profiles to harvest each group with IN PARALLEL (spreads load)
   if (typeof state.posting.contentSources.postCta !== "string") state.posting.contentSources.postCta = ""; // optional CTA line ABOVE the emoji+title+tags signature (blank = clean deal post)
   else state.posting.contentSources.postCta = state.posting.contentSources.postCta.slice(0, 300);
   // RE-USE ROTATION knobs (dynamic): a posted harvested product becomes eligible again after reuseHours (so
@@ -1584,11 +1585,12 @@ function normalizeWorkflowState(state) {
     state.affiliateProxy.apiRequestsMustUseProxy = true;
   }
   state.ixbrowser.maxProfilesPerRun = clampNumber(state.ixbrowser.maxProfilesPerRun, 1, 1000000, 100000);
+  const __mcCap = Math.min(MAX_CONCURRENT_NORMAL_IX_PROFILES, Number(state.operator?.machineParallelCap) || MAX_CONCURRENT_NORMAL_IX_PROFILES); // never above the machine auto-cap
   state.ixbrowser.maxConcurrentProfiles = clampNumber(
     state.ixbrowser.maxConcurrentProfiles,
     1,
-    MAX_CONCURRENT_NORMAL_IX_PROFILES,
-    MAX_CONCURRENT_NORMAL_IX_PROFILES
+    __mcCap,
+    __mcCap
   );
   state.ixbrowser.profileRunNotes = String(state.ixbrowser.profileRunNotes || "").slice(0, 5000);
   state.contentRotation.postTextCursor = clampNumber(state.contentRotation.postTextCursor, 0, 100000, 0);
@@ -7820,6 +7822,54 @@ let __livePostingInFlight = 0;
 function beginLivePostingBatch() { __livePostingInFlight += 1; }
 function endLivePostingBatch() { __livePostingInFlight = Math.max(0, __livePostingInFlight - 1); }
 function isLivePostingInFlight() { return __livePostingInFlight > 0; }
+
+// ── AUTO-SCALED MACHINE PARALLEL CAP ────────────────────────────────────────────────────────────
+// ONE machine-synced ceiling for BOTH parallel posting profiles AND parallel harvest profiles-per-group,
+// computed from THIS box (cpus + totalmem) with HARD reserves for the OS + the co-resident Pinterest agent.
+// We may run FEWER (the live CPU/RAM/chrome governor still throttles), but NEVER more than this. Re-synced
+// every 24h. Crash-safe: it's only a CEILING, fail-open, and waitForCpuHeadroom stays as the live breaker.
+let __lastMachineCapSyncAt = 0;
+function computeMachineParallelCap() {
+  const cores = (os.cpus() || []).length || 4;
+  const totalGB = (os.totalmem() || 4 * 1073741824) / 1073741824;
+  const RESERVED_CORES = 2;             // OS + Pinterest floor
+  const RESERVED_GB = 4;                // keep this much RAM free for OS + Pinterest
+  const PINTEREST_HEADROOM_FRAC = 0.35; // hand ~35% of usable cores to the other agent
+  const CORES_PER_PROFILE = 1.5;        // a heavy FB render saturates ~1.5 cores at peak
+  const GB_PER_PROFILE = 1.5;           // ~1.5 GiB resident per active ixBrowser profile
+  const HARD_CEILING = 8;               // never auto-scale past this without operator review
+  const usableCores = Math.max(1, (cores - RESERVED_CORES) * (1 - PINTEREST_HEADROOM_FRAC));
+  const usableGB = Math.max(1, totalGB - RESERVED_GB);
+  const byCpu = Math.floor(usableCores / CORES_PER_PROFILE);
+  const byRam = Math.floor(usableGB / GB_PER_PROFILE);
+  const cap = Math.max(1, Math.min(HARD_CEILING, byCpu, byRam));
+  return { cap, cores, totalGB: Math.round(totalGB), byCpu, byRam };
+}
+// Recompute + persist into state.operator (called on boot + every 24h). Fully wrapped / fail-open.
+function refreshMachineParallelCap(reason) {
+  try {
+    const { cap, cores, totalGB, byCpu, byRam } = computeMachineParallelCap();
+    const st = readState();
+    st.operator = st.operator || {};
+    const prev = Number(st.operator.machineParallelCap) || 0;
+    st.operator.machineParallelCap = cap;
+    st.operator.machineParallelCapComputedAt = new Date().toISOString();
+    st.operator.machineParallelCapMeta = { cores, totalGB, byCpu, byRam };
+    writeState(st);
+    if (cap !== prev) logEvent("machine_parallel_cap_synced", { reason: reason || "manual", cap, prev, cores, totalGB, byCpu, byRam });
+    return cap;
+  } catch (e) {
+    try { logEvent("machine_parallel_cap_sync_error", { error: oneLineField((e && e.message) || String(e), 160) }); } catch (_) {}
+    return Number(readState()?.operator?.machineParallelCap) || MAX_CONCURRENT_NORMAL_IX_PROFILES;
+  }
+}
+// READ helper used by EVERY dispatch path so they share one ceiling. Falls back to the CPU-adaptive
+// legacy constant if the cap was never computed yet (first boot mid-tick).
+function machineParallelCap(state) {
+  const v = Number((state || readState())?.operator?.machineParallelCap);
+  return (Number.isFinite(v) && v >= 1) ? v : MAX_CONCURRENT_NORMAL_IX_PROFILES;
+}
+
 // PREP yields to posting at SAFE boundaries (between fill batches — never mid-post, never with an
 // iX/HD browser half-open). Bounded (default 180s) then PROCEEDS, symmetric to waitForCpuHeadroom,
 // so prep can NEVER be permanently starved. Posting-idle is checked FIRST, then CPU headroom.
@@ -8025,7 +8075,8 @@ async function harvestContentSourcesAsync(options = {}) {
     const effectiveTarget = reserveTarget;
     const lines = recordLines(state.posting?.contentSources?.groupsText);
     const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
-    const perGroup = clampNumber(cs.harvestProfilesPerGroup, 1, 6, 3); // MULTI-PROFILE: harvest each group with N profiles in PARALLEL so load is spread (no single account hammered) + resilient if one is throttled
+    const __harvCap = machineParallelCap(state); // auto machine ceiling — never assign a group more profiles than the box can run
+    const perGroup = clampNumber(cs.harvestProfilesPerGroup, 1, __harvCap, Math.min(3, __harvCap)); // MULTI-PROFILE: harvest each group with N profiles in PARALLEL, bounded by the machine cap
     // HYDRATE per-group member knowledge from persisted state: __harvestWorkingProfilesByGroup is in-memory
     // only, so a server restart used to forget every proven member and pick blind (the #1 cause of "0 products
     // on a fresh process while a single proven profile works"). Reload it here so harvest is warm immediately.
@@ -8080,9 +8131,15 @@ async function harvestContentSourcesAsync(options = {}) {
     // ORPHAN SWEEP: drop any claims dir from a prior crashed/killed round (>1h old) so they never pile up.
     try { for (const d of fs.readdirSync(claimsRoot)) { const p = path.join(claimsRoot, d); try { if (Date.now() - fs.statSync(p).mtimeMs > 3600000) fs.rmSync(p, { recursive: true, force: true }); } catch (_) {} } } catch (_) {}
     const harvestStartedAt = Date.now(); // operator STOP after this aborts the remaining rounds
-    for (let i = 0; i < pairs.length; i += 4) { // 4-by-4
+    let HARVEST_BATCH = Math.max(1, machineParallelCap(state)); // recomputed per round (idle-aware) below
+    for (let i = 0; i < pairs.length; i += HARVEST_BATCH) {
       if (__externalStopRequested > harvestStartedAt) { logEvent("harvest_aborted_by_stop", { roundsLeft: pairs.length - i }); break; }
-      const round = pairs.slice(i, i + 4);
+      // IDLE-AWARE: no posting in flight => harvest at the FULL machine cap (max parallel). Posting live =>
+      // reserve the posting budget and harvest with only the leftover (>=1, never fully stalls).
+      const __cap = machineParallelCap(state);
+      const __reserve = isLivePostingInFlight() ? clampNumber(state.ixbrowser?.maxConcurrentProfiles, 1, __cap, __cap) : 0;
+      HARVEST_BATCH = Math.max(1, __cap - __reserve);
+      const round = pairs.slice(i, i + HARVEST_BATCH);
       // NO waitForPostingIdle: harvesting (low-risk browsing) runs CONCURRENTLY with posting so the reserve
       // NEVER empties mid-production. Contention is handled safely by the per-profile lock (posting's profiles
       // return 409 and are skipped) + the CPU governor below — harvesting just uses whatever profiles are free.
@@ -8137,7 +8194,7 @@ async function harvestContentSourcesAsync(options = {}) {
         }
         finally { try { if (release) release(); } catch (_) {} }
       }));
-      if (i + 4 < pairs.length) await sleep(clampNumber(options.interRoundGapMs || 25000, 5000, 120000, 25000)); // anti-throttle pacing
+      if (i + HARVEST_BATCH < pairs.length) await sleep(clampNumber(options.interRoundGapMs || 25000, 5000, 120000, 25000)); // anti-throttle pacing
     }
     try { fs.rmSync(claimsDir, { recursive: true, force: true }); } catch (_) {} // round done -> drop the claims tracker
     // PERSIST resume positions (deepest photo reached) AND the learned member set (which profiles proved
@@ -8661,7 +8718,8 @@ async function autopilotTickAsync(options = {}) {
     const minGapMs = __secMax > 0
       ? randomInt(Math.min(__secMin, __secMax), Math.max(__secMin, __secMax)) * 1000
       : clampNumber(state.rules?.minMinutesBetweenPosts || state.rules?.minutesBetweenPosts, 1, 1440, 5) * 60 * 1000;
-    const maxWorkers = clampNumber(state.ixbrowser?.maxConcurrentProfiles, 1, MAX_CONCURRENT_NORMAL_IX_PROFILES, MAX_CONCURRENT_NORMAL_IX_PROFILES);
+    const __postCap = machineParallelCap(state); // auto machine ceiling (cpu+ram, reserves OS+Pinterest); operator may run FEWER, never more
+    const maxWorkers = clampNumber(state.ixbrowser?.maxConcurrentProfiles, 1, __postCap, __postCap);
     decision.maxWorkers = maxWorkers;
     const withCapacity = capacity.profiles.filter((p) => p.remaining > 0);
     const eligibleProfiles = withCapacity.filter((p) => (now - (p.lastPostAt || 0)) >= minGapMs);
@@ -17346,6 +17404,11 @@ setInterval(() => {
     __lastPerPostLogSweep = Date.now();
     sweepPerPostLogs().catch(() => {});
   }
+  // AUTO-PARALLEL CAP: re-sync the machine ceiling every 24h (piggybacks the heartbeat; wrapped/fail-open).
+  if (Date.now() - __lastMachineCapSyncAt > 86400000) {
+    __lastMachineCapSyncAt = Date.now();
+    refreshMachineParallelCap("24h");
+  }
   const state = readState();
   const intervalMs = clampNumber(state.triggers?.heartbeatSeconds, 3, 120, 3) * 1000;
   if (Date.now() - lastHeartbeatTick < intervalMs) return;
@@ -18381,6 +18444,10 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   logEvent("dashboard_started", { url: `http://${HOST}:${PORT}` });
   console.log(`Facebook Agent dashboard: http://${HOST}:${PORT}`);
+  // AUTO-PARALLEL CAP: compute the machine-synced parallel ceiling FIRST so the very first tick already
+  // sees it. Re-synced every 24h by the heartbeat. (cpu+ram, reserves OS + the co-resident Pinterest agent.)
+  __lastMachineCapSyncAt = Date.now();
+  refreshMachineParallelCap("boot");
   // Warm up the persistent image-selector service in WSL so the first asset
   // prep call doesn't pay the WSL cold-start.
   // [WEDGE-DEBUG] temporarily disabled to isolate the boot wedge (see _wedgewatch).

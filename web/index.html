@@ -610,6 +610,10 @@
               <label class="switch" data-ux-tier="advanced"><input id="pauseOnInvalidProxy" type="checkbox"><span>Pause on invalid proxy</span></label>
               <label class="switch" data-ux-tier="advanced"><input id="pauseOnLimitedAccount" type="checkbox"><span>Pause on limited account</span></label>
             </div>
+            <div id="machineParallelCapRow" style="margin-top:10px;padding:9px 12px;border:1px solid #2a3344;border-radius:10px;background:#141a24;font-size:.92em;">
+              <b>&#9881;&#65039; Machine auto-parallel</b> &mdash; posting profiles at once: <b id="machineCapPosting">&ndash;</b> &middot; harvest profiles/group: <b id="machineCapHarvest">&ndash;</b> <span id="machineCapMeta" style="opacity:.7"></span><br>
+              <span style="opacity:.6">Auto-computed from this box (CPU + RAM, reserving the OS &amp; the Pinterest agent) &middot; re-synced every 24&nbsp;h &middot; we may run fewer, never more.</span>
+            </div>
           </section>
 
           <!-- Hidden binding-only container: legacy/auto fields kept in the DOM so their saved values round-trip

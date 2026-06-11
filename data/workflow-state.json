@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-10T23:55:40.382Z",
+  "updatedAt": "2026-06-11T00:34:47.281Z",
   "testRun": {
     "status": "ready",
     "active": false,
@@ -118,7 +118,15 @@
       "resolvedAt": "2026-06-10T23:21:20.546Z"
     },
     "autopilotConcurrentPosting": true,
-    "autopilotRunId": "1781120731682"
+    "autopilotRunId": "1781120731682",
+    "machineParallelCap": 3,
+    "machineParallelCapComputedAt": "2026-06-11T00:34:47.257Z",
+    "machineParallelCapMeta": {
+      "cores": 9,
+      "totalGB": 32,
+      "byCpu": 3,
+      "byRam": 18
+    }
   },
   "rules": {
     "minutesBetweenPosts": 12,
