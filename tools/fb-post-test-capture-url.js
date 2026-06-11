@@ -392,8 +392,15 @@ async function ensureFacebookLoggedIn(page, payload, stage = 'facebook') {
   });
 }
 
+// MULTI-LANGUAGE composer prompts. The operator's profiles run Facebook in different UI languages
+// (confirmed: Spanish "Escribe algo…", Arabic). English/French-only detection silently failed to find the
+// post box -> "could not open composer". Keep EN/FR/ES/PT/AR here; this single source feeds every composer
+// check below (composerIsOpen / openComposer locators + adaptive scorer / shouldRetryComposerOpen).
+const COMPOSER_PROMPT_RE_SRC = "write something|what's on your mind|create a public post|create post|start a post|post anonymously|answer as|exprimez-?vous|cr[eé]er une publication|cr[eé]ez une publication|[eé]crire quelque chose|escribe algo|escribir algo|qu[eé] est[aá]s pensando|crea una publicaci[oó]n|crear una publicaci[oó]n|crear publicaci[oó]n|crea una publicaci[oó]n p[uú]blica|empieza una publicaci[oó]n|publica algo|escreva algo|no que voc[eê] est[aá] pensando|criar publica[cç][aã]o|crie uma publica[cç][aã]o|comece uma publica[cç][aã]o|اكتب شي|بم تفكر|بماذا تفكر|إنشاء منشور|أنشئ منشور|كتابة منشور|انشاء منشور";
+const COMPOSER_PROMPT_RE = new RegExp(COMPOSER_PROMPT_RE_SRC, 'i');
 async function composerIsOpen(page) {
-  return await page.evaluate(() => {
+  return await page.evaluate((reSrc) => {
+    const composerLabelRegex = new RegExp(reSrc, 'i');
     const visible = (el) => {
       const rect = el.getBoundingClientRect();
       const style = getComputedStyle(el);
@@ -406,7 +413,6 @@ async function composerIsOpen(page) {
     // Q&A group composer flavor: FB renders an "Answer as <Page>" textbox
     // OUTSIDE the role=dialog wrapper. Accept any visible page-level
     // composer textbox whose aria-label/placeholder matches a composer prompt.
-    const composerLabelRegex = /(answer as|what's on your mind|write something|create a public post|start a post|post anonymously|exprimez|cr[eé]er une publication|cr[eé]ez une publication|[eé]crire quelque chose)/i;
     const composerBoxes = [...document.querySelectorAll('[role="textbox"], [contenteditable="true"], textarea')].filter(visible);
     return composerBoxes.some((el) => {
       const label = (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('data-placeholder') || el.textContent || '').replace(/\s+/g, ' ').trim();
@@ -415,11 +421,11 @@ async function composerIsOpen(page) {
       // Large editable area on the page after a click is a composer too.
       return el.getAttribute('contenteditable') === 'true' && rect.width >= 240 && rect.height >= 32;
     });
-  }).catch(() => false);
+  }, COMPOSER_PROMPT_RE_SRC).catch(() => false);
 }
 
 async function openComposer(page) {
-  const openPostRegex = /write something|what's on your mind|create a public post|create post|start a post|post anonymously|exprimez-vous|exprimez vous|créer une publication|creer une publication|créez une publication|creez une publication|écrire quelque chose|ecrire quelque chose/i;
+  const openPostRegex = COMPOSER_PROMPT_RE; // EN/FR/ES/PT/AR (see COMPOSER_PROMPT_RE_SRC)
   const locatorOpen = await clickFirst(page, [
     page.getByText(openPostRegex),
     page.getByRole('button', { name: openPostRegex }),
@@ -427,6 +433,8 @@ async function openComposer(page) {
     page.locator('div, span').filter({ hasText: openPostRegex }),
     page.locator('[aria-label*="Create a public post" i]'),
     page.locator('[aria-label*="Create post" i]'),
+    page.locator('[aria-label*="Escribe algo" i]'),
+    page.locator('[aria-label*="Crea una publicaci" i]'),
     page.locator('[aria-label*="Exprimez" i]'),
   ], { timeout: 9000 });
   if (locatorOpen) {
@@ -434,7 +442,8 @@ async function openComposer(page) {
     if (await composerIsOpen(page)) return { opened: true, method: 'known_locator' };
   }
 
-  const adaptive = await page.evaluate(() => {
+  const adaptive = await page.evaluate((reSrc) => {
+    const posRe = new RegExp(reSrc, 'i'); // EN/FR/ES/PT/AR composer prompts
     const visible = (el) => {
       const rect = el.getBoundingClientRect();
       const style = getComputedStyle(el);
@@ -446,9 +455,9 @@ async function openComposer(page) {
       const label = labelOf(el);
       const lower = label.toLowerCase();
       let score = 0;
-      if (/write something|what's on your mind|create a public post|create post|start a post|post anonymously|exprimez-vous|exprimez vous|cr[eé]er une publication|cr[eé]ez une publication|[eé]crire quelque chose/.test(lower)) score += 130;
-      if (/\bpost\b|\bpublication\b/.test(lower)) score += 20;
-      if (/photo|vid[ée]o|comment|commentaire|like|j'aime|share|partager|join|rejoindre|invite|inviter|search|rechercher|notification|messenger|menu/.test(lower)) score -= 60;
+      if (posRe.test(label)) score += 130;
+      if (/\bpost\b|\bpublication\b|\bpublicaci[oó]n\b|\bpublica[cç][aã]o\b|منشور/.test(lower)) score += 20;
+      if (/photo|foto|vid[ée]o|video|comment|commentaire|comentar|coment[aá]rio|like|j'aime|me gusta|share|partager|compartir|compartilhar|join|rejoindre|unirse|invite|inviter|invitar|search|rechercher|buscar|notification|notificaci|messenger|mensaje|menu|men[uú]/.test(lower)) score -= 60;
       if (el.getAttribute('aria-disabled') === 'true' || el.disabled) score -= 100;
       const rect = el.getBoundingClientRect();
       if (rect.width > 180 && rect.height > 24) score += 10;
@@ -459,7 +468,7 @@ async function openComposer(page) {
     best.el.scrollIntoView({ block: 'center', inline: 'center' });
     best.el.click();
     return { clicked: true, label: best.label.slice(0, 160), score: best.score };
-  }).catch((err) => ({ clicked: false, error: err.message || String(err) }));
+  }, COMPOSER_PROMPT_RE_SRC).catch((err) => ({ clicked: false, error: err.message || String(err) }));
   if (adaptive.clicked) {
     await humanPause(1400, 2800);
     if (await composerIsOpen(page)) return { opened: true, method: 'adaptive_score', ...adaptive };
@@ -484,7 +493,7 @@ function shouldRetryComposerOpen(result) {
   if (transientUnavailable) return true;
   const labels = buttons.map((button) => String(button?.label || '').trim()).filter(Boolean);
   const loadingButtons = labels.filter((label) => /^loading(?:\.\.\.)?$/i.test(label) || /\bloading\b/i.test(label)).length;
-  const usefulControls = labels.filter((label) => /write something|what's on your mind|create a public post|create post|start a post|post anonymously|exprimez-vous|exprimez vous|cr[eé]er une publication|cr[eé]ez une publication|[eé]crire quelque chose|\bpost\b|\bpublication\b/i.test(label) && !/\bloading\b/i.test(label)).length;
+  const usefulControls = labels.filter((label) => (COMPOSER_PROMPT_RE.test(label) || /\bpost\b|\bpublication\b|\bpublicaci[oó]n\b|\bpublica[cç][aã]o\b|منشور/i.test(label)) && !/\bloading\b/i.test(label)).length;
   if (buttons.length === 0 && boxes.length === 0) return true;
   if (boxes.length === 0 && loadingButtons >= 3 && usefulControls === 0) return true;
   if (boxes.length === 0 && labels.length > 0 && loadingButtons >= Math.ceil(labels.length * 0.6)) return true;
@@ -492,9 +501,8 @@ function shouldRetryComposerOpen(result) {
   // yet (FB lazy-loads the inner React tree). Retry after waiting longer so
   // the editor has time to mount instead of failing outright.
   const dialogOpened = (Number(diagnostic.dialogCount) || 0) > 0;
-  const dialogPromptsCreate = /create\s*post|cr[eé]er.*publication|cr[eé]ez.*publication/i.test(diagnostic.dialogText || '');
-  const composerLabelRegex = /(answer as|what's on your mind|write something|create a public post|start a post|post anonymously|exprimez|cr[eé]er une publication|cr[eé]ez une publication|[eé]crire quelque chose)/i;
-  const hasComposerBox = boxes.some((b) => composerLabelRegex.test(String(b?.label || '')));
+  const dialogPromptsCreate = /create\s*post|cr[eé]er.*publication|cr[eé]ez.*publication|crea(r)?\s.*publicaci[oó]n|criar.*publica[cç][aã]o|إنشاء منشور|أنشئ منشور/i.test(diagnostic.dialogText || '');
+  const hasComposerBox = boxes.some((b) => COMPOSER_PROMPT_RE.test(String(b?.label || '')));
   if (dialogOpened && dialogPromptsCreate && !hasComposerBox) return true;
   return false;
 }
@@ -741,16 +749,16 @@ async function typeIntoComposer(page, text) {
 }
 
 async function clickPostButton(page) {
+  // Submit-button label across UI languages: EN Post/Publish, FR Publier, ES/PT Publicar, AR نشر
+  const postNameRe = /^(post|publish|publier|publicar|نشر)$/i;
   const locators = [
-    page.locator('div[role="dialog"]').getByRole('button', { name: /^Post$/i }),
-    page.locator('div[role="dialog"]').getByRole('button', { name: /^Publish$/i }),
-    page.locator('div[role="dialog"]').getByRole('button', { name: /^Publier$/i }),
-    page.getByRole('button', { name: /^Post$/i }),
-    page.getByRole('button', { name: /^Publish$/i }),
-    page.getByRole('button', { name: /^Publier$/i }),
+    page.locator('div[role="dialog"]').getByRole('button', { name: postNameRe }),
+    page.getByRole('button', { name: postNameRe }),
     page.locator('div[aria-label="Post"][role="button"]'),
     page.locator('div[aria-label="Publish"][role="button"]'),
     page.locator('div[aria-label="Publier"][role="button"]'),
+    page.locator('div[aria-label="Publicar"][role="button"]'),
+    page.locator('div[aria-label="نشر"][role="button"]'),
   ];
   for (const loc of locators) {
     const n = await loc.count().catch(() => 0);
@@ -784,10 +792,10 @@ async function clickPostButton(page) {
         const label = labelOf(el);
         const lower = label.toLowerCase();
         let score = 0;
-        if (/^(post|publish|publier)$/.test(lower)) score += 120;
-        if (/\b(post|publish|publier)\b/.test(lower)) score += 45;
+        if (/^(post|publish|publier|publicar|نشر)$/.test(lower)) score += 120;
+        if (/\b(post|publish|publier|publicar)\b|نشر/.test(lower)) score += 45;
         if (dialog && dialog.contains(el)) score += 35;
-        if (/photo|video|comment|like|share|cancel|close|back|schedule|audience|friends|public/.test(lower)) score -= 70;
+        if (/photo|foto|video|comment|comentar|like|me gusta|share|compartir|cancel|cancelar|close|cerrar|back|volver|schedule|programar|audience|friends|public|amigos|p[uú]blico|إلغاء|إغلاق/.test(lower)) score -= 70;
         if (el.disabled || el.getAttribute('aria-disabled') === 'true' || getComputedStyle(el).pointerEvents === 'none') score -= 120;
         const rect = el.getBoundingClientRect();
         if (rect.width >= 48 && rect.height >= 24) score += 5;
@@ -1130,12 +1138,15 @@ async function attachImageToComposer(page, imagePath, options = {}) {
   const dialog = page.locator('div[role="dialog"]').last();
   let attachMethod = null;
   const chooserPromise = page.waitForEvent('filechooser', { timeout: 8000 }).catch(() => null);
+  const photoBtnRe = /photo\/video|photo|video|photos\/videos|foto\/v[ií]deo|foto|v[ií]deo|fotos\/v[ií]deos|صورة\/فيديو|صورة|فيديو/i;
   const clickedPhoto = await clickFirst(page, [
-    dialog.getByRole('button', { name: /photo\/video|photo|video|photos\/videos/i }),
+    dialog.getByRole('button', { name: photoBtnRe }),
     dialog.locator('[aria-label*="Photo" i]'),
     dialog.locator('[aria-label*="Video" i]'),
-    page.getByRole('button', { name: /photo\/video|photo|video|photos\/videos/i }),
+    dialog.locator('[aria-label*="Foto" i]'),
+    page.getByRole('button', { name: photoBtnRe }),
     page.locator('[aria-label*="Photo/video" i]'),
+    page.locator('[aria-label*="Foto/v" i]'),
   ], { timeout: 6000 });
   const chooser = clickedPhoto ? await chooserPromise : null;
   if (chooser) {
