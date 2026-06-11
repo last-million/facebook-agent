@@ -7854,13 +7854,11 @@ function computeMachineParallelCap() {
 function refreshMachineParallelCap(reason) {
   try {
     const { cap, cores, totalGB, byCpu, byRam } = computeMachineParallelCap();
-    const st = readState();
-    st.operator = st.operator || {};
-    const prev = Number(st.operator.machineParallelCap) || 0;
-    st.operator.machineParallelCap = cap;
-    st.operator.machineParallelCapComputedAt = new Date().toISOString();
-    st.operator.machineParallelCapMeta = { cores, totalGB, byCpu, byRam };
-    writeState(st);
+    const prev = Number(readState()?.operator?.machineParallelCap) || 0;
+    // CRITICAL: write a PARTIAL (only the cap fields), NEVER a full read-modify-write of the whole state.
+    // writeState merges this over the freshest on-disk state, so every other setting is preserved — even if
+    // a boot-time read were momentarily bad, this can no longer wipe the operator's saved configuration.
+    writeState({ operator: { machineParallelCap: cap, machineParallelCapComputedAt: new Date().toISOString(), machineParallelCapMeta: { cores, totalGB, byCpu, byRam } } });
     if (cap !== prev) logEvent("machine_parallel_cap_synced", { reason: reason || "manual", cap, prev, cores, totalGB, byCpu, byRam });
     return cap;
   } catch (e) {
