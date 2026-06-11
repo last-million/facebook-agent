@@ -3265,10 +3265,18 @@ async function harvestGroupFeed(page, count, opts = {}) {
   // set=p. single photo, so ArrowRight had nothing to move to). We also SKIP set=p. tiles (single photos).
   const tile = await page.evaluate(() => {
     const tiles = [...document.querySelectorAll('a[href*="/photo"][href*="fbid="]')];
-    for (const a of tiles) { const h = a.href || ''; if (/set=p\./i.test(h)) continue; const g = (h.match(/set=g\.(\d+)/) || [])[1] || ''; const fbid = (h.match(/fbid=(\d+)/) || [])[1] || ''; if (g && fbid) return { groupId: g, fbid }; }
+    // MOST-COMMON set=g. group wins: the group actually being viewed DOMINATES its own media grid; a wrong
+    // sidebar/suggested/removed group (observed: 4854972804605257) contributes only a tile or two. Picking the
+    // first set=g. tile let that wrong group through and built broken set=g.{wrongId} links -> non-navigable
+    // theater -> ArrowRight oscillation loop. Counting + picking the majority group fixes it.
+    const counts = {}; const firstFbid = {};
+    for (const a of tiles) { const h = a.href || ''; if (/set=p\./i.test(h)) continue; const g = (h.match(/set=g\.(\d+)/) || [])[1] || ''; const fbid = (h.match(/fbid=(\d+)/) || [])[1] || ''; if (g && fbid) { counts[g] = (counts[g] || 0) + 1; if (!firstFbid[g]) firstFbid[g] = fbid; } }
+    const gids = Object.keys(counts);
+    if (gids.length) { const best = gids.sort((a, b) => counts[b] - counts[a])[0]; return { groupId: best, fbid: firstFbid[best], groupCounts: counts }; }
     for (const a of tiles) { const h = a.href || ''; if (/set=p\./i.test(h)) continue; const fbid = (h.match(/fbid=(\d+)/) || [])[1] || ''; if (fbid) return { groupId: '', fbid }; }
     return { groupId: '', fbid: '' };
   }).catch(() => ({ groupId: '', fbid: '' }));
+  if (tile.groupCounts) console.log(JSON.stringify({ step: 'harvest_group_resolve', picked: tile.groupId, counts: tile.groupCounts }));
   let groupId = tile.groupId || await resolveNumericGroupIdFromPage(page).catch(() => '');
   const newestFbid = tile.fbid;
   // START smart: if the NEWEST post is UNSEEN, scan from the TOP (catch new posts first); otherwise the top
@@ -3309,11 +3317,19 @@ async function harvestGroupFeed(page, count, opts = {}) {
   let lastFbid = curFbid;
   const maxSteps = Math.max(60, count * pCount * 10 + 200); // walk deep past SEEN photos (skips are cheap); the budget is the real bound
   let steps = 0;
+  const visited = new Set(); // LOOP GUARD: fbids already walked this session
+  let revisits = 0;
   while (out.length < count && steps < maxSteps && Date.now() < budgetEnd) {
     steps++;
     curFbid = (await photoViewerFbid(page)) || curFbid;
     lastFbid = curFbid || lastFbid;
-    if (curFbid && !seenIds.has(curFbid)) {
+    // LOOP GUARD: the theater can oscillate between two photos (ArrowRight bouncing — usually a wrong/broken
+    // set=g. context). Repeatedly landing on already-walked photos means we're stuck -> stop instead of burning
+    // the whole 240s budget on the same 2 tiles. New (older) photos reset the counter.
+    const isRevisit = curFbid && visited.has(curFbid);
+    if (isRevisit) { if (++revisits >= 4) { console.log(JSON.stringify({ step: 'harvest_walk_end', reason: 'loop_detected', steps, collected: out.length, lastFbid })); break; } }
+    else { revisits = 0; if (curFbid) visited.add(curFbid); }
+    if (!isRevisit && curFbid && !seenIds.has(curFbid)) {
       try {
         const rec = await harvestExtractPhoto(page, { href: `https://www.facebook.com/photo/?fbid=${curFbid}&set=g.${groupId}`, postId: curFbid, seenLinks, ogState, claimsDir: opts.claimsDir, profileId: opts.profileId, budgetEnd });
         if (rec) { out.push(rec); console.log(JSON.stringify({ step: 'harvest_item', n: out.length, fbid: curFbid, textLen: (rec.text || '').length, textPreview: (rec.text || '').slice(0, 90), imageSaved: !!rec.imageLocalPath, link: rec.link })); }
@@ -3327,8 +3343,23 @@ async function harvestGroupFeed(page, count, opts = {}) {
     curFbid = moved; lastFbid = moved;
   }
   console.log(JSON.stringify({ step: 'harvest_walk_done', collected: out.length, lastFbid, steps, timedOut: Date.now() >= budgetEnd }));
-  // NO FALLBACK (operator): the photo-theater click-and-arrow walk is the ONLY method. If the theater didn't
-  // open this round, return what we have (often empty) and retry next round — never the grid-scroll workaround.
+  // DEPTH FALLBACK (operator: the source group has HUNDREDS of old deal posts): the photo-theater walk often goes
+  // shallow / oscillates near the newest posts and can't reach deep history. When it collected fewer than asked,
+  // deep-scroll the /media grid (newest -> OLDEST) and pull every old post that still has a first-comment link.
+  if (out.length < count && Date.now() < budgetEnd - 20000) {
+    console.log(JSON.stringify({ step: 'harvest_grid_fallback', walkGot: out.length, want: count }));
+    try {
+      const base = String(opts.groupUrl || '').replace(/\/+$/, '').replace(/\/media$/i, '');
+      const mediaUrl = base ? base + '/media' : `https://www.facebook.com/groups/${groupId}/media`;
+      await page.goto(mediaUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await page.waitForTimeout(2000);
+      await dismissFacebookInterstitials(page).catch(() => {});
+      const haveLinks = new Set(out.map((r) => String(r.link || '')));
+      const gridItems = await harvestGroupFeedGrid(page, count, { ...opts, budgetEnd });
+      for (const it of (Array.isArray(gridItems) ? gridItems : [])) { if (it && it.link && !haveLinks.has(String(it.link))) { out.push(it); haveLinks.add(String(it.link)); } }
+      console.log(JSON.stringify({ step: 'harvest_grid_fallback_done', total: out.length }));
+    } catch (e) { console.log(JSON.stringify({ step: 'harvest_grid_fallback_error', error: String((e && e.message) || e).slice(0, 140) })); }
+  }
   return { items: out, lastFbid };
 }
 
@@ -3596,7 +3627,7 @@ async function main() {
     }
     let harvested = [], harvestLastFbid = '';
     try {
-      const r = await harvestGroupFeed(page, harvestCount, { seenIds: payload.harvestSeenIds || [], profileIndex: payload.harvestProfileIndex || 0, profileCount: payload.harvestProfileCount || 1, resumeFromFbid: payload.harvestResumeFbid || '', claimsDir: payload.harvestClaimsDir || '', profileId: payload.profileId });
+      const r = await harvestGroupFeed(page, harvestCount, { seenIds: payload.harvestSeenIds || [], profileIndex: payload.harvestProfileIndex || 0, profileCount: payload.harvestProfileCount || 1, resumeFromFbid: payload.harvestResumeFbid || '', claimsDir: payload.harvestClaimsDir || '', profileId: payload.profileId, groupUrl: payload.groupUrl });
       if (Array.isArray(r)) { harvested = r; } else { harvested = (r && r.items) || []; harvestLastFbid = (r && r.lastFbid) || ''; }
     }
     catch (e) { console.log(JSON.stringify({ step: 'harvest_error', error: String((e && e.message) || e).slice(0, 300) })); }
