@@ -2864,20 +2864,44 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
       const scoped = root.nth(i);
       if (!(await scoped.isVisible({ timeout: 700 }).catch(() => false))) continue;
       await scoped.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
-      const clicked = await clickFirst(page, [
+      // (a) DIRECT Approve button (older FB UI — keep as a fast path).
+      let clicked = await clickFirst(page, [
         scoped.getByRole('button', { name: approveName }),
         scoped.locator('button, [role="button"]').filter({ hasText: approveText }),
         scoped.locator('[aria-label*="Approve" i], [aria-label*="Approuver" i], [aria-label*="Aprobar" i], [aria-label*="موافقة"], [aria-label*="قبول"]'),
-      ], { timeout: 4000 });
+      ], { timeout: 2500 });
+      let viaMenu = false;
+      // (b) NEW FB UI: there is NO direct Approve button — each post has an "Actions for this post" (•••) menu
+      // and Approve lives INSIDE it. Open that menu (scoped to THIS post), then click Approve in the menu.
+      if (!clicked) {
+        const actionsRe = /actions for this post|acciones para esta publicaci|m[aá]s opciones|إجراءات|action.*publication/i;
+        const menuBtn = await clickFirst(page, [
+          scoped.locator('[aria-label*="Actions for this post" i], [aria-label*="Acciones para esta" i], [aria-label*="إجراءات"]'),
+          scoped.getByRole('button', { name: actionsRe }),
+          scoped.locator('div[role="button"][aria-label]').filter({ hasText: '' }).getByRole('button', { name: actionsRe }),
+        ], { timeout: 3000 });
+        if (menuBtn) {
+          viaMenu = true;
+          await humanPause(900, 1700);
+          // the menu is a page-level role=menu; click the Approve menuitem
+          clicked = await clickFirst(page, [
+            page.getByRole('menuitem', { name: approveName }),
+            page.locator('[role="menu"] [role="menuitem"], [role="menu"] [role="button"]').filter({ hasText: approveText }),
+            page.locator('[role="menuitem"]').filter({ hasText: approveText }),
+            page.locator('[role="menu"]').getByText(approveName),
+          ], { timeout: 4500 });
+        }
+      }
       if (!clicked) continue;
       result.clicked = true;
-      result.method = 'marker_scoped_approve_button';
+      result.method = viaMenu ? 'marker_scoped_approve_via_actions_menu' : 'marker_scoped_approve_button';
       result.label = await clicked.evaluate(el => (el.getAttribute('aria-label') || el.innerText || el.textContent || '').replace(/\s+/g, ' ').slice(0, 120)).catch(() => 'Approve');
-      await humanPause(1000, 2200);
+      await humanPause(1200, 2400);
+      // optional confirm dialog
       const confirm = await clickFirst(page, [
         page.locator('div[role="dialog"]').getByRole('button', { name: approveName }),
         page.locator('div[role="dialog"] button, div[role="dialog"] [role="button"]').filter({ hasText: approveText }),
-        page.getByRole('button', { name: /^(confirm|done|ok|yes)$/i }),
+        page.getByRole('button', { name: /^(confirm|done|ok|yes|confirmar|aceptar)$/i }),
       ], { timeout: 2500 });
       result.confirmed = Boolean(confirm);
       await humanPause(4500, 8000);

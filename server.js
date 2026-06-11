@@ -13680,7 +13680,7 @@ async function completeVerifiedFacebookPostWithComment({
       // After a moderator approves, FB needs time to flip the post from PENDING to publicly LIVE before a
       // DIFFERENT profile can see it to add the first comment. 45s was sometimes too short (the comment ran
       // while the post was still propagating and failed). 80s gives propagation room; the resweep is the backstop.
-      const POST_APPROVAL_PROPAGATION_WAIT_MS_PRE = 200000; // ~3.3min: FB can take minutes to make an approved post PUBLICLY visible so a DIFFERENT profile can comment on it (80s wasn't enough -> every comment hit "target_unavailable_or_pending"). The post-not-ready break + resweep are the backstop.
+      const POST_APPROVAL_PROPAGATION_WAIT_MS_PRE = 30000; // FB makes an approved post public within ~20s. 30s is plenty once the approval ACTUALLY lands (the real bug was the approve click never firing — see the Actions-menu fix). The post-not-ready break + resweep are the backstop.
       logEvent("facebook_live_post_waiting_for_fb_approval_propagation", { profileId: ready.profileId, waitMs: POST_APPROVAL_PROPAGATION_WAIT_MS_PRE });
       await sleep(POST_APPROVAL_PROPAGATION_WAIT_MS_PRE);
     }
