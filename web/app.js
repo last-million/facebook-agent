@@ -5967,6 +5967,14 @@ function uxAttachIncompleteRunBanner() {
       const enabled = ap.enabled != null ? ap.enabled : op.autopilotEnabled;
       const dryRun = op.autopilotDryRun !== false;
       const live = Boolean(enabled) && !dryRun;
+      // RUN GUARD: once a run is active (armed OR autopilot on), HIDE Start and show only Stop so a second
+      // click can't launch an overlapping run. Driven by real server state, so it's correct on reload + in
+      // every open tab (each tab's poll re-renders this).
+      const runActive = Boolean(op.armedForExternalActions) || Boolean(enabled);
+      const startBtnEl = $("prodLaunchAllBtn");
+      const stopBtnEl = $("prodStopAllBtn");
+      if (startBtnEl) startBtnEl.style.display = runActive ? "none" : "";
+      if (stopBtnEl) stopBtnEl.style.display = runActive ? "" : "none";
       const buf = ap.buffer || {};
       const cap = ap.capacity || {};
       const hl = $("prodHeadline");
@@ -6119,6 +6127,10 @@ function uxAttachIncompleteRunBanner() {
         msg = "● LIVE — will post " + n + " then auto-stop.";
       }
       prodResult("Launching…");
+      // OPTIMISTIC: hide Start / show Stop the instant we commit, so a fast double-click can't start a 2nd run
+      // before the re-render. renderProdTab (driven by real state) corrects this if the launch fails.
+      const _sb = $("prodLaunchAllBtn"); if (_sb) _sb.style.display = "none";
+      const _xb = $("prodStopAllBtn"); if (_xb) _xb.style.display = "";
       prodSyncFormAndCache(patch.operator, patch.rules); // sync BEFORE the await so a concurrent auto-save is already consistent
       await prodPatchState(patch);
       prodResult(msg);
