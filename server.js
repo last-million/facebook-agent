@@ -12787,18 +12787,29 @@ function acquirePostCaptureLock() {
 }
 
 async function recoverFacebookCommentWithProfiles(args) {
-  const lockRequestedAt = Date.now();
-  const release = await acquireCommentLock();
-  // logEvent calls are INSIDE the try so that release() in finally is guaranteed even if
-  // logEvent throws (e.g. fs.appendFileSync EMFILE/EACCES under load). If it threw between
-  // acquire and try, the lock chain would never resolve -> permanent box-wide comment
-  // deadlock. (Each logEvent is also individually try-guarded.)
+  // CORE FIX: comment recovery FINISHES the first comment for an ALREADY-PUBLISHED post. Hold the
+  // post-completion exemption for the ENTIRE recovery (every candidate profile, every retry) so a run-limit
+  // auto-disarm in the MIDDLE of the loop can't lock out the remaining profiles ("External actions are
+  // locked") — which is exactly how a post ended up approved-but-uncommented despite 10 available profiles.
+  // A real operator STOP still aborts (requireExternalArmed checks __externalStopRequested). Wrapping HERE
+  // covers every comment path (inline first-comment, approval-retry, the resweep, cross-comment).
+  __postCompletionExternalActionInFlight += 1;
   try {
-    try { logEvent("facebook_comment_lock_acquired", { profileId: args?.ready?.profileId, queueWaitMs: Date.now() - lockRequestedAt }); } catch {}
-    return await recoverFacebookCommentWithProfilesInner(args);
+    const lockRequestedAt = Date.now();
+    const release = await acquireCommentLock();
+    // logEvent calls are INSIDE the try so that release() in finally is guaranteed even if
+    // logEvent throws (e.g. fs.appendFileSync EMFILE/EACCES under load). If it threw between
+    // acquire and try, the lock chain would never resolve -> permanent box-wide comment
+    // deadlock. (Each logEvent is also individually try-guarded.)
+    try {
+      try { logEvent("facebook_comment_lock_acquired", { profileId: args?.ready?.profileId, queueWaitMs: Date.now() - lockRequestedAt }); } catch {}
+      return await recoverFacebookCommentWithProfilesInner(args);
+    } finally {
+      release();
+      try { logEvent("facebook_comment_lock_released", { profileId: args?.ready?.profileId }); } catch {}
+    }
   } finally {
-    release();
-    try { logEvent("facebook_comment_lock_released", { profileId: args?.ready?.profileId }); } catch {}
+    __postCompletionExternalActionInFlight = Math.max(0, __postCompletionExternalActionInFlight - 1);
   }
 }
 
