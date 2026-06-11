@@ -736,20 +736,25 @@ function defaultSecrets() {
 // 2026-06-08, proven via the auto-sync git history). Keep the last successfully-parsed snapshot and
 // fall back to it; defaults are returned only if the file has never been readable in this process.
 let __lastGoodStateRaw = null;
+let __lastReadWasDefaults = false; // true ONLY when readState fell all the way back to factory defaults
+                                   // (cold cache + unreadable file). writeState refuses to persist over this.
 function readState() {
   try {
     const parsed = parseJsonFile(STATE_FILE);
     __lastGoodStateRaw = JSON.stringify(parsed);
+    __lastReadWasDefaults = false;
     const state = deepMerge(defaultState(), parsed);
     normalizeWorkflowState(state);
     return state;
   } catch (err) {
     logEvent("workflow_state_read_failed", { error: String(err), usingLastGood: Boolean(__lastGoodStateRaw) });
     if (__lastGoodStateRaw) {
+      __lastReadWasDefaults = false;
       const state = deepMerge(defaultState(), JSON.parse(__lastGoodStateRaw));
       normalizeWorkflowState(state);
       return state;
     }
+    __lastReadWasDefaults = true; // no real state ever obtained this process — DANGER for any write merge base
     return defaultState();
   }
 }
@@ -902,6 +907,20 @@ function maskHost(value) {
 
 function writeState(state, opts = {}) {
   const existing = readState();
+  // ANTI-WIPE GUARD (the real residual hole): if readState could NOT obtain any real prior state this
+  // process (cold last-good cache AND the file is unreadable — corrupt / empty / momentarily locked), then
+  // `existing` is pure factory DEFAULTS. Merging over defaults would persist defaults for every field the
+  // caller didn't explicitly set = the wipe. REFUSE the write in that case — UNLESS the state file simply
+  // doesn't exist yet (genuine first run, where creating it from defaults is correct). The next successful
+  // read warms the cache and writes resume normally; no data can be lost in the meantime.
+  if (__lastReadWasDefaults && !opts.allowDefaultsWrite) {
+    let fileExists = false; let fileSize = -1;
+    try { const st = fs.statSync(STATE_FILE); fileExists = true; fileSize = st.size; } catch (_) {}
+    if (fileExists) {
+      logEvent("workflow_state_write_aborted_unreadable_base", { reason: "no_prior_good_state", fileSize });
+      return existing; // do NOT overwrite a real-but-unreadable state file with defaults
+    }
+  }
   // MERGE OVER EXISTING, NOT OVER DEFAULTS: a caller that passes a PARTIAL state (dashboard
   // auto-save omitting uncollected fields, a background task holding a sparse snapshot, a raw
   // PUT body) must never reset the omitted fields to factory defaults — omitted keys keep their

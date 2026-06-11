@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-11T01:48:48.241Z",
+  "updatedAt": "2026-06-11T01:57:19.827Z",
   "testRun": {
     "status": "ready",
     "active": false,
@@ -120,7 +120,7 @@
     "autopilotConcurrentPosting": true,
     "autopilotRunId": "1781120731682",
     "machineParallelCap": 5,
-    "machineParallelCapComputedAt": "2026-06-11T01:48:48.211Z",
+    "machineParallelCapComputedAt": "2026-06-11T01:57:18.743Z",
     "machineParallelCapMeta": {
       "cores": 9,
       "totalGB": 32,
@@ -142,7 +142,7 @@
     "peakStartTime": "",
     "peakStopTime": "",
     "requireDealSignal": "10+ bought since yesterday",
-    "linkPlacement": "pinned_first_comment",
+    "linkPlacement": "",
     "pinFirstComment": true,
     "postBodyLinkAllowed": false,
     "pauseOnErrors": true,
