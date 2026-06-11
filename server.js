@@ -12819,6 +12819,7 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
   const profileList = (profiles || []).filter(Boolean);
   const totalProfiles = profileList.length;
   let noAccessCount = 0;
+  let postNotReadyCount = 0; // POST-LEVEL dead-end: the post itself is unavailable/pending (NOT yet live after approval) — fails the SAME for every profile, so don't burn all 40; stop after a few and let the resweep retry once it propagates.
   const __cState = readState();
   const maxNoAccess = clampNumber(__cState.operator?.maxCommentNoAccessAttempts, 1, 60, 25); // allow many no-access dead-ends before giving up — exhaust the group's allocated profiles (members come first, probes after) so a few non-member probes can't cut the list short.
   // ANTI-BURN (operator): per-profile comment cooldown + comment-limited(post-only) skip. Built fresh per
@@ -12932,6 +12933,17 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
       noAccessCount += 1;
       if (noAccessCount >= maxNoAccess) {
         logEvent("comment_recovery_no_access_cap_reached", { noAccessCount, tried: attempts.length, groupUrl });
+        break;
+      }
+    }
+    // POST-LEVEL DEAD-END: "target unavailable / pending" = the POST itself isn't live/commentable yet (an
+    // approval-group post FB hasn't finished making public after approval). This fails IDENTICALLY for every
+    // profile, so trying all 40 is pointless + slow. Stop after 3 and let the resweep re-comment once the post
+    // propagates — instead of burning the whole roster (the 30-min waste seen in the 5-post run).
+    if (/comment_target_unavailable_or_pending|post_pending_or_unavailable|comment_target_not_ready|comment_target_pending|comment_target_unavailable/.test(failStr)) {
+      postNotReadyCount += 1;
+      if (postNotReadyCount >= 3) {
+        logEvent("comment_recovery_post_not_ready_break", { postNotReadyCount, tried: attempts.length, postUrl, reason: "post_not_yet_commentable_pending_or_propagating_resweep_will_retry" });
         break;
       }
     }
@@ -13668,7 +13680,7 @@ async function completeVerifiedFacebookPostWithComment({
       // After a moderator approves, FB needs time to flip the post from PENDING to publicly LIVE before a
       // DIFFERENT profile can see it to add the first comment. 45s was sometimes too short (the comment ran
       // while the post was still propagating and failed). 80s gives propagation room; the resweep is the backstop.
-      const POST_APPROVAL_PROPAGATION_WAIT_MS_PRE = 80000;
+      const POST_APPROVAL_PROPAGATION_WAIT_MS_PRE = 200000; // ~3.3min: FB can take minutes to make an approved post PUBLICLY visible so a DIFFERENT profile can comment on it (80s wasn't enough -> every comment hit "target_unavailable_or_pending"). The post-not-ready break + resweep are the backstop.
       logEvent("facebook_live_post_waiting_for_fb_approval_propagation", { profileId: ready.profileId, waitMs: POST_APPROVAL_PROPAGATION_WAIT_MS_PRE });
       await sleep(POST_APPROVAL_PROPAGATION_WAIT_MS_PRE);
     }
