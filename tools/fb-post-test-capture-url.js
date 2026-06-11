@@ -3134,7 +3134,20 @@ async function harvestExtractPhoto(page, ctx) {
     }
     let link = linkCands.find((h) => AFFIL.test(h)) || linkCands[0] || '';
     if (link) link = link.replace(/([?&])(fbclid|brid|aem|_aem|mibextid)=[^&]*/gi, '$1').replace(/[?&]+$/, '').replace(/\?&/, '?');
-    return { text, image, link, ogTitle, ogDesc, candCount: cands.length };
+    // FIRST-COMMENT TEXT: if the source comment has lead-in text BEFORE the link, capture ALL of it. Read the
+    // comment BODY = the dir="auto" block that contains the product link (this excludes the author-name link).
+    // Strip the raw url so the server re-appends the exact clean link. Empty => bare-link comment.
+    let commentLead = '';
+    if (link) {
+      const lk = link.split(/[?#]/)[0];
+      const anchor = Array.from(document.querySelectorAll('a[href]')).find((a) => { let h = a.href || ''; if (/l\.facebook\.com\/l\.php\?u=/i.test(h)) { try { h = decodeURIComponent((h.match(/[?&]u=([^&]+)/) || [])[1] || ''); } catch (_) {} } return h && h.split(/[?#]/)[0] === lk; });
+      const body = anchor && anchor.closest('div[dir="auto"], span[dir="auto"]');
+      if (body) {
+        let txt = clean(body.innerText).replace(/https?:\/\/\S+/gi, '').replace(/\b[\w-]+\.(com|us|net|to|co|me|app|ca|io|org)\b[^\s]*/gi, '').replace(/\s+/g, ' ').trim();
+        if (txt.length >= 2 && txt.length <= 800 && !isChrome(txt) && !isUrl(txt)) commentLead = txt;
+      }
+    }
+    return { text, image, link, commentLead, ogTitle, ogDesc, candCount: cands.length };
   });
   const dkey = (data.link || '').split(/[?#]/)[0];
   if (!data.link || !dkey || seenLinks.has(dkey)) return null; // PRODUCTS only: no first-comment product link => skip (recipes/news never enter the buffer)

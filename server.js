@@ -9172,13 +9172,13 @@ function preparePostingPlan(options = {}) {
       : clampNumber(state.rules.minutesBetweenPosts, 1, 1440, 12);
     delayCursor += delay;
     const linkForPreview = shortlink || (state.affiliate?.enabled !== false ? "" : product.url);
-    // HARVESTED rows (operator): the comment carries TEXT + the link (not just the bare url). Source first
-    // comments are usually just the link, so the text we use is the EXACT product caption, followed by the
-    // exact captured shortlink (never re-shortened). Falls back to the bare link if no caption.
+    // HARVESTED rows (operator): the comment carries TEXT + the link (not just the bare url). If the SOURCE
+    // first comment had its own lead-in text before the link, use that EXACT text; otherwise fall back to the
+    // product caption. Then append the exact captured shortlink (never re-shortened).
     const __harvUrl = harvestedRec ? String(harvestedRec.firstCommentUrl || "").trim() : "";
-    const __harvCap = harvestedRec ? String(harvestedRec.text || "").trim() : "";
+    const __harvLead = harvestedRec ? (String(harvestedRec.firstCommentText || "").trim() || String(harvestedRec.text || "").trim()) : "";
     const commentText = harvestedRec
-      ? (__harvCap ? `${__harvCap} ${__harvUrl}`.trim() : __harvUrl)
+      ? (__harvLead ? `${__harvLead} ${__harvUrl}`.trim() : __harvUrl)
       : String(state.posting.commentTemplate || "{lead_in} {link}")
           .replace("{lead_in}", commentLeadIn)
           .replace("{link}", linkForPreview)
