@@ -3144,7 +3144,11 @@ async function harvestExtractPhoto(page, ctx) {
       const body = anchor && anchor.closest('div[dir="auto"], span[dir="auto"]');
       if (body) {
         let txt = clean(body.innerText).replace(/https?:\/\/\S+/gi, '').replace(/\b[\w-]+\.(com|us|net|to|co|me|app|ca|io|org)\b[^\s]*/gi, '').replace(/\s+/g, ' ').trim();
-        if (txt.length >= 2 && txt.length <= 800 && !isChrome(txt) && !isUrl(txt)) commentLead = txt;
+        // REJECT comment metadata (commenter name + timestamp) that .closest() can climb into: an "X ago" /
+        // "just now" timestamp or a name·timestamp separator means we grabbed the wrapper, not the body ->
+        // drop it (server then falls back to caption + link).
+        const META_RE = /\b\d+\s*(?:second|minute|hour|day|week|month|year)s?\b|\bjust now\b|[·•]/i;
+        if (txt.length >= 2 && txt.length <= 800 && !isChrome(txt) && !isUrl(txt) && !META_RE.test(txt.slice(0, 140))) commentLead = txt;
       }
     }
     return { text, image, link, commentLead, ogTitle, ogDesc, candCount: cands.length };

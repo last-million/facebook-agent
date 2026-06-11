@@ -2320,24 +2320,16 @@ function collectState() {
     startTime: getValue("startTime"),
     stopTime: getValue("stopTime"),
   });
+  // Collect ONLY the rules still in use. The removed/dead fields (minutes-between-posts, account-move,
+  // deal-signal, link-placement, pause-on-* etc.) are hidden in the DOM and NOT collected here — sending
+  // their empty/default values would overwrite the saved config. writeState merges over existing, so any
+  // field we omit keeps its on-disk value. Peak window is managed by the Run-mode controls.
   state.rules = {
-    minutesBetweenPosts: Number(getValue("minutesBetweenPosts") || 0),
-    randomMinutesBetweenPosts: getValue("randomMinutesBetweenPosts"),
-    minMinutesBetweenPosts: Number(getValue("minMinutesBetweenPosts") || 0),
-    maxMinutesBetweenPosts: Number(getValue("maxMinutesBetweenPosts") || 0),
-    commentsBeforeAccountMove: Number(getValue("commentsBeforeAccountMove") || 0),
-    maxCommentsBeforeAccountSave: Number(getValue("maxCommentsBeforeAccountSave") || 0),
     postsPerProfilePerDay: Number(getValue("postsPerProfilePerDay") || 0),
     peakHoursTimezone: getValue("peakHoursTimezone"),
     peakStartTime: getValue("peakStartTime"),
     peakStopTime: getValue("peakStopTime"),
-    requireDealSignal: getValue("requireDealSignal"),
-    linkPlacement: getValue("linkPlacement"),
     pinFirstComment: getValue("pinFirstComment"),
-    postBodyLinkAllowed: getValue("postBodyLinkAllowed"),
-    pauseOnErrors: getValue("pauseOnErrors"),
-    pauseOnInvalidProxy: getValue("pauseOnInvalidProxy"),
-    pauseOnLimitedAccount: getValue("pauseOnLimitedAccount"),
   };
   state.posting = {
     groups: getValue("groups"),
@@ -5300,32 +5292,45 @@ function updateContentSourceBranch() {
   }
   // reflect the prominent method switch (Manual scraping <-> Easy copy from group)
   document.querySelectorAll(".methodOpt").forEach((b) => b.classList.toggle("active", (b.dataset.method === "copy") === copy));
-  if (!copy) { try { renderManualScrapeStatus(); } catch (_) {} } // refresh connection badges when manual scraping is shown
+  if (!copy) { try { renderManualScrapeStatus(); if (__ixLiveOk === null) liveCheckIxBrowser(); } catch (_) {} } // refresh badges + live-ping IXBrowser once when manual scraping is shown
 }
 
 // MANUAL-SCRAPING setup panel: connection badges for everything research/images/links need, with a
-// "Set up ->" jump to the exact field in the right tab. Connected = key saved / profile set (honest labels).
+// "Set up ->" jump to the exact field in the right tab. IXBrowser is a LIVE ping (it runs on the default
+// local API, so a saved-field check would wrongly show red); the rest are key-saved / config signals.
+let __ixLiveOk = null; // live IXBrowser local-API result: null=checking, true=connected, false=down
 function renderManualScrapeStatus() {
   const grid = $("scrapeCredStatus");
   if (!grid) return;
   const ws = (typeof workflowState !== "undefined" && workflowState) || {};
   const sec = (typeof loadedSecrets !== "undefined" && loadedSecrets) || {};
   const af = ws.affiliate || {}, sl = ws.shortlink || {}, pa = ws.productAssets || {};
+  const mk = (name, ok, msgOk, msgBad, tab, focus) => ({ name, state: ok ? "ok" : "bad", msg: ok ? msgOk : msgBad, tab, focus });
+  const ix = __ixLiveOk === null ? { name: "IXBrowser API", state: "checking", msg: "checking…", tab: "credentials", focus: "ixbrowserBaseUrl" }
+    : __ixLiveOk ? { name: "IXBrowser API", state: "ok", msg: "connected (live)", tab: "credentials", focus: "ixbrowserBaseUrl" }
+    : { name: "IXBrowser API", state: "bad", msg: "local API not reachable", tab: "credentials", focus: "ixbrowserBaseUrl" };
   const rows = [
-    { name: "IXBrowser API", ok: !!(sec.ixbrowser && sec.ixbrowser.baseUrl), tab: "credentials", focus: "ixbrowserBaseUrl", ok2: "configured", bad: "set local API URL" },
-    { name: "Firecrawl (research/images)", ok: !!(sec.firecrawl && sec.firecrawl.hasApiKey), tab: "credentials", focus: "firecrawlApiKey", ok2: "key saved", bad: "add API key" },
-    { name: "ChatGPT HD images", ok: pa.enabled === true, tab: "content", focus: "chatgptHdEnabled", ok2: "on", bad: "enable + log in via the button" },
-    { name: "ShopYourLikes profile", ok: !!(String(af.dedicatedIxProfileId || "").trim() || String(af.dedicatedIxProfileName || "").trim()), tab: "affiliate", focus: "affiliateEnabled", ok2: "profile set", bad: "set SYL profile" },
-    { name: "Mavlynk shortlinks", ok: sl.enabled === true && !!(sec.shortlink && sec.shortlink.hasApiKey), tab: "affiliate", focus: "shortlinkEnabled", ok2: "ready", bad: "enable + add key" },
-    { name: "Webshare proxy", ok: !!(sec.webshare && sec.webshare.hasApiKey), tab: "credentials", focus: "webshareApiKey", ok2: "key saved", bad: "add API key (optional)" },
+    ix,
+    mk("Firecrawl (research/images)", !!(sec.firecrawl && sec.firecrawl.hasApiKey), "key saved", "add API key", "credentials", "firecrawlApiKey"),
+    mk("ChatGPT HD images", pa.enabled === true, "on", "enable + log in via the button", "content", "chatgptHdEnabled"),
+    mk("ShopYourLikes profile", !!(String(af.dedicatedIxProfileId || "").trim() || String(af.dedicatedIxProfileName || "").trim()), "profile set", "set SYL profile", "affiliate", "affiliateEnabled"),
+    mk("Mavlynk shortlinks", sl.enabled === true && !!(sec.shortlink && sec.shortlink.hasApiKey), "ready", "enable + add key", "affiliate", "shortlinkEnabled"),
+    mk("Webshare proxy", !!(sec.webshare && sec.webshare.hasApiKey), "key saved", "add API key (optional)", "credentials", "webshareApiKey"),
   ];
   grid.innerHTML = rows.map((r) => `
-    <div class="msCred ${r.ok ? "ok" : "bad"}">
+    <div class="msCred ${r.state}">
       <span class="msDot"></span>
       <span class="msName">${escapeHtml(r.name)}</span>
-      <span class="msState">${escapeHtml(r.ok ? r.ok2 : r.bad)}</span>
-      ${r.ok ? "" : `<a class="msFix" href="#" data-ms-tab="${r.tab}" data-ms-focus="${r.focus}">Set up &rarr;</a>`}
+      <span class="msState">${escapeHtml(r.msg)}</span>
+      ${r.state === "bad" ? `<a class="msFix" href="#" data-ms-tab="${r.tab}" data-ms-focus="${r.focus}">Set up &rarr;</a>` : ""}
     </div>`).join("");
+}
+// LIVE IXBrowser check: ping the same local-API test the rest of the app uses. Cached in __ixLiveOk so it
+// runs once on panel-show + on Re-check (not on every render).
+async function liveCheckIxBrowser() {
+  try { await integrationPost("/api/integrations/ixbrowser/test", {}, { busy: false, quiet: true }); __ixLiveOk = true; }
+  catch (_) { __ixLiveOk = false; }
+  try { renderManualScrapeStatus(); } catch (_) {}
 }
 // "Set up ->" jumps to the right tab and focuses the exact field (delegated, bound once).
 $("scrapeCredStatus")?.addEventListener("click", (e) => {
@@ -5347,7 +5352,8 @@ $("scrapeTestResearchBtn")?.addEventListener("click", async () => {
 $("scrapeRefreshCredsBtn")?.addEventListener("click", async () => {
   const out = $("scrapeSetupResult"); if (out) out.textContent = "Re-checking connections…";
   try { const r = await api("/api/secrets"); if (r && r.secrets) loadedSecrets = r.secrets; } catch (_) {}
-  renderManualScrapeStatus();
+  __ixLiveOk = null; renderManualScrapeStatus(); // show "checking…"
+  try { await liveCheckIxBrowser(); } catch (_) {}
   if (out) out.textContent = "Connection status refreshed.";
 });
 $("contentSourcesEnabled")?.addEventListener("change", updateContentSourceBranch);

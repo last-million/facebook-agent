@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-11T02:08:14.856Z",
+  "updatedAt": "2026-06-11T02:33:24.214Z",
   "testRun": {
     "status": "ready",
     "active": false,
@@ -107,8 +107,8 @@
     "runDays": "Mon,Tue,Wed,Thu,Fri,Sat,Sun",
     "startTime": "",
     "stopTime": "",
-    "contentSourcesEnabled": false,
-    "contentSourcesExclusive": false,
+    "contentSourcesEnabled": true,
+    "contentSourcesExclusive": true,
     "lastIncompleteRun": {
       "at": "2026-06-10T17:54:06.030Z",
       "posted": 2,
@@ -120,7 +120,7 @@
     "autopilotConcurrentPosting": true,
     "autopilotRunId": "1781120731682",
     "machineParallelCap": 5,
-    "machineParallelCapComputedAt": "2026-06-11T02:07:00.858Z",
+    "machineParallelCapComputedAt": "2026-06-11T02:33:24.180Z",
     "machineParallelCapMeta": {
       "cores": 9,
       "totalGB": 32,
@@ -218,7 +218,7 @@
     ],
     "equalSplitAssignments": true,
     "contentSources": {
-      "enabled": false,
+      "enabled": true,
       "groupsText": "https://www.facebook.com/groups/o38679876833911",
       "notes": "",
       "exclusive": true,

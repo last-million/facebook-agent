@@ -698,7 +698,9 @@
                   <button id="prodPauseBtn" type="button">&#10073;&#10073; Pause (dry-run)</button>
                   <button id="prodEnableBtn" type="button">Enable autopilot</button>
                   <button id="prodDisableBtn" type="button">Disable autopilot</button>
-                  <label class="hasTooltip prodConcurrencyField" data-tooltip="Max profiles posting at once. The CPU governor still throttles to real headroom and yields to Pinterest.">Concurrency
+                  <!-- Concurrency is now AUTO (machine-synced cap shown in Step 1 + control center). The manual
+                       dropdown was a false choice (Start requests machine-max), so it's hidden; kept for binding. -->
+                  <label class="hasTooltip prodConcurrencyField" style="display:none" data-tooltip="Auto machine cap">Concurrency
                     <select id="prodConcurrency"><option value="2">2</option><option value="3">3</option><option value="4">4</option></select>
                   </label>
                 </div>
@@ -877,6 +879,7 @@
             .msCred .msDot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
             .msCred.ok .msDot{background:#7ee0a5;box-shadow:0 0 6px #7ee0a5}
             .msCred.bad .msDot{background:#ff8a8a;box-shadow:0 0 6px #ff8a8a}
+            .msCred.checking .msDot{background:#f0c850;box-shadow:0 0 6px #f0c850}
             .msCred .msName{font-weight:600}
             .msCred .msState{opacity:.7;margin-left:auto;font-size:.74rem}
             .msCred a.msFix{margin-left:8px;color:#f0a93b;text-decoration:none;white-space:nowrap;font-size:.76rem}

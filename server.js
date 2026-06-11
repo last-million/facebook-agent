@@ -914,12 +914,15 @@ function writeState(state, opts = {}) {
   // doesn't exist yet (genuine first run, where creating it from defaults is correct). The next successful
   // read warms the cache and writes resume normally; no data can be lost in the meantime.
   if (__lastReadWasDefaults && !opts.allowDefaultsWrite) {
-    let fileExists = false; let fileSize = -1;
-    try { const st = fs.statSync(STATE_FILE); fileExists = true; fileSize = st.size; } catch (_) {}
-    if (fileExists) {
+    let hasRealData = false; let fileSize = -1;
+    try { fileSize = fs.statSync(STATE_FILE).size; hasRealData = fileSize > 2; } // >2 bytes = real content we failed to parse (corrupt/locked)
+    catch (err) { if (err && err.code !== "ENOENT") logEvent("workflow_state_stat_failed", { error: String(err) }); } // missing => first run, allow
+    if (hasRealData) {
       logEvent("workflow_state_write_aborted_unreadable_base", { reason: "no_prior_good_state", fileSize });
-      return existing; // do NOT overwrite a real-but-unreadable state file with defaults
+      return existing; // do NOT overwrite a real-but-unreadable (corrupt/locked) state file with defaults
     }
+    // empty/missing file => the data is already gone; allow the write so the server self-heals (recreates a
+    // valid state + the next read succeeds) instead of stalling boot or permanently blocking all writes.
   }
   // MERGE OVER EXISTING, NOT OVER DEFAULTS: a caller that passes a PARTIAL state (dashboard
   // auto-save omitting uncollected fields, a background task holding a sparse snapshot, a raw
@@ -1512,7 +1515,7 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.reserveTarget = clampNumber(state.posting.contentSources.reserveTarget, 1, 5000, 20); // DAYTIME working buffer (manual override when auto is OFF)
   state.posting.contentSources.reserveRefillAt = clampNumber(state.posting.contentSources.reserveRefillAt, 0, Math.max(0, state.posting.contentSources.reserveTarget - 1), 10); // daytime: resume harvesting when reserve drops to this
   state.posting.contentSources.overnightReserveTarget = clampNumber(state.posting.contentSources.overnightReserveTarget, state.posting.contentSources.reserveTarget, 5000, Math.max(state.posting.contentSources.reserveTarget, 200)); // OVERNIGHT: stock up to this many for the whole next day
-  const __hpgCap = Math.min(6, Number(state.operator?.machineParallelCap) || 6); // never above the machine auto-cap (read off state to avoid normalize recursion)
+  const __hpgCap = Math.min(6, machineParallelCap(state)); // never above the machine auto-cap (same source as the runtime harvest clamp; state passed -> no readState recursion)
   state.posting.contentSources.harvestProfilesPerGroup = clampNumber(state.posting.contentSources.harvestProfilesPerGroup, 1, __hpgCap, Math.min(3, __hpgCap)); // # member profiles to harvest each group with IN PARALLEL (spreads load)
   if (typeof state.posting.contentSources.postCta !== "string") state.posting.contentSources.postCta = ""; // optional CTA line ABOVE the emoji+title+tags signature (blank = clean deal post)
   else state.posting.contentSources.postCta = state.posting.contentSources.postCta.slice(0, 300);
@@ -9239,7 +9242,12 @@ function preparePostingPlan(options = {}) {
     // see-more leak — urls because the link lives in the COMMENT). The unique tag signature line
     // is appended by livePostPayloadForRow.
     const postText = harvestedRec
-      ? String(harvestedRec.text || "").trim() // EXACT harvested caption, NO editing (operator); the <=8 unique locator tags are appended by livePostPayloadForRow
+      // EXACT harvested caption (operator: no editing) EXCEPT the link must live in the COMMENT, never the
+      // post body — so strip only full URLs + known affiliate bare-domains; text/hashtags/emojis stay verbatim.
+      ? String(harvestedRec.text || "")
+          .replace(/https?:\/\/\S+/gi, "")
+          .replace(/\b(?:mavlynk\.com|walmrt\.us|amzn\.to|amzlink\.to|a\.co|bit\.ly|tinyurl\.com|geni\.us|ltk\.app|liketk\.it|shareasale\.com|rstyle\.me)\S*/gi, "")
+          .replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim()
       : rotationValue(postTexts, state.contentRotation.postTextCursor, index, state.contentRotation.avoidPostTextReuse);
     const commentLeadIn = rotationValue(commentLeadIns, state.contentRotation.commentLeadInCursor, index, state.contentRotation.avoidCommentLeadInReuse);
     const affiliateLink = affiliateShortlinkForProduct(product, state);
@@ -9266,7 +9274,7 @@ function preparePostingPlan(options = {}) {
     if (harvestedRec) { if (!image) missingAssets.push("harvested_image"); } // harvested image is the downloaded local file, not a review-image record
     else if (!imageRecord) missingAssets.push("positive_review_image");
     else if (!imageRecord.approved) missingAssets.push("human_approved_review_image");
-    if (!postText && !harvestedRec) missingAssets.push("unique_post_text"); // harvested text comes from the auto signature line (emoji + short title + tags)
+    if (!postText) missingAssets.push(harvestedRec ? "harvested_product_text" : "unique_post_text"); // never post a body-less row (harvested rows must have real caption text, not just the tag signature)
     // commentLeadIn is intentionally NOT a readiness gate. It is a cosmetic comment intro (the comment
     // template may not even use {lead_in}). With a small lead-in pool + avoid-reuse, gating on it BLOCKED
     // every row past the pool size — starving all but the first ~9 profiles of ready rows so fresh
