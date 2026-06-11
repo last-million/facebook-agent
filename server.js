@@ -11496,7 +11496,11 @@ function facebookAdminApprovalValidationFromLog(objects = [], postUrl = "") {
     // ONLY trust "post is not pending" when the moderation queue ACTUALLY rendered (surface===true).
     // A feed redirect (non-admin) or an inconclusive gid produces the same reason but proves nothing
     // — must NOT be read as "not pending" (the bug that left every post pending forever).
-    surfaceReachable === true
+    surfaceReachable === true &&
+    // ...AND the queue actually rendered posts to scan. articleCount===0 means the pending queue had not
+    // loaded yet (slow moderator render) — NOT proof the post is absent; retry the next moderator instead of
+    // false-bailing (the "fast-bailed finding no pending post" that abandoned profile 42).
+    Number(diagnosticStep.articleCount || diagnosticStep.diagnostic?.articleCount || 0) > 0
   );
   const errors = [];
   const warnings = [];
@@ -11947,6 +11951,14 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
           profile: attempt.profile,
           groupUrl,
         });
+        continue;
+      }
+      // ERRORED PROFILE -> try the NEXT moderator: a connector/session/Not-Found error on one moderator (e.g.
+      // a glitchy 41) must never stop us from trying the other (42). Only a real pending-queue scan (the
+      // fast-bail below) ends the cycle. This is what lets a working moderator approve when another errors.
+      const attemptErrored = !attempt.validation || (Array.isArray(attempt.validation.errors) && attempt.validation.errors.some((e) => /profile_busy|quarantined|name_blocked|connector_failed|session|timeout|page_unavailable|not_found/i.test(String(e || ""))));
+      if (attemptErrored && !attempt.validation?.noPendingPostForPublisher) {
+        logEvent("facebook_admin_approval_profile_errored_trying_next", { profileId: attempt.profileId, errors: attempt.validation?.errors || ["unknown"] });
         continue;
       }
       if (attempt.validation?.noPendingPostForPublisher) {
@@ -14088,11 +14100,14 @@ async function runLiveFacebookPostFromPlan(body = {}) {
         // only when confirmed-live AND the only residual errors are comment-step ones.
         const postConfirmedLive = validation.markerPermalinkVerified === true && (!validation.imageRequired || validation.postMediaVerified === true);
         const liveEnoughToComment = postConfirmedLive && (validation.ok || livePostValidationAllowsCommentProfileFallback(validation));
-        // GROUP-AWARE APPROVAL: in an admin-approval group a just-published post is PENDING (only the publisher
-        // can self-view it -> no public permalink -> markerPermalinkVerified !== true). Always try moderator
-        // approval there, even if the post "looks ok" to its own author. approvePending no-ops for non-approval
-        // groups, so ordinary groups are unaffected.
-        if ((!validation.ok && !liveEnoughToComment) || (isAdminApprovalEnabledForGroup(groupUrl, readState()) && validation.markerPermalinkVerified !== true)) {
+        // GROUP-AWARE APPROVAL: in an admin-approval group a just-published post is PENDING. The PUBLISHER can
+        // self-view its OWN pending post (own permalink + visible marker), so markerPermalinkVerified===true here
+        // is NOT proof the post is PUBLICLY live -> never skip approval on that basis. ALWAYS attempt approval
+        // exactly once for an approval group; approvePending no-ops for non-approval groups and fast-bails if a
+        // moderator confirms the post is already live. (Approval only ever approves THIS post via its unique
+        // marker / the publisher's author-id — never another member's pending post.)
+        const groupRequiresApproval = isAdminApprovalEnabledForGroup(groupUrl, readState());
+        if ((!validation.ok && !liveEnoughToComment) || groupRequiresApproval) {
           approvalResult = await approvePendingFacebookPostWithAdminProfiles({
             row,
             ready,

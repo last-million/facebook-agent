@@ -2709,7 +2709,7 @@ async function bodyMarkerChecks(page, marker) {
     };
     return {
       markerVisible: matchesLoose(text),
-      ownControls: /Edit post|Delete post|Approve|Decline|Reject/.test(text),
+      ownControls: /Edit post|Delete post|Approve|Decline|Reject|Editar|Eliminar|Aprobar|Rechazar|تعديل|حذف|موافقة|رفض/.test(text),
       postMediaVerified: media.length > 0,
       postMedia: media.slice(0, 4),
       snippet: text.split('\n').filter(line => matchesLoose(line) || /approve|pending|admin/i.test(line)).slice(0, 20),
@@ -2769,6 +2769,10 @@ async function captureApprovalDiagnostic(page, marker) {
   }
 }
 
+// MULTI-LANGUAGE approve-button labels (moderators 41/42 may run FB in EN/FR/ES/AR). Mirrors the
+// COMPOSER_PROMPT_RE multilingual fix — an EN-only match left Spanish "Aprobar" posts pending.
+const APPROVE_NAME_RE = /^(approve|approve post|approve all|approuver|autoriser|aprobar|aprobar publicaci[oó]n|aprobar todo|موافقة|قبول|الموافقة)$/i;
+const APPROVE_TEXT_RE = /\b(approve|approve post|approuver|autoriser|aprobar|موافقة|قبول)\b/i;
 async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', groupId = '') {
   const result = {
     clicked: false,
@@ -2799,13 +2803,13 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
     return result;
   }
   if (!markerVisible && cleanPublisherId) {
-    const authorMatchResult = await page.evaluate(({ publisherId, gid }) => {
+    const authorMatchResult = await page.evaluate(({ publisherId, gid, approveSrc }) => {
       const visible = (el) => {
         const r = el.getBoundingClientRect();
         const s = getComputedStyle(el);
         return r.width > 50 && r.height > 50 && s.visibility !== 'hidden' && s.display !== 'none';
       };
-      const approveRegex = /^(approve|approve post|approve all|approuver|autoriser)$/i;
+      const approveRegex = new RegExp(approveSrc, 'i'); // EN/FR/ES/AR (passed in; RegExp can't cross evaluate)
       const articles = [...document.querySelectorAll('[role="article"]')].filter(visible);
       for (const a of articles) {
         const authorLinks = [...a.querySelectorAll('a[href]')].filter(link => {
@@ -2825,14 +2829,14 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
         }
       }
       return { clicked: false, reason: 'no_pending_article_matched_publisher_or_no_approve_button', articleCount: articles.length };
-    }, { publisherId: cleanPublisherId, gid: groupId }).catch((err) => ({ clicked: false, reason: err?.message || String(err) }));
+    }, { publisherId: cleanPublisherId, gid: groupId, approveSrc: APPROVE_NAME_RE.source }).catch((err) => ({ clicked: false, reason: err?.message || String(err) }));
     if (authorMatchResult.clicked) {
       result.clicked = true;
       result.method = 'author_matched_publisher_user_id';
       result.label = authorMatchResult.label || 'Approve';
       await humanPause(1000, 2200);
-      const confirmName = /^(approve|approve post|approve all|approuver|autoriser)$/i;
-      const confirmText = /\b(approve|approve post|approuver|autoriser)\b/i;
+      const confirmName = APPROVE_NAME_RE;
+      const confirmText = APPROVE_TEXT_RE;
       const confirm = await clickFirst(page, [
         page.locator('div[role="dialog"]').getByRole('button', { name: confirmName }),
         page.locator('div[role="dialog"] button, div[role="dialog"] [role="button"]').filter({ hasText: confirmText }),
@@ -2844,11 +2848,11 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
     }
     result.reason = authorMatchResult.reason || 'author_match_failed_and_marker_not_visible';
     result.diagnostic = await captureApprovalDiagnostic(page, marker);
-    console.log(JSON.stringify({ step: 'admin_approval_diagnostic', reason: result.reason, authorMatchInfo: authorMatchResult, diagnostic: result.diagnostic }));
+    console.log(JSON.stringify({ step: 'admin_approval_diagnostic', reason: result.reason, articleCount: result.diagnostic?.articleCount || authorMatchResult.articleCount || 0, authorMatchInfo: authorMatchResult, diagnostic: result.diagnostic }));
     return result;
   }
-  const approveName = /^(approve|approve post|approve all|approuver|autoriser)$/i;
-  const approveText = /\b(approve|approve post|approuver|autoriser)\b/i;
+  const approveName = APPROVE_NAME_RE;
+  const approveText = APPROVE_TEXT_RE;
   const roots = [
     page.locator('[role="article"]').filter({ hasText: marker }),
     page.locator('[data-pagelet]').filter({ hasText: marker }),
@@ -2863,7 +2867,7 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
       const clicked = await clickFirst(page, [
         scoped.getByRole('button', { name: approveName }),
         scoped.locator('button, [role="button"]').filter({ hasText: approveText }),
-        scoped.locator('[aria-label*="Approve" i], [aria-label*="Approuver" i]'),
+        scoped.locator('[aria-label*="Approve" i], [aria-label*="Approuver" i], [aria-label*="Aprobar" i], [aria-label*="موافقة"], [aria-label*="قبول"]'),
       ], { timeout: 4000 });
       if (!clicked) continue;
       result.clicked = true;
