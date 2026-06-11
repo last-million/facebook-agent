@@ -54,7 +54,7 @@ const MAX_EVENTS_BYTES = 500000;
 // each ixBrowser profile spawns ~10-20 chrome procs, so 7 posting + 3 harvest = ~150+ chrome processes at once,
 // and with the Pinterest agent sharing the box Chrome crashed ("application error"). Half-cores is stable. 9 vCPU -> 4.
 const MAX_CONCURRENT_NORMAL_IX_PROFILES = Math.max(3, Math.min(6, Math.floor(((os.cpus() || []).length || 4) / 2)));
-const MAX_COMMENT_FALLBACK_PROFILES = 6;
+const MAX_COMMENT_FALLBACK_PROFILES = 40; // try EVERY profile allocated to the group for the first comment (was 6) — keep going until one lands; the loop stops as soon as a comment succeeds, so this is just the ceiling.
 const FACEBOOK_LIVE_POST_TIMEOUT_MS = 600000;
 const FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS = 360000;
 const FACEBOOK_COMMENT_RECOVERY_TIMEOUT_MS = 240000;
@@ -12820,7 +12820,7 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
   const totalProfiles = profileList.length;
   let noAccessCount = 0;
   const __cState = readState();
-  const maxNoAccess = clampNumber(__cState.operator?.maxCommentNoAccessAttempts, 1, 20, 3);
+  const maxNoAccess = clampNumber(__cState.operator?.maxCommentNoAccessAttempts, 1, 60, 25); // allow many no-access dead-ends before giving up — exhaust the group's allocated profiles (members come first, probes after) so a few non-member probes can't cut the list short.
   // ANTI-BURN (operator): per-profile comment cooldown + comment-limited(post-only) skip. Built fresh per
   // call (post-lock) so concurrent comment workers always see the latest log — never double-consume a window.
   const __cooldownMs = clampNumber(__cState.rules?.commentCooldownMinutes, 1, 1440, 5) * 60 * 1000;
