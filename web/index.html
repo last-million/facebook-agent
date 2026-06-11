@@ -812,7 +812,7 @@
                 <label>Profiles per group <span style="opacity:.7">(parallel harvest)</span> <input type="number" id="contentSourcesProfilesPerGroup" min="1" max="6" step="1" placeholder="3"></label>
                 <label>Re-use copied products after <input type="number" id="contentSourcesReuseHours" min="1" max="720" step="1" placeholder="26"> hours <span style="opacity:.7">(eligible to re-post after this; never stalls)</span></label>
                 <label>Delete copied images older than <input type="number" id="contentSourcesImageRetentionDays" min="1" max="90" step="1" placeholder="7"> days <span style="opacity:.7">(frees disk; record kept)</span></label>
-                <label class="span2">Post call-to-action <span style="opacity:.7">(appended under copied posts; blank = none)</span> <input type="text" id="contentSourcesPostCta" placeholder="🛒 Deal link in the first comment 👇"></label>
+                <label class="span2" style="display:none">Post call-to-action <input type="text" id="contentSourcesPostCta"></label>
                 <label class="span2" data-ux-tier="advanced">Content source notes <textarea id="contentSourcesNotes" spellcheck="false" placeholder="Optional notes (e.g. which posts to prefer)."></textarea></label>
               </div>
 

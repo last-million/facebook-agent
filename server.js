@@ -1976,6 +1976,7 @@ function appendHarvestedProduct(record, state = readState()) {
     firstCommentUrl: url,
     productKey: record.productKey || harvestSyntheticKey(url),
     text: String(record.text || "").slice(0, 60000), // exact caption, effectively uncapped (operator: no character limit)
+    firstCommentText: String(record.firstCommentText || record.commentLead || "").slice(0, 2000), // source first-comment lead-in (text that holds the link); posted comment = this + the link
     imageLocalPath: String(record.imageLocalPath || ""),
     sourceGroupUrl: String(record.sourceGroupUrl || ""),
     postId: String(record.postId || ""),
@@ -8113,7 +8114,7 @@ async function harvestContentSourcesAsync(options = {}) {
               existing.lastPostedAt = ""; existing.posted = ""; reusedOld++;
               continue;
             }
-            const persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId, ogTitle: it.ogTitle, ogDescription: it.ogDescription }, readState());
+            const persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, firstCommentText: it.commentLead, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId, ogTitle: it.ogTitle, ogDescription: it.ogDescription }, readState());
             if (persisted) { existingByUrl.set(url, { firstCommentUrl: url, posted: "" }); harvestedNew++; }
           }
           // AUTO-LEARN the member profile: a profile that READ the group (returned items) is a proven member
@@ -9159,7 +9160,7 @@ function preparePostingPlan(options = {}) {
     // see-more leak — urls because the link lives in the COMMENT). The unique tag signature line
     // is appended by livePostPayloadForRow.
     const postText = harvestedRec
-      ? cleanHarvestedPostText(harvestedRec.text, 60000)
+      ? String(harvestedRec.text || "").trim() // EXACT harvested caption, NO editing (operator); the <=8 unique locator tags are appended by livePostPayloadForRow
       : rotationValue(postTexts, state.contentRotation.postTextCursor, index, state.contentRotation.avoidPostTextReuse);
     const commentLeadIn = rotationValue(commentLeadIns, state.contentRotation.commentLeadInCursor, index, state.contentRotation.avoidCommentLeadInReuse);
     const affiliateLink = affiliateShortlinkForProduct(product, state);
@@ -9171,10 +9172,13 @@ function preparePostingPlan(options = {}) {
       : clampNumber(state.rules.minutesBetweenPosts, 1, 1440, 12);
     delayCursor += delay;
     const linkForPreview = shortlink || (state.affiliate?.enabled !== false ? "" : product.url);
-    // HARVESTED rows (operator): the comment is the harvested first-comment URL EXACTLY as captured —
-    // already shortened at the source; no lead-in phrase, no template, never re-shortened/modified.
+    // HARVESTED rows (operator): the comment carries TEXT + the link (not just the bare url). Source first
+    // comments are usually just the link, so the text we use is the EXACT product caption, followed by the
+    // exact captured shortlink (never re-shortened). Falls back to the bare link if no caption.
+    const __harvUrl = harvestedRec ? String(harvestedRec.firstCommentUrl || "").trim() : "";
+    const __harvCap = harvestedRec ? String(harvestedRec.text || "").trim() : "";
     const commentText = harvestedRec
-      ? String(harvestedRec.firstCommentUrl || "").trim()
+      ? (__harvCap ? `${__harvCap} ${__harvUrl}`.trim() : __harvUrl)
       : String(state.posting.commentTemplate || "{lead_in} {link}")
           .replace("{lead_in}", commentLeadIn)
           .replace("{link}", linkForPreview)
