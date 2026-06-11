@@ -1585,7 +1585,10 @@ function normalizeWorkflowState(state) {
     state.affiliateProxy.apiRequestsMustUseProxy = true;
   }
   state.ixbrowser.maxProfilesPerRun = clampNumber(state.ixbrowser.maxProfilesPerRun, 1, 1000000, 100000);
-  const __mcCap = Math.min(MAX_CONCURRENT_NORMAL_IX_PROFILES, Number(state.operator?.machineParallelCap) || MAX_CONCURRENT_NORMAL_IX_PROFILES); // never above the machine auto-cap
+  // The AUTO MACHINE CAP is the single authority (detected from THIS box's cpus+ram, any machine,
+  // re-synced every 24h). The legacy MAX_CONCURRENT_NORMAL_IX_PROFILES constant is only the fallback
+  // for the first boot before the cap has ever been computed.
+  const __mcCap = Number(state.operator?.machineParallelCap) || MAX_CONCURRENT_NORMAL_IX_PROFILES;
   state.ixbrowser.maxConcurrentProfiles = clampNumber(
     state.ixbrowser.maxConcurrentProfiles,
     1,
@@ -7410,11 +7413,12 @@ function fallbackGroupUrlsForSlot(slot, state) {
 }
 
 function concurrencyBatchForSlot(slot, state) {
+  const __slotCap = machineParallelCap(state); // auto machine cap is the authority (any machine, 24h-synced)
   const maxConcurrentProfiles = clampNumber(
     state.ixbrowser?.maxConcurrentProfiles,
     1,
-    MAX_CONCURRENT_NORMAL_IX_PROFILES,
-    MAX_CONCURRENT_NORMAL_IX_PROFILES
+    __slotCap,
+    __slotCap
   );
   const profileIndex = Math.max(0, Number(slot.profileRunIndex || 0));
   return {
@@ -14852,11 +14856,12 @@ async function runLiveFacebookFullPostingPlan(body = {}) {
   assertFullPostingPlanRowsApproved(rows, state);
   assertFullPostingPlanHasFreshDiscovery(rows, state);
   assertFullPostingPlanUsesLatestDiscoveryProducts(rows, state);
+  const __runCap = machineParallelCap(state); // auto machine cap is the authority (any machine, 24h-synced)
   const maxConcurrentProfiles = clampNumber(
     body.maxConcurrentProfiles || body.max_concurrent_profiles || state.ixbrowser?.maxConcurrentProfiles,
     1,
-    MAX_CONCURRENT_NORMAL_IX_PROFILES,
-    MAX_CONCURRENT_NORMAL_IX_PROFILES,
+    __runCap,
+    __runCap,
   );
   const results = [];
   const batches = livePostingBatchesByUniqueProfile(rows, maxConcurrentProfiles);
