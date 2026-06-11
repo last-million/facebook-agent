@@ -28,6 +28,12 @@ let __lastPerPostLogSweep = 0;
 // run-limit auto-disarm just set armedForExternalActions=false — otherwise the just-made posts' first comments
 // get locked out ("External actions are locked") and the post stays permanently uncommented.
 let __forcedCommentResweepActive = false;
+// In-flight COUNTER for post-COMPLETION external actions (the required first comment + moderator approval of
+// an ALREADY-published post). When >0, these finishing actions are let through a run-limit auto-disarm so the
+// last posts of a run still get their comment + approval — but a real operator STOP (which sets
+// __externalStopRequested) still hard-blocks them. A counter, not a boolean, so overlapping inline comments
+// across concurrent posts don't clear the exemption early.
+let __postCompletionExternalActionInFlight = 0;
 const PER_POST_LOG_SWEEP_INTERVAL_MS = 6 * 3600 * 1000;
 const STATE_FILE = path.join(DATA_DIR, "workflow-state.json");
 const LOCAL_DB_DIR = path.join(DATA_DIR, "local-db");
@@ -11800,7 +11806,14 @@ function acquireAdminApprovalLock() {
   __adminApprovalLockChain = prior.then(() => next);
   return prior.then(() => release);
 }
-async function approvePendingFacebookPostWithAdminProfiles({ row, ready, groupUrl, candidateUrls, ledgerKey, closeResults, reason }) {
+async function approvePendingFacebookPostWithAdminProfiles(args) {
+  // Moderator approval finishes an ALREADY-published (pending) post — let it complete through a run-limit
+  // auto-disarm (a real operator STOP still hard-blocks it via requireExternalArmed's __externalStopRequested).
+  __postCompletionExternalActionInFlight += 1;
+  try { return await approvePendingFacebookPostWithAdminProfilesImpl(args); }
+  finally { __postCompletionExternalActionInFlight = Math.max(0, __postCompletionExternalActionInFlight - 1); }
+}
+async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, groupUrl, candidateUrls, ledgerKey, closeResults, reason }) {
   let state = readState();
   if (!isAdminApprovalEnabledForGroup(groupUrl, state)) {
     const autoEnabled = autoEnableAdminApprovalIfPersistentFailures(groupUrl);
@@ -11995,6 +12008,38 @@ async function runFacebookCommentRecoveryAttempt({ row, profileId, profileLabel,
   const cleanProfile = oneLineField(profileLabel || numericProfileId || "", 180);
   const closeResults = [];
   const state = readState();
+  // MODERATORS ARE APPROVE-ONLY — universal last-line guard at the comment runtime choke point (mirrors the
+  // POSTING guard). Even if a candidate source regresses, a moderator (41/42) can never be spawned to comment.
+  if (isFacebookAdminApprovalProfileId(numericProfileId, state, groupUrl) || isFacebookAdminApprovalProfileLabel(cleanProfile, state, groupUrl)) {
+    const validation = { ok: false, errors: ["facebook_moderator_profile_reserved_for_approval"], warnings: [], commentRequired: true, commentSubmitted: false, commentVerified: false };
+    appendFacebookLivePostLedger({
+      event: "comment_recovery_skipped",
+      key: ledgerKey,
+      planId: row.planId,
+      sequence: row.sequence,
+      profileId: numericProfileId,
+      profile: cleanProfile,
+      groupUrl,
+      actualGroupUrl: groupUrl,
+      postUrl,
+      status: "comment_recovery_failed",
+      message: `IXBrowser profile "${cleanProfile}" is a moderator/approval profile and will not be used for comments.`,
+      validation,
+    });
+    return {
+      ok: false,
+      profileId: numericProfileId,
+      profile: cleanProfile,
+      validation,
+      closeResults,
+      message: `IXBrowser profile "${cleanProfile}" is a moderator/approval profile and will not be used for comments.`,
+      liveLog: [],
+      liveLogFile: "",
+      payloadFile: "",
+      payloadDeleted: false,
+      script: path.relative(ROOT, liveFacebookPostingScriptPath()).replace(/\\/g, "/"),
+    };
+  }
   if (isDedicatedShopYourLikesIxProfile(numericProfileId) || isDedicatedShopYourLikesProfileLabel(cleanProfile)) {
     const validation = {
       ok: false,
@@ -13103,6 +13148,9 @@ function recentGroupPosterCommentCandidates(groupUrl, state = readState(), optio
       if (isDedicatedShopYourLikesProfileLabel(label, state)) continue;
       if (isBlockedIxBrowserProfileLabel(label, state)) continue;
       if (isFacebookProfileQuarantinedForFacebook(label, state, groupUrl)) continue;
+      // MODERATORS ARE APPROVE-ONLY: never offer 41/42 as a commenter, even if they previously posted here.
+      // (This prepend tier lacked the check the other candidate sources have — it's how moderator 42 slipped in.)
+      if (isFacebookAdminApprovalProfileId(pid, state, groupUrl) || isFacebookAdminApprovalProfileLabel(label, state, groupUrl)) continue;
       seen.add(pid);
       out.push({ profileId: pid, profile: r.profile || String(pid), source: "recent_group_poster" });
     }
@@ -13110,7 +13158,14 @@ function recentGroupPosterCommentCandidates(groupUrl, state = readState(), optio
   return out;
 }
 
-async function addRequiredFirstCommentWithDifferentProfile({ row, ready, groupUrl, postUrl, imagePath, postValidation, ledgerKey, closeResults }) {
+async function addRequiredFirstCommentWithDifferentProfile(args) {
+  // Wrap the whole comment-completion body so a run-limit auto-disarm doesn't lock out the REQUIRED first
+  // comment of an already-published post (see __postCompletionExternalActionInFlight). A real STOP still blocks.
+  __postCompletionExternalActionInFlight += 1;
+  try { return await addRequiredFirstCommentWithDifferentProfileImpl(args); }
+  finally { __postCompletionExternalActionInFlight = Math.max(0, __postCompletionExternalActionInFlight - 1); }
+}
+async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, groupUrl, postUrl, imagePath, postValidation, ledgerKey, closeResults }) {
   const state = readState();
   const configuredProfiles = commentRecoveryFallbackProfilesForGroup(row, groupUrl, state, { excludeProfileId: ready.profileId });
   const ixProfiles = await ixBrowserCommentFallbackProfilesForGroup(row, groupUrl, state, { excludeProfileId: ready.profileId });
@@ -14033,7 +14088,11 @@ async function runLiveFacebookPostFromPlan(body = {}) {
         // only when confirmed-live AND the only residual errors are comment-step ones.
         const postConfirmedLive = validation.markerPermalinkVerified === true && (!validation.imageRequired || validation.postMediaVerified === true);
         const liveEnoughToComment = postConfirmedLive && (validation.ok || livePostValidationAllowsCommentProfileFallback(validation));
-        if (!validation.ok && !liveEnoughToComment) {
+        // GROUP-AWARE APPROVAL: in an admin-approval group a just-published post is PENDING (only the publisher
+        // can self-view it -> no public permalink -> markerPermalinkVerified !== true). Always try moderator
+        // approval there, even if the post "looks ok" to its own author. approvePending no-ops for non-approval
+        // groups, so ordinary groups are unaffected.
+        if ((!validation.ok && !liveEnoughToComment) || (isAdminApprovalEnabledForGroup(groupUrl, readState()) && validation.markerPermalinkVerified !== true)) {
           approvalResult = await approvePendingFacebookPostWithAdminProfiles({
             row,
             ready,
@@ -16875,6 +16934,10 @@ function requireExternalArmed() {
   // a forced post-publish comment resweep is finishing the first-comments of posts ALREADY made this armed
   // cycle — allow it through even though the run-limit auto-disarm just flipped the flag (see Fix A).
   if (__forcedCommentResweepActive) return;
+  // Same intent for the INLINE required-first-comment + the moderator approval of an already-published post:
+  // let them finish after a run-limit auto-disarm, but NEVER after a real operator STOP (which sets
+  // __externalStopRequested and also kills connector children). New posts stay capped via autopilotMayPostNow.
+  if (__postCompletionExternalActionInFlight > 0 && __externalStopRequested === 0) return;
   if (!readState().operator.armedForExternalActions) {
     const err = new Error("External actions are locked. Arm external actions first.");
     err.statusCode = 409;

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-11T18:08:33.613Z",
+  "updatedAt": "2026-06-11T18:49:19.266Z",
   "testRun": {
     "status": "ready",
     "active": false,
@@ -120,7 +120,7 @@
     "autopilotConcurrentPosting": true,
     "autopilotRunId": "1781201078345",
     "machineParallelCap": 5,
-    "machineParallelCapComputedAt": "2026-06-11T16:12:21.516Z",
+    "machineParallelCapComputedAt": "2026-06-11T18:49:19.237Z",
     "machineParallelCapMeta": {
       "cores": 9,
       "totalGB": 32,
