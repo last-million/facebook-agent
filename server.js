@@ -9308,11 +9308,11 @@ function preparePostingPlan(options = {}) {
     const delay = 0; // NO minutes-between-posts pacing (operator) — plan rows carry no scheduled delay
     delayCursor += delay;
     const linkForPreview = shortlink || (state.affiliate?.enabled !== false ? "" : product.url);
-    // HARVESTED rows (operator): the comment carries TEXT + the link (not just the bare url). If the SOURCE
-    // first comment had its own lead-in text before the link, use that EXACT text; otherwise fall back to the
-    // product caption. Then append the exact captured shortlink (never re-shortened).
+    // HARVESTED rows (operator): the comment is the SOURCE first-comment's OWN lead text (the text that held
+    // the link in the source comment) + the link. It must NEVER duplicate the POST caption — so if the source
+    // comment was just a bare link with no lead text, the comment is JUST the link (no post-text repeat).
     const __harvUrl = harvestedRec ? String(harvestedRec.firstCommentUrl || "").trim() : "";
-    const __harvLead = harvestedRec ? (String(harvestedRec.firstCommentText || "").trim() || String(harvestedRec.text || "").trim()) : "";
+    const __harvLead = harvestedRec ? String(harvestedRec.firstCommentText || "").trim() : ""; // source comment lead ONLY — not the caption
     const commentText = harvestedRec
       ? (__harvLead ? `${__harvLead} ${__harvUrl}`.trim() : __harvUrl)
       : String(state.posting.commentTemplate || "{lead_in} {link}")
