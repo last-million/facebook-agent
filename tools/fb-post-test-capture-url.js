@@ -3108,15 +3108,40 @@ async function harvestExtractPhoto(page, ctx) {
     const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim(); // \s+ collapse keeps emojis intact
     const isUrl = (s) => /^https?:\/\//i.test(s.trim()) || /^www\./i.test(s.trim());
     const isChrome = (s) => /^(Like|Comment|Share|Reply|See more|See less|All reactions|Active|Write a comment|See translation|Most relevant|Top fan|Author|Follow|Send|Share to|Sponsored|·)\b/i.test(s) || /^\d+\s*(comment|share|reaction|like)/i.test(s);
+    // RICH TEXT: Facebook renders many emojis as <img alt="🔥"> (or <span aria-label="🔥">), and el.innerText
+    // DROPS those -> emojis vanish from the caption. Reconstruct the text including each emoji image's alt /
+    // aria-label so the caption keeps its emojis.
+    const richText = (el) => {
+      let out = '';
+      for (const node of (el.childNodes || [])) {
+        if (node.nodeType === 3) { out += node.textContent || ''; continue; }
+        if (node.nodeType !== 1) continue;
+        if (node.tagName === 'IMG') { out += (node.getAttribute('alt') || ''); continue; }
+        const al = node.getAttribute && node.getAttribute('aria-label');
+        if (al && al.length <= 8 && !String(node.textContent || '').trim()) { out += al; continue; } // emoji span (aria-label, no text)
+        out += richText(node);
+      }
+      return out;
+    };
     const cands = [];
     for (const el of Array.from(document.querySelectorAll('div[dir="auto"], span[dir="auto"]'))) {
-      const t = clean(el.innerText);
-      if (t.length >= 12 && t.length <= 6000 && !isUrl(t) && !isChrome(t)) cands.push(t);
+      const t = clean(richText(el));
+      if (t.length >= 12 && t.length <= 6000 && !isUrl(t) && !isChrome(t)) {
+        const art = el.closest('[role="article"]');
+        cands.push({ t, art: art ? String(art.getAttribute('aria-label') || 'article').slice(0, 36) : '' });
+      }
     }
-    cands.sort((a, b) => b.length - a.length);
+    cands.sort((a, b) => b.t.length - a.t.length);
     const ogTitle = clean((document.querySelector('meta[property="og:title"]') || {}).content);
     const ogDesc = clean((document.querySelector('meta[property="og:description"]') || {}).content);
-    let text = cands[0] || ogDesc || ogTitle || '';
+    // CAPTION = the seller's actual POST text. Pick the longest block that is (a) NOT inside a comment (FB wraps
+    // each comment in role="article" with an aria-label like "Comment by X" / "Comentario de X" -> c.art is set),
+    // (b) not a duplicated header/UI string (the group name + chrome repeat), and (c) not a metadata line
+    // (·, member/follower counts). This stops grabbing the first COMMENT (a product-name paste) or the group name
+    // instead of the real caption. Emojis ride along whenever the caption has them.
+    const counts = {}; for (const c of cands) counts[c.t] = (counts[c.t] || 0) + 1;
+    const isCaption = (c) => !c.art && counts[c.t] === 1 && !/·|\b(miembros|members|seguidores|followers|متابع|عضو)\b/i.test(c.t);
+    let text = (cands.find(isCaption) || {}).t || (cands.find((c) => !c.art) || {}).t || (cands[0] && cands[0].t) || ogDesc || ogTitle || '';
     let image = '', max = 0;
     for (const im of Array.from(document.querySelectorAll('img'))) {
       const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
