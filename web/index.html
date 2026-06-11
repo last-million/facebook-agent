@@ -633,11 +633,15 @@
               <label style="display:none">Required deal signal <input id="requireDealSignal"></label>
             </div>
             <div class="checks">
-              <label class="switch"><input id="pauseOnErrors" type="checkbox"><span>Pause on errors</span></label>
-              <label class="switch" data-ux-tier="advanced"><input id="pinFirstComment" type="checkbox"><span>Pin first comment</span></label>
-              <label class="switch" data-ux-tier="advanced"><input id="postBodyLinkAllowed" type="checkbox"><span>Allow link in post body</span></label>
-              <label class="switch" data-ux-tier="advanced"><input id="pauseOnInvalidProxy" type="checkbox"><span>Pause on invalid proxy</span></label>
-              <label class="switch" data-ux-tier="advanced"><input id="pauseOnLimitedAccount" type="checkbox"><span>Pause on limited account</span></label>
+              <!-- The ONLY real switch here: pinFirstComment flows into the connector (pins the link comment).
+                   pauseOnErrors / postBodyLinkAllowed / pauseOnInvalidProxy / pauseOnLimitedAccount are DEAD
+                   (defaults only, never read — account problems are handled by the auto-flagging panels).
+                   Dead ones hidden; kept in the DOM for binding round-trip. -->
+              <label class="switch"><input id="pinFirstComment" type="checkbox"><span>Pin first comment <small style="opacity:.65">(pin the link comment under each post)</small></span></label>
+              <label class="switch" style="display:none"><input id="pauseOnErrors" type="checkbox"><span>Pause on errors</span></label>
+              <label class="switch" style="display:none"><input id="postBodyLinkAllowed" type="checkbox"><span>Allow link in post body</span></label>
+              <label class="switch" style="display:none"><input id="pauseOnInvalidProxy" type="checkbox"><span>Pause on invalid proxy</span></label>
+              <label class="switch" style="display:none"><input id="pauseOnLimitedAccount" type="checkbox"><span>Pause on limited account</span></label>
             </div>
             <div id="machineParallelCapRow" style="margin-top:10px;padding:9px 12px;border:1px solid #2a3344;border-radius:10px;background:#141a24;font-size:.92em;">
               <b>&#9881;&#65039; Machine auto-parallel</b> &mdash; posting profiles at once: <b id="machineCapPosting">&ndash;</b> &middot; harvest profiles/group: <b id="machineCapHarvest">&ndash;</b> <span id="machineCapMeta" style="opacity:.7"></span><br>
