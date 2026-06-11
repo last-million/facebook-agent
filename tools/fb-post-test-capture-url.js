@@ -1218,33 +1218,32 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
   };
   if (applyRestriction(await facebookRestrictionSnapshot(page, { includeBody: false }))) return result;
   if (!(await ensureExpectedPostLoaded('initial_page'))) return result;
-  // Duplicate-comment guard: if a comment with this exact text already exists
-  // on the page (e.g. from a previous test run on this same post URL, or from
-  // an earlier submission of this run that we didn't initially verify), skip
-  // posting another one. The verify-after-submit step will mark it ok.
-  const existingDupCheck = await page.evaluate(({ commentText }) => {
+  // Duplicate-comment guard (IDEMPOTENT): if the post ALREADY has a comment containing the required LINK, skip
+  // posting another. We match the LINK needle (the unique, stable part) — NOT the full text, which mismatches
+  // when emojis render as <img> or whitespace differs (that exact-text miss is what produced the double
+  // comment: a profile whose comment FB accepted but we couldn't verify, then a retry adding a 2nd). The link
+  // lives only in COMMENTS (the post body has the caption with the link stripped), so this can't false-match.
+  const dupNeedles = requiredCommentNeedles(commentText);
+  const existingDupCheck = await page.evaluate((needles) => {
     try {
-      const target = String(commentText || '').trim();
-      if (!target) return { found: false };
-      const body = document.body.innerText || '';
-      if (!body.includes(target)) return { found: false };
-      // Also check via permalink extraction: any element whose innerText
-      // contains the FULL target text (not just a fragment).
-      const matches = [...document.querySelectorAll('div, span')].filter((el) => {
-        const t = (el.innerText || '').trim();
-        return t.length >= target.length && t.length <= target.length + 1500 && t.includes(target);
-      }).length;
-      return { found: matches > 0, matchCount: matches };
+      if (!needles || !needles.length) return { found: false };
+      const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+      const editors = [...document.querySelectorAll('textarea, input, [contenteditable="true"], [role="textbox"]')].filter(visible);
+      const texts = [...document.querySelectorAll('[role="article"], div, span, a')].filter(visible)
+        .filter((el) => !editors.some((ed) => el === ed || el.contains(ed))) // ignore the comment box itself
+        .map((el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' '));
+      for (const t of texts) { const n = needles.find((v) => t.includes(v)); if (n) return { found: true, needle: n }; }
+      return { found: false };
     } catch (e) { return { found: false, error: e?.message || String(e) }; }
-  }, { commentText }).catch(() => ({ found: false }));
+  }, dupNeedles).catch(() => ({ found: false }));
   if (existingDupCheck.found) {
     result.clicked = false;
     result.typed = false;
     result.submitted = true;
     result.verified = true;
     result.skipped = true;
-    result.skipReason = 'comment_already_exists_on_post_no_duplicate_needed';
-    result.verifiedNeedle = commentText;
+    result.skipReason = 'comment_link_already_exists_on_post_no_duplicate_needed';
+    result.verifiedNeedle = existingDupCheck.needle || commentText;
     result.duplicateCheck = existingDupCheck;
     return result;
   }
