@@ -426,9 +426,11 @@ function defaultState() {
       pauseOnErrors: true,
       pauseOnInvalidProxy: true,
       pauseOnLimitedAccount: true,
+      commentCooldownMinutes: 5, // ANTI-BURN: minimum minutes between two comments by the SAME profile (operator-visible, Step 1)
     },
     posting: {
       groups: "",
+      commentLimitedProfiles: [], // profiles comment-limited by FB: blocked from COMMENTING, still allowed to POST (admin releases manually)
       groupAssignmentMode: "percentage_manual_review",
       groupProfileAssignments: "",
       groupAssignmentData: [],
@@ -1427,6 +1429,7 @@ function normalizedProfileListLines(...sources) {
 
 function normalizeWorkflowState(state) {
   state.testRun = sanitizeTestRunState(state.testRun);
+  state.rules.commentCooldownMinutes = clampNumber(state.rules.commentCooldownMinutes, 1, 1440, 5); // anti-burn: min minutes between comments by the SAME profile
   state.rules.minutesBetweenPosts = clampNumber(state.rules.minutesBetweenPosts, 1, 1440, 12);
   state.rules.randomMinutesBetweenPosts = Boolean(state.rules.randomMinutesBetweenPosts);
   state.rules.minMinutesBetweenPosts = clampNumber(state.rules.minMinutesBetweenPosts, 1, 1440, 5);
@@ -1545,6 +1548,13 @@ function normalizeWorkflowState(state) {
   // (even with the same name -> new ix id) starts fresh. Otherwise stays blocked until manually released.
   if (!Array.isArray(state.posting.suspendedProfiles)) state.posting.suspendedProfiles = [];
   state.posting.suspendedProfiles = state.posting.suspendedProfiles
+    .filter((p) => p && (p.profileId || p.profile_id))
+    .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200) }))
+    .slice(0, 1000);
+  // COMMENT-LIMITED profiles (FB limited the account's COMMENTING) — blocked from commenting only; still
+  // fully eligible for POSTING. Admin releases manually from the Prod-tab section. NOT in any posting skip-set.
+  if (!Array.isArray(state.posting.commentLimitedProfiles)) state.posting.commentLimitedProfiles = [];
+  state.posting.commentLimitedProfiles = state.posting.commentLimitedProfiles
     .filter((p) => p && (p.profileId || p.profile_id))
     .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200) }))
     .slice(0, 1000);
@@ -2142,15 +2152,34 @@ function markProfileErrored(profileId, label, reason) {
   logEvent("profile_account_error_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
   return true;
 }
-// release a profile from ANY parked list (login-disconnected, account-error, OR suspended).
+// COMMENT-LIMITED -> POST-ONLY (operator): FB limited the account's commenting. Block it from COMMENTING
+// only; it stays fully eligible for POSTING (deliberately NOT in any posting skip-set). Admin releases it
+// manually from the Prod-tab "Comment-limited" section (the shared release below clears it too).
+function commentLimitedProfileIdSet(state = readState()) {
+  return new Set((state.posting?.commentLimitedProfiles || []).map((p) => String(p.profileId || "")));
+}
+function markProfileCommentLimited(profileId, label, reason) {
+  const id = String(profileId || "").replace(/\D+/g, "");
+  if (!id) return false;
+  const state = readState();
+  const list = Array.isArray(state.posting.commentLimitedProfiles) ? state.posting.commentLimitedProfiles : [];
+  if (list.some((p) => String(p.profileId) === id)) return false; // already parked
+  list.push({ profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "Facebook comment-limited (cannot_comment); kept post-only").slice(0, 200) });
+  state.posting.commentLimitedProfiles = list;
+  writeState(state);
+  logEvent("profile_comment_limited_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
+  return true;
+}
+// release a profile from ANY parked list (login-disconnected, account-error, suspended, OR comment-limited).
 function releaseParkedProfile(profileId) {
   const id = String(profileId || "").replace(/\D+/g, "");
   const state = readState();
-  const before = (state.posting.disconnectedProfiles || []).length + (state.posting.erroredProfiles || []).length + (state.posting.suspendedProfiles || []).length;
+  const before = (state.posting.disconnectedProfiles || []).length + (state.posting.erroredProfiles || []).length + (state.posting.suspendedProfiles || []).length + (state.posting.commentLimitedProfiles || []).length;
   state.posting.disconnectedProfiles = (state.posting.disconnectedProfiles || []).filter((p) => String(p.profileId) !== id);
   state.posting.erroredProfiles = (state.posting.erroredProfiles || []).filter((p) => String(p.profileId) !== id);
   state.posting.suspendedProfiles = (state.posting.suspendedProfiles || []).filter((p) => String(p.profileId) !== id);
-  const after = state.posting.disconnectedProfiles.length + state.posting.erroredProfiles.length + state.posting.suspendedProfiles.length;
+  state.posting.commentLimitedProfiles = (state.posting.commentLimitedProfiles || []).filter((p) => String(p.profileId) !== id);
+  const after = state.posting.disconnectedProfiles.length + state.posting.erroredProfiles.length + state.posting.suspendedProfiles.length + state.posting.commentLimitedProfiles.length;
   if (after !== before) { writeState(state); logEvent("profile_released_reconnected", { profileId: id }); return true; }
   return false;
 }
@@ -12703,10 +12732,27 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
   const profileList = (profiles || []).filter(Boolean);
   const totalProfiles = profileList.length;
   let noAccessCount = 0;
-  const maxNoAccess = clampNumber(readState().operator?.maxCommentNoAccessAttempts, 1, 20, 3);
+  const __cState = readState();
+  const maxNoAccess = clampNumber(__cState.operator?.maxCommentNoAccessAttempts, 1, 20, 3);
+  // ANTI-BURN (operator): per-profile comment cooldown + comment-limited(post-only) skip. Built fresh per
+  // call (post-lock) so concurrent comment workers always see the latest log — never double-consume a window.
+  const __cooldownMs = clampNumber(__cState.rules?.commentCooldownMinutes, 1, 1440, 5) * 60 * 1000;
+  const __lastCommentByPid = profileLastCommentTimeByProfileId(__cState);
+  const __commentLimitedIds = commentLimitedProfileIdSet(__cState);
   for (const profile of profileList) {
     const profileId = Number(profile?.profileId || profile?.profile_id || profile);
     if (!profileId) continue;
+    if (__commentLimitedIds.has(String(profileId))) {
+      attempts.push({ profileId, profile: profile?.profile || profile?.label || profileId, ok: false, skipped: "comment_limited_post_only" });
+      continue; // blocked from commenting (still posts); next candidate
+    }
+    const __lastMs = __lastCommentByPid.get(profileId) || 0;
+    const __remainMs = __lastMs ? (__cooldownMs - (Date.now() - __lastMs)) : 0;
+    if (__remainMs > 0) {
+      try { logEvent("comment_profile_skipped_cooldown", { profileId, remainSec: Math.ceil(__remainMs / 1000) }); } catch (_) {}
+      attempts.push({ profileId, profile: profile?.profile || profile?.label || profileId, ok: false, skipped: "cooldown", cooldownRemainingMs: __remainMs });
+      continue; // cooling down; yield to a fresher profile
+    }
     const attemptNumber = attempts.length + 1;
     const profileLabel = profile?.profile || profile?.profileLabel || profile?.label || profileId;
     persistTestRunStepProgress({
@@ -12782,6 +12828,14 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
         state: readState(),
         registers: readRegisters(),
       };
+    }
+    // AUTO COMMENT-LIMITED -> POST-ONLY (operator): a GENUINE FB comment block (cannot_comment /
+    // action_blocked — non-transient) parks this profile in commentLimitedProfiles: blocked from
+    // commenting, still posts. Admin releases it from the Prod-tab section.
+    const __blockStr = `${Array.isArray(attempt.validation?.errors) ? attempt.validation.errors.join(" ") : ""} ${String(attempt.validation?.commentBlockReason || "")} ${attempt.message || ""}`.toLowerCase();
+    if (/cannot_comment|action_blocked|comment[ _-]?(blocked|restricted|limit(ed)?)|blocked from commenting|temporarily (blocked|restricted).*comment/i.test(__blockStr)
+      && !isTransientCommentProfileFailure(attempt.validation || {})) {
+      markProfileCommentLimited(attempt.profileId || profileId, attempt.profile || profileLabel, `FB comment block during live comment: ${__blockStr.slice(0, 140)}`);
     }
     // NO-ACCESS CAP: if this profile failed because it can't reach the group, count it; after
     // `maxNoAccess` such dead-ends stop cycling (give up fast -> post kept, comment skipped)
@@ -12950,6 +13004,23 @@ function commentUsageCountByProfile(state = readState(), windowMs = PROFILE_USAG
     if (idM) { const pid = Number(idM[1]); counts.set(pid, (counts.get(pid) || 0) + 1); }
   }
   return counts;
+}
+// PER-PROFILE COMMENT COOLDOWN (operator anti-burn): the LAST comment timestamp per profile, derived from
+// the same durable dailyActionLog lines as commentUsageCountByProfile — survives restarts, no extra state.
+// A profile may not comment again within rules.commentCooldownMinutes (default 5) of its last comment.
+function profileLastCommentTimeByProfileId(state = readState()) {
+  const map = new Map();
+  for (const line of recordLines(state.tracking?.dailyActionLog)) {
+    if (!/type=facebook_first_comment_profile_used/i.test(line)) continue;
+    const tsM = line.match(/(\d{4}-\d{2}-\d{2}T[0-9:.]+Z)/);
+    const at = tsM ? Date.parse(tsM[1]) : NaN;
+    if (!Number.isFinite(at)) continue;
+    const idM = line.match(/profile_id=(\d{1,20})/i);
+    if (!idM) continue;
+    const pid = Number(idM[1]);
+    if (at > (map.get(pid) || 0)) map.set(pid, at);
+  }
+  return map;
 }
 const RECENT_FAILURE_WINDOW_MS = 60 * 60 * 1000;
 // Profiles that FAILED to post/open within the last hour — these are DEPRIORITIZED in fairness so a
@@ -13652,6 +13723,30 @@ async function completeVerifiedFacebookPostWithComment({
   };
 }
 
+// POST-PACING horizon: a commenter whose cooldown clears within this window still counts as "free" (the
+// comment lands shortly after the post, within the operator's ~2-min no-bare-post target).
+const POST_PACING_GRACE_MS = 120000;
+// Is there at least one commenter that can comment this post now (or within the grace window)? Uses the SAME
+// candidate pool as the real comment step, minus comment-limited and cooled-down profiles. Returns the count
+// and the soonest free time so a hold can be logged informatively.
+function anyCommenterFreeForPost(row, groupUrl, excludeProfileId, state = readState()) {
+  let candidates = [];
+  try { candidates = commentRecoveryFallbackProfilesForGroup(row, groupUrl, state, { excludeProfileId }) || []; } catch (_) { candidates = []; }
+  if (!candidates.length) return { free: true, candidates: 0, soonestFreeSec: 0 }; // no known pool -> don't block (the live step's broader probe still tries)
+  const cooldownMs = clampNumber(state.rules?.commentCooldownMinutes, 1, 1440, 5) * 60 * 1000;
+  const lastByPid = profileLastCommentTimeByProfileId(state);
+  const limited = commentLimitedProfileIdSet(state);
+  let soonest = Infinity;
+  for (const c of candidates) {
+    const pid = Number(c.profileId || 0);
+    if (!pid || limited.has(String(pid))) continue;
+    const lastMs = lastByPid.get(pid) || 0;
+    const remainMs = lastMs ? (cooldownMs - (Date.now() - lastMs)) : 0;
+    if (remainMs <= POST_PACING_GRACE_MS) return { free: true, candidates: candidates.length, soonestFreeSec: Math.max(0, Math.ceil(remainMs / 1000)) };
+    if (remainMs < soonest) soonest = remainMs;
+  }
+  return { free: false, candidates: candidates.length, soonestFreeSec: Number.isFinite(soonest) ? Math.ceil(soonest / 1000) : Infinity };
+}
 async function runLiveFacebookPostFromPlan(body = {}) {
   requireExternalArmed();
   const state = readState();
@@ -13688,6 +13783,18 @@ async function runLiveFacebookPostFromPlan(body = {}) {
   }
   const ledgerKey = livePostLedgerKey(row, ready.profileId);
   const priorPublished = latestPublishedFacebookLivePostForRow(row, ready.profileId);
+  // POST-PACING GATE (operator): never publish a NEW post that can't get its first comment within ~2 min —
+  // if every commenter candidate is comment-limited or still on the per-profile cooldown (beyond the grace
+  // horizon), HOLD this post for the tick (no publish, product NOT retired, counter NOT bumped). It re-runs
+  // next tick and publishes the moment a commenter frees up. Autopilot-only; skipped when a post already
+  // exists (priorPublished just needs its comment) so it never blocks comment-recovery.
+  if (body.autopilot && !priorPublished?.postUrl) {
+    const __gate = anyCommenterFreeForPost(row, ready.groupUrl, ready.profileId, state);
+    if (!__gate.free) {
+      try { logEvent("post_held_no_free_commenter", { planId: row.planId, groupUrl: ready.groupUrl, candidates: __gate.candidates, soonestFreeSec: __gate.soonestFreeSec }); } catch (_) {}
+      return { ok: false, posted: false, held: true, planId: row.planId, sequence: row.sequence, groupUrl: ready.groupUrl, message: `Held (post-pacing): no commenter profile free within ${POST_PACING_GRACE_MS / 60000}m — will retry next tick.${Number.isFinite(__gate.soonestFreeSec) ? ` Soonest free in ~${__gate.soonestFreeSec}s.` : ""}` };
+    }
+  }
   if (priorPublished?.postUrl) {
     const actualGroupUrl = priorPublished.actualGroupUrl || facebookGroupUrlFromPostUrl(priorPublished.postUrl) || priorPublished.groupUrl || ready.groupUrl;
     const commentText = String(row.commentTextPreview || row.link || "").trim();
@@ -15180,6 +15287,12 @@ function autoBlacklistProfileIfNeeded(opts = {}) {
     if (ok) { __profileBlockStreak[pid] = 0; return; }
     const errorText = String(opts.errorText || opts.error || "");
     const hard = isHardAccountBlockOutcome(errorText, opts.validation);
+    // INFRA, NOT ACCOUNT HEALTH: a pure ixBrowser PROFILE-OPEN / connection failure (1004 "Profile Open
+    // Failed", could-not-open, cdp/connect, window closed, server busy) is ixBrowser's fault — NEVER bench the
+    // profile for it. This is what wrongly auto-blacklisted good (member) profiles during the ixBrowser wedge.
+    // Retry handles it; the blacklist streak ignores it entirely.
+    const isOpenInfraFailure = !hard && /\b1004\b|profile[ _-]?open[ _-]?failed|could not open (?:the )?profile|配置文件打开失败|connectovercdp|connect over cdp|cdp (?:timeout|timed out|refused|closed|error)|websocket|target (?:page )?closed|browser has been closed|connection (?:closed|refused)|server busy|ECONNREFUSED|ECONNRESET|socket hang/i.test(errorText);
+    if (isOpenInfraFailure) { try { logEvent("profile_open_infra_not_benched", { profileId: pid, error: oneLineField(errorText, 140) }); } catch (_) {} return; }
     // opts.profileRetryable is the connector's structured "profile open/login failed" signal —
     // robust even when the wrapper message hides/truncates the original reason. Treat it as soft.
     const soft = isTransientBlockingPostFailure(errorText) || opts.profileRetryable === true;
@@ -17612,6 +17725,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/profiles/suspended") {
     return json(res, 200, { suspended: (readState().posting?.suspendedProfiles || []) });
   }
+  if (req.method === "GET" && url.pathname === "/api/profiles/comment-limited") {
+    return json(res, 200, { commentLimited: (readState().posting?.commentLimitedProfiles || []) }); // post-only profiles; Release via /api/profiles/release
+  }
   if (req.method === "POST" && url.pathname === "/api/profiles/suspend") {
     const id = url.searchParams.get("profileId") || "";
     const ok = markProfileSuspended(id, url.searchParams.get("label") || "", "manually marked suspended by admin");
@@ -17628,9 +17744,9 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/release") {
     const id = url.searchParams.get("profileId") || "";
-    const ok = releaseParkedProfile(id); // clears ANY parked list (disconnected / account error / suspended)
+    const ok = releaseParkedProfile(id); // clears ANY parked list (disconnected / account error / suspended / comment-limited)
     const stx = readState();
-    return json(res, 200, { ok, profileId: id, disconnected: (stx.posting?.disconnectedProfiles || []), errored: (stx.posting?.erroredProfiles || []), suspended: (stx.posting?.suspendedProfiles || []) });
+    return json(res, 200, { ok, profileId: id, disconnected: (stx.posting?.disconnectedProfiles || []), errored: (stx.posting?.erroredProfiles || []), suspended: (stx.posting?.suspendedProfiles || []), commentLimited: (stx.posting?.commentLimitedProfiles || []) });
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/disconnect") {
     const id = url.searchParams.get("profileId") || "";

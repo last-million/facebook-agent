@@ -1553,6 +1553,7 @@ function renderState(state) {
   setValue("commentsBeforeAccountMove", state.rules.commentsBeforeAccountMove);
   setValue("maxCommentsBeforeAccountSave", state.rules.maxCommentsBeforeAccountSave);
   setValue("postsPerProfilePerDay", state.rules.postsPerProfilePerDay);
+  setValue("commentCooldownMinutes", state.rules.commentCooldownMinutes);
   // Read-only machine auto-parallel cap (Step 1): show "N of CAP max" for posting + harvest, plus the box specs.
   {
     const __mc = Number(state.operator?.machineParallelCap);
@@ -2325,6 +2326,7 @@ function collectState() {
   // their empty/default values would overwrite the saved config. writeState merges over existing, so any
   // field we omit keeps its on-disk value. Peak window is managed by the Run-mode controls.
   state.rules = {
+    commentCooldownMinutes: Number(getValue("commentCooldownMinutes") || 5),
     postsPerProfilePerDay: Number(getValue("postsPerProfilePerDay") || 0),
     peakHoursTimezone: getValue("peakHoursTimezone"),
     peakStartTime: getValue("peakStartTime"),
@@ -5598,6 +5600,23 @@ function uxSetAllPanels(collapsed) {
 }
 
 function uxAttachConfirmGuards() {
+  // Comment-cooldown input: CHANGE-based 'not advised' confirm that REVERTS on cancel (not the generic
+  // click-guard, which would nag on every focus). Marked guarded so the generic loop below skips it.
+  const cd = $("commentCooldownMinutes");
+  if (cd && cd.dataset.confirmGuardAttached !== "1") {
+    cd.dataset.confirmGuardAttached = "1";
+    let prior = cd.value;
+    cd.addEventListener("focus", () => { prior = cd.value; });
+    cd.addEventListener("change", () => {
+      if (String(cd.value) === String(prior)) return;
+      if (!window.confirm(cd.dataset.confirm || "Changing this is not advised. Continue?")) {
+        cd.value = prior;
+        cd.dispatchEvent(new Event("input", { bubbles: true })); // keep auto-save on the reverted value
+        return;
+      }
+      prior = cd.value;
+    });
+  }
   document.querySelectorAll("[data-confirm]").forEach((el) => {
     if (el.dataset.confirmGuardAttached === "1") return;
     el.dataset.confirmGuardAttached = "1";
@@ -5838,6 +5857,31 @@ function uxAttachSuspendedProfiles() {
   load();
 }
 
+// COMMENT-LIMITED (post-only) profiles: blocked from commenting, still posting. Release re-enables commenting.
+function uxAttachCommentLimitedPostOnlyProfiles() {
+  const list = $("commentLimitedPostOnlyList");
+  if (!list) return;
+  async function load() {
+    try {
+      const data = await api("/api/profiles/comment-limited");
+      const rows = (data && data.commentLimited) || [];
+      const c = $("commentLimitedCount"); if (c) c.textContent = String(rows.length);
+      if (!rows.length) { list.innerHTML = '<div style="opacity:.6">No comment-limited profiles — all can comment. ✓</div>'; return; }
+      list.innerHTML = "";
+      for (const r of rows) {
+        const row = document.createElement("div"); row.className = "discRow";
+        const info = document.createElement("div"); info.className = "di-info";
+        info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "comment-limited (still posting)") + (r.at ? ' · ' + r.at : '') + '</div>';
+        const btn = document.createElement("button"); btn.type = "button"; btn.textContent = "Release";
+        btn.addEventListener("click", async () => { btn.disabled = true; try { await api("/api/profiles/release?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
+        row.appendChild(info); row.appendChild(btn); list.appendChild(row);
+      }
+    } catch (e) { list.innerHTML = '<div style="opacity:.6">Could not load comment-limited profiles.</div>'; }
+  }
+  $("refreshCommentLimitedBtn")?.addEventListener("click", () => load());
+  load();
+}
+
 // ── INTERRUPTED-RUN BANNER (Prod tab) ──────────────────────────────────────
 // Shown when the server recorded operator.lastIncompleteRun at boot (a restart cut a live
 // run short). Continue = arm for the remaining posts; Relaunch = arm for the full count
@@ -5892,6 +5936,7 @@ function uxAttachIncompleteRunBanner() {
     try { uxAttachDisconnectedProfiles(); } catch (err) { console.warn("uxAttachDisconnectedProfiles failed", err); }
     try { uxAttachErroredProfiles(); } catch (err) { console.warn("uxAttachErroredProfiles failed", err); }
     try { uxAttachSuspendedProfiles(); } catch (err) { console.warn("uxAttachSuspendedProfiles failed", err); }
+    try { uxAttachCommentLimitedPostOnlyProfiles(); } catch (err) { console.warn("uxAttachCommentLimitedPostOnlyProfiles failed", err); }
     try { uxAttachIncompleteRunBanner(); } catch (err) { console.warn("uxAttachIncompleteRunBanner failed", err); }
   };
   if (document.readyState === "loading") {

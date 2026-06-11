@@ -607,6 +607,10 @@
               </div>
             </div>
             <div class="formGrid">
+              <label class="hasTooltip" data-tooltip="Minimum minutes between two comments by the SAME profile. 5 is the anti-burn default.">&#128172; Minutes between comments (per profile)
+                <input id="commentCooldownMinutes" type="number" min="1" max="1440" step="1" placeholder="5"
+                  data-confirm="Changing the per-profile comment cooldown is NOT advised. 5 minutes is the anti-burn default that stops Facebook flagging the same profile for rapid repeat comments. Lower values raise the risk of comment-limiting / account review. Continue anyway?">
+              </label>
               <!-- Peak window = the Run-mode time window above (run-mode writes rules.peakStartTime/StopTime
                    itself). Hidden to avoid showing the same setting twice; kept in the DOM for binding round-trip. -->
               <label style="display:none">Peak timezone <input id="peakHoursTimezone"></label>
@@ -1037,6 +1041,18 @@
               <button id="refreshSuspendedBtn" type="button">Refresh</button>
             </div>
             <div id="suspendedProfilesList"><div style="opacity:.6">No suspended accounts. ✓</div></div>
+          </section>
+
+          <section class="panel wide prodStep" data-view="prod" data-prod-step="2h">
+            <div class="panelHead">
+              <div>
+                <span class="stepBadge">Profiles</span>
+                <h2>Comment-limited (post-only) <span class="badge" data-tone="muted" id="commentLimitedCount">0</span></h2>
+                <p>Accounts Facebook <b>limited from commenting</b> are blocked from <b>commenting</b> but <b>still used for posting</b> (so a healthy account keeps working). They're skipped only when picking a profile to add the first comment. Click <b>Release</b> to let an account comment again once it's recovered.</p>
+              </div>
+              <button id="refreshCommentLimitedBtn" type="button">Refresh</button>
+            </div>
+            <div id="commentLimitedPostOnlyList"><div style="opacity:.6">No comment-limited profiles — all can comment. ✓</div></div>
           </section>
 
           <!-- Step 3 moved up to sit directly under Step 1 & 2 (after Step 2 · Source). -->

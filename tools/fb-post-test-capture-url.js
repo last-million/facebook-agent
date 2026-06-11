@@ -70,6 +70,32 @@ async function ixPost(path, body, timeoutMs = 70000) {
   return parsed;
 }
 
+// Open an ixBrowser profile WITH 1004-recovery. Error 1004 ("Profile Open Failed") means the profile window
+// is locked/orphaned (the wedge that failed every post). Force-close it to clear the lock, wait, then retry
+// ONCE — so a wedged profile self-heals instead of failing the post + getting (wrongly) benched.
+async function openIxProfile(payload, targetUrl) {
+  const body = {
+    profile_id: Number(payload.profileId),
+    args: ['--disable-popup-blocking', targetUrl],
+    load_extensions: true,
+    cookies_backup: false,
+    load_profile_info_page: false,
+  };
+  const timeout = Number(payload.profileOpenTimeoutMs || 70000);
+  try {
+    return await ixPost('profile-open', body, timeout);
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    if (/error 1004|profile open failed|配置文件打开失败/i.test(msg)) {
+      console.log(JSON.stringify({ step: 'ix_open_1004_recovering', profileId: payload.profileId }));
+      try { await ixPost('profile-close', { profile_id: Number(payload.profileId) }, 20000); } catch (_) {}
+      await new Promise((r) => setTimeout(r, 2500)); // let ixBrowser release the window
+      return await ixPost('profile-open', body, timeout); // retry once; a 2nd failure propagates to the caller
+    }
+    throw e;
+  }
+}
+
 async function clickFirst(page, candidates, opts = {}) {
   for (const c of candidates) {
     try {
@@ -3510,13 +3536,7 @@ async function main() {
     console.log(JSON.stringify({ step: 'ix_reuse', endpoint }));
     logTiming('after_ix_reuse_connect_skipped');
   } else {
-    const open = await ixPost('profile-open', {
-      profile_id: Number(payload.profileId),
-      args: ['--disable-popup-blocking', targetUrl],
-      load_extensions: true,
-      cookies_backup: false,
-      load_profile_info_page: false,
-    }, Number(payload.profileOpenTimeoutMs || 70000));
+    const open = await openIxProfile(payload, targetUrl);
     endpoint = open.data.ws || ('http://' + open.data.debugging_address);
     console.log(JSON.stringify({ step: 'ix_open', endpoint }));
     logTiming('after_ix_profile_open');
@@ -3531,13 +3551,7 @@ async function main() {
     // Reuse endpoint died between the server's liveness check and this connect -> fall back to a FRESH
     // open so the (cross-)comment still completes. This is the load-bearing reuse safety net.
     console.log(JSON.stringify({ step: 'ix_reuse_connect_failed', endpoint, error: String((connErr && connErr.message) || connErr).slice(0, 200), fallback: 'fresh_open' }));
-    const freshOpen = await ixPost('profile-open', {
-      profile_id: Number(payload.profileId),
-      args: ['--disable-popup-blocking', targetUrl],
-      load_extensions: true,
-      cookies_backup: false,
-      load_profile_info_page: false,
-    }, Number(payload.profileOpenTimeoutMs || 70000));
+    const freshOpen = await openIxProfile(payload, targetUrl);
     endpoint = freshOpen.data.ws || ('http://' + freshOpen.data.debugging_address);
     console.log(JSON.stringify({ step: 'ix_open_fallback', endpoint }));
     browser = await chromium.connectOverCDP(endpoint, { timeout: 30000 });
