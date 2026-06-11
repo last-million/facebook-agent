@@ -612,8 +612,11 @@
               <label style="display:none">Peak timezone <input id="peakHoursTimezone"></label>
               <label style="display:none">Peak start <input id="peakStartTime" type="time"></label>
               <label style="display:none">Peak stop <input id="peakStopTime" type="time"></label>
-              <label>Posts per profile/day <input id="postsPerProfilePerDay" type="number" min="1" max="100"></label>
-              <label>Move account after comments <input id="commentsBeforeAccountMove" type="number" min="1" max="100"></label>
+              <!-- NO per-profile daily limit (operator): suspension auto-flagging is the safety net; admin
+                   releases/removes parked accounts. postsPerProfilePerDay stays hidden as a buffer-sizing hint;
+                   commentsBeforeAccountMove is dead legacy. Both kept in DOM for binding round-trip. -->
+              <label style="display:none">Posts per profile/day <input id="postsPerProfilePerDay" type="number" min="1" max="100"></label>
+              <label style="display:none">Move account after comments <input id="commentsBeforeAccountMove" type="number" min="1" max="100"></label>
               <label>Link placement <input id="linkPlacement"></label>
               <label data-ux-tier="advanced" class="switch line"><input id="randomMinutesBetweenPosts" type="checkbox"><span>Randomize minutes between posts</span></label>
               <label data-ux-tier="advanced">Fallback fixed minutes <input id="minutesBetweenPosts" type="number" min="1" max="1440"></label>

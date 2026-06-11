@@ -8460,13 +8460,12 @@ function autopilotPostHistoryByProfile() {
 }
 
 function autopilotCapacityByProfile(state = readState()) {
-  // A count-mode run (operator.autopilotMaxPostsPerRun > 0) is bounded ONLY by the requested count:
-  // the per-profile DAILY cap is intentionally lifted so the run always reaches the number asked for
-  // (operator opted out of the 75/day-style throttle and has plenty of profiles). Continuous/time
-  // runs keep the daily cap (now raisable up to 1000/profile) as their safety throttle.
+  // NO PER-PROFILE DAILY CAP (operator, 2026-06-10): profiles post without a daily limit. The safety net
+  // is the suspension/disconnection auto-flagging — a bad account gets parked and the admin decides
+  // (release or remove). rules.postsPerProfilePerDay is now ONLY a capacity-planning hint for buffer
+  // sizing (reserve/discovery targets), never an enforcement gate.
   const runLimit = clampNumber(state.operator?.autopilotMaxPostsPerRun, 0, 1000000, 0);
-  const dailyCap = clampNumber(state.rules?.postsPerProfilePerDay, 1, 1000, 5);
-  const perProfile = runLimit > 0 ? Math.max(runLimit, dailyCap) : dailyCap;
+  const perProfile = Math.max(runLimit, 1000000); // effectively unlimited per profile per day
   const published = autopilotPublishedTodayByProfile(state);
   const profiles = new Map();
   for (const slot of filterExcludedProfileSlots(postingSlots(state), {})) {
