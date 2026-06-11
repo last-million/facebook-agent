@@ -5300,7 +5300,56 @@ function updateContentSourceBranch() {
   }
   // reflect the prominent method switch (Manual scraping <-> Easy copy from group)
   document.querySelectorAll(".methodOpt").forEach((b) => b.classList.toggle("active", (b.dataset.method === "copy") === copy));
+  if (!copy) { try { renderManualScrapeStatus(); } catch (_) {} } // refresh connection badges when manual scraping is shown
 }
+
+// MANUAL-SCRAPING setup panel: connection badges for everything research/images/links need, with a
+// "Set up ->" jump to the exact field in the right tab. Connected = key saved / profile set (honest labels).
+function renderManualScrapeStatus() {
+  const grid = $("scrapeCredStatus");
+  if (!grid) return;
+  const ws = (typeof workflowState !== "undefined" && workflowState) || {};
+  const sec = (typeof loadedSecrets !== "undefined" && loadedSecrets) || {};
+  const af = ws.affiliate || {}, sl = ws.shortlink || {}, pa = ws.productAssets || {};
+  const rows = [
+    { name: "IXBrowser API", ok: !!(sec.ixbrowser && sec.ixbrowser.baseUrl), tab: "credentials", focus: "ixbrowserBaseUrl", ok2: "configured", bad: "set local API URL" },
+    { name: "Firecrawl (research/images)", ok: !!(sec.firecrawl && sec.firecrawl.hasApiKey), tab: "credentials", focus: "firecrawlApiKey", ok2: "key saved", bad: "add API key" },
+    { name: "ChatGPT HD images", ok: pa.enabled === true, tab: "content", focus: "chatgptHdEnabled", ok2: "on", bad: "enable + log in via the button" },
+    { name: "ShopYourLikes profile", ok: !!(String(af.dedicatedIxProfileId || "").trim() || String(af.dedicatedIxProfileName || "").trim()), tab: "affiliate", focus: "affiliateEnabled", ok2: "profile set", bad: "set SYL profile" },
+    { name: "Mavlynk shortlinks", ok: sl.enabled === true && !!(sec.shortlink && sec.shortlink.hasApiKey), tab: "affiliate", focus: "shortlinkEnabled", ok2: "ready", bad: "enable + add key" },
+    { name: "Webshare proxy", ok: !!(sec.webshare && sec.webshare.hasApiKey), tab: "credentials", focus: "webshareApiKey", ok2: "key saved", bad: "add API key (optional)" },
+  ];
+  grid.innerHTML = rows.map((r) => `
+    <div class="msCred ${r.ok ? "ok" : "bad"}">
+      <span class="msDot"></span>
+      <span class="msName">${escapeHtml(r.name)}</span>
+      <span class="msState">${escapeHtml(r.ok ? r.ok2 : r.bad)}</span>
+      ${r.ok ? "" : `<a class="msFix" href="#" data-ms-tab="${r.tab}" data-ms-focus="${r.focus}">Set up &rarr;</a>`}
+    </div>`).join("");
+}
+// "Set up ->" jumps to the right tab and focuses the exact field (delegated, bound once).
+$("scrapeCredStatus")?.addEventListener("click", (e) => {
+  const a = e.target.closest("a.msFix"); if (!a) return; e.preventDefault();
+  const nav = document.querySelector(`[data-view-target="${a.dataset.msTab}"]`); if (nav) nav.click();
+  setTimeout(() => { const el = $(a.dataset.msFocus); if (el) { try { el.scrollIntoView({ behavior: "smooth", block: "center" }); } catch (_) {} try { el.focus(); } catch (_) {} const lab = el.closest("label"); if (lab) { lab.classList.add("flash"); setTimeout(() => lab.classList.remove("flash"), 1400); } } }, 280);
+});
+// Action buttons.
+$("scrapeOpenGptBtn")?.addEventListener("click", async () => {
+  const out = $("scrapeSetupResult"); if (out) out.textContent = "Opening ChatGPT browser…";
+  try { if (typeof openDedicatedChatGptBrowser === "function") { await openDedicatedChatGptBrowser(); if (out) out.textContent = "ChatGPT browser opened — log in / verify, then close it when done."; } }
+  catch (e) { if (out) out.textContent = "Could not open ChatGPT browser: " + ((e && e.message) || e); }
+});
+$("scrapeTestResearchBtn")?.addEventListener("click", async () => {
+  const out = $("scrapeSetupResult"); if (out) out.textContent = "Running a product-research test…";
+  try { if (typeof runWorkflowAction === "function") { await runWorkflowAction("/api/products/discover", "Product research test finished — see Saved Products / workflow output."); if (out) out.textContent = "Product research test finished. Check Saved Products for results."; } }
+  catch (e) { if (out) out.textContent = "Research test failed: " + ((e && e.message) || e); }
+});
+$("scrapeRefreshCredsBtn")?.addEventListener("click", async () => {
+  const out = $("scrapeSetupResult"); if (out) out.textContent = "Re-checking connections…";
+  try { const r = await api("/api/secrets"); if (r && r.secrets) loadedSecrets = r.secrets; } catch (_) {}
+  renderManualScrapeStatus();
+  if (out) out.textContent = "Connection status refreshed.";
+});
 $("contentSourcesEnabled")?.addEventListener("change", updateContentSourceBranch);
 // PROMINENT METHOD SWITCH: the two big buttons drive the contentSourcesEnabled state (copy vs scrape).
 document.querySelectorAll(".methodOpt").forEach((btn) => btn.addEventListener("click", () => {

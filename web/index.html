@@ -841,6 +841,17 @@
 
               <!-- TRADITIONAL WEB-SCRAPING branch — everything for manual scraping lives here, in THIS section -->
               <div id="sourceScrapeFields" class="span2 formGrid sourceBranch">
+                <!-- SETUP & TESTS: shown only for manual scraping (research + HD images + links need these). -->
+                <div id="manualScrapeSetup" class="span2">
+                  <div class="msHead">&#128295; Manual scraping &mdash; setup &amp; tests</div>
+                  <div class="msActions">
+                    <button type="button" id="scrapeOpenGptBtn">&#128443;&#65039; Open ChatGPT browser <small>(log in &middot; HD images)</small></button>
+                    <button type="button" id="scrapeTestResearchBtn">&#128269; Test product research</button>
+                    <button type="button" id="scrapeRefreshCredsBtn">&#8635; Re-check connections</button>
+                  </div>
+                  <div id="scrapeCredStatus" class="msCredGrid"><div class="muted">Checking connections&hellip;</div></div>
+                  <div id="scrapeSetupResult" class="muted msResult"></div>
+                </div>
                 <label class="span2">Product / Source URLs <span style="opacity:.7">(Walmart, Amazon, etc. — one per line; product research, review images &amp; links are built from these)</span> <textarea id="sourceUrls" spellcheck="false"></textarea></label>
                 <label class="span2">First comment template <textarea id="commentTemplate"></textarea></label>
                 <label class="span2">Post texts <span style="opacity:.7">— one caption per line; each line is used as the text for one post</span> <textarea id="postTextsList" spellcheck="false" placeholder="One post caption per line"></textarea></label>
@@ -856,6 +867,21 @@
             .methodOpt small{opacity:.7;font-size:.74rem;line-height:1.25}
             .methodOpt.active{border-color:#f0a93b;background:linear-gradient(180deg,rgba(240,169,59,.14),transparent);color:#fff;box-shadow:0 0 0 1px #f0a93b inset}
             @media(max-width:640px){.methodSwitch{grid-template-columns:1fr}}
+            #manualScrapeSetup{border:1px solid #2a3344;border-radius:12px;padding:12px 14px;margin-bottom:12px;background:#141a24}
+            .msHead{font-weight:700;margin-bottom:10px}
+            .msActions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+            .msActions button{font-size:.84rem}
+            .msActions small{opacity:.6;font-weight:400}
+            .msCredGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px}
+            .msCred{display:flex;align-items:center;gap:8px;border:1px solid #2a3344;border-radius:9px;padding:7px 10px;font-size:.82rem;background:#0f141c}
+            .msCred .msDot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
+            .msCred.ok .msDot{background:#7ee0a5;box-shadow:0 0 6px #7ee0a5}
+            .msCred.bad .msDot{background:#ff8a8a;box-shadow:0 0 6px #ff8a8a}
+            .msCred .msName{font-weight:600}
+            .msCred .msState{opacity:.7;margin-left:auto;font-size:.74rem}
+            .msCred a.msFix{margin-left:8px;color:#f0a93b;text-decoration:none;white-space:nowrap;font-size:.76rem}
+            .msCred a.msFix:hover{text-decoration:underline}
+            .msResult{margin-top:8px;min-height:1.1em}
             .scrapedGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:8px}
             .scrapedCard{border:1px solid #2a3344;border-radius:10px;padding:10px;cursor:pointer;background:#141a24;transition:border-color .15s}
             .scrapedCard:hover{border-color:#f0a93b}
