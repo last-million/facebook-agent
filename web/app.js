@@ -5999,12 +5999,12 @@ function uxAttachIncompleteRunBanner() {
         const stopT = (($("prodStopTime") || {}).value || "").trim();
         const tz = ((($("prodScheduleTimezone") || {}).value || "").trim()) || "America/New_York";
         if (!startT || !stopT) { prodResult("⚠ Set both a start and end time first."); return; }
-        patch = { operator: Object.assign({}, base, { scheduleEnabled: true, startTime: startT, stopTime: stopT, scheduleTimezone: tz, autopilotMaxPostsPerRun: 0 }), ixbrowser: { maxConcurrentProfiles: 3 } };
+        patch = { operator: Object.assign({}, base, { scheduleEnabled: true, startTime: startT, stopTime: stopT, scheduleTimezone: tz, autopilotMaxPostsPerRun: 0 }), ixbrowser: { maxConcurrentProfiles: 999 } }; // 999 = "machine max" — the server clamps to the auto machine cap
         msg = "● LIVE — posting between " + startT + " and " + stopT + " (" + tz + "); no post-count limit.";
       } else {
         const n = Math.max(0, Math.min(500, parseInt((($("prodMaxPosts") || {}).value || ""), 10) || 0));
         if (!n) { prodResult("⚠ Enter how many posts (1–500) first."); return; }
-        patch = { operator: Object.assign({}, base, { scheduleEnabled: false, autopilotMaxPostsPerRun: n, autopilotPostsThisRun: 0 }), rules: { peakStartTime: "", peakStopTime: "" }, ixbrowser: { maxConcurrentProfiles: 3 } };
+        patch = { operator: Object.assign({}, base, { scheduleEnabled: false, autopilotMaxPostsPerRun: n, autopilotPostsThisRun: 0 }), rules: { peakStartTime: "", peakStopTime: "" }, ixbrowser: { maxConcurrentProfiles: 999 } }; // 999 = "machine max" — the server clamps to the auto machine cap
         msg = "● LIVE — will post " + n + " then auto-stop.";
       }
       prodResult("Launching…");

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-11T01:18:06.646Z",
+  "updatedAt": "2026-06-11T01:41:42.312Z",
   "testRun": {
     "status": "ready",
     "active": false,
@@ -119,12 +119,12 @@
     },
     "autopilotConcurrentPosting": true,
     "autopilotRunId": "1781120731682",
-    "machineParallelCap": 3,
-    "machineParallelCapComputedAt": "2026-06-11T01:04:04.694Z",
+    "machineParallelCap": 5,
+    "machineParallelCapComputedAt": "2026-06-11T01:41:41.375Z",
     "machineParallelCapMeta": {
       "cores": 9,
       "totalGB": 32,
-      "byCpu": 3,
+      "byCpu": 5,
       "byRam": 18
     }
   },
@@ -3503,7 +3503,7 @@
     "enabled": true,
     "apiStatus": "not configured",
     "maxProfilesPerRun": 100000,
-    "maxConcurrentProfiles": 3,
+    "maxConcurrentProfiles": 4,
     "profilesForNextRun": "",
     "activeProfiles": "",
     "blockedProfiles": "wise\n43 - wise",

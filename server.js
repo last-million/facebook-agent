@@ -7834,8 +7834,9 @@ function computeMachineParallelCap() {
   const totalGB = (os.totalmem() || 4 * 1073741824) / 1073741824;
   const RESERVED_CORES = 2;             // OS + Pinterest floor
   const RESERVED_GB = 4;                // keep this much RAM free for OS + Pinterest
-  const PINTEREST_HEADROOM_FRAC = 0.35; // hand ~35% of usable cores to the other agent
-  const CORES_PER_PROFILE = 1.5;        // a heavy FB render saturates ~1.5 cores at peak
+  const PINTEREST_HEADROOM_FRAC = 0.25; // hand ~25% of usable cores to the other agent
+  const CORES_PER_PROFILE = 1.0;        // empirical: this box ran ~6 concurrent profiles without locking;
+                                        // a render peaks ~1 core averaged — the LIVE cpu governor throttles real spikes
   const GB_PER_PROFILE = 1.5;           // ~1.5 GiB resident per active ixBrowser profile
   const HARD_CEILING = 8;               // never auto-scale past this without operator review
   const usableCores = Math.max(1, (cores - RESERVED_CORES) * (1 - PINTEREST_HEADROOM_FRAC));
