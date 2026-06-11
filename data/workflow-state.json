@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-06-11T01:04:04.720Z",
+  "updatedAt": "2026-06-11T01:18:06.646Z",
   "testRun": {
     "status": "ready",
     "active": false,
@@ -143,7 +143,7 @@
     "peakStopTime": "",
     "requireDealSignal": "10+ bought since yesterday",
     "linkPlacement": "pinned_first_comment",
-    "pinFirstComment": false,
+    "pinFirstComment": true,
     "postBodyLinkAllowed": false,
     "pauseOnErrors": true,
     "pauseOnInvalidProxy": true,

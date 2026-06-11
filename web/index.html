@@ -637,7 +637,9 @@
                    pauseOnErrors / postBodyLinkAllowed / pauseOnInvalidProxy / pauseOnLimitedAccount are DEAD
                    (defaults only, never read — account problems are handled by the auto-flagging panels).
                    Dead ones hidden; kept in the DOM for binding round-trip. -->
-              <label class="switch"><input id="pinFirstComment" type="checkbox"><span>Pin first comment <small style="opacity:.65">(pin the link comment under each post)</small></span></label>
+              <!-- pinFirstComment removed from view (operator): a different-profile commenter can never pin on
+                   Facebook (author/admin only), so the switch over-promises. Stays OFF; kept for round-trip. -->
+              <label class="switch" style="display:none"><input id="pinFirstComment" type="checkbox"><span>Pin first comment</span></label>
               <label class="switch" style="display:none"><input id="pauseOnErrors" type="checkbox"><span>Pause on errors</span></label>
               <label class="switch" style="display:none"><input id="postBodyLinkAllowed" type="checkbox"><span>Allow link in post body</span></label>
               <label class="switch" style="display:none"><input id="pauseOnInvalidProxy" type="checkbox"><span>Pause on invalid proxy</span></label>
