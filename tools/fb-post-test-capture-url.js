@@ -2907,6 +2907,19 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
   const visited = [];
   const MAX_SCROLLS_PER_TARGET = 12;
   const cleanPublisherId = String(publisherUserId || '').replace(/\D+/g, '');
+  // EXPAND collapsed posts: a just-published post's unique marker (hashtags / #fb fingerprint) often sits at
+  // the END of the caption behind a "See more" / "Ver más" fold, so it is NOT in body.innerText and the marker
+  // check misses it. Click every truncation toggle before each marker check.
+  const expandSeeMore = async () => {
+    try {
+      await page.evaluate(() => {
+        const re = /^(see more|ver m[aá]s|voir plus|mehr anzeigen|عرض المزيد|اقرأ المزيد)$/i;
+        const btns = [...document.querySelectorAll('div[role="button"], span[role="button"], [role="button"]')]
+          .filter((el) => re.test((el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()));
+        for (const b of btns.slice(0, 40)) { try { b.click(); } catch (_) {} }
+      });
+    } catch (_) {}
+  };
   const markerCheck = async () => page.evaluate(({ marker, publisherId, gid }) => {
     try {
       const bodyText = document.body.innerText || '';
@@ -2929,11 +2942,32 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
       return false;
     } catch { return false; }
   }, { marker, publisherId: cleanPublisherId, gid: groupId }).catch(() => false);
+  // Scan ONE loaded surface (expand -> first screen -> scroll, expanding each step). Returns a found-result or null.
+  const scanLoadedSurface = async (methodPrefix) => {
+    await expandSeeMore();
+    if (await markerCheck()) return { opened: true, url: page.url(), visited, method: `${methodPrefix}_first_screen`, scrollsRequired: 0 };
+    let lastHeight = await page.evaluate(() => document.body.scrollHeight).catch(() => 0);
+    let stagnantScrolls = 0;
+    for (let scroll = 1; scroll <= MAX_SCROLLS_PER_TARGET; scroll += 1) {
+      await page.mouse.wheel(0, 1800).catch(() => {});
+      await humanPause(1500, 2400);
+      await expandSeeMore();
+      if (await markerCheck()) return { opened: true, url: page.url(), visited, method: `${methodPrefix}_after_scroll`, scrollsRequired: scroll };
+      const newHeight = await page.evaluate(() => document.body.scrollHeight).catch(() => 0);
+      if (newHeight <= lastHeight + 20) { stagnantScrolls += 1; if (stagnantScrolls >= 2) break; }
+      else { stagnantScrolls = 0; lastHeight = newHeight; }
+    }
+    return null;
+  };
+  // FIRST PASS: find the working admin surface (numeric-gid pending queue) and scan it.
+  let workingTarget = null;
   for (const target of targets) {
     await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
     visited.push(page.url());
     await humanPause(3500, 5000);
-    if (await markerCheck()) return { opened: true, url: page.url(), visited, method: 'direct_review_url_first_screen', scrollsRequired: 0 };
+    if (/\/(pending_posts|manage_post_queue|posts\/pending)/i.test(String(page.url() || ''))) workingTarget = target;
+    let found = await scanLoadedSurface('direct_review_url');
+    if (found) return found;
     const clicked = await clickFirst(page, [
       page.getByRole('link', { name: /manage content|pending admin approval|pending posts|post approval/i }),
       page.getByRole('button', { name: /manage content|pending admin approval|pending posts|post approval/i }),
@@ -2942,22 +2976,22 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
     if (clicked) {
       await humanPause(3000, 5000);
       visited.push(page.url());
-      if (await markerCheck()) return { opened: true, url: page.url(), visited, method: 'clicked_manage_content_first_screen', scrollsRequired: 0 };
+      if (/\/(pending_posts|manage_post_queue|posts\/pending)/i.test(String(page.url() || ''))) workingTarget = target;
+      found = await scanLoadedSurface('clicked_manage_content');
+      if (found) return found;
     }
-    let lastHeight = await page.evaluate(() => document.body.scrollHeight).catch(() => 0);
-    let stagnantScrolls = 0;
-    for (let scroll = 1; scroll <= MAX_SCROLLS_PER_TARGET; scroll += 1) {
-      await page.mouse.wheel(0, 1800).catch(() => {});
-      await humanPause(1800, 2800);
-      if (await markerCheck()) return { opened: true, url: page.url(), visited, method: 'direct_review_url_after_scroll', scrollsRequired: scroll };
-      const newHeight = await page.evaluate(() => document.body.scrollHeight).catch(() => 0);
-      if (newHeight <= lastHeight + 20) {
-        stagnantScrolls += 1;
-        if (stagnantScrolls >= 2) break;
-      } else {
-        stagnantScrolls = 0;
-        lastHeight = newHeight;
-      }
+  }
+  // RETRY PASSES: a JUST-published post can take up to ~60-90s to APPEAR in the moderation queue. If we
+  // reached a real admin surface but did not find the post yet, reload that surface a few times (waiting
+  // between) so the pending post shows up — instead of falsely concluding it is "not pending".
+  if (workingTarget) {
+    for (let attempt = 2; attempt <= 5; attempt += 1) {
+      await humanPause(14000, 18000); // let the pending post propagate into the queue
+      await page.goto(workingTarget, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      visited.push(page.url());
+      await humanPause(3000, 4500);
+      const found = await scanLoadedSurface(`retry${attempt}_review_url`);
+      if (found) return { ...found, retried: attempt };
     }
   }
   // PERMISSION SIGNAL: if NONE of the visited urls kept an admin-queue path, every
