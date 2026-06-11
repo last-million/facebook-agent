@@ -626,8 +626,11 @@
               <label style="display:none">Fallback fixed minutes <input id="minutesBetweenPosts" type="number" min="1" max="1440"></label>
               <label style="display:none">Minimum minutes <input id="minMinutesBetweenPosts" type="number" min="1" max="1440"></label>
               <label style="display:none">Maximum minutes <input id="maxMinutesBetweenPosts" type="number" min="1" max="1440"></label>
-              <label data-ux-tier="advanced">Save account after comments <input id="maxCommentsBeforeAccountSave" type="number" min="1" max="500"></label>
-              <label data-ux-tier="advanced">Required deal signal <input id="requireDealSignal"></label>
+              <!-- Both DEAD: maxCommentsBeforeAccountSave is never read by any logic; requireDealSignal is an
+                   orphaned duplicate (the live filter is productDiscovery.minActivitySignal in the Content tab).
+                   Hidden; kept in the DOM for binding round-trip. -->
+              <label style="display:none">Save account after comments <input id="maxCommentsBeforeAccountSave" type="number" min="1" max="500"></label>
+              <label style="display:none">Required deal signal <input id="requireDealSignal"></label>
             </div>
             <div class="checks">
               <label class="switch"><input id="pauseOnErrors" type="checkbox"><span>Pause on errors</span></label>
