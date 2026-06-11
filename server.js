@@ -411,6 +411,13 @@ function defaultState() {
       runDays: "Mon\nTue\nWed\nThu\nFri\nSat\nSun",
       startTime: "",
       stopTime: "",
+      // DYNAMIC ixBrowser PROFILE SYNC:
+      autoAddNewProfilesEnabled: true,        // auto-onboard any NEW ixBrowser profile into every posting group
+                                              // (excludes reserved/moderator/ShopYourLikes/blocked) so it can
+                                              // post + comment without a manual rebuild.
+      autoRemoveGoneProfilesEnabled: false,   // HARD RULE: NEVER auto-remove a profile that vanished from
+                                              // ixBrowser — the operator removes manually. true re-enables the
+                                              // old GONE-removal (not advised).
     },
     rules: {
       minutesBetweenPosts: 12,
@@ -10702,6 +10709,16 @@ async function existingIxBrowserProfileIdSet() {
     .map((profile) => Number(profile.profile_id || profile.id || 0))
     .filter(Boolean));
 }
+// Same fail-closed fetch, but returns {id,name} rows so the auto-add sync can build the canonical
+// "{id} - {name}" roster label. Throws on a hard ixBrowser failure (callers fail-closed).
+async function existingIxBrowserProfileRows() {
+  const data = await ixBrowserRequest("profile-list", { page: 1, limit: 200 });
+  const rows = ixBrowserProfileRows(data);
+  return (rows.profiles || [])
+    .map((profile) => sanitizeIxBrowserProfile(profile))
+    .map((profile) => ({ id: Number(profile.profile_id || profile.id || 0), name: String(profile.name || "").trim() }))
+    .filter((row) => row.id);
+}
 
 async function filterExistingIxBrowserProfiles(profiles = [], groupUrl = "", reason = "comment_fallback") {
   let idSet = null;
@@ -15431,8 +15448,10 @@ const RECONCILE_REMOVAL_STREAK_REQUIRED = 2;
 const RECONCILE_MIN_PLAUSIBLE_PROFILE_COUNT = 3;
 const RECONCILE_RESERVED_PROFILE_IDS = new Set([40, 41, 42, 43]);
 const RECONCILE_MIN_INTERVAL_MS = 60 * 1000;
+const IXBROWSER_SYNC_INTERVAL_MS = 5 * 60 * 1000; // standalone "always" sync cadence (boot + heartbeat), independent of posting
 let __reconcileInFlight = false;
 let __reconcileLastAt = 0;
+let __lastStandaloneReconcileAt = 0;
 
 function isReservedReconcileProfile(profileId, label, state) {
   const id = Number(profileId || profileIdFromLabel(label) || 0);
@@ -15521,13 +15540,15 @@ async function reconcileProfilesWithIxBrowser(options = {}) {
     return { skipped: "reconcile_debounced_interval" };
   }
   __reconcileInFlight = true;
-  const summary = { at: new Date().toISOString(), removed: [], unbenched: [], pendingRemoval: [], kept: 0 };
+  const summary = { at: new Date().toISOString(), removed: [], added: [], unbenched: [], pendingRemoval: [], kept: 0 };
   try {
-    // SAFETY GUARD (a): FAIL-CLOSED on a bad/empty/tiny fetch. existingIxBrowserProfileIdSet()
+    // SAFETY GUARD (a): FAIL-CLOSED on a bad/empty/tiny fetch. existingIxBrowserProfileRows()
     // throws on a hard failure; an implausibly small set means iX is mid-restart / logged out.
-    let liveIds;
+    // ONE fetch feeds both the GONE-check (ids) and the auto-add (id+name rows).
+    let liveIds, liveRows;
     try {
-      liveIds = await existingIxBrowserProfileIdSet();
+      liveRows = await existingIxBrowserProfileRows();
+      liveIds = new Set(liveRows.map((r) => r.id));
     } catch (err) {
       logEvent("ixbrowser_reconcile_skipped_fetch_failed", { error: oneLineField(err.message || String(err), 240) });
       return { skipped: "profile_list_fetch_failed" };
@@ -15556,7 +15577,11 @@ async function reconcileProfilesWithIxBrowser(options = {}) {
       if (liveIds.has(id)) continue; // still exists in iX -> not gone
       // GONE this cycle. Bump the persisted miss-streak (SAFETY GUARD (b): debounce).
       const streak = (Number(missStreak[id]) || 0) + 1;
-      if (streak >= RECONCILE_REMOVAL_STREAK_REQUIRED) {
+      // HARD RULE (operator): NEVER auto-remove a vanished profile. The destructive branch only runs if the
+      // operator explicitly opts back in via operator.autoRemoveGoneProfilesEnabled (default false). Otherwise
+      // the profile is KEPT in the roster indefinitely; we only track the miss-streak for dashboard visibility.
+      const autoRemoveOn = state.operator?.autoRemoveGoneProfilesEnabled === true;
+      if (autoRemoveOn && streak >= RECONCILE_REMOVAL_STREAK_REQUIRED) {
         const removedFromRoster = reconcileRemoveProfileFromRoster(state, id);
         reconcileClearGoneProfileBlacklist(state, id, label);
         // profile removed from ixBrowser -> clear the SOFTER parked entries (errored / disconnected) so re-adding
@@ -15595,12 +15620,39 @@ async function reconcileProfilesWithIxBrowser(options = {}) {
       }
     }
 
+    // PASS 3: AUTO-ADD new ixBrowser profiles (dynamic onboarding). Any LIVE profile not yet in the roster
+    // — and not a reserved / moderator / ShopYourLikes / blocked profile — is added to EVERY current posting
+    // group's profiles[] so it can immediately POST and COMMENT, with no manual Build-Matrix rebuild.
+    // Idempotent: skips ids already present anywhere; re-running adds nothing. Gated by autoAddNewProfilesEnabled
+    // (default true). Runs downstream of the fail-closed fetch guard, so a logged-out/tiny iX never auto-adds.
+    if (state.operator?.autoAddNewProfilesEnabled !== false) {
+      const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
+      for (const row of liveRows) {
+        const id = row.id;
+        if (!id || rosterIds.has(id)) continue;
+        const label = oneLineField(`${id} - ${row.name || id}`, 180);
+        if (isReservedReconcileProfile(id, label, state)) continue; // never auto-add reserved/moderator/SYL/blocked
+        let addedToAny = false;
+        for (const entry of groups) {
+          if (!entry || !entry.url) continue;
+          if (!Array.isArray(entry.profiles)) entry.profiles = [];
+          if (isFacebookAdminApprovalProfileLabel(label, state, entry.url)) continue; // never a moderator/approval profile for this group
+          if (entry.profiles.some((p) => profileIdFromLabel(p) === id)) continue; // already assigned to this group
+          if (entry.profiles.length >= 500) continue; // per-group cap
+          entry.profiles.push(label);
+          addedToAny = true;
+        }
+        if (addedToAny) { rosterIds.set(id, label); dirty = true; summary.added.push({ profileId: id, label }); }
+      }
+    }
+
     state.ixbrowser.reconcileMissStreak = JSON.stringify(nextMissStreak);
     // Always persist the (possibly empty) miss-streak so a recovered profile clears its counter.
     writeState(state);
     if (dirty || summary.unbenched.length || Object.keys(nextMissStreak).length) {
       logEvent("ixbrowser_reconcile_applied", {
         removed: summary.removed.length,
+        added: summary.added.length,
         unbenched: summary.unbenched.length,
         pendingRemoval: summary.pendingRemoval.length,
         liveCount: liveIds.size,
@@ -17638,6 +17690,12 @@ setInterval(() => {
     __lastMachineCapSyncAt = Date.now();
     refreshMachineParallelCap("24h");
   }
+  // DYNAMIC ixBrowser SYNC: onboard any NEW profile every ~5min, independent of armed/posting, so new profiles
+  // become usable even while idle. Fail-closed + single-flight inside; never removes a profile (operator rule).
+  if (Date.now() - __lastStandaloneReconcileAt > IXBROWSER_SYNC_INTERVAL_MS) {
+    __lastStandaloneReconcileAt = Date.now();
+    reconcileProfilesWithIxBrowser({ force: false }).catch((err) => logEvent("ixbrowser_sync_interval_error", { error: oneLineField(err.message || String(err), 200) }));
+  }
   const state = readState();
   const intervalMs = clampNumber(state.triggers?.heartbeatSeconds, 3, 120, 3) * 1000;
   if (Date.now() - lastHeartbeatTick < intervalMs) return;
@@ -18725,6 +18783,9 @@ server.listen(PORT, HOST, () => {
   // armed; dry-run by default (logs decisions, never posts) until
   // operator.autopilotDryRun is set false.
   startAutopilotScheduler();
+  // DYNAMIC ixBrowser SYNC at boot: onboard any profile added while the server was down. Delayed 15s so it
+  // doesn't contend with boot warmup; force:true bypasses the 60s debounce for this single run.
+  setTimeout(() => { __lastStandaloneReconcileAt = Date.now(); reconcileProfilesWithIxBrowser({ force: true }).catch((err) => logEvent("ixbrowser_sync_boot_error", { error: oneLineField(err.message || String(err), 200) })); }, 15000);
   // Kick one per-post-log retention sweep shortly after startup (covers a process that was down
   // across the interval), then the heartbeat repeats it every >=6h.
   setTimeout(() => { __lastPerPostLogSweep = Date.now(); sweepPerPostLogs().catch(() => {}); }, 30000);
