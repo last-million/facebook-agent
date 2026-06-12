@@ -11457,6 +11457,20 @@ function facebookAdminProfileLabelsFromConfiguredText(text = "", groupUrl = "", 
   return candidates;
 }
 
+// EQUAL MODERATOR ROTATION: how many times each moderator profile has been USED for approval (from the
+// ledger). Lets the approver order moderators least-used-first so they share the load evenly instead of
+// always hammering the first-listed one. Single 5000-row scan -> Map(profileId -> approval attempts).
+function facebookApprovalCountByProfile() {
+  const counts = new Map();
+  for (const item of readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 })) {
+    if (!item || item.event !== "admin_approval_finished") continue;
+    const pid = Number(item.profileId || 0);
+    if (!pid) continue;
+    counts.set(pid, (counts.get(pid) || 0) + 1);
+  }
+  return counts;
+}
+
 async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState(), options = {}) {
   const excludedIds = new Set([options.excludeProfileId, options.publisherProfileId]
     .map((value) => Number(value || 0))
@@ -11505,6 +11519,10 @@ async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState
       error: oneLineField(err.message || String(err), 260),
     });
   }
+  // EQUAL ROTATION: order moderators least-used-first so approvals spread evenly across all of them instead
+  // of always hitting the first-listed one. Stable sort keeps configured order for ties.
+  const __apprUsage = facebookApprovalCountByProfile();
+  candidates.sort((a, b) => (__apprUsage.get(a.profileId) || 0) - (__apprUsage.get(b.profileId) || 0));
   return candidates.slice(0, MAX_COMMENT_FALLBACK_PROFILES);
 }
 

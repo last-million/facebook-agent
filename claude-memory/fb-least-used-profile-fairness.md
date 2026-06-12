@@ -19,5 +19,16 @@ evenly across all profiles (no profile gets over-used/burned).
   the ixBrowser profile list by `facebookCommentCountByProfile()` (total successful comments per profileId from the
   ledger) **least-used-first** before taking the top MAX_COMMENT_FALLBACK_PROFILES. Never-used profiles (count 0)
   come first; stable sort keeps ixBrowser order for ties.
+- MODERATORS (added 2026-06-12): `facebookAdminApprovalProfilesForGroup` now sorts moderators least-used-first
+  via `facebookApprovalCountByProfile()` (admin_approval_finished count per profileId from the ledger), so 42/16/1
+  share approval load instead of 42 always going first. Needs server restart to load.
 - Any NEW profile-selection path must apply the same least-used-first ordering. See [[fb-admin-approval-page-identity]]
-  (moderators 42/16/1 are still excluded from BOTH rosters regardless of usage).
+  (moderators 42/16/1 are still excluded from BOTH posting/comment rosters regardless of usage).
+
+PERMALINK CAPTURE via /user surface (operator-requested 2026-06-12): connector `userSurfaceMarkerUrls(page, gid,
+authorId, marker)` navigates to `/groups/{gid}/user/{pageId}/` (lists ONLY that page's posts, newest first — all
+profiles post AS the Page 61590707785162), then matches the EXACT marker (post text + #fb tag) via the existing
+extractMarkerScopedPostUrls. Wired as PRIMARY in approvePendingPost's collectVerifiedUrls, feed scan = fallback.
+authorId = payload.publisherFacebookUserId || facebookUserId. Faster + safer than feed-sifting. Also: connector
+`dismissGroupRulesDialog(page)` clears the first-time "Group Rules" acknowledgment dialog (multilingual) before
+commenting/posting. Connector changes need NO restart. ALL still UNVALIDATED LIVE (next run proves them).

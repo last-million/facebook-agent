@@ -2287,6 +2287,30 @@ async function extractMarkerScopedPostUrls(page, gid, marker) {
   }, {gid, marker}).catch(() => []);
 }
 
+// USER-SURFACE permalink capture (operator-requested): /groups/{gid}/user/{authorId}/ lists ONLY that
+// page/profile's posts in the group, NEWEST FIRST — so our just-published post is right there with no
+// feed-sifting. We STILL match by the EXACT marker (the post's text + #fb tag, via extractMarkerScopedPostUrls)
+// so we can never grab a neighbouring post by the same author. Returns the marker-scoped permalink(s); empty
+// if not found, so the caller can fall back to the feed scan. Faster + more reliable than scanning the feed.
+async function userSurfaceMarkerUrls(page, gid, authorId, marker) {
+  const url = facebookGroupUserPageUrl(gid, authorId);
+  if (!url) return [];
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    await humanPause(2500, 4200);
+    for (let i = 0; i < 3; i += 1) {
+      // expand "See more" so the #fb tag at the END of the caption is in the DOM text before we match
+      await page.evaluate(() => { const re = /^(see more|ver m[aá]s|voir plus|mehr anzeigen|عرض المزيد|leia mais|altro)$/i; for (const b of document.querySelectorAll('div[role="button"],span[role="button"]')) { if (re.test((b.innerText || '').trim())) { try { b.click(); } catch (_) {} } } }).catch(() => {});
+      await humanPause(600, 1100);
+      const found = await extractMarkerScopedPostUrls(page, gid, marker).catch(() => []);
+      if (found.length) { console.log(JSON.stringify({ step: 'user_surface_permalink_found', authorId: String(authorId || '').replace(/\D+/g, ''), count: found.length })); return found; }
+      await page.mouse.wheel(0, 1500).catch(() => {});
+      await humanPause(900, 1500);
+    }
+    return await extractMarkerScopedPostUrls(page, gid, marker).catch(() => []);
+  } catch (_) { return []; }
+}
+
 function facebookGroupUserPageUrl(gid, userId) {
   const cleanGid = String(gid || '').replace(/\D+/g, '');
   const cleanUserId = String(userId || '').replace(/\D+/g, '');
@@ -3187,7 +3211,16 @@ async function approvePendingPost(page, context, payload, gid, marker) {
   attempts.push({ step: 'ensure_admin_identity', ...identitySwitch });
   console.log(JSON.stringify({ step: 'admin_identity', ...identitySwitch }));
   const collectVerifiedUrls = async (source) => {
-    const markerScopedUrls = await extractMarkerScopedPostUrls(page, gid, marker).catch(() => []);
+    // PRIMARY: capture via the /user/{pageId}/ surface (only our page's posts, newest first) matched by the
+    // EXACT marker (text + #fb tag). Faster + safer than feed-sifting. Falls back to the current-page feed scan.
+    const __authorId = String(payload.publisherFacebookUserId || payload.facebookUserId || '').replace(/\D+/g, '');
+    const __prevUrl = page.url();
+    const userScopedUrls = __authorId ? await userSurfaceMarkerUrls(page, gid, __authorId, marker).catch(() => []) : [];
+    if (!userScopedUrls.length && __prevUrl && !/\/user\//.test(__prevUrl)) {
+      await page.goto(__prevUrl, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      await humanPause(1200, 2200);
+    }
+    const markerScopedUrls = userScopedUrls.length ? userScopedUrls : await extractMarkerScopedPostUrls(page, gid, marker).catch(() => []);
     const domUrls = await extractDomUrls(page, gid, marker).catch(() => []);
     const candidateUrls = [...new Set([...markerScopedUrls, ...domUrls])].filter(url => isFacebookGroupPostUrl(url, gid));
     for (const u of candidateUrls.slice(0, 25)) {
