@@ -6950,10 +6950,10 @@ function isFacebookAdminApprovalProfileLabel(label, state = readState(), groupUr
   const lower = clean.toLowerCase();
   if (/\b(admin|administrator|moderator|mod|owner|approve|approval)\b/i.test(lower)) return true;
   const targetGroupKey = normalizedFacebookGroupKey(groupUrl);
-  for (const source of [
-    state.ixbrowser?.moderatorProfiles,
-    state.posting?.ownedGroupsByProfile,
-    state.posting?.moderatorAccountNotes,
+  for (const [source, isExplicitModeratorList] of [
+    [state.ixbrowser?.moderatorProfiles, true],   // operator-curated moderator list: ID membership ALONE = moderator
+    [state.posting?.ownedGroupsByProfile, false],
+    [state.posting?.moderatorAccountNotes, false],
   ]) {
     for (const line of recordLines(source)) {
       const lineProfileId = profileIdFromLabel(line);
@@ -6965,6 +6965,10 @@ function isFacebookAdminApprovalProfileLabel(label, state = readState(), groupUr
         const lineGroupUrls = sanitizeFacebookGroupUrlList(line);
         if (lineGroupUrls.length && !lineGroupUrls.some((url) => normalizedFacebookGroupKey(url) === targetGroupKey)) continue;
       }
+      // A profile in the operator's moderatorProfiles list IS approve-only by MEMBERSHIP — do NOT also require a
+      // "moderator" keyword on the line. The old keyword gate let "1 - moderator1" slip through (\bmoderator\b
+      // fails before the trailing digit), so moderator profile 1 was wrongly used to POST a live group post.
+      if (isExplicitModeratorList) return true;
       if (/\b(role|status|source)\s*=\s*(admin|administrator|moderator|mod|owner|approve|approval|admin_approval)\b/i.test(line)) return true;
       if (/\b(admin|administrator|moderator|mod|owner|approve|approval)\b/i.test(line)) return true;
     }

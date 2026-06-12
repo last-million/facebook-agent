@@ -30,5 +30,13 @@ fallback and the proximity author branch. The per-post Approve button has aria-l
 One-time backlog clear (2026-06-11, operator said "approve all"): mass-approved 60 pending posts (all authors)
 via a throwaway script — all our #fb-marker posts cleared. That script was DELETED; production never mass-approves.
 
-Connector changes need NO restart (fresh-spawned per run). server.js validation guard still needs a restart. See
-[[fb-agent-highscale-pipeline]] and [[fb-no-live-post-without-ok]].
+RULE (operator, 2026-06-11): moderator accounts (42, 16, 1) are **approve-ONLY** — they must NEVER post or
+comment. ENFORCED + verified in server.js: posting roster excludes them (isFacebookAdminApprovalProfileLabel,
+~L7289) and a moderator used for posting hard-errors `facebook_moderator_profile_reserved_for_approval`
+(~L10221); the comment candidate pool excludes them (~L10679). Detection is by ID: isFacebookAdminApprovalProfileId
+matches each profile's leading id against `state.ixbrowser.moderatorProfiles` ("42 - moderator" / "16 - moderator 2"
+/ "1 - moderator1") for ALL groups — so it catches them even if the real ixBrowser name isn't literally "moderator".
+Never wire a moderator profile into any posting/comment path when adding features or running tests.
+
+Connector changes need NO restart (fresh-spawned per run). server.js validation guard loaded via restart
+2026-06-11 (server PID 5040). See [[fb-agent-highscale-pipeline]] and [[fb-no-live-post-without-ok]].
