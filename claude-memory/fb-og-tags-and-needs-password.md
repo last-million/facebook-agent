@@ -41,4 +41,17 @@ login wall throws facebook_login_required_for_profile → server parks it as DIS
 a healthy-but-transient composer miss is a no-op (no false park). Disconnected section already exists:
 uxAttachDisconnectedProfiles (web/app.js) + GET /api/profiles/disconnected + Release btn (POST /api/profiles/release).
 
+AUTO DISCONNECT DETECTION — now FULLY AUTOMATIC (operator 2026-06-12: "all should be dynamic automatique to
+detect disconnected accounts"). Root cause they hit: logged-out IDLE profiles (e.g. 50 = login wall "Alexandra
+Gonzalez / Continue", 45) were NEVER flagged because the logout detection only fires when a profile is USED for a
+post/comment — a profile not selected that cycle is never opened, never checked. `runProfileHealthSweep()`
+(server.js ~8083) opens EVERY assigned profile (group→profile map), detects logout/suspension, and parks it
+(markProfileDisconnected/Suspended → Prod-tab Disconnected list + skipped) — but it was MANUAL-ONLY (one endpoint
+~18012, never auto-called). FIX (server.js heartbeat ~17828, needs restart — done, server PID 8588 2026-06-12):
+auto-trigger every HEALTH_SWEEP_INTERVAL_MS (~2h) gated on `!active` (idle only, so it never fights a live run for
+ixBrowser), single-flight + CPU-aware + concurrency 2; boot-grace back-dates `__lastHealthSweepAt` so the first
+sweep is ~10min after boot (no boot storm). Used-but-logged-out profiles are still caught in-line by the
+posting/comment path. To flag NOW without waiting: POST /api/profiles/disconnect?profileId=N&label=... (header
+x-dashboard-token); Release via POST /api/profiles/release. Did this for 50+45 manually before the auto-fix.
+
 Connector changes = NO restart (fresh spawn). The OG cap + #fb removal apply to NEW harvests/plans only.

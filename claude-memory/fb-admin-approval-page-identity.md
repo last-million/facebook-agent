@@ -78,6 +78,16 @@ empty → that's the empty-h1 state seen on /me). FIX: connector `dismissForcedA
 URL, click Continue multilingual, verify URL cleared) wired into ensureAdminIdentity (re-goto /me after) and
 openGroupReviewSurface (retry target after). Posting profiles (Pages) don't hit this.
 
+HARDENED (operator 2026-06-12, watching profile 16 "Laura Gomez" sit on /forced_account_switch: "why he dont
+clique on continue"): the handler WAS working (logs showed detected→dismissed cleared=true→home.php every
+session) — what the operator saw was the **2.2–3.6s humanPause that ran BEFORE the click** (the profile visibly
+sat on the card). FIX (connector, NO restart): (1) ensureAdminIdentity now calls dismissForcedAccountSwitch
+IMMEDIATELY after the /me goto (moved the long humanPause to AFTER), so Continue is clicked the moment the card
+renders; (2) dismissForcedAccountSwitch now LOOPS up to 4 passes (waitFor the Continue button visible → click ASAP
+→ verify URL cleared → if FB re-renders the card, click again), returns everCleared. Note: moderators DO still hit
+forced_account_switch even though they default to the personal admin — it's FB's active-account confirmation on
+first navigation (not a misconfig), and clicking Continue is the only path; it's auto-handled now.
+
 DEFAULT CHANGED (operator, 2026-06-12): moderator profiles now open Facebook **as the PERSONAL admin directly**
 (no longer as the Page) — operator flipped the default identity in FB. ensureAdminIdentity auto-detects and
 SKIPS the switch (reason already_personal_profile) → approvals faster. HARDENED for this: the switch now runs
