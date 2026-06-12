@@ -2883,7 +2883,11 @@ async function ensureAdminIdentity(page) {
     const h1 = await page.evaluate(() => ((document.querySelector('h1') || {}).innerText || '').trim()).catch(() => '');
     out.identity = h1;
     out.wasPage = MANAGE_PAGE_RE.test(h1);
-    if (h1 && !out.wasPage) { out.reason = 'already_personal_profile'; return out; } // already the personal admin — nothing to do
+    // Switch ONLY when the Page identity is POSITIVELY detected. Moderator profiles now default to the
+    // PERSONAL admin (operator changed this 2026-06-12), so on an unreadable/empty h1 the safe move is to
+    // NOT touch the switcher — blindly clicking row[1] would flip personal -> Page (the wrong direction)
+    // and the approval queue would render 0 Approve buttons.
+    if (!out.wasPage) { out.reason = h1 ? 'already_personal_profile' : 'identity_unreadable_skip_switch'; return out; }
     await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
     await humanPause(2200, 3600);
     await page.click('[aria-label="Your profile"], [aria-label="Tu perfil"], [aria-label="Votre profil"]', { timeout: 12000 }).catch(() => {});
@@ -3216,12 +3220,15 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
       if (found) return found;
     }
   }
-  // RETRY PASSES: a JUST-published post can take up to ~60-90s to APPEAR in the moderation queue. If we
-  // reached a real admin surface but did not find the post yet, reload that surface a few times (waiting
-  // between) so the pending post shows up — instead of falsely concluding it is "not pending".
+  // RETRY PASSES: a JUST-published post takes a while to APPEAR in the moderation queue — measured LIVE at
+  // 10-30 MINUTES (not 60-90s): run of 2026-06-12 burned 8 failed ~3-min moderator sessions over 30 min before
+  // the queue finally showed post #1. Opening a fresh session per retry is pure waste (all moderator profiles
+  // are the same FB admin account — same queue), so POLL PATIENTLY IN THIS SESSION: reload the queue every
+  // ~60-75s for up to ~14 min. One patient session approves the moment the post appears (and the batch pass
+  // then drains every other pending post) instead of many short sessions finding nothing.
   if (workingTarget) {
-    for (let attempt = 2; attempt <= 5; attempt += 1) {
-      await humanPause(14000, 18000); // let the pending post propagate into the queue
+    for (let attempt = 2; attempt <= 14; attempt += 1) {
+      await humanPause(55000, 75000); // let the pending post propagate into the queue
       await page.goto(workingTarget, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
       visited.push(page.url());
       await humanPause(3000, 4500);

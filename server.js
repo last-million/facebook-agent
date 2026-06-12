@@ -56,7 +56,11 @@ const MAX_EVENTS_BYTES = 500000;
 const MAX_CONCURRENT_NORMAL_IX_PROFILES = Math.max(3, Math.min(6, Math.floor(((os.cpus() || []).length || 4) / 2)));
 const MAX_COMMENT_FALLBACK_PROFILES = 40; // try EVERY profile allocated to the group for the first comment (was 6) — keep going until one lands; the loop stops as soon as a comment succeeds, so this is just the ceiling.
 const FACEBOOK_LIVE_POST_TIMEOUT_MS = 600000;
-const FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS = 360000;
+// 18 min: the pending-queue propagation is 10-30 min (measured live 2026-06-12), and the connector now POLLS
+// the queue in ONE patient session (~14 min max) instead of burning a fresh ~3-min session per retry across
+// moderators. The timeout must outlast that poll or the patient session gets killed mid-wait (the old 6 min
+// guaranteed every first-attempt approval died before the post even appeared).
+const FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS = 1080000;
 const FACEBOOK_COMMENT_RECOVERY_TIMEOUT_MS = 240000;
 const HERMES_IMAGE_SELECTOR_TIMEOUT_MS = 120000;
 const TEST_HERMES_IMAGE_SELECTOR_TIMEOUT_MS = 90000;
