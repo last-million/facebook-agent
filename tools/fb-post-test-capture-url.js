@@ -2771,8 +2771,77 @@ async function captureApprovalDiagnostic(page, marker) {
 
 // MULTI-LANGUAGE approve-button labels (moderators 41/42 may run FB in EN/FR/ES/AR). Mirrors the
 // COMPOSER_PROMPT_RE multilingual fix — an EN-only match left Spanish "Aprobar" posts pending.
-const APPROVE_NAME_RE = /^(approve|approve post|approve all|approuver|autoriser|aprobar|aprobar publicaci[oó]n|aprobar todo|موافقة|قبول|الموافقة)$/i;
-const APPROVE_TEXT_RE = /\b(approve|approve post|approuver|autoriser|aprobar|موافقة|قبول)\b/i;
+const APPROVE_NAME_RE = /^(approve|approve post|approve all|approuver|approuver|autoriser|aprobar|aprobar publicaci[oó]n|aprobar todo|aprovar|aprovar tudo|genehmigen|approva|approva tutto|موافقة|قبول|الموافقة)$/i;
+const APPROVE_TEXT_RE = /\b(approve|approve post|approuver|autoriser|aprobar|aprovar|genehmigen|approva|موافقة|قبول)\b/i;
+
+// ── ADMIN-IDENTITY SWITCH (root cause of "approved but still pending") ────────────────────────────
+// Moderator FB profiles open Facebook as the POSTING Page (e.g. the Page "Couponing for beginners").
+// Acting as a Page you can ONLY see your own pending posts and Facebook renders NO Approve/Decline
+// control at all — so the moderator reached the queue but had nothing to click, and posts stayed
+// pending forever (the old code then logged a FALSE "approved"). The group's real admin is the PERSONAL
+// profile that runs the Page (e.g. the person "Sara Marouani"). Switching to that personal profile makes
+// the queue render real "Approve"/"Decline" buttons. PROVEN: as the Page the pending queue has 0 Approve
+// buttons; after this switch, 6 appear. detectIdentityRows reads the account-menu popover top-to-bottom;
+// row 0 is the ACTIVE identity (the Page), so the personal admin is the first row that is not active. No
+// name is hardcoded — it auto-detects per moderator profile.
+async function detectIdentityRows(page) {
+  return await page.evaluate(() => {
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const SYS = /see all profiles|ver todos los perfiles|voir tous les profils|meta business suite|settings & privacy|configuraci|param[eè]tres|help & support|ayuda|aide|report a problem|display & accessibility|log out|cerrar sesi|d[eé]connexion|privacy|terms|ranking transparency|advertising|cookies/i;
+    const els = [...document.querySelectorAll('a,[role="button"],[role="menuitem"],div,span')];
+    const seeAll = els.find((e) => /^(see all profiles|ver todos los perfiles|voir tous les profils)$/i.test(norm(e.innerText)) && e.getBoundingClientRect().width > 0);
+    if (!seeAll) return { names: [], reason: 'no_see_all_profiles' };
+    const sr = seeAll.getBoundingClientRect();
+    // climb to the bounded menu POPOVER so feed posts/ads behind it are excluded
+    let menu = seeAll;
+    for (let i = 0; i < 10; i += 1) { if (!menu.parentElement) break; menu = menu.parentElement; const r = menu.getBoundingClientRect(); if (r.width >= 200 && r.width <= 480 && r.height >= 180) break; }
+    const rows = [...menu.querySelectorAll('a[role="link"],a[href],div[role="button"],[role="menuitem"]')]
+      .map((e) => { const r = e.getBoundingClientRect(); return { t: norm(e.innerText), top: r.top, h: r.height }; })
+      .filter((c) => c.t && c.t.length > 1 && c.t.length < 60 && c.h >= 28 && !SYS.test(c.t) && c.top < sr.top)
+      .sort((a, b) => a.top - b.top);
+    const seen = new Set(); const names = [];
+    for (const r of rows) { if (seen.has(r.t)) continue; seen.add(r.t); names.push(r.t); }
+    return { names };
+  }).catch(() => ({ names: [], reason: 'evaluate_error' }));
+}
+
+const MANAGE_PAGE_RE = /manage page|gestionar p[aá]gina|g[eé]rer la page/i;
+async function ensureAdminIdentity(page) {
+  const out = { switched: false, wasPage: null, identity: '', target: '', reason: '' };
+  try {
+    await page.goto('https://www.facebook.com/me', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    await humanPause(2200, 3600);
+    const h1 = await page.evaluate(() => ((document.querySelector('h1') || {}).innerText || '').trim()).catch(() => '');
+    out.identity = h1;
+    out.wasPage = MANAGE_PAGE_RE.test(h1);
+    if (h1 && !out.wasPage) { out.reason = 'already_personal_profile'; return out; } // already the personal admin — nothing to do
+    await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    await humanPause(2200, 3600);
+    await page.click('[aria-label="Your profile"], [aria-label="Tu perfil"], [aria-label="Votre profil"]', { timeout: 12000 }).catch(() => {});
+    await humanPause(1800, 3200);
+    const det = await detectIdentityRows(page);
+    if (!det.names || det.names.length < 2) { out.reason = det.reason || 'no_switch_target_found'; return out; }
+    const target = det.names[1]; // names[0] = active Page, names[1] = personal admin profile
+    out.target = target;
+    const esc = target.replace(/"/g, '\\"');
+    let clicked = false;
+    try { await page.click(`div[role="menuitem"]:has-text("${esc}"), div[role="button"]:has-text("${esc}"), a:has-text("${esc}")`, { timeout: 8000 }); clicked = true; }
+    catch (_) { try { await page.getByText(target, { exact: true }).first().click({ timeout: 6000 }); clicked = true; } catch (_2) {} }
+    if (!clicked) { out.reason = 'switch_click_failed'; return out; }
+    await humanPause(7000, 9500); // the identity switch performs a full reload
+    await page.goto('https://www.facebook.com/me', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+    await humanPause(2000, 3500);
+    const h1b = await page.evaluate(() => ((document.querySelector('h1') || {}).innerText || '').trim()).catch(() => '');
+    out.identity = h1b || out.identity;
+    out.switched = Boolean(h1b) && !MANAGE_PAGE_RE.test(h1b);
+    out.reason = out.switched ? 'switched_to_personal' : 'switch_did_not_take';
+    return out;
+  } catch (e) {
+    out.reason = 'error:' + String((e && e.message) || e).slice(0, 120);
+    return out;
+  }
+}
+
 async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', groupId = '') {
   const result = {
     clicked: false,
@@ -2853,6 +2922,60 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
   }
   const approveName = APPROVE_NAME_RE;
   const approveText = APPROVE_TEXT_RE;
+  // PRIMARY (new admin queue): the post caption (with the marker) and the Approve button are NOT inside one
+  // [role="article"] — the article node's innerText is EMPTY and the marker lives in a sibling subtree. So
+  // locate the deepest element whose text contains the marker, climb to the post-card ancestor that holds a
+  // PER-POST Approve button (aria-label "Approve post by <author>" / text "Approve"), and click it. CRITICAL:
+  // never click "Approve selected pending posts" (the BULK button — it would approve every selected post).
+  const directApprove = await page.evaluate((marker) => {
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const isPerPostApprove = (b) => {
+      const al = norm(b.getAttribute('aria-label'));
+      const tx = norm(b.innerText);
+      // EXCLUDE the BULK "Approve selected pending posts" button in every language (it approves all selected).
+      if (/selected pending|seleccionad|sélectionn|selezionat|ausgewählt|selecionad|المحدد|المختار/i.test(al)) return false;
+      // PER-POST approve aria-label "Approve post by <author>" across languages, OR a bare "Approve" button.
+      const ariaPerPost = /^(approve post by|aprobar (la )?publicaci|approuver (la )?publication|aprovar (a )?publica|genehmige|beitrag genehmigen|approva il post|الموافقة على|قبول (ال)?منشور|قبول المنشور)/i;
+      const bareApprove = /^(approve|aprobar|approuver|aprovar|genehmigen|approva|موافقة|قبول)$/i;
+      return ariaPerPost.test(al) || bareApprove.test(tx);
+    };
+    // deepest element containing the marker text
+    let markerEl = null;
+    for (const el of document.querySelectorAll('*')) {
+      if (!(el.textContent || '').includes(marker)) continue;
+      if (!markerEl || markerEl.contains(el)) markerEl = el;
+    }
+    if (!markerEl) return { clicked: false, reason: 'marker_text_node_not_found' };
+    let node = markerEl, found = [];
+    for (let i = 0; i < 14 && node; i += 1) {
+      const btns = [...node.querySelectorAll('div[role="button"],button,a[role="button"]')].filter(isPerPostApprove);
+      if (btns.length) { found = btns; break; }
+      node = node.parentElement;
+    }
+    if (!found.length) return { clicked: false, reason: 'no_perpost_approve_near_marker' };
+    let best = found[0];
+    if (found.length > 1) { // climbed into a container with multiple posts — take the Approve nearest the marker
+      const mr = markerEl.getBoundingClientRect(); let bestD = Infinity;
+      for (const b of found) { const br = b.getBoundingClientRect(); const d = Math.abs(br.top - mr.top); if (d < bestD) { bestD = d; best = b; } }
+    }
+    best.scrollIntoView({ block: 'center' });
+    best.click();
+    return { clicked: true, label: norm(best.getAttribute('aria-label')) || norm(best.innerText) || 'Approve' };
+  }, marker).catch((e) => ({ clicked: false, reason: 'direct_approve_error:' + String((e && e.message) || e).slice(0, 80) }));
+  if (directApprove.clicked) {
+    result.clicked = true;
+    result.method = 'marker_container_perpost_approve';
+    result.label = directApprove.label || 'Approve';
+    await humanPause(1200, 2400);
+    const confirmD = await clickFirst(page, [
+      page.locator('div[role="dialog"]').getByRole('button', { name: approveName }),
+      page.locator('div[role="dialog"] button, div[role="dialog"] [role="button"]').filter({ hasText: approveText }),
+      page.getByRole('button', { name: /^(confirm|done|ok|yes|confirmar|aceptar)$/i }),
+    ], { timeout: 2500 });
+    result.confirmed = Boolean(confirmD);
+    await humanPause(4500, 8000);
+    return result;
+  }
   const roots = [
     page.locator('[role="article"]').filter({ hasText: marker }),
     page.locator('[data-pagelet]').filter({ hasText: marker }),
@@ -2870,31 +2993,50 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
         scoped.locator('button, [role="button"]').filter({ hasText: approveText }),
         scoped.locator('[aria-label*="Approve" i], [aria-label*="Approuver" i], [aria-label*="Aprobar" i], [aria-label*="موافقة"], [aria-label*="قبول"]'),
       ], { timeout: 2500 });
-      let viaMenu = false;
-      // (b) NEW FB UI: there is NO direct Approve button — each post has an "Actions for this post" (•••) menu
-      // and Approve lives INSIDE it. Open that menu (scoped to THIS post), then click Approve in the menu.
+      // (b) NEW admin queue: "Approve" is a standalone text button in the post's action bar, but it is often
+      // a SIBLING of the article node (not a descendant) so the scoped locator above can miss it. Fall back
+      // to PROXIMITY — find the marker/author article, then click the visible Approve button closest to (just
+      // below) it. Measured in-page so geometry is exact. (This replaces the old "Actions for this post" menu
+      // path, which was WRONG: that menu only holds Edit/Delete/Notifications, never Approve.)
       if (!clicked) {
-        const actionsRe = /actions for this post|acciones para esta publicaci|m[aá]s opciones|إجراءات|action.*publication/i;
-        const menuBtn = await clickFirst(page, [
-          scoped.locator('[aria-label*="Actions for this post" i], [aria-label*="Acciones para esta" i], [aria-label*="إجراءات"]'),
-          scoped.getByRole('button', { name: actionsRe }),
-          scoped.locator('div[role="button"][aria-label]').filter({ hasText: '' }).getByRole('button', { name: actionsRe }),
-        ], { timeout: 3000 });
-        if (menuBtn) {
-          viaMenu = true;
-          await humanPause(900, 1700);
-          // the menu is a page-level role=menu; click the Approve menuitem
-          clicked = await clickFirst(page, [
-            page.getByRole('menuitem', { name: approveName }),
-            page.locator('[role="menu"] [role="menuitem"], [role="menu"] [role="button"]').filter({ hasText: approveText }),
-            page.locator('[role="menuitem"]').filter({ hasText: approveText }),
-            page.locator('[role="menu"]').getByText(approveName),
-          ], { timeout: 4500 });
+        const prox = await page.evaluate(({ marker, approveSrc, publisherId, gid }) => {
+          const approveRe = new RegExp(approveSrc, 'i');
+          const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+          const vis = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 20 && r.height > 12 && s.visibility !== 'hidden' && s.display !== 'none'; };
+          const articles = [...document.querySelectorAll('[role="article"]')].filter(vis);
+          let target = null;
+          if (marker) for (const a of articles) { if ((a.innerText || '').includes(marker)) { target = a; break; } }
+          if (!target && publisherId && gid) for (const a of articles) { if ([...a.querySelectorAll('a[href]')].some((l) => { const h = String(l.href || ''); return h.includes(`/groups/${gid}/user/${publisherId}/`) || h.includes(`profile.php?id=${publisherId}`); })) { target = a; break; } }
+          if (!target) return { clicked: false, reason: 'no_target_article' };
+          const tr = target.getBoundingClientRect();
+          const btns = [...document.querySelectorAll('div[role="button"],button,a[role="button"]')].filter(vis)
+            .filter((b) => approveRe.test(norm(b.innerText)) || approveRe.test(norm(b.getAttribute('aria-label'))));
+          if (!btns.length) return { clicked: false, reason: 'no_approve_button_on_surface' };
+          let best = null, bestD = Infinity;
+          for (const b of btns) { const br = b.getBoundingClientRect(); const below = br.top >= tr.top - 30; const d = Math.abs(br.top - tr.bottom) + (below ? 0 : 1e6); if (d < bestD) { bestD = d; best = b; } }
+          if (!best) return { clicked: false, reason: 'no_nearest_approve' };
+          best.scrollIntoView({ block: 'center' });
+          best.click();
+          return { clicked: true, label: norm(best.innerText) || 'Approve' };
+        }, { marker, approveSrc: APPROVE_NAME_RE.source, publisherId: cleanPublisherId, gid: groupId }).catch((e) => ({ clicked: false, reason: 'proximity_error:' + String((e && e.message) || e).slice(0, 80) }));
+        if (prox.clicked) {
+          result.clicked = true;
+          result.method = 'marker_proximity_approve_button';
+          result.label = prox.label || 'Approve';
+          await humanPause(1200, 2400);
+          const confirmP = await clickFirst(page, [
+            page.locator('div[role="dialog"]').getByRole('button', { name: approveName }),
+            page.locator('div[role="dialog"] button, div[role="dialog"] [role="button"]').filter({ hasText: approveText }),
+            page.getByRole('button', { name: /^(confirm|done|ok|yes|confirmar|aceptar)$/i }),
+          ], { timeout: 2500 });
+          result.confirmed = Boolean(confirmP);
+          await humanPause(4500, 8000);
+          return result;
         }
       }
       if (!clicked) continue;
       result.clicked = true;
-      result.method = viaMenu ? 'marker_scoped_approve_via_actions_menu' : 'marker_scoped_approve_button';
+      result.method = 'marker_scoped_approve_button';
       result.label = await clicked.evaluate(el => (el.getAttribute('aria-label') || el.innerText || el.textContent || '').replace(/\s+/g, ' ').slice(0, 120)).catch(() => 'Approve');
       await humanPause(1200, 2400);
       // optional confirm dialog
@@ -3043,6 +3185,12 @@ async function approvePendingPost(page, context, payload, gid, marker) {
   const attempts = [];
   const verified = [];
   let approvalResult = { clicked: false, confirmed: false, reason: 'not_attempted' };
+  // STEP 0 (critical): become the PERSONAL group-admin identity. Moderator profiles default to acting as
+  // the posting Page, which cannot see/approve other members' pending posts (queue renders 0 Approve
+  // buttons). Switching to the personal admin profile is what makes Approve/Decline appear. Idempotent.
+  const identitySwitch = await ensureAdminIdentity(page);
+  attempts.push({ step: 'ensure_admin_identity', ...identitySwitch });
+  console.log(JSON.stringify({ step: 'admin_identity', ...identitySwitch }));
   const collectVerifiedUrls = async (source) => {
     const markerScopedUrls = await extractMarkerScopedPostUrls(page, gid, marker).catch(() => []);
     const domUrls = await extractDomUrls(page, gid, marker).catch(() => []);
@@ -3061,7 +3209,13 @@ async function approvePendingPost(page, context, payload, gid, marker) {
     attempts.push({ target: postUrl, url: page.url(), title: await page.title().catch(() => '') });
     approvalResult = await clickApproveForVisibleMarker(page, marker, payload.publisherFacebookUserId || payload.facebookUserId, gid);
     const directChecks = await bodyMarkerChecks(page, marker);
-    if (!approvalResult.clicked && directChecks.markerVisible && directChecks.postMediaVerified) {
+    // A pending post's OWN permalink renders fine (marker + image visible) even though it is NOT approved
+    // yet — so "visible" must NOT be read as "approved" (that was the false-positive that left posts pending
+    // while the server logged them approved). Detect the pending banner; accept the visibility-only success
+    // ONLY when the post is genuinely LIVE (not pending). When pending, fall through to the moderation QUEUE
+    // below where the real Approve button is clicked.
+    const pendingDetected = await page.evaluate(() => /\b(pending|waiting for approval|awaiting approval|pendiente|en attente|en espera|in attesa)\b/i.test(document.body.innerText || '') || /قيد المراجعة|بانتظار الموافقة/.test(document.body.innerText || '')).catch(() => false);
+    if (!approvalResult.clicked && directChecks.markerVisible && directChecks.postMediaVerified && !pendingDetected) {
       console.log(JSON.stringify({
         step: 'approval_attempted',
         mode: 'approve_only',
@@ -3079,6 +3233,9 @@ async function approvePendingPost(page, context, payload, gid, marker) {
         marker,
         postUrl,
         postPageUrl: postUrl,
+        // notPending: the server REQUIRES this to accept a clicked:false approval (proof the post is already
+        // live, not merely that its permalink rendered). Set only on this genuinely-live, non-pending branch.
+        notPending: true,
         bodyChecks: {
           markerVisible: true,
           ownControls: directChecks.ownControls,

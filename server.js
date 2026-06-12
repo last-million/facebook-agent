@@ -11526,7 +11526,17 @@ function facebookAdminApprovalValidationFromLog(objects = [], postUrl = "") {
   if (approverLacksAdminRole) errors.push("admin_approval_surface_unavailable_approver_not_admin");
   if (!markerVisible) errors.push("admin_approval_post_marker_not_verified");
   if (!postMediaVerified) errors.push("admin_approval_post_image_not_verified");
-  if (!approvalStep?.clicked && markerVisible && postMediaVerified) warnings.push("admin_approval_button_not_needed_or_not_found");
+  // A pending post needs the moderator to actually CLICK Approve. If Approve was never clicked, the post is
+  // STILL PENDING — the permalink rendering (markerVisible) does NOT mean it was approved (a pending post's
+  // own permalink renders fine). This was the FALSE POSITIVE that logged posts "approved_and_verified" while
+  // they sat pending forever (never commented, never retried). Accept a not-clicked approval ONLY when the
+  // connector proved the post is already live & not pending (notPending === true).
+  const approvalButtonClicked = Boolean(approvalStep?.clicked);
+  const provenAlreadyLive = resultStep?.notPending === true;
+  if (!approvalButtonClicked && markerVisible && postMediaVerified) {
+    if (provenAlreadyLive) warnings.push("admin_approval_button_not_needed_post_already_live");
+    else errors.push("admin_approval_button_not_clicked_post_still_pending");
+  }
   return {
     noPendingPostForPublisher,
     approverLacksAdminRole,
