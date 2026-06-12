@@ -71,6 +71,13 @@ opened to facebook.com/forced_account_switch with empty h1 on a fast /me — the
 switch safely in that state.) Warm-pool-of-2-always-open still SKIPPED: patient-session + batch removed the
 bottleneck; revisit only if approval volume grows.
 
+FORCED_ACCOUNT_SWITCH (2026-06-12, after moderators re-logged as distinct personal accounts): FB intercepts the
+first navigation with facebook.com/forced_account_switch — "Switching accounts / You need to switch to <Name>
+to continue." + ONE blue "Continue" button. Until clicked the session reaches NOTHING (queue never loads, h1
+empty → that's the empty-h1 state seen on /me). FIX: connector `dismissForcedAccountSwitch(page)` (detect by
+URL, click Continue multilingual, verify URL cleared) wired into ensureAdminIdentity (re-goto /me after) and
+openGroupReviewSurface (retry target after). Posting profiles (Pages) don't hit this.
+
 DEFAULT CHANGED (operator, 2026-06-12): moderator profiles now open Facebook **as the PERSONAL admin directly**
 (no longer as the Page) — operator flipped the default identity in FB. ensureAdminIdentity auto-detects and
 SKIPS the switch (reason already_personal_profile) → approvals faster. HARDENED for this: the switch now runs
