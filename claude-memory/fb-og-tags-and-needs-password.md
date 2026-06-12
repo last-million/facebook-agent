@@ -33,4 +33,12 @@ TWO operator rules implemented 2026-06-12 (during the long FB-agent session):
   password-prompt connector signal lands as a not-logged-in error so it parks (vs the forced_account_switch case,
   which is auto-clicked, see [[fb-admin-approval-page-identity]]).
 
+GAP FIX (2026-06-12): logged-out accounts that failed at the COMPOSER ("could not open composer") were NOT
+flagged — that error isn't isFacebookNotLoggedInError, so the auto-park (server.js ~9074-9081: suspended→
+markProfileSuspended, login→markProfileDisconnected, account-err→markProfileErrored) skipped them. FIX: connector
+now calls ensureFacebookLoggedIn at the composer-open failure ('composer_open_failed_login_recheck') — a real
+login wall throws facebook_login_required_for_profile → server parks it as DISCONNECTED (Prod tab list + skip);
+a healthy-but-transient composer miss is a no-op (no false park). Disconnected section already exists:
+uxAttachDisconnectedProfiles (web/app.js) + GET /api/profiles/disconnected + Release btn (POST /api/profiles/release).
+
 Connector changes = NO restart (fresh spawn). The OG cap + #fb removal apply to NEW harvests/plans only.

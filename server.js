@@ -13461,16 +13461,25 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
         .slice(0, MAX_COMMENT_FALLBACK_PROFILES);
       commentProfiles = (await filterExistingIxBrowserProfiles(commentProfiles, groupUrl, "required_first_comment_after_admin_approval"))
         .slice(0, MAX_COMMENT_FALLBACK_PROFILES);
-      const retry = await recoverFacebookCommentWithProfiles({
-        row,
-        ready,
-        groupUrl,
-        postUrl: approvalResult.postUrl || postUrl,
-        imagePath,
-        ledgerKey,
-        profiles: commentProfiles,
-        reason: "Admin approval was verified; retrying required first comment with a different profile.",
-      });
+      // PRIORITISE the just-approved post for commenting: a post FRESH from approval takes ~30-90s to become
+      // commentable (pending -> live), so a single immediate retry often fails and the post falls to the slow
+      // periodic resweep (the 7-20 min post->comment gap the operator saw). Instead SETTLE + RETRY a few times
+      // right here so the comment lands within ~2-3 min of approval.
+      let retry;
+      for (let __attempt = 1; __attempt <= 4 && !(retry && retry.ok); __attempt += 1) {
+        if (__attempt > 1) await sleep(40000); // let the just-approved post finish going live, then retry
+        retry = await recoverFacebookCommentWithProfiles({
+          row,
+          ready,
+          groupUrl,
+          postUrl: approvalResult.postUrl || postUrl,
+          imagePath,
+          ledgerKey,
+          profiles: commentProfiles,
+          reason: `Admin approval verified; commenting the approved post now (attempt ${__attempt}/4).`,
+        });
+        closeResults.push(...((retry && retry.closeResults) || []));
+      }
       closeResults.push(...(retry.closeResults || []));
       if (retry.ok && livePostValidationNeedsPinRecovery(retry.validation)) {
         const pinRecovery = await recoverFacebookCommentPinWithProfiles({

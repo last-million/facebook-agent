@@ -4401,6 +4401,12 @@ async function main() {
     if (/join group|request to join|pending approval|cancel request|must be a member|you are not a member|only members can|members of this group|invitation only|invited to join|private group|answer.*question.*join|membership question/.test(probe)) {
       throw new Error('facebook_group_membership_required_not_a_member');
     }
+    // LOGGED-OUT CHECK: a logged-out profile has NO composer either — but it must be flagged as
+    // NEEDS-LOGIN (parked in the Prod-tab "Disconnected profiles" section + skipped) NOT bounced as a
+    // generic composer miss. Re-verify the session: if it's a real login wall, throw the login error so the
+    // server's isFacebookNotLoggedInError -> markProfileDisconnected fires. ensureFacebookLoggedIn throws
+    // facebook_login_required_for_profile on a true wall and is a no-op when healthy (avoids false parks).
+    try { await ensureFacebookLoggedIn(page, payload, 'composer_open_failed_login_recheck'); } catch (e) { throw e; }
     throw new Error('could not open composer');
   }
   logTiming('after_composer_opened');

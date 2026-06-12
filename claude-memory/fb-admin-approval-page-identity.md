@@ -85,5 +85,11 @@ ONLY when "Manage Page" is POSITIVELY detected; an unreadable/empty h1 SKIPS (id
 — blindly clicking row[1] would now flip personal→Page (wrong direction, 0 Approve buttons). Posting profiles
 still post AS the Page (unchanged — posts authored by "Couponing for beginners"/61590707785162).
 
+COMMENT-AFTER-APPROVAL PRIORITY (operator 2026-06-12, measured 7.2 min approve→comment gap): the post-approval
+comment retry ran ONCE (server.js ~13464); a post FRESH from approval takes ~30-90s to go pending→live, so that
+single retry often failed and the post fell to the slow periodic resweep (the 7-20 min gap). FIX: wrapped it in
+a SETTLE+RETRY loop (4 attempts, 40s between) so the approved post is commented within ~2-3 min. server.js change
+→ needs restart.
+
 Connector changes need NO restart (fresh-spawned per run). server.js validation guard loaded via restart
 2026-06-11 (server PID 5040). See [[fb-agent-highscale-pipeline]] and [[fb-no-live-post-without-ok]].
