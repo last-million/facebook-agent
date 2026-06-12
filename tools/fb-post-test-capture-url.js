@@ -2881,29 +2881,46 @@ async function detectIdentityRows(page) {
 // patient session). Detect by URL and click Continue (multilingual). Safe + idempotent.
 const FORCED_SWITCH_CONTINUE_RE = /^(continue|continuer|continuar|weiter|continua|prosseguir|devam|doorgaan|kontynuuj|متابعة|استمرار)$/i;
 async function dismissForcedAccountSwitch(page) {
-  try {
-    if (!/forced_account_switch|account_switcher/i.test(String(page.url() || ''))) return false;
-    console.log(JSON.stringify({ step: 'forced_account_switch_detected', url: page.url() }));
-    const clicked = await clickFirst(page, [
-      page.getByRole('button', { name: FORCED_SWITCH_CONTINUE_RE }),
-      page.locator('button, [role="button"], input[type="submit"], a[role="link"]').filter({ hasText: FORCED_SWITCH_CONTINUE_RE }),
-      page.locator('input[type="submit"]'),
-    ], { timeout: 6000 });
-    if (!clicked) {
-      // last resort: in-page click on any control whose exact text is a Continue variant
-      await page.evaluate((src) => {
-        const re = new RegExp(src, 'i');
-        for (const el of document.querySelectorAll('button, [role="button"], input[type="submit"], a')) {
-          const t = ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim();
-          if (re.test(t)) { el.click(); return; }
-        }
-      }, FORCED_SWITCH_CONTINUE_RE.source).catch(() => {});
-    }
-    await humanPause(3500, 5500); // FB reloads into the confirmed account
-    const cleared = !/forced_account_switch|account_switcher/i.test(String(page.url() || ''));
-    console.log(JSON.stringify({ step: 'forced_account_switch_dismissed', cleared, url: page.url() }));
-    return cleared;
-  } catch (_) { return false; }
+  // FB can re-throw the card on the next navigation, so LOOP: click Continue ASAP, verify the URL cleared,
+  // and if FB re-renders it, click again (up to 4 passes). Click is immediate (wait for the button, not a
+  // fixed pause) so the profile never visibly sits on the switch page.
+  let everCleared = false;
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    try {
+      if (!/forced_account_switch|account_switcher/i.test(String(page.url() || ''))) return everCleared;
+      console.log(JSON.stringify({ step: 'forced_account_switch_detected', attempt, url: page.url() }));
+      let clicked = false;
+      try {
+        const btn = page.getByRole('button', { name: FORCED_SWITCH_CONTINUE_RE }).first();
+        await btn.waitFor({ state: 'visible', timeout: 7000 });
+        await btn.click({ timeout: 4000 });
+        clicked = true;
+      } catch (_) {}
+      if (!clicked) {
+        clicked = await clickFirst(page, [
+          page.getByRole('button', { name: FORCED_SWITCH_CONTINUE_RE }),
+          page.locator('button, [role="button"], input[type="submit"], a[role="link"]').filter({ hasText: FORCED_SWITCH_CONTINUE_RE }),
+          page.locator('input[type="submit"]'),
+        ], { timeout: 5000 });
+      }
+      if (!clicked) {
+        // last resort: in-page click on any control whose exact text is a Continue variant
+        await page.evaluate((src) => {
+          const re = new RegExp(src, 'i');
+          for (const el of document.querySelectorAll('button, [role="button"], input[type="submit"], a')) {
+            const t = ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim();
+            if (re.test(t)) { el.click(); return; }
+          }
+        }, FORCED_SWITCH_CONTINUE_RE.source).catch(() => {});
+      }
+      await humanPause(2500, 4000); // FB reloads into the confirmed account
+      const cleared = !/forced_account_switch|account_switcher/i.test(String(page.url() || ''));
+      console.log(JSON.stringify({ step: 'forced_account_switch_dismissed', attempt, cleared, url: page.url() }));
+      if (cleared) { everCleared = true; return true; }
+      // still on the card — FB re-rendered it; loop and click again
+    } catch (_) { /* retry next pass */ }
+  }
+  return everCleared;
 }
 
 const MANAGE_PAGE_RE = /manage page|gestionar p[aá]gina|g[eé]rer la page/i;
@@ -2911,13 +2928,12 @@ async function ensureAdminIdentity(page) {
   const out = { switched: false, wasPage: null, identity: '', target: '', reason: '' };
   try {
     await page.goto('https://www.facebook.com/me', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-    await humanPause(2200, 3600);
-    // FB may intercept with the forced_account_switch card ("Continue as <Name>") — click through it, then
-    // re-load /me so the identity read below sees the real profile, not the interstitial (empty h1).
+    // FB may intercept with the forced_account_switch card ("Continue as <Name>") — click Continue IMMEDIATELY
+    // (don't let the profile sit on it), then re-load /me so the identity read below sees the real profile.
     if (await dismissForcedAccountSwitch(page)) {
       await page.goto('https://www.facebook.com/me', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-      await humanPause(2000, 3200);
     }
+    await humanPause(2000, 3200);
     const h1 = await page.evaluate(() => ((document.querySelector('h1') || {}).innerText || '').trim()).catch(() => '');
     out.identity = h1;
     out.wasPage = MANAGE_PAGE_RE.test(h1);

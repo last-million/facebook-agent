@@ -15587,6 +15587,9 @@ const IXBROWSER_SYNC_INTERVAL_MS = 5 * 60 * 1000; // standalone "always" sync ca
 let __reconcileInFlight = false;
 let __reconcileLastAt = 0;
 let __lastStandaloneReconcileAt = 0;
+// AUTO DISCONNECT DETECTION: how often (idle-only) to sweep every assigned profile for logout/suspension.
+let __lastHealthSweepAt = 0;
+const HEALTH_SWEEP_INTERVAL_MS = 7200000; // ~2h; first sweep fires on the first idle tick after boot
 
 function isReservedReconcileProfile(profileId, label, state) {
   const id = Number(profileId || profileIdFromLabel(label) || 0);
@@ -17831,6 +17834,16 @@ setInterval(() => {
     __lastStandaloneReconcileAt = Date.now();
     reconcileProfilesWithIxBrowser({ force: false }).catch((err) => logEvent("ixbrowser_sync_interval_error", { error: oneLineField(err.message || String(err), 200) }));
   }
+  // AUTO DISCONNECT DETECTION: every ~2h while IDLE (no posting/harvest job in flight), open each assigned
+  // profile and park the logged-out/suspended ones (runProfileHealthSweep → markProfileDisconnected/Suspended
+  // → Prod-tab Disconnected list + skipped). Gated on !active so it never competes with a live run for
+  // ixBrowser; single-flight + CPU-aware inside; fail-open. Catches idle logged-out profiles (e.g. 50/45) that
+  // a posting run never selects, so they surface WITHOUT being used. Used-but-logged-out profiles are still
+  // caught in-line by the posting/comment path.
+  if (!active && Date.now() - __lastHealthSweepAt > HEALTH_SWEEP_INTERVAL_MS) {
+    __lastHealthSweepAt = Date.now();
+    runProfileHealthSweep({ concurrency: 2 }).catch((err) => logEvent("profile_health_sweep_interval_error", { error: oneLineField(err.message || String(err), 200) }));
+  }
   const state = readState();
   const intervalMs = clampNumber(state.triggers?.heartbeatSeconds, 3, 120, 3) * 1000;
   if (Date.now() - lastHeartbeatTick < intervalMs) return;
@@ -18924,4 +18937,8 @@ server.listen(PORT, HOST, () => {
   // Kick one per-post-log retention sweep shortly after startup (covers a process that was down
   // across the interval), then the heartbeat repeats it every >=6h.
   setTimeout(() => { __lastPerPostLogSweep = Date.now(); sweepPerPostLogs().catch(() => {}); }, 30000);
+  // AUTO DISCONNECT DETECTION boot-grace: don't let the first health-sweep fire the instant we boot (would
+  // storm ixBrowser if the operator re-arms right away). Back-date the clock so the first idle sweep becomes
+  // eligible ~10min after boot, then every ~2h while idle.
+  __lastHealthSweepAt = Date.now() - (HEALTH_SWEEP_INTERVAL_MS - 600000);
 });
