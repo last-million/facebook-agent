@@ -25,6 +25,18 @@ evenly across all profiles (no profile gets over-used/burned).
 - Any NEW profile-selection path must apply the same least-used-first ordering. See [[fb-admin-approval-page-identity]]
   (moderators 42/16/1 are still excluded from BOTH posting/comment rosters regardless of usage).
 
+EQUAL POSTS ACROSS GROUPS (operator rule 2026-06-12): with N groups defined (each with its OWN posting/comment
+profiles in the Prod tab), posts must spread EQUALLY across ALL groups. The cluster ("4/0 to one group") is NOT
+the interleave or worker-slice — it's the PICKER. FIX: in the autopilot publish picker (server.js ~L8917) added a
+group-balance cap — first pass caps each group at ceil(maxWorkers / groupsWithReadyRows), second pass fills the
+remainder. Dynamic for any group count; group key = row.groupUrl. PROVEN: split improved 4/0 → 3/1. REMAINING gap
+to perfect 2/2 = supply: a group only gets its share if it has enough ELIGIBLE+READY rows that cycle — and a group
+heavily used last run has most profiles in their per-profile posting-spacing cooldown (minGapMs), so few are
+eligible. Also a STALE assignment entry (e.g. profile 8 in 4854 = deleted from ixBrowser → "profile-open error
+2007"; fallback skips it but operator should remove it). True per-batch equality needs both groups to have rested
+profiles. An existence-filter for the plan was attempted but preparePostingPlan is SYNC (can't await
+filterExistingIxBrowserProfiles) — reverted; do it via a sync cached id-set if revisited.
+
 PERMALINK CAPTURE via /user surface (operator-requested 2026-06-12): connector `userSurfaceMarkerUrls(page, gid,
 authorId, marker)` navigates to `/groups/{gid}/user/{pageId}/` (lists ONLY that page's posts, newest first — all
 profiles post AS the Page 61590707785162), then matches the EXACT marker (post text + #fb tag) via the existing

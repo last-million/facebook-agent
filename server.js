@@ -7245,6 +7245,7 @@ function shuffledCopy(items = []) {
 function postingSlots(state) {
   const slots = [];
   const __disconnectedIds = disconnectedProfileIdSet(state); const __erroredIds = erroredProfileIdSet(state); const __suspendedIds = suspendedProfileIdSet(state); // skip parked profiles (not-logged-in / account error / suspended)
+  const __liveIds = cachedLiveIxProfileIdSet(); // DYNAMIC: live ixBrowser ids (sync cache, kept warm by the reconcile); null => fail open
   const postsPerProfile = clampNumber(state.rules.postsPerProfilePerDay, 1, 20, 5);
   const maxProfilesPerRun = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 1000000, 100000);
   const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
@@ -7294,6 +7295,7 @@ function postingSlots(state) {
         const label = String(profile || "").trim();
         if (!label) continue;
         const profileId = profileIdFromLabel(label);
+        if (__liveIds && profileId && !__liveIds.has(profileId)) continue; // DYNAMIC: profile no longer exists in ixBrowser (operator deleted/renamed) -> auto-skip, no stale 2007 failure
         if (__disconnectedIds.has(String(profileId)) || __erroredIds.has(String(profileId)) || __suspendedIds.has(String(profileId))) continue; // parked (not logged in / account error / suspended) -> skipped until released
         if (isDedicatedShopYourLikesProfileLabel(label, state)) continue;
         if (isBlockedIxBrowserProfileLabel(label, state)) continue;
@@ -8918,22 +8920,36 @@ async function autopilotTickAsync(options = {}) {
     const usedIds = new Set();
     const usedProductKeys = new Set();
     const usedMarkers = new Set();
-    for (const row of readyRows) {
-      const pid = Number(row.profileId || profileIdFromLabel(row.profile) || 0);
-      if (!eligibleIds.has(pid) || usedIds.has(pid)) continue;
-      const prodKey = String(row.productKey || row.productUrl || row.link || "").toLowerCase();
-      if (prodKey && usedProductKeys.has(prodKey)) continue; // each post must use a UNIQUE product
-      // CONCURRENCY SAFETY: two products whose markers are the same OR variant SIBLINGS (shared
-      // long title prefix, e.g. RC Lambo "...- Red" vs "...- White") must NOT be in the same
-      // parallel batch — their near-identical captions make feed-capture ambiguous. Skip siblings.
-      const markerKey = computePostMarkerPhrase(row).toLowerCase();
-      if (markerKey && [...usedMarkers].some((m) => markersAreSiblings(markerKey, m))) continue;
-      usedIds.add(pid);
-      if (prodKey) usedProductKeys.add(prodKey);
-      usedMarkers.add(markerKey);
-      picked.push(row);
-      if (picked.length >= maxWorkers) break;
-    }
+    // GROUP BALANCE: spread this batch EVENLY across the groups that have ready rows, so a multi-group run
+    // never lands entirely in one group. Cap each group at ceil(maxWorkers / groupsWithReadyRows) on a first
+    // pass (forces an even split), then a second pass fills any remainder if one group ran short — so the
+    // batch is still filled when a group has fewer ready rows. Group key = the row's groupUrl.
+    const __readyGroupKeys = [...new Set(readyRows.map((r) => normalizedFacebookGroupKey(r.groupUrl)).filter(Boolean))];
+    const __perGroupCap = Math.max(1, Math.ceil(maxWorkers / Math.max(1, __readyGroupKeys.length)));
+    const __pickedByGroup = new Map();
+    const __pickPass = (enforceGroupCap) => {
+      for (const row of readyRows) {
+        if (picked.length >= maxWorkers) break;
+        const pid = Number(row.profileId || profileIdFromLabel(row.profile) || 0);
+        if (!eligibleIds.has(pid) || usedIds.has(pid)) continue;
+        const gKey = normalizedFacebookGroupKey(row.groupUrl);
+        if (enforceGroupCap && (__pickedByGroup.get(gKey) || 0) >= __perGroupCap) continue; // hold this group at its fair share on the first pass
+        const prodKey = String(row.productKey || row.productUrl || row.link || "").toLowerCase();
+        if (prodKey && usedProductKeys.has(prodKey)) continue; // each post must use a UNIQUE product
+        // CONCURRENCY SAFETY: two products whose markers are the same OR variant SIBLINGS (shared long title
+        // prefix, e.g. RC Lambo "...- Red" vs "...- White") must NOT be in the same parallel batch — their
+        // near-identical captions make feed-capture ambiguous. Skip siblings.
+        const markerKey = computePostMarkerPhrase(row).toLowerCase();
+        if (markerKey && [...usedMarkers].some((m) => markersAreSiblings(markerKey, m))) continue;
+        usedIds.add(pid);
+        if (prodKey) usedProductKeys.add(prodKey);
+        usedMarkers.add(markerKey);
+        __pickedByGroup.set(gKey, (__pickedByGroup.get(gKey) || 0) + 1);
+        picked.push(row);
+      }
+    };
+    __pickPass(true);                                  // even split — each group capped at its fair share
+    if (picked.length < maxWorkers) __pickPass(false); // fill the remainder if a group had too few ready rows
     if (!picked.length) {
       decision.action = "no_ready_row";
       decision.detail = `plan ${plan.planId}: ${readyRows.length} ready row(s), none match the ${eligibleIds.size} eligible profile(s)`;
@@ -10722,22 +10738,40 @@ async function ixBrowserCommentFallbackProfilesForGroup(row, groupUrl, state = r
   }
 }
 
+// SYNC live-profile cache: every ixBrowser profile-list fetch (the 5-min reconcile heartbeat, the comment
+// existence filter, etc.) refreshes this, so SYNCHRONOUS code (postingSlots) can DYNAMICALLY skip profiles the
+// operator deleted/renamed in ixBrowser with NO async call. null when never-fetched/stale -> callers FAIL OPEN
+// (never drop every profile on a transient empty). This is what makes Step-3 group rosters self-clean.
+let __liveIxProfileIdSet = null;
+let __liveIxProfileIdSetAt = 0;
+function __noteLiveIxProfileIds(ids) {
+  try { const s = new Set((ids || []).map(Number).filter(Boolean)); if (s.size) { __liveIxProfileIdSet = s; __liveIxProfileIdSetAt = Date.now(); } } catch (_) {}
+}
+function cachedLiveIxProfileIdSet(maxAgeMs = 30 * 60 * 1000) {
+  if (!__liveIxProfileIdSet || !__liveIxProfileIdSet.size) return null;
+  if (maxAgeMs > 0 && (Date.now() - __liveIxProfileIdSetAt) > maxAgeMs) return null;
+  return __liveIxProfileIdSet;
+}
 async function existingIxBrowserProfileIdSet() {
   const data = await ixBrowserRequest("profile-list", { page: 1, limit: 200 });
   const rows = ixBrowserProfileRows(data);
-  return new Set((rows.profiles || [])
+  const set = new Set((rows.profiles || [])
     .map((profile) => Number(profile.profile_id || profile.id || 0))
     .filter(Boolean));
+  __noteLiveIxProfileIds([...set]);
+  return set;
 }
 // Same fail-closed fetch, but returns {id,name} rows so the auto-add sync can build the canonical
 // "{id} - {name}" roster label. Throws on a hard ixBrowser failure (callers fail-closed).
 async function existingIxBrowserProfileRows() {
   const data = await ixBrowserRequest("profile-list", { page: 1, limit: 200 });
   const rows = ixBrowserProfileRows(data);
-  return (rows.profiles || [])
+  const out = (rows.profiles || [])
     .map((profile) => sanitizeIxBrowserProfile(profile))
     .map((profile) => ({ id: Number(profile.profile_id || profile.id || 0), name: String(profile.name || "").trim() }))
     .filter((row) => row.id);
+  __noteLiveIxProfileIds(out.map((r) => r.id));
+  return out;
 }
 
 async function filterExistingIxBrowserProfiles(profiles = [], groupUrl = "", reason = "comment_fallback") {
