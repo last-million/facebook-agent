@@ -2850,10 +2850,17 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
     method: '',
     reason: '',
   };
-  const markerVisible = await page.evaluate((marker) => {
+  // EXACT-MATCH KEY: the post's unique #fb<6hex> fingerprint is the single most reliable identifier of OUR
+  // post (seeded per-post -> guaranteed unique, and immune to the whitespace/line-break reflow that can break
+  // a full tag-line includes()). Prefer it; fall back to the full marker only when no fingerprint is present.
+  // This is what guarantees we approve ONLY our exact post — never a member's post or another of our posts
+  // that merely shares the same Page author.
+  const fingerprint = (String(marker || '').match(/#fb[0-9a-f]{6}/i) || [])[0] || '';
+  const matchKey = fingerprint || marker;
+  const markerVisible = await page.evaluate((matchKey) => {
     const text = document.body.innerText || '';
-    if (!marker) return false;
-    if (text.includes(marker)) return true;
+    if (!matchKey) return false;
+    if (text.includes(matchKey)) return true;
     const normalize = (input) => String(input || '')
       .normalize('NFD')
       .replace(/[̀-ͯ︀-️]/g, '')
@@ -2861,63 +2868,19 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
       .replace(/\s+/g, ' ')
       .trim()
       .toLowerCase();
-    const cleanMarker = normalize(marker);
-    return cleanMarker.length >= 12 && normalize(text).includes(cleanMarker);
-  }, marker).catch(() => false);
+    const cleanMarker = normalize(matchKey);
+    return cleanMarker.length >= 8 && normalize(text).includes(cleanMarker);
+  }, matchKey).catch(() => false);
   const cleanPublisherId = String(publisherUserId || '').replace(/\D+/g, '');
-  if (!markerVisible && !cleanPublisherId) {
-    result.reason = 'marker_not_visible_before_approval';
-    result.diagnostic = await captureApprovalDiagnostic(page, marker);
-    console.log(JSON.stringify({ step: 'admin_approval_diagnostic', reason: result.reason, diagnostic: result.diagnostic }));
-    return result;
-  }
-  if (!markerVisible && cleanPublisherId) {
-    const authorMatchResult = await page.evaluate(({ publisherId, gid, approveSrc }) => {
-      const visible = (el) => {
-        const r = el.getBoundingClientRect();
-        const s = getComputedStyle(el);
-        return r.width > 50 && r.height > 50 && s.visibility !== 'hidden' && s.display !== 'none';
-      };
-      const approveRegex = new RegExp(approveSrc, 'i'); // EN/FR/ES/AR (passed in; RegExp can't cross evaluate)
-      const articles = [...document.querySelectorAll('[role="article"]')].filter(visible);
-      for (const a of articles) {
-        const authorLinks = [...a.querySelectorAll('a[href]')].filter(link => {
-          const href = String(link.href || '');
-          return href.includes(`/groups/${gid}/user/${publisherId}/`) || href.includes(`profile.php?id=${publisherId}`) || (href.includes(`/user/${publisherId}/`) && href.includes(`/groups/${gid}/`));
-        });
-        if (!authorLinks.length) continue;
-        const btns = [...a.querySelectorAll('button, [role="button"], a[role="button"]')];
-        const approveBtn = btns.find(b => {
-          const label = (b.innerText || b.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
-          return approveRegex.test(label);
-        });
-        if (approveBtn) {
-          approveBtn.scrollIntoView({ block: 'center' });
-          approveBtn.click();
-          return { clicked: true, label: (approveBtn.innerText || approveBtn.getAttribute('aria-label') || 'Approve').slice(0, 80) };
-        }
-      }
-      return { clicked: false, reason: 'no_pending_article_matched_publisher_or_no_approve_button', articleCount: articles.length };
-    }, { publisherId: cleanPublisherId, gid: groupId, approveSrc: APPROVE_NAME_RE.source }).catch((err) => ({ clicked: false, reason: err?.message || String(err) }));
-    if (authorMatchResult.clicked) {
-      result.clicked = true;
-      result.method = 'author_matched_publisher_user_id';
-      result.label = authorMatchResult.label || 'Approve';
-      await humanPause(1000, 2200);
-      const confirmName = APPROVE_NAME_RE;
-      const confirmText = APPROVE_TEXT_RE;
-      const confirm = await clickFirst(page, [
-        page.locator('div[role="dialog"]').getByRole('button', { name: confirmName }),
-        page.locator('div[role="dialog"] button, div[role="dialog"] [role="button"]').filter({ hasText: confirmText }),
-        page.getByRole('button', { name: /^(confirm|done|ok|yes)$/i }),
-      ], { timeout: 2500 });
-      result.confirmed = Boolean(confirm);
-      await humanPause(4500, 8000);
-      return result;
-    }
-    result.reason = authorMatchResult.reason || 'author_match_failed_and_marker_not_visible';
-    result.diagnostic = await captureApprovalDiagnostic(page, marker);
-    console.log(JSON.stringify({ step: 'admin_approval_diagnostic', reason: result.reason, articleCount: result.diagnostic?.articleCount || authorMatchResult.articleCount || 0, authorMatchInfo: authorMatchResult, diagnostic: result.diagnostic }));
+  if (!markerVisible) {
+    // EXACT-MATCH ONLY: our post's unique #fb fingerprint / tag line is NOT in the queue, so the post has not
+    // propagated into the moderation queue yet (or is already live). We deliberately DO NOT approve by author
+    // or position — EVERY one of our posts shares the same Page author, and real members' posts sit in the
+    // SAME queue, so any author/position fallback could approve the WRONG post (ours or, worse, a member's).
+    // Approve nothing; report not-found so the server simply retries once the post appears.
+    result.reason = 'exact_marker_not_visible_no_approval';
+    result.diagnostic = await captureApprovalDiagnostic(page, matchKey);
+    console.log(JSON.stringify({ step: 'admin_approval_diagnostic', reason: result.reason, matchKey, diagnostic: result.diagnostic }));
     return result;
   }
   const approveName = APPROVE_NAME_RE;
@@ -2927,7 +2890,7 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
   // locate the deepest element whose text contains the marker, climb to the post-card ancestor that holds a
   // PER-POST Approve button (aria-label "Approve post by <author>" / text "Approve"), and click it. CRITICAL:
   // never click "Approve selected pending posts" (the BULK button — it would approve every selected post).
-  const directApprove = await page.evaluate((marker) => {
+  const directApprove = await page.evaluate((key) => {
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const isPerPostApprove = (b) => {
       const al = norm(b.getAttribute('aria-label'));
@@ -2939,10 +2902,10 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
       const bareApprove = /^(approve|aprobar|approuver|aprovar|genehmigen|approva|موافقة|قبول)$/i;
       return ariaPerPost.test(al) || bareApprove.test(tx);
     };
-    // deepest element containing the marker text
+    // deepest element containing the exact fingerprint/marker text
     let markerEl = null;
     for (const el of document.querySelectorAll('*')) {
-      if (!(el.textContent || '').includes(marker)) continue;
+      if (!(el.textContent || '').includes(key)) continue;
       if (!markerEl || markerEl.contains(el)) markerEl = el;
     }
     if (!markerEl) return { clicked: false, reason: 'marker_text_node_not_found' };
@@ -2961,7 +2924,7 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
     best.scrollIntoView({ block: 'center' });
     best.click();
     return { clicked: true, label: norm(best.getAttribute('aria-label')) || norm(best.innerText) || 'Approve' };
-  }, marker).catch((e) => ({ clicked: false, reason: 'direct_approve_error:' + String((e && e.message) || e).slice(0, 80) }));
+  }, matchKey).catch((e) => ({ clicked: false, reason: 'direct_approve_error:' + String((e && e.message) || e).slice(0, 80) }));
   if (directApprove.clicked) {
     result.clicked = true;
     result.method = 'marker_container_perpost_approve';
@@ -2977,9 +2940,9 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
     return result;
   }
   const roots = [
-    page.locator('[role="article"]').filter({ hasText: marker }),
-    page.locator('[data-pagelet]').filter({ hasText: marker }),
-    page.locator('div').filter({ hasText: marker }),
+    page.locator('[role="article"]').filter({ hasText: matchKey }),
+    page.locator('[data-pagelet]').filter({ hasText: matchKey }),
+    page.locator('div').filter({ hasText: matchKey }),
   ];
   for (const root of roots) {
     const count = await root.count().catch(() => 0);
@@ -2999,14 +2962,15 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
       // below) it. Measured in-page so geometry is exact. (This replaces the old "Actions for this post" menu
       // path, which was WRONG: that menu only holds Edit/Delete/Notifications, never Approve.)
       if (!clicked) {
-        const prox = await page.evaluate(({ marker, approveSrc, publisherId, gid }) => {
+        const prox = await page.evaluate(({ key, approveSrc }) => {
           const approveRe = new RegExp(approveSrc, 'i');
           const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
           const vis = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 20 && r.height > 12 && s.visibility !== 'hidden' && s.display !== 'none'; };
           const articles = [...document.querySelectorAll('[role="article"]')].filter(vis);
+          // EXACT-MATCH ONLY: locate the article by our unique fingerprint/marker — NEVER by author (all our
+          // posts share the same Page author; an author match could approve the wrong post or a member's).
           let target = null;
-          if (marker) for (const a of articles) { if ((a.innerText || '').includes(marker)) { target = a; break; } }
-          if (!target && publisherId && gid) for (const a of articles) { if ([...a.querySelectorAll('a[href]')].some((l) => { const h = String(l.href || ''); return h.includes(`/groups/${gid}/user/${publisherId}/`) || h.includes(`profile.php?id=${publisherId}`); })) { target = a; break; } }
+          if (key) for (const a of articles) { if ((a.innerText || '').includes(key)) { target = a; break; } }
           if (!target) return { clicked: false, reason: 'no_target_article' };
           const tr = target.getBoundingClientRect();
           const btns = [...document.querySelectorAll('div[role="button"],button,a[role="button"]')].filter(vis)
@@ -3018,7 +2982,7 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
           best.scrollIntoView({ block: 'center' });
           best.click();
           return { clicked: true, label: norm(best.innerText) || 'Approve' };
-        }, { marker, approveSrc: APPROVE_NAME_RE.source, publisherId: cleanPublisherId, gid: groupId }).catch((e) => ({ clicked: false, reason: 'proximity_error:' + String((e && e.message) || e).slice(0, 80) }));
+        }, { key: matchKey, approveSrc: APPROVE_NAME_RE.source }).catch((e) => ({ clicked: false, reason: 'proximity_error:' + String((e && e.message) || e).slice(0, 80) }));
         if (prox.clicked) {
           result.clicked = true;
           result.method = 'marker_proximity_approve_button';
@@ -3086,28 +3050,14 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
       });
     } catch (_) {}
   };
-  const markerCheck = async () => page.evaluate(({ marker, publisherId, gid }) => {
-    try {
-      const bodyText = document.body.innerText || '';
-      if (marker && bodyText.includes(marker)) return true;
-      if (publisherId && gid) {
-        const visible = (el) => {
-          const r = el.getBoundingClientRect();
-          const s = getComputedStyle(el);
-          return r.width > 50 && r.height > 50 && s.visibility !== 'hidden' && s.display !== 'none';
-        };
-        const articles = [...document.querySelectorAll('[role="article"]')].filter(visible);
-        for (const a of articles) {
-          const authorLinks = [...a.querySelectorAll('a[href]')].filter(link => {
-            const href = String(link.href || '');
-            return href.includes(`/groups/${gid}/user/${publisherId}/`) || href.includes(`profile.php?id=${publisherId}`);
-          });
-          if (authorLinks.length) return true;
-        }
-      }
-      return false;
-    } catch { return false; }
-  }, { marker, publisherId: cleanPublisherId, gid: groupId }).catch(() => false);
+  // EXACT-MATCH ONLY: scroll the queue until OUR post's unique #fb fingerprint (or full tag marker) is visible.
+  // Do NOT stop on a post that merely shares our Page author — members' posts and our other posts live in the
+  // same queue, so an author match would point approval at the wrong post.
+  const reviewFingerprint = (String(marker || '').match(/#fb[0-9a-f]{6}/i) || [])[0] || '';
+  const reviewMatchKey = reviewFingerprint || marker;
+  const markerCheck = async () => page.evaluate((key) => {
+    try { const bodyText = document.body.innerText || ''; return Boolean(key && bodyText.includes(key)); } catch { return false; }
+  }, reviewMatchKey).catch(() => false);
   // Scan ONE loaded surface (expand -> first screen -> scroll, expanding each step). Returns a found-result or null.
   const scanLoadedSurface = async (methodPrefix) => {
     await expandSeeMore();

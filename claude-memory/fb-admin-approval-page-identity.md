@@ -18,4 +18,17 @@ FIX (shipped): connector `tools/fb-post-test-capture-url.js`:
 
 FALSE-POSITIVE fix (was logging "approved_and_verified" while posts stayed pending): a pending post's own permalink renders fine, so "markerVisible" ≠ approved. Connector early-success now requires `!pendingDetected` and emits `notPending:true`. server.js `facebookAdminApprovalValidationFromLog`: if `!approvalButtonClicked && markerVisible && postMediaVerified` → ERROR `admin_approval_button_not_clicked_post_still_pending` UNLESS `resultStep.notPending===true`. Server restart required to load this.
 
-Connector changes need NO restart (fresh-spawned per run). See [[fb-agent-highscale-pipeline]] and [[fb-no-live-post-without-ok]] (still need explicit go-ahead before a live approval test).
+EXACT-MATCH ONLY (operator rule 2026-06-11): approve ONLY our own posts, matched by the post's unique tag. The
+real admin queue mixes our posts with real members' posts (Marlon, Rana, Acil, Amy…), and ALL our posts share
+the same Page author — so approval must key on the unique **#fb<6hex> fingerprint** (extracted from `marker`),
+never on author/position. clickApproveForVisibleMarker: `matchKey = #fb-fingerprint || marker`; if matchKey not
+visible → `exact_marker_not_visible_no_approval` (approve NOTHING). REMOVED the author-match-by-publisher
+fallback and the proximity author branch. The per-post Approve button has aria-label "Approve post by <author>"
+(text "Approve"); NEVER click "Approve selected pending posts" (bulk). Approve matching is multilingual
+(EN/ES/FR/PT/DE/IT/AR). PROVEN end-to-end: single-post approve of #fbfad11c left the queue.
+
+One-time backlog clear (2026-06-11, operator said "approve all"): mass-approved 60 pending posts (all authors)
+via a throwaway script — all our #fb-marker posts cleared. That script was DELETED; production never mass-approves.
+
+Connector changes need NO restart (fresh-spawned per run). server.js validation guard still needs a restart. See
+[[fb-agent-highscale-pipeline]] and [[fb-no-live-post-without-ok]].
