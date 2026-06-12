@@ -30,6 +30,15 @@ fallback and the proximity author branch. The per-post Approve button has aria-l
 One-time backlog clear (2026-06-11, operator said "approve all"): mass-approved 60 pending posts (all authors)
 via a throwaway script — all our #fb-marker posts cleared. That script was DELETED; production never mass-approves.
 
+BUG FOUND LIVE (2026-06-11): moderator profile **1** ("1 - moderator1") was used to PUBLISH a real post during
+a prod run — because `isFacebookAdminApprovalProfileLabel` gated on `\b(moderator|mod|...)\b` and **`\bmoderator\b`
+does NOT match "moderator1"** (no word boundary before the trailing digit), so 42/16 matched but 1 slipped
+through and posted. FIX: in that function, a profileId match against `state.ixbrowser.moderatorProfiles` now
+returns true by MEMBERSHIP (no keyword needed) — the explicit list is the source of truth. Caught it via
+monitoring (autopilot_publishing target seq3=profile 1), STOPped the run (POST /api/operator/stop-all with header
+`x-dashboard-token` = data/.dashboard-token), killed connectors, fixed, restarted. The errant post landed PENDING
+in o1498765421290862 (not yet live/approved). Server STOP API needs the dashboard token header (plain curl → 403).
+
 RULE (operator, 2026-06-11): moderator accounts (42, 16, 1) are **approve-ONLY** — they must NEVER post or
 comment. ENFORCED + verified in server.js: posting roster excludes them (isFacebookAdminApprovalProfileLabel,
 ~L7289) and a moderator used for posting hard-errors `facebook_moderator_profile_reserved_for_approval`

@@ -10672,7 +10672,13 @@ async function ixBrowserCommentFallbackProfilesForGroup(row, groupUrl, state = r
     const seen = new Set();
     const candidates = [];
     const benchedCommenters = commentCooldownBenchedSet(groupUrl, state); // single ledger scan; O(1) per candidate
-    for (const rawProfile of rows.profiles || []) {
+    // LEAST-USED-FIRST: order the profile list by how FEW comments each has made so comment load spreads
+    // EVENLY across all eligible profiles (no profile gets over-used). Stable sort keeps ixBrowser order for
+    // ties; never-used profiles (count 0) come first. Mirrors the posting-side orderFreshFirst fairness.
+    const __commentUsage = facebookCommentCountByProfile();
+    const __pidOf = (raw) => { const s = sanitizeIxBrowserProfile(raw); return Number(s.profile_id || s.id || 0); };
+    const __profilesLeastUsedFirst = [...(rows.profiles || [])].sort((a, b) => (__commentUsage.get(__pidOf(a)) || 0) - (__commentUsage.get(__pidOf(b)) || 0));
+    for (const rawProfile of __profilesLeastUsedFirst) {
       const profile = sanitizeIxBrowserProfile(rawProfile);
       const profileId = Number(profile.profile_id || profile.id || 0);
       const label = oneLineField(`${profileId}${profile.name ? ` - ${profile.name}` : ""}`, 180);
@@ -11336,6 +11342,23 @@ function facebookCommentProfileStatusForGroup(profileId, groupUrl) {
     return text === "comment_profile_cannot_access_post_permalink" || text.startsWith("comment_blocked");
   });
   return { hasSuccess, hasRecentFailure, isTransientFailure, latest };
+}
+
+// LEAST-USED-FIRST comment fairness: total successful comments per profileId across the ledger, so the
+// comment candidate builder can prioritise the profiles that have commented the FEWEST times — spreading
+// comment load EVENLY across all eligible profiles instead of always reusing the ones first in the list.
+// Single 5000-row ledger scan -> Map(profileId -> count). Profiles never used are absent (count 0 -> first).
+function facebookCommentCountByProfile() {
+  const counts = new Map();
+  for (const item of readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 })) {
+    if (!item || item.event !== "comment_recovery_finished") continue;
+    const pid = Number(item.profileId || 0);
+    if (!pid) continue;
+    const succeeded = ["published", "published_with_warning"].includes(String(item.status || "")) && item.validation?.commentVerified !== false;
+    if (!succeeded) continue;
+    counts.set(pid, (counts.get(pid) || 0) + 1);
+  }
+  return counts;
 }
 
 // 48h COMMENT COOLDOWN: a profile whose LAST comment in this group failed/was auto-removed (FB
