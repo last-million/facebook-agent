@@ -2911,6 +2911,56 @@ async function ensureAdminIdentity(page) {
   }
 }
 
+// BATCH APPROVAL (speed fix): once a moderator session is on the pending queue AS ADMIN, approve EVERY pending
+// post by OUR publisher (page) in this SAME session — not just the one that triggered it. This turns "one slow
+// ~6-min session per post" into "one session for all", so later posts don't queue minutes behind earlier ones
+// (the cause of the 8–40 min post→comment delay). STRICTLY scoped to our publisher id (each Approve is mapped
+// to its nearest post card and only clicked if that card's author link is /user/<ourPublisherId>/), so a
+// member's post is NEVER approved. Returns how many EXTRA posts it approved.
+async function batchApproveAllPublisherPosts(page, gid, publisherId) {
+  const cleanPub = String(publisherId || '').replace(/\D+/g, '');
+  if (!cleanPub) return 0;
+  let approved = 0;
+  // LOAD-SPREAD CAP: approve at most ~5 per moderator SESSION, then stop — the least-used-first moderator
+  // rotation (server side) hands the REST of the queue to the NEXT moderator. This shares the approval load
+  // EVENLY across all moderators so no single account does too many and gets flagged/blocked by Facebook.
+  const MAX_EXTRA_PER_SESSION = 4; // +1 for the triggering post already approved => ~5 total per moderator/session
+  for (let round = 0; round < MAX_EXTRA_PER_SESSION; round += 1) {
+    const r = await page.evaluate(({ pub }) => {
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      const vis = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 20 && r.height > 12 && s.visibility !== 'hidden' && s.display !== 'none'; };
+      const isPerPostApprove = (b) => {
+        const al = norm(b.getAttribute('aria-label')); const tx = norm(b.innerText);
+        if (/selected pending|seleccionad|sélectionn|selezionat|ausgewählt|selecionad|المحدد/i.test(al)) return false; // NEVER the bulk button
+        return /^(approve post by|aprobar (la )?publicaci|approuver (la )?publication|aprovar (a )?publica|genehmige|الموافقة على|قبول)/i.test(al) || /^(approve|aprobar|approuver|aprovar|genehmigen|approva|موافقة|قبول)$/i.test(tx);
+      };
+      const articles = [...document.querySelectorAll('[role="article"]')].filter(vis);
+      const btns = [...document.querySelectorAll('div[role="button"],button,a[role="button"]')].filter(vis).filter(isPerPostApprove);
+      for (const b of btns) {
+        const br = b.getBoundingClientRect();
+        let best = null, bestD = Infinity;
+        for (const a of articles) { const ar = a.getBoundingClientRect(); const d = Math.abs(ar.top - br.top); if (d < bestD) { bestD = d; best = a; } }
+        if (!best) continue;
+        const byUs = [...best.querySelectorAll('a[href]')].some((l) => { const h = String(l.href || ''); return h.includes(`/user/${pub}/`) || h.includes(`profile.php?id=${pub}`); });
+        if (!byUs) continue;
+        b.scrollIntoView({ block: 'center' });
+        b.click();
+        return { clicked: true };
+      }
+      return { clicked: false };
+    }, { pub: cleanPub }).catch(() => ({ clicked: false }));
+    if (!r.clicked) break;
+    approved += 1;
+    await humanPause(1800, 3200); // let the queue re-render before the next click
+    await clickFirst(page, [
+      page.locator('div[role="dialog"]').getByRole('button', { name: APPROVE_NAME_RE }),
+      page.getByRole('button', { name: /^(confirm|done|ok|yes|confirmar|aceptar)$/i }),
+    ], { timeout: 1500 }).catch(() => {});
+  }
+  if (approved) console.log(JSON.stringify({ step: 'batch_approved_publisher_posts', count: approved, publisherId: cleanPub }));
+  return approved;
+}
+
 async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', groupId = '') {
   const result = {
     clicked: false,
@@ -3291,6 +3341,12 @@ async function approvePendingPost(page, context, payload, gid, marker) {
       visited: (reviewSurface.visited || []).slice(-5),
     }));
     approvalResult = await clickApproveForVisibleMarker(page, marker, payload.publisherFacebookUserId || payload.facebookUserId, gid);
+    // BATCH (speed): we're already on the queue as admin — approve ALL our OTHER pending posts in this same
+    // session so they don't each wait for a fresh ~6-min session. Scoped to our publisher id only. Runs before
+    // collectVerifiedUrls (which navigates to the /user/ surface).
+    if (approvalResult.clicked) {
+      try { const extra = await batchApproveAllPublisherPosts(page, gid, payload.publisherFacebookUserId || payload.facebookUserId); if (extra) approvalResult.batchApprovedExtra = extra; } catch (_) {}
+    }
     attempts.push({ target: page.url(), ...(await collectVerifiedUrls('review_surface')) });
   }
   if (!postUrl && approvalResult.clicked) {

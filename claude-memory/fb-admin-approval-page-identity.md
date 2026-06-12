@@ -47,5 +47,15 @@ matches each profile's leading id against `state.ixbrowser.moderatorProfiles` ("
 / "1 - moderator1") for ALL groups — so it catches them even if the real ixBrowser name isn't literally "moderator".
 Never wire a moderator profile into any posting/comment path when adding features or running tests.
 
+SPEED FIX — BATCH APPROVAL (operator: post→comment took 8–40 min, 2026-06-12): root cause = approvals are
+SERIALIZED + each pending post got its OWN ~6-min moderator session (open profile + switch identity + load queue
++ wait-for-propagation + click + close), so post #3 waited behind #1/#2. The comment itself is ~1 min after
+approval (NOT the slow part); the non-approval group 4854 has no delay. FIX: connector `batchApproveAllPublisherPosts(page,
+gid, publisherId)` — once on the queue as admin, approve EVERY pending post by OUR publisher in the SAME session
+(maps each per-post Approve to its nearest article, clicks only if that article's author link is /user/<pubId>/,
+so members' posts are never touched). Wired in approvePendingPost right after the queue clickApproveForVisibleMarker
+(BEFORE collectVerifiedUrls, which navigates to /user/). So one session drains the whole queue → later posts find
+themselves already approved → comments fire fast. Connector = NO restart; UNVALIDATED live.
+
 Connector changes need NO restart (fresh-spawned per run). server.js validation guard loaded via restart
 2026-06-11 (server PID 5040). See [[fb-agent-highscale-pipeline]] and [[fb-no-live-post-without-ok]].
