@@ -3598,22 +3598,41 @@ async function harvestExtractPhoto(page, ctx) {
     } catch (e) { console.log(JSON.stringify({ step: 'harvest_image_download_failed', error: String((e && e.message) || e).slice(0, 140) })); }
   }
   let productOgTitle = '', productOgDescription = '';
-  if (data.link && ogState.n < 4 && (!ctx.budgetEnd || Date.now() < ctx.budgetEnd - 25000)) { // budget-aware: cap 4 og fetches, skip in the last 25s
+  // EVERY harvested product gets the OG attempt (operator: tags must ALWAYS come from the link's og title) —
+  // the old cap of 4/round left ~all records with an empty ogTitle. The budget guard still prevents overruns.
+  if (data.link && ogState.n < 60 && (!ctx.budgetEnd || Date.now() < ctx.budgetEnd - 25000)) {
     ogState.n++;
     let p2 = null;
     try {
       p2 = await page.context().newPage();
-      await p2.goto(data.link, { waitUntil: 'domcontentloaded', timeout: 8000 });
-      await p2.waitForTimeout(1500);
+      await p2.goto(data.link, { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+      // mavlynk shortlinks JS-redirect through bizrate/skimresources to the retailer — give the chain time
+      // to settle on the FINAL url (the og read below + the url-decode fallback both need it).
+      await p2.waitForTimeout(4500);
       const og = await p2.evaluate(() => {
         const meta = (k) => (((document.querySelector('meta[property="' + k + '"]') || document.querySelector('meta[name="' + k + '"]') || {}).content) || '').trim();
         return { t: meta('og:title') || (document.title || '').trim(), d: meta('og:description') || meta('description') };
-      });
-      const junk = /just a moment|are you a human|verify you are|captcha|access denied|robot or human|attention required|enable javascript|'s amazon page$|amazon page$|storefront|idea list|shop recommended products|amazon\.com\s*$|^walmart\.com/i;
+      }).catch(() => ({ t: '', d: '' }));
+      const junk = /just a moment|are you a human|verify you are|captcha|access denied|robot or human|attention required|enable javascript|'s amazon page$|amazon page$|storefront|idea list|shop recommended products|amazon\.com\s*$|^walmart\.com|^robot|blocked/i;
       let t = String(og.t || '').replace(/\s*[-|–—:]\s*Walmart(\.com)?\s*$/i, '').replace(/\s*[-|]\s*Amazon\.com.*$/i, '').replace(/^Amazon\.com\s*[:\-]\s*/i, '').trim();
       if (t.length < 8 || junk.test(t)) t = '';
       let d = String(og.d || '').trim();
       if (junk.test(d)) d = '';
+      // URL-DECODE FALLBACK (the og meta is usually behind Walmart's bot wall): the REAL product name is
+      // recoverable from the FINAL url — walmart.com/blocked?url=<base64-of-/ip/PRODUCT-SLUG> (base64-decode
+      // the url= param) or a direct /ip/<slug> path. Slug -> human name (dashes -> spaces, drop trailing id).
+      if (!t) {
+        try {
+          let fin = String(p2.url() || '');
+          const bm = fin.match(/[?&]url=([^&]+)/);
+          if (/walmart\.com\/blocked/i.test(fin) && bm) { try { fin = Buffer.from(decodeURIComponent(bm[1]), 'base64').toString('utf8'); } catch (_) {} }
+          const ip = fin.match(/\/ip\/([^/?#]+)/i);
+          if (ip) {
+            let name = decodeURIComponent(ip[1]).replace(/-/g, ' ').replace(/\b\d{6,}\b\s*$/, '').replace(/\s+/g, ' ').trim();
+            if (name.length >= 8) t = name.slice(0, 200);
+          }
+        } catch (_) {}
+      }
       productOgTitle = t.slice(0, 200);
       productOgDescription = d.slice(0, 500);
       console.log(JSON.stringify({ step: 'harvest_og_fetched', key: dkey, ogTitle: productOgTitle.slice(0, 80), hasDesc: !!productOgDescription }));

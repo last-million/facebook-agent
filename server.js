@@ -9227,10 +9227,10 @@ function harvestedHashtags(title, description = "", productKey = "", maxTags = 8
     if (HASHTAG_STOPWORDS.has(m[1].toLowerCase())) continue;
     add("#" + m[1].charAt(0).toUpperCase() + m[1].slice(1).slice(0, 23));
   }
-  // PER-POST uniqueness fingerprint: seed from uniqueSeed (the per-post trackingSeed = planId|productKey|sequence|link)
-  // when supplied, so the SAME product RE-POSTED (reuse rotation) still yields a DISTINCT tag -> unique caption ->
-  // unique permalink. Falls back to productKey (per-product) only when no per-post seed is given. 6 hex = negligible collision.
-  tags.push("#fb" + crypto.createHash("sha1").update(String(uniqueSeed || productKey || title || src || "harvested")).digest("hex").slice(0, 6));
+  // NO reference tag (operator 2026-06-12): the #fb<hex> tracking fingerprint is REMOVED from the tags — the
+  // visible tags are ONLY product words from the link's og:title/description. Post matching now keys on the
+  // full tag line + caption (matchKey falls back to the marker when no #fb fingerprint exists); the /user/
+  // surface lists newest-first, so a re-posted same product still resolves to the newest post.
   return tags;
 }
 
