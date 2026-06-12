@@ -538,6 +538,12 @@ async function dismissFacebookInterstitials(page) {
 async function openComposerWithRecovery(page, groupUrl) {
   let result = await openComposer(page);
   if (result.opened || !shouldRetryComposerOpen(result)) return result;
+  // A first-time-in-group "Group Rules" acknowledgment dialog (any language) can block the composer — clear
+  // it and retry once before the slower scroll/reload recoveries.
+  if (await dismissGroupRulesDialog(page)) {
+    result = await openComposer(page);
+    if (result.opened || !shouldRetryComposerOpen(result)) return { ...result, retry: 'group_rules_dismissed' };
+  }
   console.log(JSON.stringify({
     step: 'composer_open_retry_wait',
     reason: 'facebook_group_loaded_without_visible_controls',
@@ -1173,6 +1179,41 @@ async function attachImageToComposer(page, imagePath, options = {}) {
   return { ...attachMethod, preview };
 }
 
+// FB shows a "Group Rules" acknowledgment dialog the FIRST time a profile posts/comments in a group — it
+// BLOCKS the comment box (and the composer) until you agree. Detect it in ANY language (by the heading
+// "Group Rules" / "Règles du groupe" / "Reglas del grupo" / ...), tick any "I agree" checkbox, then click the
+// agree/OK button (Agree/I Agree/OK/Got it/Continue/J'accepte/Aceptar/Aceitar/Zustimmen/موافق ...). Best-effort,
+// idempotent, cheap — safe to call before/around every comment + post attempt. Returns true if it dismissed one.
+const GROUP_RULES_RE = /group rules|r[èe]gles du groupe|reglas del grupo|regras do grupo|regole del gruppo|gruppenregeln|قواعد المجموعة|gruppregler|groepsregels|reguły grupy|grup kurallar|agree to the group rules|aceptar las reglas|accepter les r[èe]gles/i;
+const GROUP_RULES_AGREE_RE = /^(agree|i agree|accept|i accept|ok|okay|got it|continue|done|close|j'accepte|j’accepte|accepter|continuer|compris|d'accord|d’accord|j'ai compris|aceptar|de acuerdo|acepto|entendido|continuar|cerrar|aceitar|concordo|aceito|entendi|fechar|accetto|accetta|ho capito|continua|chiudi|zustimmen|akzeptieren|einverstanden|verstanden|weiter|schließen|موافق|أوافق|موافقة|قبول|متابعة|حسنا|حسناً|إغلاق|tamam|kabul|akkoord|sluiten|zgadzam si[eę]|rozumiem)$/i;
+async function dismissGroupRulesDialog(page) {
+  try {
+    const hasDialog = await page.evaluate((src) => {
+      const re = new RegExp(src, 'i');
+      return [...document.querySelectorAll('[role="dialog"]')].some((d) => re.test(((d.innerText || '') + ' ' + (d.getAttribute('aria-label') || '')).slice(0, 600)));
+    }, GROUP_RULES_RE.source).catch(() => false);
+    if (!hasDialog) return false;
+    // tick any "I have read / I agree to the rules" checkbox inside the dialog first
+    await page.evaluate(() => {
+      const dlg = [...document.querySelectorAll('[role="dialog"]')].pop();
+      if (!dlg) return;
+      for (const cb of dlg.querySelectorAll('[role="checkbox"],input[type="checkbox"]')) {
+        const checked = cb.getAttribute('aria-checked') === 'true' || cb.checked === true;
+        if (!checked) { try { cb.click(); } catch (_) {} }
+      }
+    }).catch(() => {});
+    await humanPause(400, 900);
+    const clicked = await clickFirst(page, [
+      page.locator('[role="dialog"]').getByRole('button', { name: GROUP_RULES_AGREE_RE }),
+      page.locator('[role="dialog"] [role="button"], [role="dialog"] button').filter({ hasText: GROUP_RULES_AGREE_RE }),
+      page.getByRole('button', { name: GROUP_RULES_AGREE_RE }),
+    ], { timeout: 3500 });
+    await humanPause(900, 1700);
+    console.log(JSON.stringify({ step: 'group_rules_dialog_dismissed', clicked: Boolean(clicked) }));
+    return Boolean(clicked);
+  } catch (_) { return false; }
+}
+
 async function submitCommentOnVisiblePost(page, marker, commentText, expectedPostUrl = '') {
   const expectedPostParts = facebookGroupPostParts(expectedPostUrl);
   const result = {
@@ -1186,6 +1227,9 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
     restrictionText: '',
     expectedPostUrl: expectedPostUrl || '',
   };
+  // FB may show the group-rules acknowledgment dialog the first time this profile comments here — clear it
+  // (multilingual) up front so the comment box is reachable.
+  await dismissGroupRulesDialog(page);
   const currentPostSnapshot = async () => {
     const url = await page.evaluate(() => location.href).catch(() => page.url());
     const parts = facebookGroupPostParts(url);
@@ -1196,6 +1240,7 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
     };
   };
   const ensureExpectedPostLoaded = async (stage) => {
+    await dismissGroupRulesDialog(page); // a first-time-in-group rules dialog can block the comment box at ANY step — clear it before every box interaction
     const snapshot = await currentPostSnapshot();
     result.currentPostUrl = snapshot.url;
     if (!snapshot.matchesExpected) {

@@ -7279,10 +7279,18 @@ function postingSlots(state) {
   const normalProfileKeys = new Set();
   const seenSlots = new Set();
   for (let postNumber = 1; postNumber <= postsPerProfile; postNumber += 1) {
-    for (const group of groups) {
-      const groupUrl = String(group.url || "").trim();
-      if (!groupUrl) continue;
-      for (const profile of orderFreshFirstCached(group.profiles)) {
+    // ROUND-ROBIN across groups: emit ONE slot per group per pass (g1,g2,g1,g2,...) so a run with multiple
+    // groups fills them EQUALLY. The plan consumes slots in order up to the post limit, so emitting ALL of
+    // group1's slots before group2's made a small run land entirely in one group. Each group's profiles are
+    // still least-used-first (orderFreshFirstCached); we just interleave the groups.
+    const __orderedByGroup = groups.map((g) => ({ group: g, profiles: orderFreshFirstCached(g.profiles) }));
+    const __maxLen = __orderedByGroup.reduce((m, g) => Math.max(m, g.profiles.length), 0);
+    for (let __k = 0; __k < __maxLen; __k += 1) {
+      for (const { group, profiles } of __orderedByGroup) {
+        const profile = profiles[__k];
+        if (profile === undefined) continue;
+        const groupUrl = String(group.url || "").trim();
+        if (!groupUrl) continue;
         const label = String(profile || "").trim();
         if (!label) continue;
         const profileId = profileIdFromLabel(label);
