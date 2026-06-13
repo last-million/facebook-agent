@@ -3595,7 +3595,13 @@ async function harvestExtractPhoto(page, ctx) {
     let image = '', max = 0;
     for (const im of Array.from(document.querySelectorAll('img'))) {
       const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
-      if (w >= 350 && h >= 200 && w * h > max && !/emoji|static|rsrc\.php/i.test(im.src)) { max = w * h; image = im.src; }
+      if (!(w >= 350 && h >= 200) || /emoji|static|rsrc\.php/i.test(im.src)) continue;
+      // CORRECT IMAGE: take the POST's product photo, NOT an image someone posted in a COMMENT. FB wraps each
+      // comment in role="article" with an aria-label like "Comment by X" / "Comentario de X" — skip images inside
+      // those so a big commenter image can't win over the actual product photo.
+      const art = im.closest('[role="article"]');
+      if (art && /\bcomment\b|comentario|commentaire|coment[aá]rio|kommentar|تعليق/i.test(art.getAttribute('aria-label') || '')) continue;
+      if (w * h > max) { max = w * h; image = im.src; }
     }
     const META = /facebook\.com|fbcdn|messenger|fb\.me|meta\.(ai|com)|instagram\.com|whatsapp\.com|oculus|threads\.net/i;
     const JUNK = /giphy\.com|tenor\.com|\.(gif|mp4|webm|mov)(\?|$)|imgur\.com|youtu\.?be|youtube\.com|spotify|soundcloud|wikipedia|gph\.is|\/news\/|\/article\/|theguardian\.|nyti\.ms|nytimes\.com|washingtonpost\.|usatoday\.|npr\.org|supercarblondie\.|buzzfeed\.|huffpost\.|dailymail\.|people\.com|wivb\.com|\b(cnn|bbc|foxnews|reuters|apnews|kptv|kgw|kxan|nbcnews|abcnews|cbsnews)\.com/i;

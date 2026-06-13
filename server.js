@@ -2081,7 +2081,21 @@ async function fetchOpenGraphForHarvestedLink(url) {
           "accept-language": "en-US,en;q=0.9",
         },
       });
-      html = String(await res.text()).slice(0, 500000);
+      // CHARSET-CORRECT decode (was: res.text() which ALWAYS forces UTF-8 → a windows-1252/iso-8859-1 page
+      // gets mojibake'd, and that garbage was leaking into ogTitle/ogDescription → the #tags). Honor the real
+      // charset from the Content-Type header, falling back to a <meta charset> sniff, then UTF-8.
+      const buf = Buffer.from(await res.arrayBuffer());
+      let charset = "";
+      const ctm = String(res.headers.get("content-type") || "").match(/charset=["']?([\w-]+)/i);
+      if (ctm) charset = ctm[1].toLowerCase();
+      if (!charset) {
+        const head = buf.slice(0, 4096).toString("latin1");
+        const mm = head.match(/<meta[^>]+charset=["']?([\w-]+)/i) || head.match(/charset=["']?([\w-]+)/i);
+        if (mm) charset = mm[1].toLowerCase();
+      }
+      if (!charset || charset === "utf8") charset = "utf-8";
+      try { html = new TextDecoder(charset).decode(buf).slice(0, 500000); }
+      catch { html = buf.toString("utf8").slice(0, 500000); }
     } finally { clearTimeout(timer); }
     const meta = (prop) => {
       const m = html.match(new RegExp(`<meta[^>]+(?:property|name)=["']${prop}["'][^>]*content=["']([^"']+)["']`, "i"))
@@ -2090,7 +2104,10 @@ async function fetchOpenGraphForHarvestedLink(url) {
     };
     const decode = (s) => String(s || "")
       .replace(/&amp;/gi, "&").replace(/&#0?39;|&apos;/gi, "'").replace(/&quot;/gi, '"').replace(/&nbsp;/gi, " ")
+      .replace(/&#x([0-9a-f]+);/gi, (_, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return " "; } })
       .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCodePoint(Number(d)); } catch { return " "; } })
+      .replace(/�/g, "") // drop the Unicode replacement char (the visible mojibake the operator saw)
+      .replace(/[ --]/g, "") // drop control chars
       .replace(/\s+/g, " ").trim();
     // junk guard: bot walls AND storefront/profile pages ("Kelly's Amazon Page") must NEVER beat
     // the caption-derived product name at plan time.

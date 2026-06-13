@@ -23,6 +23,22 @@ TWO operator rules implemented 2026-06-12 (during the long FB-agent session):
   operator: no reference in the post. NOTE: post matching's matchKey preferred that fingerprint; it now falls back
   to the full tag-line/marker, and the /user/{pageId}/ surface is newest-first so a re-posted same product still
   resolves. Watch capture reliability without the fingerprint; if ambiguous, add a NON-visible per-post token.
+- POST BODY = EXACT harvested caption, ALREADY correct (operator re-confirmed 2026-06-13 "post text should be exact
+  match, no generation; generate ONLY the tags from the link's meta title"). server.js ~9396-9402: postText =
+  `harvestedRec.text` VERBATIM, only stripping full URLs + affiliate bare-domains (the link must live in the COMMENT,
+  not the body) + whitespace collapse — no truncation, no hashtag-strip, emojis kept. For harvested rows
+  livePostPayloadForRow (~11061) appends ONLY the og-title tags (signatureLine = sigTags, NO emoji/short-title
+  header — that emoji+phrase+tags signature is WEB rows only). So body=exact, tags=only generated thing, from og:title.
+
+**EMOJI / §§§ mojibake (operator 2026-06-13 "some emojis show as §§§§§").** Byte-checked harvested-products.jsonl:
+CLEAN (263 real emojis, 0 §, 0 mojibake) — browser caption extraction, server→connector payload (writeFileSync utf8
+→ readFileSync 'utf8'), and composer insertion (shouldAvoidKeyboardType blocks page.keyboard.type for any non-ASCII,
+so emojis go via execCommand/keyboard.insertText = emoji-safe) are all clean. The ONE real mojibake vector was the
+META-TITLE HTTP fetch: `res.text()` ALWAYS force-decodes UTF-8, so a windows-1252/iso-8859-1 retailer page got
+garbled and that garbage leaked into ogTitle/ogDescription→tags. FIXED (server.js ~2086, NEEDS RESTART): read
+res.arrayBuffer() + decode with the real charset (Content-Type header → <meta charset> sniff → utf-8 fallback via
+TextDecoder), and the decode() helper now strips U+FFFD (�) + control chars + handles &#xHEX; entities. If §§§ still
+appears in a SPECIFIC post, get the permalink and trace that exact record (could be a pre-fix leftover).
 
 **2. Profiles that need a password → list in Prod tab + manual release (ALREADY EXISTS).**
 - When a profile is logged out / needs login, `markProfileDisconnected()` parks it in `state.posting.disconnectedProfiles`
