@@ -97,6 +97,17 @@ ONLY when "Manage Page" is POSITIVELY detected; an unreadable/empty h1 SKIPS (id
 — blindly clicking row[1] would now flip personal→Page (wrong direction, 0 Approve buttons). Posting profiles
 still post AS the Page (unchanged — posts authored by "Couponing for beginners"/61590707785162).
 
+POST→COMMENT ~20-MIN GAP ROOT CAUSE + FIX (operator 2026-06-13, observed even on NON-pending/live posts):
+the gap is NOT approval — measured live, non-pending posts counted then commented in ~1-2.5min (post 64→43s,
+79→1m49s, 70→2m25s). The delay is the CROSS-PROFILE comment cycling: a DIFFERENT profile must comment, and a
+just-published post often hasn't rendered its comment control for THAT other account yet, so the commenter hits
+`marker_scoped_comment_button_not_found` (connector submitCommentOnVisiblePost ~L1451) and the server cycles to
+the next profile (~15-30s each). 3-4 fails then success = ~1-2.5min; a long streak of failing profiles = the
+~20-min worst case. FIX (connector, NO restart): the comment-button scan is now a PATIENT RETRY — re-scan up to
+5x (~17s) with settles (ensureExpectedPostLoaded + humanPause) before giving up, so a live post gets commented on
+the FIRST profile instead of burning 15-20. Operator set commentCooldownMinutes=1 (cooldown was never the
+bottleneck). Applies to the next run's posts (connector = fresh spawn).
+
 COMMENT-AFTER-APPROVAL PRIORITY (operator 2026-06-12, measured 7.2 min approve→comment gap): the post-approval
 comment retry ran ONCE (server.js ~13464); a post FRESH from approval takes ~30-90s to go pending→live, so that
 single retry often failed and the post fell to the slow periodic resweep (the 7-20 min gap). FIX: wrapped it in

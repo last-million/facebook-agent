@@ -13692,7 +13692,13 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       if (options.force) __forcedCommentResweepActive = true; // Fix A: a forced post-publish resweep may comment despite the run-limit auto-disarm
       const resweepStartedAt = Date.now(); // if the operator hits STOP after this, abort the loop (real stop)
       const windowMs = clampNumber(options.windowHours, 1, 168, 24) * 3600 * 1000;
-      const cutoff = Date.now() - windowMs;
+      let cutoff = Date.now() - windowMs;
+      // OPERATOR (2026-06-13): FOCUS the resweep on the CURRENT run's posts only — never chase OLD uncommented
+      // posts from earlier runs/days. autopilotRunId is this run's arm timestamp (ms); clamp the cutoff up to it
+      // so only posts published since the run started are re-commented. (Old posts that missed their comment stay
+      // as-is — the operator wants the agent commenting what it posts NOW, not back-filling history.)
+      const __runStart = Number(state.operator?.autopilotRunId) || 0;
+      if (__runStart > 0) cutoff = Math.max(cutoff, __runStart);
       const maxToFix = clampNumber(options.max, 1, 50, 10);
       const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 8000 });
       const publishedByPlan = new Map();

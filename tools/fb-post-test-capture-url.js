@@ -1392,7 +1392,8 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
     return result;
   }
   if (!(await ensureExpectedPostLoaded('before_comment_button_click'))) return result;
-  const clickedByMarker = (markerVisibleBeforeComment || exactPermalinkFallbackAllowed || onExpectedPermalinkWithMarker) ? await page.evaluate(({ marker, allowTitleFallback }) => {
+  const __commentEligible = (markerVisibleBeforeComment || exactPermalinkFallbackAllowed || onExpectedPermalinkWithMarker);
+  const findAndClickCommentBtn = () => page.evaluate(({ marker, allowTitleFallback }) => {
     const normalize = (input) => String(input || '')
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '')
@@ -1447,7 +1448,19 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
       if (btn) { btn.click(); return true; }
     }
     return false;
-  }, { marker, allowTitleFallback: exactPermalinkFallbackAllowed }).catch(() => false) : false;
+  }, { marker, allowTitleFallback: exactPermalinkFallbackAllowed }).catch(() => false);
+  // PATIENT RETRY (operator: comment LIVE posts fast, don't cycle 15-20 profiles for ~20 min): a just-published
+  // post often hasn't rendered its comment control yet for THIS (different) profile. Re-scan with short settles
+  // up to 5x (~17s) before giving up, so the post gets commented on the FIRST profile (~1-2 min) instead of
+  // failing fast -> the server burning through many profiles (the worst-case 20-min gap).
+  let clickedByMarker = false;
+  if (__commentEligible) {
+    for (let __ca = 1; __ca <= 5; __ca += 1) {
+      clickedByMarker = await findAndClickCommentBtn();
+      if (clickedByMarker) break;
+      if (__ca < 5) { await ensureExpectedPostLoaded('comment_button_retry_settle').catch(() => {}); await humanPause(2500, 4000); }
+    }
+  }
   if (!clickedByMarker && !exactPermalinkFallbackAllowed) {
     result.blocked = true;
     result.blockReason = 'marker_scoped_comment_button_not_found';
