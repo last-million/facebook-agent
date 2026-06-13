@@ -2897,7 +2897,12 @@ async function detectIdentityRows(page) {
 // — a "Switching accounts / You need to switch to <Name> to continue." card with ONE blue "Continue" button.
 // Until it's clicked the session can't reach any page (the queue never loads and approvals burn the whole
 // patient session). Detect by URL and click Continue (multilingual). Safe + idempotent.
-const FORCED_SWITCH_CONTINUE_RE = /^(continue|continuer|continuar|weiter|continua|prosseguir|devam|doorgaan|kontynuuj|متابعة|استمرار)$/i;
+// PREFIX match (was exact `^(...)$`): FB's button is usually "Continue as <Name>" (e.g. "Continue as Alexandra
+// Gonzalez") / "Continuar como <Name>" — the old end-anchor required the text to be EXACTLY "Continue", so it never
+// matched "Continue as X" and the profile sat on the switch wall. Match the leading continue-variant, name or not.
+const FORCED_SWITCH_CONTINUE_RE = /^(continue|continuer|continuar|weiter|continua|prosseguir|devam|doorgaan|kontynuuj|متابعة|استمرار)\b/i;
+// looser CONTAINS variant for the last-resort in-page scan (catches "Switch and continue", "Continue as X", etc.)
+const FORCED_SWITCH_CONTINUE_CONTAINS_RE = /(continue|continuar|continuer|weiter|continua|prosseguir|devam|doorgaan|kontynuuj|متابعة|استمرار)/i;
 async function dismissForcedAccountSwitch(page) {
   // FB can re-throw the card on the next navigation, so LOOP: click Continue ASAP, verify the URL cleared,
   // and if FB re-renders it, click again (up to 4 passes). Click is immediate (wait for the button, not a
@@ -2922,14 +2927,19 @@ async function dismissForcedAccountSwitch(page) {
         ], { timeout: 5000 });
       }
       if (!clicked) {
-        // last resort: in-page click on any control whose exact text is a Continue variant
+        // last resort: in-page click on any control whose text CONTAINS a Continue variant ("Continue as X",
+        // "Switch and continue", localized). Prefer a real button over a link; skip negative actions.
         await page.evaluate((src) => {
           const re = new RegExp(src, 'i');
-          for (const el of document.querySelectorAll('button, [role="button"], input[type="submit"], a')) {
+          const neg = /(not now|cancel|go back|annuler|cancelar|abbrechen|إلغاء|لاحقا|later)/i;
+          const els = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a[role="link"], a'));
+          // buttons first, then links
+          els.sort((a, b) => (a.tagName === 'A' ? 1 : 0) - (b.tagName === 'A' ? 1 : 0));
+          for (const el of els) {
             const t = ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim();
-            if (re.test(t)) { el.click(); return; }
+            if (t && re.test(t) && !neg.test(t)) { el.click(); return; }
           }
-        }, FORCED_SWITCH_CONTINUE_RE.source).catch(() => {});
+        }, FORCED_SWITCH_CONTINUE_CONTAINS_RE.source).catch(() => {});
       }
       await humanPause(2500, 4000); // FB reloads into the confirmed account
       const cleared = !/forced_account_switch|account_switcher/i.test(String(page.url() || ''));
