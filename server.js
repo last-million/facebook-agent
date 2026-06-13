@@ -7469,6 +7469,14 @@ function isProfileGroupBlockedForPosting(label, groupUrl, state) {
   const latest = matching[matching.length - 1] || "";
   if (!latest) return false;
   if (/status=(resolved|approved|cleared|ignored)|action=(profile_unblocked|profile_group_unblocked)/i.test(latest)) return false;
+  // POST-PUBLISHED-but-COMMENT-failed is NOT a posting block. These lines say the post LANDED fine and only the
+  // first-comment verification failed (e.g. "Post published but required first comment was not verified:
+  // comment_blocked:marker_scoped_comment_button_not_found"). Treating that as cannot_post_in_group wrongly fell
+  // the profile back to another group — so every comment hiccup in a group (4854 especially) funnelled that
+  // profile into the o-group and STARVED the even split. The post succeeded; comment reliability is handled
+  // separately by the comment resweep. Genuine post failures ("could not open composer", profile-open 2007/1004)
+  // do NOT match this and still block.
+  if (/post published|first comment was not verified|comment_blocked|comment_not_submitted|comment_profile_cannot_access/i.test(latest)) return false;
   if (isTransientPostingProfileFailureLine(latest)) return false;
   if (postingFailureLineExceededAgeBudget(latest)) return false;
   return /status=cannot_post_in_group/i.test(latest);
@@ -8929,11 +8937,19 @@ async function autopilotTickAsync(options = {}) {
     // pass (forces an even split), then a second pass fills any remainder if one group ran short — so the
     // batch is still filled when a group has fewer ready rows. Group key = the row's groupUrl.
     const __readyGroupKeys = [...new Set(readyRows.map((r) => normalizedFacebookGroupKey(r.groupUrl)).filter(Boolean))];
-    const __perGroupCap = Math.max(1, Math.ceil(maxWorkers / Math.max(1, __readyGroupKeys.length)));
+    // BATCH CAP for the EVEN SPLIT: size the per-group cap to the posts this batch will ACTUALLY make — the
+    // run-limit remaining — NOT the machine maxWorkers. Otherwise the picker balances a big batch (e.g. 2/group
+    // at cap 4) and the hard run-limit trim below keeps only the FIRST N (all one group), re-skewing the split
+    // to 2/0. Clamping to the remaining run allowance makes the balance correct BEFORE the trim (which then
+    // no-ops). runLimit=0 (unlimited) keeps the old machine-cap behavior.
+    const __runLimitForBatch = autopilotRunLimit(state);
+    const __runRemainingForBatch = __runLimitForBatch > 0 ? Math.max(0, __runLimitForBatch - autopilotPostsThisRunCount(readState())) : Infinity;
+    const __batchCap = Math.max(1, Math.min(maxWorkers, __runRemainingForBatch));
+    const __perGroupCap = Math.max(1, Math.ceil(__batchCap / Math.max(1, __readyGroupKeys.length)));
     const __pickedByGroup = new Map();
     const __pickPass = (enforceGroupCap) => {
       for (const row of readyRows) {
-        if (picked.length >= maxWorkers) break;
+        if (picked.length >= __batchCap) break;
         const pid = Number(row.profileId || profileIdFromLabel(row.profile) || 0);
         if (!eligibleIds.has(pid) || usedIds.has(pid)) continue;
         const gKey = normalizedFacebookGroupKey(row.groupUrl);
@@ -8953,7 +8969,7 @@ async function autopilotTickAsync(options = {}) {
       }
     };
     __pickPass(true);                                  // even split — each group capped at its fair share
-    if (picked.length < maxWorkers) __pickPass(false); // fill the remainder if a group had too few ready rows
+    if (picked.length < __batchCap) __pickPass(false); // fill the remainder if a group had too few ready rows
     if (!picked.length) {
       decision.action = "no_ready_row";
       decision.detail = `plan ${plan.planId}: ${readyRows.length} ready row(s), none match the ${eligibleIds.size} eligible profile(s)`;
