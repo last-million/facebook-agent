@@ -6143,10 +6143,34 @@ function uxAttachIncompleteRunBanner() {
         if (rulesPatch) workflowState.rules = Object.assign({}, workflowState.rules || {}, rulesPatch);
       }
     }
-    document.querySelectorAll('input[name="prodRunMode"]').forEach(function (r) { r.addEventListener("change", function () { prodRunModeTouched = true; prodApplyRunModeVisibility(); if (workflowState && workflowState.operator) workflowState.operator.scheduleEnabled = (r.value === "time"); }); });
+    // PERSIST run-mode settings on EVERY change (not only at Start) — debounced ~700ms. BUGFIX: switching to
+    // "stop after N posts" / typing N / editing start-stop times previously updated ONLY the in-memory cache, so
+    // the choice was LOST on reload or server restart unless the operator happened to click Start. Now every edit
+    // is written to the server. This saves SETTINGS ONLY — it never arms/disarms a run (armedForExternalActions
+    // and autopilotEnabled are untouched, and autopilotPostsThisRun is NOT reset — those belong to Start/Stop).
+    let __prodRunModeSaveTimer = null;
+    function prodPersistRunModeSoon() {
+      if (__prodRunModeSaveTimer) clearTimeout(__prodRunModeSaveTimer);
+      __prodRunModeSaveTimer = setTimeout(function () {
+        __prodRunModeSaveTimer = null;
+        const mode = prodRunModeValue();
+        const op = { scheduleEnabled: mode === "time" };
+        if (mode === "time") {
+          const s = (($("prodStartTime") || {}).value || "").trim(); if (s) op.startTime = s;
+          const e = (($("prodStopTime") || {}).value || "").trim(); if (e) op.stopTime = e;
+          const tz = (($("prodScheduleTimezone") || {}).value || "").trim(); if (tz) op.scheduleTimezone = tz;
+        } else {
+          const n = parseInt((($("prodMaxPosts") || {}).value || ""), 10);
+          if (n > 0) op.autopilotMaxPostsPerRun = Math.min(500, n);
+        }
+        prodSyncFormAndCache(op);
+        prodPatchState({ operator: op }).then(function () { prodResult("✓ Run-mode saved."); }).catch(function (e) { prodResult("Save failed: " + ((e && e.message) || e)); });
+      }, 700);
+    }
+    document.querySelectorAll('input[name="prodRunMode"]').forEach(function (r) { r.addEventListener("change", function () { prodRunModeTouched = true; prodApplyRunModeVisibility(); if (workflowState && workflowState.operator) workflowState.operator.scheduleEnabled = (r.value === "time"); prodPersistRunModeSoon(); }); });
     const prodMaxEl = $("prodMaxPosts");
-    if (prodMaxEl) prodMaxEl.addEventListener("input", function () { prodRunModeTouched = true; const n = parseInt(prodMaxEl.value, 10); if (workflowState && workflowState.operator && n > 0) workflowState.operator.autopilotMaxPostsPerRun = n; });
-    ["prodStartTime", "prodStopTime", "prodScheduleTimezone"].forEach(function (id) { const el = $(id); if (el) el.addEventListener("input", function () { prodRunModeTouched = true; }); });
+    if (prodMaxEl) prodMaxEl.addEventListener("input", function () { prodRunModeTouched = true; const n = parseInt(prodMaxEl.value, 10); if (workflowState && workflowState.operator && n > 0) workflowState.operator.autopilotMaxPostsPerRun = n; prodPersistRunModeSoon(); });
+    ["prodStartTime", "prodStopTime", "prodScheduleTimezone"].forEach(function (id) { const el = $(id); if (el) el.addEventListener("input", function () { prodRunModeTouched = true; prodPersistRunModeSoon(); }); });
     // RUN CONTROLS — Start / Pause / Resume / Stop. Mirrored bars live in the control center + Step 1 + Step 3,
     // all driven by ONE delegated listener so every copy works and stays in sync. setProdCtlButtons (above
     // renderProdTab) shows the right buttons for the state everywhere at once.

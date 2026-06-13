@@ -17429,7 +17429,11 @@ function readBody(req) {
     req.on("data", (chunk) => {
       chunks.push(chunk);
       size += chunk.length;
-      if (size > 2_000_000) {
+      if (size > 64_000_000) {
+        // Was 2_000_000 (~1.91MB). The dashboard PUTs the ENTIRE state on every save, and the live
+        // workflow-state grew past ~1.94MB → every save 413'd and the UI hung on "Saving…" forever.
+        // 64MB gives long headroom; this is a localhost, token-gated, single-operator endpoint so the
+        // larger cap is not a meaningful DoS surface. (Follow-up: trim state bloat / send field-level patches.)
         const err = new Error("Request body too large.");
         err.statusCode = 413;
         err.publicError = "request_body_too_large";
