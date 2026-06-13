@@ -52,6 +52,9 @@ auto-trigger every HEALTH_SWEEP_INTERVAL_MS (~2h) gated on `!active` (idle only,
 ixBrowser), single-flight + CPU-aware + concurrency 2; boot-grace back-dates `__lastHealthSweepAt` so the first
 sweep is ~10min after boot (no boot storm). Used-but-logged-out profiles are still caught in-line by the
 posting/comment path. To flag NOW without waiting: POST /api/profiles/disconnect?profileId=N&label=... (header
-x-dashboard-token); Release via POST /api/profiles/release. Did this for 50+45 manually before the auto-fix.
+x-dashboard-token); Release via POST /api/profiles/release. Did this for 50+45 manually before the auto-fix. PROVEN
+LIVE 2026-06-12 (2-post validation run): the in-line path auto-flagged profile 48 as disconnected and 65 as
+suspended DURING the run (no manual action) — so disconnected list ended {50,45,48}, suspended {65}. The periodic
+idle-sweep (every ~2h) is the complementary half for profiles never selected.
 
 Connector changes = NO restart (fresh spawn). The OG cap + #fb removal apply to NEW harvests/plans only.

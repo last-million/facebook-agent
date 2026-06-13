@@ -86,7 +86,9 @@ IMMEDIATELY after the /me goto (moved the long humanPause to AFTER), so Continue
 renders; (2) dismissForcedAccountSwitch now LOOPS up to 4 passes (waitFor the Continue button visible → click ASAP
 → verify URL cleared → if FB re-renders the card, click again), returns everCleared. Note: moderators DO still hit
 forced_account_switch even though they default to the personal admin — it's FB's active-account confirmation on
-first navigation (not a misconfig), and clicking Continue is the only path; it's auto-handled now.
+first navigation (not a misconfig), and clicking Continue is the only path; it's auto-handled now. PROVEN LIVE 2026-06-12 (2-post validation run, server 8588): moderator 1
+approved a real o-group post THROUGH forced_account_switch (facebook_admin_approval_finished id=1) — the queue
+loaded (= switch cleared) and the post went live + got commented. No stuck card.
 
 DEFAULT CHANGED (operator, 2026-06-12): moderator profiles now open Facebook **as the PERSONAL admin directly**
 (no longer as the Page) — operator flipped the default identity in FB. ensureAdminIdentity auto-detects and
