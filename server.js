@@ -449,6 +449,7 @@ function defaultState() {
     posting: {
       groups: "",
       commentLimitedProfiles: [], // profiles comment-limited by FB: blocked from COMMENTING, still allowed to POST (admin releases manually)
+      blockedModerators: [], // moderators FB temporarily walls on forced_account_switch: skipped from approval rotation for a 24-min cooldown, then auto-retested; success auto-removes (admin can Release early)
       groupAssignmentMode: "percentage_manual_review",
       groupProfileAssignments: "",
       groupAssignmentData: [],
@@ -1576,6 +1577,11 @@ function normalizeWorkflowState(state) {
     .filter((p) => p && (p.profileId || p.profile_id))
     .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200) }))
     .slice(0, 1000);
+  if (!Array.isArray(state.posting.blockedModerators)) state.posting.blockedModerators = [];
+  state.posting.blockedModerators = state.posting.blockedModerators
+    .filter((p) => p && (p.profileId || p.profile_id))
+    .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200) }))
+    .slice(0, 1000);
   state.operator = state.operator || {};
   state.operator.contentSourcesEnabled = state.posting.contentSources.enabled === true;
   state.operator.contentSourcesExclusive = state.posting.contentSources.enabled === true && state.posting.contentSources.exclusive === true;
@@ -2188,16 +2194,53 @@ function markProfileCommentLimited(profileId, label, reason) {
   logEvent("profile_comment_limited_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
   return true;
 }
-// release a profile from ANY parked list (login-disconnected, account-error, suspended, OR comment-limited).
+// TEMPORARY BLOCKED MODERATOR (operator): a moderator FB walls on forced_account_switch (the Continue click can't
+// clear it) cannot approve right now — FB blocks the account for ~20min. Bench it for a 24-min cooldown, then it
+// AUTO-RETESTS on its next approval turn; a SUCCESSFUL approval auto-removes it (orchestrator). Admin can also
+// Release early from the Prod tab. Unlike the other parked lists this is TIME-BASED: the cooldown set excludes an
+// entry once 24min have elapsed, so the moderator becomes eligible again without manual action.
+const BLOCKED_MODERATOR_COOLDOWN_MS = 24 * 60 * 1000;
+function blockedModeratorCooldownSet(state = readState()) {
+  const now = Date.now();
+  const ids = new Set();
+  for (const p of (state.posting?.blockedModerators || [])) {
+    const at = Date.parse(String(p.at || "")) || 0;
+    if (at && (now - at) < BLOCKED_MODERATOR_COOLDOWN_MS) ids.add(String(p.profileId || "")); // still cooling down -> skip in the rotation
+  }
+  return ids;
+}
+function markModeratorBlocked(profileId, label, reason) {
+  const id = String(profileId || "").replace(/\D+/g, "");
+  if (!id) return false;
+  const state = readState();
+  const list = Array.isArray(state.posting.blockedModerators) ? state.posting.blockedModerators : [];
+  const existing = list.find((p) => String(p.profileId) === id);
+  if (existing) { existing.at = new Date().toISOString(); existing.reason = String(reason || existing.reason || "stuck on forced_account_switch").slice(0, 200); } // re-stamp -> fresh 24-min cooldown
+  else { list.push({ profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "Moderator stuck on forced_account_switch (Continue did not clear)").slice(0, 200) }); }
+  state.posting.blockedModerators = list;
+  writeState(state);
+  logEvent("moderator_blocked_temporary", { profileId: id, cooldownMinutes: 24, reason: String(reason || "").slice(0, 120) });
+  return true;
+}
+function releaseModeratorBlocked(profileId) {
+  const id = String(profileId || "").replace(/\D+/g, "");
+  const state = readState();
+  const before = (state.posting.blockedModerators || []).length;
+  state.posting.blockedModerators = (state.posting.blockedModerators || []).filter((p) => String(p.profileId) !== id);
+  if (state.posting.blockedModerators.length !== before) { writeState(state); logEvent("moderator_block_cleared", { profileId: id }); return true; }
+  return false;
+}
+// release a profile from ANY parked list (login-disconnected, account-error, suspended, comment-limited, OR blocked-moderator).
 function releaseParkedProfile(profileId) {
   const id = String(profileId || "").replace(/\D+/g, "");
   const state = readState();
-  const before = (state.posting.disconnectedProfiles || []).length + (state.posting.erroredProfiles || []).length + (state.posting.suspendedProfiles || []).length + (state.posting.commentLimitedProfiles || []).length;
+  const before = (state.posting.disconnectedProfiles || []).length + (state.posting.erroredProfiles || []).length + (state.posting.suspendedProfiles || []).length + (state.posting.commentLimitedProfiles || []).length + (state.posting.blockedModerators || []).length;
   state.posting.disconnectedProfiles = (state.posting.disconnectedProfiles || []).filter((p) => String(p.profileId) !== id);
   state.posting.erroredProfiles = (state.posting.erroredProfiles || []).filter((p) => String(p.profileId) !== id);
   state.posting.suspendedProfiles = (state.posting.suspendedProfiles || []).filter((p) => String(p.profileId) !== id);
   state.posting.commentLimitedProfiles = (state.posting.commentLimitedProfiles || []).filter((p) => String(p.profileId) !== id);
-  const after = state.posting.disconnectedProfiles.length + state.posting.erroredProfiles.length + state.posting.suspendedProfiles.length + state.posting.commentLimitedProfiles.length;
+  state.posting.blockedModerators = (state.posting.blockedModerators || []).filter((p) => String(p.profileId) !== id);
+  const after = state.posting.disconnectedProfiles.length + state.posting.erroredProfiles.length + state.posting.suspendedProfiles.length + state.posting.commentLimitedProfiles.length + state.posting.blockedModerators.length;
   if (after !== before) { writeState(state); logEvent("profile_released_reconnected", { profileId: id }); return true; }
   return false;
 }
@@ -11541,10 +11584,15 @@ async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState
     .filter(Boolean));
   const seen = new Set();
   const candidates = [];
+  // TEMPORARY BLOCKED MODERATORS: skip any moderator FB is currently walling on forced_account_switch (within its
+  // 24-min cooldown) so the rotation falls through to the next least-used moderator. After the cooldown the id
+  // drops out of this set automatically -> the moderator is retried (auto-retest); a successful approval removes it.
+  const __blockedModCooldown = blockedModeratorCooldownSet(state);
   const add = (profileId, profile, source) => {
     const numericProfileId = Number(profileId || profileIdFromLabel(profile) || 0);
     const label = oneLineField(profile || numericProfileId || "", 180);
     if (!numericProfileId || !label || excludedIds.has(numericProfileId) || seen.has(numericProfileId)) return;
+    if (__blockedModCooldown.has(String(numericProfileId))) return; // temporarily blocked moderator -> skip during cooldown
     if (isDedicatedShopYourLikesIxProfile(numericProfileId, state) || isDedicatedShopYourLikesProfileLabel(label, state)) return;
     if (isFacebookProfileQuarantinedForFacebook(label, state, groupUrl)) return;
     const approvalOnlyProfile = isFacebookAdminApprovalProfileId(numericProfileId, state, groupUrl) || isFacebookAdminApprovalProfileLabel(label, state, groupUrl);
@@ -11587,7 +11635,13 @@ async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState
   // of always hitting the first-listed one. Stable sort keeps configured order for ties.
   const __apprUsage = facebookApprovalCountByProfile();
   candidates.sort((a, b) => (__apprUsage.get(a.profileId) || 0) - (__apprUsage.get(b.profileId) || 0));
-  return candidates.slice(0, MAX_COMMENT_FALLBACK_PROFILES);
+  const __out = candidates.slice(0, MAX_COMMENT_FALLBACK_PROFILES);
+  if (!__out.length && (state.posting?.blockedModerators || []).length) {
+    // every moderator is in its forced_account_switch cooldown -> posts stay pending until one's 24-min cooldown
+    // elapses (correct: don't hammer FB-blocked accounts). Surface it so the admin knows why approvals paused.
+    logEvent("admin_approval_moderator_pool_empty_all_blocked", { blockedCount: (state.posting.blockedModerators || []).length });
+  }
+  return __out;
 }
 
 function facebookAdminApprovalValidationFromLog(objects = [], postUrl = "") {
@@ -11625,6 +11679,11 @@ function facebookAdminApprovalValidationFromLog(objects = [], postUrl = "") {
   // (not a moderator of THIS group) | null = INCONCLUSIVE (numeric gid unresolved — prove nothing).
   const surfaceReachable = surfaceStep ? surfaceStep.adminSurfaceReachable : undefined;
   const approverLacksAdminRole = surfaceReachable === false;
+  // MODERATOR STUCK on forced_account_switch: the connector emits this terminal step when its Continue-click loop
+  // can't clear the switch wall (FB temporarily blocked the moderator). The orchestrator benches the moderator
+  // (24-min cooldown) and rotates to the next one.
+  const __stuckStep = latestLiveLogStep(objects, "admin_approval_forced_account_switch_stuck");
+  const moderatorStuckForcedSwitch = Boolean(__stuckStep && __stuckStep.cleared === false);
   const noPendingPostForPublisher = Boolean(
     diagnosticStep &&
     /no_pending_article_matched_publisher/i.test(String(diagnosticStep.reason || "")) &&
@@ -11641,6 +11700,7 @@ function facebookAdminApprovalValidationFromLog(objects = [], postUrl = "") {
   const errors = [];
   const warnings = [];
   if (approverLacksAdminRole) errors.push("admin_approval_surface_unavailable_approver_not_admin");
+  if (moderatorStuckForcedSwitch) errors.push("admin_approval_moderator_stuck_forced_account_switch");
   if (!markerVisible) errors.push("admin_approval_post_marker_not_verified");
   if (!postMediaVerified) errors.push("admin_approval_post_image_not_verified");
   // A pending post needs the moderator to actually CLICK Approve. If Approve was never clicked, the post is
@@ -11657,6 +11717,7 @@ function facebookAdminApprovalValidationFromLog(objects = [], postUrl = "") {
   return {
     noPendingPostForPublisher,
     approverLacksAdminRole,
+    moderatorStuckForcedSwitch,
     ok: errors.length === 0,
     errors,
     warnings,
@@ -12076,6 +12137,7 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
         message: oneLineField(attempt.message || "", 300),
       });
       if (attempt.ok && attempt.postUrl) {
+        try { releaseModeratorBlocked(attempt.profileId); } catch (_) {} // this moderator just approved successfully -> auto-clear any temporary block (retest passed)
         return {
           ...attempt,
           attemptedApprovalProfiles: attempts,
@@ -12091,12 +12153,23 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
       // APPROVER IS NOT A MODERATOR OF THIS GROUP: the pending queue redirected to the feed for
       // this profile. Do NOT fast-bail — a DIFFERENT configured moderator (e.g. 42 vs 41) may hold
       // the role. Try the next profile instead.
-      if (attempt.validation?.approverLacksAdminRole) {
+      // STUCK takes precedence over "lacks admin role": a moderator walled on forced_account_switch can't reach
+      // ANY surface, so the feed-redirect that LOOKS like missing-rights is just a SYMPTOM of the wall. Gate the
+      // lacks-admin branch so a stuck moderator falls through to the bench branch below (else it's retried every
+      // cycle and never benched — the bug that made this whole feature dead on its real-world path).
+      if (attempt.validation?.approverLacksAdminRole && !attempt.validation?.moderatorStuckForcedSwitch) {
         logEvent("facebook_admin_approval_profile_not_admin_of_group", {
           profileId: attempt.profileId,
           profile: attempt.profile,
           groupUrl,
         });
+        continue;
+      }
+      // MODERATOR STUCK on forced_account_switch (FB temporarily blocked it): bench for the 24-min cooldown and
+      // rotate to the next least-used moderator. After the cooldown it's auto-retested; a success auto-removes it.
+      if (attempt.validation?.moderatorStuckForcedSwitch) {
+        markModeratorBlocked(attempt.profileId, attempt.profile, "Stuck on forced_account_switch (FB temporary block) during approval");
+        logEvent("facebook_admin_approval_moderator_blocked_forced_switch", { profileId: attempt.profileId, profile: attempt.profile, groupUrl });
         continue;
       }
       // ERRORED PROFILE -> try the NEXT moderator: a connector/session/Not-Found error on one moderator (e.g.
@@ -18143,6 +18216,17 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/api/profiles/comment-limited") {
     return json(res, 200, { commentLimited: (readState().posting?.commentLimitedProfiles || []) }); // post-only profiles; Release via /api/profiles/release
+  }
+  if (req.method === "GET" && url.pathname === "/api/profiles/blocked-moderators") {
+    // moderators FB temporarily walls on forced_account_switch; skipped from the approval rotation for ~24min then
+    // auto-retested. cooldownMs/cooldownRemainingMs let the UI show "retesting soon". Release early via /api/profiles/release.
+    const __now = Date.now();
+    const __list = (readState().posting?.blockedModerators || []).map((p) => {
+      const at = Date.parse(String(p.at || "")) || 0;
+      const remain = at ? Math.max(0, BLOCKED_MODERATOR_COOLDOWN_MS - (__now - at)) : 0;
+      return { ...p, cooldownRemainingMs: remain, retesting: remain <= 0 };
+    });
+    return json(res, 200, { blockedModerators: __list, cooldownMs: BLOCKED_MODERATOR_COOLDOWN_MS });
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/suspend") {
     const id = url.searchParams.get("profileId") || "";

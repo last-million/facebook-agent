@@ -103,5 +103,32 @@ single retry often failed and the post fell to the slow periodic resweep (the 7-
 a SETTLE+RETRY loop (4 attempts, 40s between) so the approved post is commented within ~2-3 min. server.js change
 → needs restart.
 
+PARKED PROFILES NOW SKIPPED EVERYWHERE (operator 2026-06-13 "he uses disconnected profiles, he shouldn't"):
+posting already skipped parked (disconnected/errored/suspended) but COMMENT-recovery + HARVEST did not.
+FIXED (restart-loaded): (a) recoverFacebookCommentWithProfilesInner now skips parked ids (__parkedCommentIds)
+— it's the chokepoint for every comment path; (b) the harvest profile selection (postingSlots-derived pool +
+the proven-member set __harvestWorkingProfilesByGroup + any "url|pin") now filters __harvParked, so harvest stops
+re-opening dead profiles (e.g. 65 went suspended). PROVEN: a 20-post run opened ZERO parked profiles in any path.
+
+2-APPROVALS-PER-MODERATOR (operator 2026-06-13): connector batchApproveAllPublisherPosts MAX_EXTRA_PER_SESSION
+4→1 (~2 total per moderator session, then the least-used-next moderator drains the rest). Spreads approval load
++ block-risk. Connector = no restart.
+
+TEMPORARY BLOCKED-MODERATOR FEATURE — BUILT 2026-06-13, NOT YET ACTIVATED (needs a server restart + connector
+fix-2; do this FIRST next session). Operator rule: a moderator FB walls on forced_account_switch that the Continue
+loop CAN'T clear = temporarily blocked (~20min) → bench it 24min → AUTO-RETEST on its next approval turn → a
+SUCCESSFUL approval auto-removes it (admin can Release early). Implemented: state.posting.blockedModerators
+(timestamped) + blockedModeratorCooldownSet/markModeratorBlocked/releaseModeratorBlocked (server.js ~2191) +
+default seed + normalizer + rotation skip in facebookAdminApprovalProfilesForGroup add() + GET
+/api/profiles/blocked-moderators + shared release + connector emits step admin_approval_forced_account_switch_stuck
+{cleared:false} in ensureAdminIdentity + facebookAdminApprovalValidationFromLog reads it (validation.moderatorStuckForcedSwitch)
++ orchestrator branch markModeratorBlocked+continue + releaseModeratorBlocked on success + web/app.js
+uxAttachBlockedModerators + index.html Prod-tab panel. ADVERSARIAL REVIEW found + FIX-1 APPLIED: a stuck moderator
+ALSO trips approverLacksAdminRole (re-walled review surface → adminSurfaceReachable:false) and that branch ran
+first → bench was dead; gated it `&& !moderatorStuckForcedSwitch` (server.js orchestrator). STILL TODO (fix-2,
+deferred — user stopped): short-circuit the connector's approveOnly flow when ensureAdminIdentity returns
+forcedSwitchStuck (return BEFORE openGroupReviewSurface) so a stuck moderator benches INSTANTLY instead of burning
+a ~14-min re-walled poll. Then restart to activate the whole feature.
+
 Connector changes need NO restart (fresh-spawned per run). server.js validation guard loaded via restart
 2026-06-11 (server PID 5040). See [[fb-agent-highscale-pipeline]] and [[fb-no-live-post-without-ok]].

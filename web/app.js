@@ -5857,6 +5857,35 @@ function uxAttachSuspendedProfiles() {
   load();
 }
 
+// TEMPORARY BLOCKED MODERATORS: moderators FB walls on forced_account_switch are skipped from the approval rotation
+// for a 24-min cooldown, then auto-retested (a successful approval auto-removes them). Shows the cooldown left;
+// Release clears the block early.
+function uxAttachBlockedModerators() {
+  const list = $("blockedModeratorsList");
+  if (!list) return;
+  async function load() {
+    try {
+      const data = await api("/api/profiles/blocked-moderators");
+      const rows = (data && data.blockedModerators) || [];
+      const c = $("blockedModeratorsCount"); if (c) c.textContent = String(rows.length);
+      if (!rows.length) { list.innerHTML = '<div style="opacity:.6">No blocked moderators. ✓</div>'; return; }
+      list.innerHTML = "";
+      for (const r of rows) {
+        const row = document.createElement("div"); row.className = "discRow";
+        const info = document.createElement("div"); info.className = "di-info";
+        const mins = Math.ceil((Number(r.cooldownRemainingMs) || 0) / 60000);
+        const status = r.retesting ? 'retesting on next approval' : ('blocked · ~' + mins + ' min left');
+        info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "stuck on forced_account_switch") + ' · ' + status + '</div>';
+        const btn = document.createElement("button"); btn.type = "button"; btn.textContent = "Release";
+        btn.addEventListener("click", async () => { btn.disabled = true; try { await api("/api/profiles/release?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
+        row.appendChild(info); row.appendChild(btn); list.appendChild(row);
+      }
+    } catch (e) { list.innerHTML = '<div style="opacity:.6">Could not load blocked moderators.</div>'; }
+  }
+  $("refreshBlockedModeratorsBtn")?.addEventListener("click", () => load());
+  load();
+}
+
 // COMMENT-LIMITED (post-only) profiles: blocked from commenting, still posting. Release re-enables commenting.
 function uxAttachCommentLimitedPostOnlyProfiles() {
   const list = $("commentLimitedPostOnlyList");
@@ -5936,6 +5965,7 @@ function uxAttachIncompleteRunBanner() {
     try { uxAttachDisconnectedProfiles(); } catch (err) { console.warn("uxAttachDisconnectedProfiles failed", err); }
     try { uxAttachErroredProfiles(); } catch (err) { console.warn("uxAttachErroredProfiles failed", err); }
     try { uxAttachSuspendedProfiles(); } catch (err) { console.warn("uxAttachSuspendedProfiles failed", err); }
+    try { uxAttachBlockedModerators(); } catch (err) { console.warn("uxAttachBlockedModerators failed", err); }
     try { uxAttachCommentLimitedPostOnlyProfiles(); } catch (err) { console.warn("uxAttachCommentLimitedPostOnlyProfiles failed", err); }
     try { uxAttachIncompleteRunBanner(); } catch (err) { console.warn("uxAttachIncompleteRunBanner failed", err); }
   };

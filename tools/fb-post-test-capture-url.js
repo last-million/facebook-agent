@@ -2934,6 +2934,14 @@ async function ensureAdminIdentity(page) {
       await page.goto('https://www.facebook.com/me', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
     }
     await humanPause(2000, 3200);
+    // MODERATOR STUCK: if FB STILL walls this moderator on forced_account_switch after the Continue-click loop, the
+    // account is temporarily blocked by FB and can't approve right now. Emit a terminal signal so the server benches
+    // it for a 24-min cooldown and rotates to the next moderator (it's auto-retested after the cooldown).
+    if (/forced_account_switch|account_switcher/i.test(String(page.url() || ''))) {
+      out.forcedSwitchStuck = true; out.reason = 'forced_account_switch_stuck';
+      console.log(JSON.stringify({ step: 'admin_approval_forced_account_switch_stuck', cleared: false, url: page.url() }));
+      return out;
+    }
     const h1 = await page.evaluate(() => ((document.querySelector('h1') || {}).innerText || '').trim()).catch(() => '');
     out.identity = h1;
     out.wasPage = MANAGE_PAGE_RE.test(h1);
@@ -2982,7 +2990,7 @@ async function batchApproveAllPublisherPosts(page, gid, publisherId) {
   // LOAD-SPREAD CAP: approve at most ~5 per moderator SESSION, then stop — the least-used-first moderator
   // rotation (server side) hands the REST of the queue to the NEXT moderator. This shares the approval load
   // EVENLY across all moderators so no single account does too many and gets flagged/blocked by Facebook.
-  const MAX_EXTRA_PER_SESSION = 4; // +1 for the triggering post already approved => ~5 total per moderator/session
+  const MAX_EXTRA_PER_SESSION = 1; // +1 for the triggering post already approved => ~2 total per moderator/session (operator: spread approvals EVENLY, max ~2 per moderator, then the least-used-next moderator takes the rest)
   for (let round = 0; round < MAX_EXTRA_PER_SESSION; round += 1) {
     const r = await page.evaluate(({ pub }) => {
       const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
