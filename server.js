@@ -12944,9 +12944,17 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
   const __cooldownMs = clampNumber(__cState.rules?.commentCooldownMinutes, 1, 1440, 5) * 60 * 1000;
   const __lastCommentByPid = profileLastCommentTimeByProfileId(__cState);
   const __commentLimitedIds = commentLimitedProfileIdSet(__cState);
+  // OPERATOR RULE: NEVER comment with a PARKED profile (disconnected / errored / suspended) until the admin
+  // RELEASES it — the same exclusion the posting roster applies. This comment-recovery pool previously skipped
+  // only comment-limited + cooldown, so logged-out/dead profiles (e.g. 45, 84) were opened to comment and failed.
+  const __parkedCommentIds = new Set([...disconnectedProfileIdSet(__cState), ...erroredProfileIdSet(__cState), ...suspendedProfileIdSet(__cState)].map(String));
   for (const profile of profileList) {
     const profileId = Number(profile?.profileId || profile?.profile_id || profile);
     if (!profileId) continue;
+    if (__parkedCommentIds.has(String(profileId))) {
+      attempts.push({ profileId, profile: profile?.profile || profile?.label || profileId, ok: false, skipped: "parked_profile_not_released" });
+      continue; // disconnected/errored/suspended -> never comment until admin releases (matches posting roster)
+    }
     if (__commentLimitedIds.has(String(profileId))) {
       attempts.push({ profileId, profile: profile?.profile || profile?.label || profileId, ok: false, skipped: "comment_limited_post_only" });
       continue; // blocked from commenting (still posts); next candidate
