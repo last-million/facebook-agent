@@ -69,6 +69,22 @@ PROVEN LANDED 1/1 (2026-06-13, server 8752): after all 3 fixes + 84 parked, a 2-
 (4854) and profile 12 LANDED in 4854 (post 26152622487746980) — first time the even split actually landed a post
 in each group, not 2/0.
 
+COMMENTING NOW RESPECTS PER-GROUP ATTRIBUTION (operator 2026-06-13 "each group has its attributed profiles that
+work on it; all should be robust"). POSTING already respected it (plan rows are group+profile slots from
+groupAssignmentData — verified live: o-group posters ∈ its 64-87 set, 4854 posters ∈ its set, no cross-leak). But
+COMMENTING did NOT: both comment-pool builders (`commentRecoveryFallbackProfilesForGroup` ~L10746 and async
+`ixBrowserCommentFallbackProfilesForGroup` ~L10798) pulled from ALL ixBrowser profiles (profile-list + other-group
+"probe_same_group_access" fallbacks) → a 4854 profile (60) / o-group profile (80) commented cross-group (proven in
+a live run). FIX (server.js, restart-loaded): new helper `attributedCommentProfileIdsForGroup(groupUrl, state)`
+parses groupAssignmentData (match by normalizedFacebookGroupKey — the comment groupUrl IS the assignment form, NOT
+the permalink) → Set of profileIds (profileIdFromLabel = the FIRST number in "87 - 53"). Gate added in BOTH pool
+builders AND — the robust backstop — as a UNIVERSAL LAST-LINE GUARD in `runFacebookCommentRecoveryAttempt` (~L12277,
+right beside the moderator-approve-only guard, the choke point EVERY comment funnels through): a profile not in the
+group's attributed set is skipped with `comment_recovery_skipped` / error `profile_not_attributed_to_group`.
+FAIL-OPEN: if a group has NO attribution (set size 0) it does NOT restrict, so commenting is never hard-blocked.
+PROVEN LIVE 2026-06-13: a fresh run logged comments IN-GROUP=3, cross-group LEAKS=0. Also a member-only profile is
+the only one that CAN comment, so this is more reliable too. See [[fb-admin-approval-page-identity]].
+
 APPROVAL SCOPING HARDENED (operator 2026-06-12 "he should approve only our posts"): batchApproveAllPublisherPosts
 already approved ONLY posts whose author link is our Page (byUs check), but it paired each Approve button to a post
 by SCREEN POSITION (nearest article) — a dense queue could mis-pair with a neighbour. FIX (connector, no restart):
