@@ -386,6 +386,11 @@ async function ensureFacebookLoggedIn(page, payload, stage = 'facebook') {
   // accept cookie/continue interstitials BEFORE the login assertion (EN/FR/AR) — a cookie banner can hide the
   // real page and trip a FALSE login wall, which would wrongly park a healthy profile. Best-effort, never throws.
   await dismissFacebookInterstitials(page).catch(() => {});
+  // FORCED ACCOUNT SWITCH: ANY profile (posting / harvest / comment — not just moderators) can hit FB's
+  // "Switching accounts… Continue" wall on a navigation. Click Continue here (multilingual, loops) so EVERY
+  // path clears it before the login assertion — otherwise a healthy profile trips a false login wall / can't
+  // post. (dismissForcedAccountSwitch is hoisted; safe + best-effort, never throws.)
+  await dismissForcedAccountSwitch(page).catch(() => {});
   if (payload.waitForManualLogin === false) return await assertFacebookLoggedIn(page, stage);
   return await waitForManualFacebookLogin(page, stage, {
     timeoutMs: payload.manualLoginTimeoutMs || payload.manual_login_timeout_ms || 300000,

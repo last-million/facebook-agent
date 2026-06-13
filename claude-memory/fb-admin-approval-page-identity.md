@@ -76,7 +76,11 @@ first navigation with facebook.com/forced_account_switch — "Switching accounts
 to continue." + ONE blue "Continue" button. Until clicked the session reaches NOTHING (queue never loads, h1
 empty → that's the empty-h1 state seen on /me). FIX: connector `dismissForcedAccountSwitch(page)` (detect by
 URL, click Continue multilingual, verify URL cleared) wired into ensureAdminIdentity (re-goto /me after) and
-openGroupReviewSurface (retry target after). Posting profiles (Pages) don't hit this.
+openGroupReviewSurface (retry target after). UPDATE 2026-06-13: posting/harvest/comment profiles DO hit it too
+(operator observed it) — so dismissForcedAccountSwitch is now ALSO called in ensureFacebookLoggedIn (~L393, the
+CENTRAL login fn every path uses: posting group_page, harvest, comment-only, approve), right after
+dismissFacebookInterstitials. So ANY profile hitting "Switching accounts/Continue" clicks through it. No restart
+(connector).
 
 HARDENED (operator 2026-06-12, watching profile 16 "Laura Gomez" sit on /forced_account_switch: "why he dont
 clique on continue"): the handler WAS working (logs showed detected→dismissed cleared=true→home.php every
