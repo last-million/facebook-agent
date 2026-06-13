@@ -10724,8 +10724,28 @@ function recordPublishedPostCommentIssue({ row, ready, groupUrl, attemptedGroups
   }
 }
 
+// STRICT per-group attribution (operator: "each group has its attributed profiles that work on it"). Returns the
+// set of profileIds assigned to `groupUrl` in groupAssignmentData. The comment pools gate every candidate on this
+// so ONLY a group's OWN attributed profiles comment on that group's posts (it's also more reliable — a profile that
+// isn't a member of the group can't comment there anyway). Empty set => no attribution configured for this group =>
+// callers DO NOT restrict (fail-open, so commenting is never hard-blocked by a missing/odd assignment).
+function attributedCommentProfileIdsForGroup(groupUrl, state = readState()) {
+  const targetKey = normalizedFacebookGroupKey(groupUrl);
+  const ids = new Set();
+  if (!targetKey) return ids;
+  for (const entry of (Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [])) {
+    if (!entry || normalizedFacebookGroupKey(entry.url) !== targetKey) continue;
+    for (const label of (Array.isArray(entry.profiles) ? entry.profiles : [])) {
+      const id = profileIdFromLabel(label);
+      if (id) ids.add(id);
+    }
+  }
+  return ids;
+}
+
 function commentRecoveryFallbackProfilesForGroup(row, groupUrl, state = readState(), options = {}) {
   const targetGroupKey = normalizedFacebookGroupKey(groupUrl);
+  const __attrIds = attributedCommentProfileIdsForGroup(groupUrl, state); // only this group's attributed profiles may comment
   if (!targetGroupKey) return [];
   const excludedIds = new Set(
     [row?.profileId, profileIdFromLabel(row?.profile), options.excludeProfileId]
@@ -10739,6 +10759,7 @@ function commentRecoveryFallbackProfilesForGroup(row, groupUrl, state = readStat
     const cleanLabel = oneLineField(label || "", 180);
     const profileId = profileIdFromLabel(cleanLabel);
     if (!cleanLabel || !profileId || excludedIds.has(profileId) || seen.has(profileId)) return;
+    if (__attrIds.size && !__attrIds.has(profileId)) return; // STRICT: only THIS group's attributed profiles comment here
     if (isDedicatedShopYourLikesProfileLabel(cleanLabel, state) || isDedicatedShopYourLikesIxProfile(profileId, state)) return;
     if (isBlockedIxBrowserProfileLabel(cleanLabel, state)) return;
     if (isFacebookProfileQuarantinedForFacebook(cleanLabel, state, groupUrl)) return;
@@ -10775,6 +10796,7 @@ function commentRecoveryFallbackProfilesForGroup(row, groupUrl, state = readStat
 }
 
 async function ixBrowserCommentFallbackProfilesForGroup(row, groupUrl, state = readState(), options = {}) {
+  const __attrIds = attributedCommentProfileIdsForGroup(groupUrl, state); // STRICT: only this group's attributed profiles comment
   const excludedIds = new Set(
     [row?.profileId, profileIdFromLabel(row?.profile), options.excludeProfileId]
       .map((value) => Number(value || 0))
@@ -10797,6 +10819,7 @@ async function ixBrowserCommentFallbackProfilesForGroup(row, groupUrl, state = r
       const profileId = Number(profile.profile_id || profile.id || 0);
       const label = oneLineField(`${profileId}${profile.name ? ` - ${profile.name}` : ""}`, 180);
       if (!profileId || excludedIds.has(profileId) || seen.has(profileId)) continue;
+      if (__attrIds.size && !__attrIds.has(profileId)) continue; // STRICT: only this group's attributed profiles comment
       if (isDedicatedShopYourLikesIxProfile(profileId, state) || isDedicatedShopYourLikesProfileLabel(label, state)) continue;
       if (isBlockedIxBrowserProfileLabel(label, state)) continue;
       if (isFacebookProfileQuarantinedForFacebook(label, state, groupUrl)) continue;
@@ -12281,6 +12304,41 @@ async function runFacebookCommentRecoveryAttempt({ row, profileId, profileLabel,
       validation,
       closeResults,
       message: `IXBrowser profile "${cleanProfile}" is a moderator/approval profile and will not be used for comments.`,
+      liveLog: [],
+      liveLogFile: "",
+      payloadFile: "",
+      payloadDeleted: false,
+      script: path.relative(ROOT, liveFacebookPostingScriptPath()).replace(/\\/g, "/"),
+    };
+  }
+  // STRICT PER-GROUP ATTRIBUTION — universal last-line guard (operator: "each group has its attributed profiles
+  // that work on it"). EVERY comment funnels through here, so even if any candidate source regresses, a profile
+  // NOT assigned to this group in groupAssignmentData can NEVER comment on this group's post. Fail-open ONLY when
+  // the group has no attribution configured (size 0) so commenting is never hard-blocked by a missing assignment.
+  const __groupAttrIds = attributedCommentProfileIdsForGroup(groupUrl, state);
+  if (__groupAttrIds.size && !__groupAttrIds.has(numericProfileId)) {
+    const validation = { ok: false, errors: ["profile_not_attributed_to_group"], warnings: [], commentRequired: true, commentSubmitted: false, commentVerified: false };
+    appendFacebookLivePostLedger({
+      event: "comment_recovery_skipped",
+      key: ledgerKey,
+      planId: row.planId,
+      sequence: row.sequence,
+      profileId: numericProfileId,
+      profile: cleanProfile,
+      groupUrl,
+      actualGroupUrl: groupUrl,
+      postUrl,
+      status: "comment_recovery_failed",
+      message: `IXBrowser profile "${cleanProfile}" is not attributed to this group; it will not comment here.`,
+      validation,
+    });
+    return {
+      ok: false,
+      profileId: numericProfileId,
+      profile: cleanProfile,
+      validation,
+      closeResults,
+      message: `IXBrowser profile "${cleanProfile}" is not attributed to this group; it will not comment here.`,
       liveLog: [],
       liveLogFile: "",
       payloadFile: "",
