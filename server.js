@@ -8169,6 +8169,11 @@ async function harvestContentSourcesAsync(options = {}) {
     const effectiveTarget = reserveTarget;
     const lines = recordLines(state.posting?.contentSources?.groupsText);
     const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
+    // OPERATOR RULE: NEVER harvest with a PARKED profile (disconnected/errored/suspended) until the admin releases
+    // it. postingSlots already excludes them from `pool`, but the proven-member set (__harvestWorkingProfilesByGroup)
+    // and a "url | pin" can still name a profile that was parked AFTER it proved itself (e.g. 65 went suspended) —
+    // so filter those selections too, or harvest re-opens the dead profile every cycle.
+    const __harvParked = new Set([...disconnectedProfileIdSet(state), ...erroredProfileIdSet(state), ...suspendedProfileIdSet(state)].map(Number));
     const __harvCap = machineParallelCap(state); // auto machine ceiling — never assign a group more profiles than the box can run
     const perGroup = clampNumber(cs.harvestProfilesPerGroup, 1, __harvCap, Math.min(3, __harvCap)); // MULTI-PROFILE: harvest each group with N profiles in PARALLEL, bounded by the machine cap
     // HYDRATE per-group member knowledge from persisted state: __harvestWorkingProfilesByGroup is in-memory
@@ -8188,7 +8193,11 @@ async function harvestContentSourcesAsync(options = {}) {
       if (!m) continue;
       const groupUrl = m[1];
       const pidMatch = String(line).match(/[|@]\s*(\d{1,6})/); // OPTIONAL "url | profileId" pin
-      if (pidMatch) { pairs.push({ groupUrl, profileId: Number(pidMatch[1]), pinned: true, profileIndex: 0, profileCount: 1 }); continue; }
+      if (pidMatch) {
+        const __pp = Number(pidMatch[1]);
+        if (!__harvParked.has(__pp)) { pairs.push({ groupUrl, profileId: __pp, pinned: true, profileIndex: 0, profileCount: 1 }); continue; }
+        // pinned profile is parked -> ignore the pin and fall through to auto-pick a healthy member
+      }
       // AUTOMATIC + MULTI-PROFILE: known members first (up to perGroup-1), always keep >=1 slot exploring NEW profiles
       // so it keeps discovering members even when all known ones are momentarily throttled.
       const memberSet = __harvestWorkingProfilesByGroup.get(groupUrl) || new Set();
@@ -8196,10 +8205,11 @@ async function harvestContentSourcesAsync(options = {}) {
       // WARM group (>= perGroup proven members) -> fill EVERY slot from members so a round can't be all-explorers
       // (which read 0). COLD/unknown group -> keep 1 exploration slot to discover members.
       const memberCap = (memberSet.size >= perGroup) ? perGroup : Math.max(1, perGroup - 1);
-      for (const pid of memberSet) { if (chosen.length >= memberCap) break; if (!chosen.includes(pid)) chosen.push(pid); }
+      for (const pid of memberSet) { if (chosen.length >= memberCap) break; if (__harvParked.has(Number(pid))) continue; if (!chosen.includes(pid)) chosen.push(pid); }
       let attempt = __harvestProfileAttemptByGroup.get(groupUrl) || 0, guard = 0;
       while (chosen.length < perGroup && pool.length && guard < pool.length * 2) {
         const pid = pool[attempt % pool.length]; attempt += 1; guard += 1;
+        if (__harvParked.has(Number(pid))) continue; // never harvest with a parked profile (belt-and-suspenders; pool is already filtered)
         if (!chosen.includes(pid)) chosen.push(pid);
       }
       __harvestProfileAttemptByGroup.set(groupUrl, attempt);
