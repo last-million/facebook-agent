@@ -2996,10 +2996,27 @@ async function batchApproveAllPublisherPosts(page, gid, publisherId) {
       const btns = [...document.querySelectorAll('div[role="button"],button,a[role="button"]')].filter(vis).filter(isPerPostApprove);
       for (const b of btns) {
         const br = b.getBoundingClientRect();
-        let best = null, bestD = Infinity;
-        for (const a of articles) { const ar = a.getBoundingClientRect(); const d = Math.abs(ar.top - br.top); if (d < bestD) { bestD = d; best = a; } }
-        if (!best) continue;
-        const byUs = [...best.querySelectorAll('a[href]')].some((l) => { const h = String(l.href || ''); return h.includes(`/user/${pub}/`) || h.includes(`profile.php?id=${pub}`); });
+        // STRICT scoping (operator: approve ONLY our posts): tie this Approve button to its OWN post by DOM
+        // CONTAINMENT first — screen-position "nearest article" can mis-pair with a neighbouring member's post
+        // in a dense queue. Climb to the smallest ancestor that holds EXACTLY ONE article = this button's post
+        // cell. Only if containment is ambiguous (no single-article cell) fall back to the nearest-article
+        // heuristic, so we never regress to approving nothing. Either way, approve ONLY if that post's author
+        // link is our publisher.
+        let resolved = null;
+        let cell = b.parentElement;
+        for (let up = 0; up < 12 && cell; up += 1) {
+          const arts = cell.querySelectorAll ? [...cell.querySelectorAll('[role="article"]')] : [];
+          if (arts.length === 1) { resolved = arts[0]; break; }
+          if (arts.length > 1) break; // climbed into a multi-post container -> containment inconclusive
+          cell = cell.parentElement;
+        }
+        if (!resolved) {
+          let best = null, bestD = Infinity;
+          for (const a of articles) { const ar = a.getBoundingClientRect(); const d = Math.abs(ar.top - br.top); if (d < bestD) { bestD = d; best = a; } }
+          resolved = best;
+        }
+        if (!resolved) continue;
+        const byUs = [...resolved.querySelectorAll('a[href]')].some((l) => { const h = String(l.href || ''); return h.includes(`/user/${pub}/`) || h.includes(`profile.php?id=${pub}`); });
         if (!byUs) continue;
         b.scrollIntoView({ block: 'center' });
         b.click();
