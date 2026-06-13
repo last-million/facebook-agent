@@ -15483,6 +15483,15 @@ function unblockPostingProfile(body = {}) {
 let __profileBlockStreak = {};
 const PROFILE_AUTO_BLOCK_THRESHOLD = 2;
 const PROFILE_AUTO_BLOCK_RECENT_WINDOW_MS = 3 * 60 * 60 * 1000;
+// PERSISTENT profile-OPEN (1004) park: a single 1004 "Profile Open Failed" stays transient infra (never benched),
+// but a profile ixBrowser can NEVER open keeps getting picked as the freshest in its group and burns the slot
+// (the even split never LANDS). Park it (errored -> Prod tab + Release) after N strikes in the window, counted
+// ONLY when the system is otherwise healthy (guards against an ixBrowser WEDGE parking many good profiles).
+const OPEN_1004_PARK_THRESHOLD = 4;
+const OPEN_1004_WINDOW_MS = 3 * 60 * 60 * 1000;          // strikes age out after 3h (self-healing)
+const OPEN_1004_MIN_SPACING_MS = 5 * 60 * 1000;         // collapse fast-retry bursts: count strikes >=5min apart
+const OPEN_1004_WEDGE_WINDOW_MS = 6 * 60 * 1000;        // "right now" window for the distinct-profile wedge check
+const OPEN_1004_WEDGE_MIN_PROFILES = 3;                 // >=3 distinct profiles failing to OPEN == ixBrowser wedge -> never park
 
 function isHardAccountBlockOutcome(errorText, validation) {
   if (validation && validation.facebookAccountBlocked === true) return true;
@@ -15520,6 +15529,92 @@ function recentProfileBlockingFailureCount(pid, state) {
   return n;
 }
 
+// Counts persistent profile-OPEN (1004) strike breadcrumbs for a profile, within the window AND only those
+// recorded AFTER the profile's most recent SUCCESSFUL post — so ANY success resets the tally (a flaky-but-working
+// profile never accumulates to a park; only a profile ixBrowser can never open does).
+function recentProfileOpen1004Count(pid, state, published) {
+  const pub = published || autopilotPublishedTodayByProfile(state);
+  const lastOk = (pub && pub.lastAtByProfile && (pub.lastAtByProfile.get(Number(pid)) || pub.lastAtByProfile.get(String(pid)) || pub.lastAtByProfile.get(pid))) || 0;
+  const floor = Math.max(Date.now() - OPEN_1004_WINDOW_MS, lastOk); // window + reset-on-success (per-pid: strikes before the profile's last success don't count)
+  const sources = [state.posting?.facebookProfileStatus, state.ixbrowser?.failedProfiles].join("\n").split(/\r?\n/);
+  const pidRe = new RegExp(`profile_id=${pid}(?!\\d)`); // anchored: profile_id=8 must NOT also match profile_id=80/84/87
+  const times = [];
+  for (const line of sources) {
+    if (!pidRe.test(line)) continue;
+    if (!/auto_open_strike=1/i.test(line)) continue;
+    if (/status=(resolved|approved|cleared|ignored)|action=(profile_unblocked|profile_group_unblocked)/i.test(line)) continue;
+    const m = line.match(/(\d{4}-\d{2}-\d{2}T[0-9:.]+Z)/);
+    const at = m ? Date.parse(m[1]) : NaN;
+    if (!Number.isFinite(at) || at < floor) continue;
+    times.push(at);
+  }
+  // SPACING: collapse fast-retry bursts — only count strikes >= OPEN_1004_MIN_SPACING_MS apart, so 4 retries in
+  // ~100s count as ONE. A persistently-dead profile fails across distinct picks (minutes/runs apart) and still
+  // accumulates; a wedge burst against one profile can never reach the threshold on retries alone.
+  times.sort((a, b) => a - b);
+  let n = 0, lastCounted = -Infinity;
+  for (const t of times) { if (t - lastCounted >= OPEN_1004_MIN_SPACING_MS) { n += 1; lastCounted = t; } }
+  return n;
+}
+
+// PERSISTENT-DEAD-PROFILE PARK on repeated profile-OPEN 1004 ("Profile Open Failed"). Default behavior keeps 1004
+// as transient infra (the caller already declined to bench it); here we additionally COUNT it and, after
+// OPEN_1004_PARK_THRESHOLD strikes in the window, PARK the profile (errored -> Prod-tab list + Release button) so
+// it stops being picked + burning its group's slot. WEDGE GUARD: only counts/parks when a real post landed in the
+// last 20min (system healthy) — during an ixBrowser wedge MANY profiles fail 1004 at once and must NOT be parked.
+// Reset is automatic: the count only tallies strikes AFTER the profile's last success (recentProfileOpen1004Count).
+// Count DISTINCT profiles that logged a profile-OPEN 1004 strike within windowMs. A true ixBrowser WEDGE shows
+// MANY profiles failing to open at once; a single genuinely-dead profile does not. Used to SUPPRESS the 1004 park
+// during a wedge so healthy profiles are never benched for an infra outage.
+function distinctRecentOpen1004Profiles(state, windowMs) {
+  const cutoff = Date.now() - windowMs;
+  const sources = [state.posting?.facebookProfileStatus, state.ixbrowser?.failedProfiles].join("\n").split(/\r?\n/);
+  const pids = new Set();
+  for (const line of sources) {
+    if (!/auto_open_strike=1/i.test(line)) continue;
+    if (/status=(resolved|approved|cleared|ignored)|action=(profile_unblocked|profile_group_unblocked)/i.test(line)) continue;
+    const tm = line.match(/(\d{4}-\d{2}-\d{2}T[0-9:.]+Z)/);
+    const at = tm ? Date.parse(tm[1]) : NaN;
+    if (!Number.isFinite(at) || at < cutoff) continue;
+    const pm = line.match(/profile_id=(\d+)/);
+    if (pm) pids.add(pm[1]);
+  }
+  return pids.size;
+}
+
+function maybeParkPersistentOpen1004(pid, profile, errorText, opts = {}) {
+  try {
+    const txt = String(errorText || "");
+    const is1004Open = /\b1004\b|profile[ _-]?open[ _-]?failed|配置文件打开失败/i.test(txt) || opts.publicError === "ixbrowser_profile_open_failed";
+    if (!is1004Open) return;
+    let state = readState();
+    if (isProfileBlockedForPosting(String(pid), state, "")) return; // already excluded
+    // ALWAYS record the strike (recording is harmless; only the PARK decision is guarded). Gating the RECORD on a
+    // fresh GLOBAL post wrongly silenced the counter during the exact slow stretches where a dead profile burns the
+    // slot — so record unconditionally and let spacing + the distinct-profile wedge guard decide if it counts.
+    const record = normalizeProfileRecord({ profileId: pid, profileLabel: profile || String(pid) });
+    const crumb = buildProfileRecordLine(record, { component: "facebook_review", issue: "profile_open_failure", status: "open_infra_pending", action: "count_open_1004", reason: oneLineField(txt, 120), auto_open_strike: "1", source: "ixbrowser_open_1004" });
+    state.ixbrowser.failedProfiles = appendUniqueRecordLine(state.ixbrowser.failedProfiles, crumb);
+    writeState(state);
+    state = readState();
+    // WEDGE GUARD: if MULTIPLE distinct profiles are failing to OPEN right now, it's an ixBrowser wedge (infra),
+    // not a dead profile — never park. (A fleet-wide "last post" is the wrong signal: one lucky post masks a wedge,
+    // a slow night masks a real dead profile. Distinct concurrent open-failers is the true wedge signature.)
+    const distinct = distinctRecentOpen1004Profiles(state, OPEN_1004_WEDGE_WINDOW_MS);
+    if (distinct >= OPEN_1004_WEDGE_MIN_PROFILES) {
+      logEvent("profile_open_1004_strike_wedge_suppressed", { profileId: pid, distinct });
+      return;
+    }
+    const count = recentProfileOpen1004Count(pid, state); // window + per-pid reset-on-success + min-spacing
+    if (count >= OPEN_1004_PARK_THRESHOLD) {
+      markProfileErrored(pid, profile || String(pid), `ixBrowser could not open this profile (1004) ${count}x over time — parked for manual recheck/release`);
+      logEvent("profile_parked_persistent_open_1004", { profileId: pid, count, threshold: OPEN_1004_PARK_THRESHOLD });
+    } else {
+      logEvent("profile_open_1004_strike", { profileId: pid, count, threshold: OPEN_1004_PARK_THRESHOLD });
+    }
+  } catch (_e) { /* never break a posting flow */ }
+}
+
 // Records the outcome of a single profile's post attempt and auto-blacklists the
 // profile when it is genuinely blocked/restricted. NEVER throws (health tracking
 // must not break a posting flow).
@@ -15537,7 +15632,7 @@ function autoBlacklistProfileIfNeeded(opts = {}) {
     // profile for it. This is what wrongly auto-blacklisted good (member) profiles during the ixBrowser wedge.
     // Retry handles it; the blacklist streak ignores it entirely.
     const isOpenInfraFailure = !hard && /\b1004\b|profile[ _-]?open[ _-]?failed|could not open (?:the )?profile|配置文件打开失败|connectovercdp|connect over cdp|cdp (?:timeout|timed out|refused|closed|error)|websocket|target (?:page )?closed|browser has been closed|connection (?:closed|refused)|server busy|ECONNREFUSED|ECONNRESET|socket hang/i.test(errorText);
-    if (isOpenInfraFailure) { try { logEvent("profile_open_infra_not_benched", { profileId: pid, error: oneLineField(errorText, 140) }); } catch (_) {} return; }
+    if (isOpenInfraFailure) { try { logEvent("profile_open_infra_not_benched", { profileId: pid, error: oneLineField(errorText, 140) }); } catch (_) {} maybeParkPersistentOpen1004(pid, profile, errorText, opts); return; }
     // opts.profileRetryable is the connector's structured "profile open/login failed" signal —
     // robust even when the wrapper message hides/truncates the original reason. Treat it as soft.
     const soft = isTransientBlockingPostFailure(errorText) || opts.profileRetryable === true;

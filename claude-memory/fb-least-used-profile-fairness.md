@@ -51,11 +51,23 @@ both groups being configured. THREE compounding causes, all fixed in server.js (
    the FIRST N (all o-group). FIX: a `__batchCap = min(maxWorkers, runLimitRemaining)` now sizes the per-group cap
    and pick loop (~L8932) so the balance is correct PRE-trim. Proven: a 2-post run then picked ONE profile per
    group (73 o-group + 84 4854).
-3. **Dead profiles (1004) aren't auto-parked.** 1004 "Profile Open Failed" is INTENTIONALLY treated as transient
-   infra, not account health (server.js ~L15535, isOpenInfraFailure) so a glitch doesn't park a healthy account —
-   but a PERSISTENTLY-broken profile (84 failed 1004 6+ times/day) keeps getting picked as the freshest 4854
-   profile and fails, so the 4854 post never LANDS. Manually parked 84 via POST /api/profiles/disconnect. OPEN
-   follow-up: park a profile after N repeated 1004s in a window (threshold-based, careful — don't park on one).
+3. **Dead profiles (1004) now auto-park (FIXED + adversarially reviewed).** 1004 "Profile Open Failed" stays
+   transient infra by default (server.js isOpenInfraFailure) — but a PERSISTENTLY-dead profile (84 failed 1004 6+
+   times/day) kept getting picked as the freshest 4854 profile and failed, so the 4854 post never LANDED. FIX
+   (server.js, restart-loaded): in autoBlacklistProfileIfNeeded's isOpenInfraFailure branch, call
+   maybeParkPersistentOpen1004 — it ALWAYS records an auto_open_strike=1 breadcrumb, then parks the profile
+   (markProfileErrored -> Prod-tab errored list + Release) after OPEN_1004_PARK_THRESHOLD=4 strikes. Two-agent
+   adversarial review caught + fixed: (a) reset-on-success via a per-pid last-success floor in
+   recentProfileOpen1004Count; (b) 5-min MIN-SPACING so a fast-retry burst (4 in ~100s) collapses to ONE strike;
+   (c) WEDGE GUARD distinctRecentOpen1004Profiles — if >=3 distinct profiles fail to open within 6min it's an
+   ixBrowser WEDGE (infra), NOT dead profiles, so NEVER park (the old fleet-wide "recent post" guard was wrong:
+   one lucky post masked a wedge, a slow night masked a real dead profile); (d) anchored profile_id match (8 must
+   not match 80/84). Residual LOW (accepted): lastAtByProfile is today-only, so a profile whose last success was
+   yesterday could count pre-success strikes across midnight — heavily mitigated by spacing+wedge guard.
+
+PROVEN LANDED 1/1 (2026-06-13, server 8752): after all 3 fixes + 84 parked, a 2-post run picked 73 (o-group) + 12
+(4854) and profile 12 LANDED in 4854 (post 26152622487746980) — first time the even split actually landed a post
+in each group, not 2/0.
 
 APPROVAL SCOPING HARDENED (operator 2026-06-12 "he should approve only our posts"): batchApproveAllPublisherPosts
 already approved ONLY posts whose author link is our Page (byUs check), but it paired each Approve button to a post
