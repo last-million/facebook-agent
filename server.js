@@ -13812,7 +13812,13 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       // so only posts published since the run started are re-commented. (Old posts that missed their comment stay
       // as-is — the operator wants the agent commenting what it posts NOW, not back-filling history.)
       const __runStart = Number(state.operator?.autopilotRunId) || 0;
-      if (__runStart > 0) cutoff = Math.max(cutoff, __runStart);
+      // FORCED sweeps (auto-disarm drain / manual button / boot recovery) SKIP this clamp so they can reach back the
+      // full windowHours to back-fill a post left PENDING when a PRIOR run ended (STOP / crash / window-close / late
+      // approval) — today the clamp silently overrode their windowHours, so those posts went live with NO comment and
+      // were never recovered (the stale-pending hole). NORMAL tick-driven sweeps keep the run-only focus (operator:
+      // don't chase history every 90s during a run). Forced reach-back stays bounded by windowMs + maxToFix + the
+      // attribution / comment-lock / never-twice guards below — it can never loop on un-commentable old posts.
+      if (__runStart > 0 && !options.force) cutoff = Math.max(cutoff, __runStart);
       const maxToFix = clampNumber(options.max, 1, 50, 10);
       const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 8000 });
       const publishedByPlan = new Map();
@@ -19298,6 +19304,12 @@ server.listen(PORT, HOST, () => {
   // Kick one per-post-log retention sweep shortly after startup (covers a process that was down
   // across the interval), then the heartbeat repeats it every >=6h.
   setTimeout(() => { __lastPerPostLogSweep = Date.now(); sweepPerPostLogs().catch(() => {}); }, 30000);
+  // STALE-PENDING RECOVERY (2026-06-13): ~60s after boot, ONE forced resweep to back-fill any post a PRIOR run left
+  // live-but-uncommented (a count run that ended before a late approval surfaced, or a crash). With the !force clamp
+  // relaxation in resweepUncommentedFacebookPostsAsync, a FORCED sweep now reaches back the full windowHours instead
+  // of being silently clamped to the (now-stale) run id. Single fire-and-forget; bounded by max + the attribution /
+  // comment-lock / never-twice guards (completes a post's comment, never double-comments, never picks the poster).
+  setTimeout(() => { resweepUncommentedFacebookPostsAsync({ force: true, max: 50, windowHours: 24 }).then((r) => logEvent("boot_stale_pending_resweep_done", { checked: r && r.checked, recommented: r && r.recommented })).catch((err) => logEvent("boot_stale_pending_resweep_error", { error: oneLineField(err.message || String(err), 160) })); }, 60000);
   // AUTO DISCONNECT DETECTION boot-grace: don't let the first health-sweep fire the instant we boot (would
   // storm ixBrowser if the operator re-arms right away). Back-date the clock so the first idle sweep becomes
   // eligible ~10min after boot, then every ~2h while idle.
