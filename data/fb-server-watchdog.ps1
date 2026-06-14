@@ -33,10 +33,14 @@ function Start-FbServer($reason) {
   $exe = $node
   if (-not (Test-Path $exe)) { $c = Get-Command node.exe -ErrorAction SilentlyContinue; if ($c) { $exe = $c.Source } }
   if ($exe -and (Test-Path $exe)) {
+    # DATE-STAMP stderr so a crash's fatal line (esp. "JavaScript heap out of memory", which bypasses the in-process
+    # crash.log handler) is PRESERVED instead of truncated by the restart. Keep the last 15 to bound disk.
+    try { Get-ChildItem (Join-Path $proj 'data') -Filter 'server-stderr-*.log' -EA SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 15 | Remove-Item -Force -EA SilentlyContinue } catch {}
+    $errLog = Join-Path $proj ("data\server-stderr-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
     Start-Process -FilePath $exe -ArgumentList 'server.js' -WorkingDirectory $proj -WindowStyle Hidden `
       -RedirectStandardOutput (Join-Path $proj 'data\server-stdout.log') `
-      -RedirectStandardError  (Join-Path $proj 'data\server-stderr.log')
-    Write-WatchdogLog ("action=restarted`treason={0}" -f $reason)
+      -RedirectStandardError  $errLog
+    Write-WatchdogLog ("action=restarted`treason={0}`tstderr={1}" -f $reason, (Split-Path $errLog -Leaf))
   } else {
     Write-WatchdogLog "action=skipped`treason=node_not_found"
   }

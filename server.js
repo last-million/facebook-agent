@@ -15,6 +15,24 @@ const execFileAsync = promisify(execFile);
 
 const ROOT = __dirname;
 const DATA_DIR = path.join(ROOT, "data");
+// CRASH DIAGNOSTICS (2026-06-14, after a silent crash halted a 100-post run at 31 with NO captured cause — the
+// watchdog truncates stderr on restart). Append-only crash.log captures the fatal line + a memory snapshot BEFORE
+// the process dies. uncaughtException: log then exit(1) (matches Node's default + lets the watchdog restart with
+// clean state — never swallow, which risks corrupt in-memory run state). unhandledRejection: LOG ONLY (capture the
+// diagnostic without introducing new crash behavior). NOTE: a V8 OOM ("JavaScript heap out of memory") bypasses both
+// handlers — the date-stamped watchdog stderr captures that; the real OOM fix is fewer concurrent chrome.
+function __logFatal(kind, err) {
+  try {
+    const mu = process.memoryUsage();
+    fs.appendFileSync(path.join(DATA_DIR, "crash.log"), JSON.stringify({
+      at: new Date().toISOString(), kind,
+      error: (err && err.stack) ? String(err.stack).slice(0, 4000) : String((err && err.message) || err).slice(0, 2000),
+      rssMB: Math.round(mu.rss / 1048576), heapUsedMB: Math.round(mu.heapUsed / 1048576), freeMemMB: Math.round(os.freemem() / 1048576),
+    }) + "\n");
+  } catch (_) {}
+}
+process.on("uncaughtException", (err) => { __logFatal("uncaughtException", err); process.exit(1); });
+process.on("unhandledRejection", (err) => { __logFatal("unhandledRejection", err); });
 const AGENT_CHATGPT_EDGE_USER_DATA_DIR = path.join(DATA_DIR, "chatgpt-agent-edge-profile");
 const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
 const LOG_FILE = path.join(DATA_DIR, "events.log");
@@ -8252,7 +8270,7 @@ function harvestAutoReserves(state) {
   // SINGLE steady working reserve, kept topped up by CONTINUOUS parallel harvesting (no big overnight batch —
   // source groups don't post at night either). Sized to bridge between harvests so production never stalls.
   const target = Math.max(15, Math.min(60, Math.ceil(daily * 0.1)));
-  const refillAt = Math.max(8, Math.floor(target * 0.6));
+  const refillAt = Math.max(8, Math.floor(target * 0.85)); // operator 2026-06-14: refill at 0.85*target (was 0.6) so a long 100-post run never thins out — harvest was sleeping (harvest_reserve_satisfied) at reserve>=target while posting drained the ready buffer.
   return { daily, target, refillAt };
 }
 // Parallel 4-by-4 harvest across DISTINCT member profiles. Single-flight, posting/CPU-governed, dedups
@@ -19323,6 +19341,28 @@ server.listen(PORT, HOST, () => {
   // If a prod run was interrupted by this restart, record it for the Prod-tab banner and
   // disarm BEFORE the scheduler starts — the operator chooses Continue / Relaunch / Dismiss.
   detectIncompleteRunAtBoot();
+  // CRASH-SCOPED COMMENT RECOVERY (2026-06-14): if THIS restart interrupted an ACTIVE run (a crash — reason
+  // run_active_at_restart, NOT a clean stop), the run's in-flight first comments never finished (no clean auto-disarm
+  // / stop drain ran), leaving posts published-but-uncommented. Fire ONE comment drain SCOPED TO THE CRASHED RUN's
+  // posts: ignoreArmedGate keeps the run-cutoff clamp (cutoff = max(cutoff, autopilotRunId)), so it can NEVER
+  // back-fill OLD posts (honors the operator's no-old-back-fill rule) — only the just-crashed run's own posts.
+  // Posting stays DISARMED (comments only); a real operator STOP still aborts it. ~90s after boot so the box settles.
+  setTimeout(() => {
+    try {
+      const __ir = readState().operator?.lastIncompleteRun;
+      if (__ir && __ir.reason === "run_active_at_restart" && __ir.status === "pending") {
+        logEvent("crash_run_comment_recovery_start", { posted: __ir.posted, max: __ir.max });
+        (async () => {
+          for (let pass = 0; pass < 5; pass += 1) {
+            const r = await resweepUncommentedFacebookPostsAsync({ ignoreArmedGate: true, max: 50, windowHours: 24 }).catch(() => null);
+            if (!r || (r.checked === 0 && r.recommented === 0)) break;
+            await sleep(5000);
+          }
+          logEvent("crash_run_comment_recovery_done", {});
+        })().catch(() => {});
+      }
+    } catch (_) {}
+  }, 90000);
   // ORPHAN CLEANUP: a few seconds after boot (and ONLY if no run got armed in the meantime), kill leftover
   // ixBrowser chrome from the prior/crashed process so it can't wedge ixBrowser or hog RAM. Targeted + safe.
   setTimeout(() => { try { const __st = readState(); if (!(__st.operator?.autopilotEnabled && __st.operator?.armedForExternalActions)) cleanOrphanIxBrowserChromeAtBoot(); else logEvent("boot_orphan_cleanup_skipped_armed", {}); } catch (_) {} }, 4000);

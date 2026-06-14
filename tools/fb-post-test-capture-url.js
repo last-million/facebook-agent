@@ -1391,7 +1391,7 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
     initialTargetState.exactGroupPostPath &&
     initialTargetState.markerVisible
   );
-  if (!markerVisibleBeforeComment && !exactPermalinkFallbackAllowed && !onExpectedPermalinkWithMarker) {
+  if (!markerVisibleBeforeComment && !exactPermalinkFallbackAllowed && !onExpectedPermalinkWithMarker && !urlConfirmsRightPost) {
     result.blocked = true;
     result.blockReason = 'target_marker_article_not_visible_before_comment';
     return result;
@@ -1466,7 +1466,7 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
       if (__ca < 5) { await ensureExpectedPostLoaded('comment_button_retry_settle').catch(() => {}); await humanPause(2500, 4000); }
     }
   }
-  if (!clickedByMarker && !exactPermalinkFallbackAllowed) {
+  if (!clickedByMarker && !exactPermalinkFallbackAllowed && !urlConfirmsRightPost) {
     result.blocked = true;
     result.blockReason = 'marker_scoped_comment_button_not_found';
     return result;
@@ -1618,9 +1618,43 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
     }, { marker, initialPath: initialCommentPath }).catch((err) => ({ clicked: false, reason: err.message || String(err) }));
     result.permalinkScopedBox = permalinkScopedBox;
     if (!permalinkScopedBox.clicked) {
-      result.blocked = true;
-      result.blockReason = markerScopedBox.reason || permalinkScopedBox.reason || 'marker_scoped_comment_box_not_found';
-      return result;
+      // FOLDED-POST FALLBACK (operator 2026-06-14: every post MUST get commented). FB collapses long posts
+      // ("See more") so the hashtag MARKER isn't in the visible/body text -> every marker-scoped finder above
+      // misses and the whole eligible profile pool gets burned with 0 comments (the 5 orphaned posts of this run).
+      // But we are PROVABLY on the RIGHT post: the connector already hard-blocks (expected_post_permalink_mismatch_
+      // before_comment) unless the live URL's postId == the expected postId, and this is a single-post permalink page.
+      // So find the first real comment box on the page WITHOUT the marker. STRICTLY gated: urlConfirmsRightPost AND
+      // the live pathname STILL matches the expected group+post id (re-checked inside). The downstream insertText +
+      // waitForPublishedCommentText still gates success, so a misfire becomes "not commented", never a wrong comment.
+      let foldedClicked = false;
+      if (urlConfirmsRightPost && expectedPostParts) {
+        const foldedBox = await page.evaluate(({ gid, pid }) => {
+          const m = (location.pathname || '').match(/\/groups\/([0-9]+)\/(?:permalink|posts)\/([0-9]+)/i);
+          if (!m || m[1] !== String(gid) || m[2] !== String(pid)) return { clicked: false, reason: 'folded_fallback_url_not_exact_expected_post' };
+          const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+          const labelOf = (el) => (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').replace(/\s+/g, ' ').trim();
+          const boxes = [...document.querySelectorAll('[contenteditable="true"],[role="textbox"],textarea,[aria-label*="Comment as" i],[aria-label*="Write a comment" i],[aria-label*="commenter" i]')]
+            .filter(visible)
+            .map((el) => { const lower = labelOf(el).toLowerCase(); let score = 0;
+              if (/comment as|write a comment|commenter/.test(lower)) score += 130; else if (/\bcomment\b|leave a comment/.test(lower)) score += 85;
+              if (/what.*mind|write something|create post|search facebook/.test(lower)) score -= 180;
+              return { el, score, top: Math.round(el.getBoundingClientRect().top) }; })
+            .filter((b) => b.score >= 85)
+            .sort((a, b) => (b.score - a.score) || (a.top - b.top));
+          const best = boxes[0];
+          if (!best) return { clicked: false, reason: 'folded_fallback_no_comment_box' };
+          best.el.scrollIntoView({ block: 'center', inline: 'center' });
+          best.el.click();
+          return { clicked: true, score: best.score, top: best.top, foldedFallback: true };
+        }, { gid: expectedPostParts.groupId, pid: expectedPostParts.postId }).catch((err) => ({ clicked: false, reason: err.message || String(err) }));
+        result.foldedBox = foldedBox;
+        foldedClicked = Boolean(foldedBox.clicked);
+      }
+      if (!foldedClicked) {
+        result.blocked = true;
+        result.blockReason = markerScopedBox.reason || permalinkScopedBox.reason || 'marker_scoped_comment_box_not_found';
+        return result;
+      }
     }
   }
   if (!(await ensureExpectedPostLoaded('before_comment_text_insert'))) return result;
