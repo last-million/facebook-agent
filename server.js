@@ -18198,7 +18198,13 @@ setInterval(() => {
   // ixBrowser; single-flight + CPU-aware inside; fail-open. Catches idle logged-out profiles (e.g. 50/45) that
   // a posting run never selects, so they surface WITHOUT being used. Used-but-logged-out profiles are still
   // caught in-line by the posting/comment path.
-  if (!active && Date.now() - __lastHealthSweepAt > HEALTH_SWEEP_INTERVAL_MS) {
+  // OPERATOR (2026-06-14): a server AT REST must open ZERO browsers. This idle health sweep opened EVERY assigned
+  // profile (a 1-post harvest each, logged as harvest_done) ~10min after boot + every ~2h while DISARMED — that is
+  // the "harvest running at rest" the operator saw. Now gated behind an explicit opt-in flag (default OFF): with the
+  // flag absent it NEVER runs automatically, so a disarmed/idle server stays SILENT. Logged-out profiles are still
+  // caught INLINE by the posting/comment path during a real run, and an on-demand check is available via the
+  // /api/profiles/health-sweep endpoint. (active = a posting/harvest job already in flight.)
+  if (!active && Date.now() - __lastHealthSweepAt > HEALTH_SWEEP_INTERVAL_MS && readState().operator?.idleHealthSweepEnabled === true) {
     __lastHealthSweepAt = Date.now();
     runProfileHealthSweep({ concurrency: 2 }).catch((err) => logEvent("profile_health_sweep_interval_error", { error: oneLineField(err.message || String(err), 200) }));
   }
