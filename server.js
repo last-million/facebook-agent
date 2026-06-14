@@ -8133,6 +8133,26 @@ async function stopAllExternalWork(reason) {
   } catch (_) {}
   try { await closeAllOpenIxProfiles(); } catch (_) {}
   logEvent("external_work_stop_all", { reason: reason || "operator_stop" });
+  // OPERATOR (2026-06-14): "even when we click STOP, he should FINISH his comments." After the hard stop of posting +
+  // harvest above, fire ONE delayed, CURRENT-RUN-scoped comment drain so this run's published-but-uncommented posts
+  // still get their different-profile comment. Delayed ~10s so the connector-kill above fully settles before we
+  // re-open a commenter; ignoreArmedGate (NOT force) bypasses the disarm yet KEEPS the run-cutoff clamp, so it only
+  // finishes THIS run's comments and NEVER back-fills old posts; a SECOND stop (newer __externalStopRequested)
+  // aborts it (the L13837 guard). If nothing is owed, the drain finds 0 posts and opens no browser — a quiet stop.
+  if (reason === "operator_stop_all" || reason === "dashboard_disarm") {
+    setTimeout(() => {
+      (async () => {
+        for (let pass = 0; pass < 5; pass += 1) {
+          try {
+            const r = await resweepUncommentedFacebookPostsAsync({ ignoreArmedGate: true, max: 50, windowHours: 24 });
+            if (!r || (r.checked === 0 && r.recommented === 0)) break;
+          } catch {}
+          await sleep(5000);
+        }
+        logEvent("stop_comment_drain_done", { reason });
+      })().catch(() => {});
+    }, 10000);
+  }
   return { stopped: true, at: new Date().toISOString() };
 }
 
@@ -8808,13 +8828,14 @@ function autopilotAutoDisarm(reason, detail) {
   logEvent("autopilot_auto_disarmed", { reason, detail });
   // 100% COMMENTS to the very end: a count run disarms the instant it hits N, which would otherwise
   // stop the armed-gated comment resweep — leaving a tail post (whose posters were still busy at
-  // inline-comment time) uncommented. Kick a few FORCED resweeps (now that posting is idle, the
-  // proven-access poster profiles are free) so every post still gets its different-profile comment.
+  // inline-comment time) uncommented. Kick a few CURRENT-RUN-scoped resweeps (ignoreArmedGate, NOT force:
+  // bypasses the just-set disarm but KEEPS the run-cutoff clamp) so every post THIS run still gets its
+  // different-profile comment — without ever chasing OLD posts from earlier runs (operator 2026-06-14).
   if (reason === "run_limit_reached") {
     (async () => {
       for (let pass = 0; pass < 5; pass += 1) {
         try {
-          const r = await resweepUncommentedFacebookPostsAsync({ force: true, max: 50, windowHours: 12 });
+          const r = await resweepUncommentedFacebookPostsAsync({ ignoreArmedGate: true, max: 50, windowHours: 24 });
           if (!r || (r.checked === 0 && r.recommented === 0)) break; // nothing left to comment
         } catch {}
         await sleep(5000);
@@ -13800,10 +13821,13 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
     try {
       const state = readState();
       // Re-commenting is an EXTERNAL action — gate on the universal kill switch unless forced.
-      if (!options.force && !(state.operator?.autopilotEnabled && state.operator?.armedForExternalActions)) {
+      // ignoreArmedGate = the operator FINISH/STOP comment-drain: run despite a fresh disarm, but WITHOUT force's
+      // reach-back — it keeps the run-cutoff clamp below, so it only finishes the CURRENT run's comments and never
+      // chases OLD posts from earlier runs (operator 2026-06-14: "don't go back for previous posts at launch").
+      if (!options.force && !options.ignoreArmedGate && !(state.operator?.autopilotEnabled && state.operator?.armedForExternalActions)) {
         return summary;
       }
-      if (options.force) __forcedCommentResweepActive = true; // Fix A: a forced post-publish resweep may comment despite the run-limit auto-disarm
+      if (options.force || options.ignoreArmedGate) __forcedCommentResweepActive = true; // a forced post-publish resweep OR the finish/stop comment-drain may comment despite the run-limit/disarm
       const resweepStartedAt = Date.now(); // if the operator hits STOP after this, abort the loop (real stop)
       const windowMs = clampNumber(options.windowHours, 1, 168, 24) * 3600 * 1000;
       let cutoff = Date.now() - windowMs;
@@ -19306,12 +19330,11 @@ server.listen(PORT, HOST, () => {
   // Kick one per-post-log retention sweep shortly after startup (covers a process that was down
   // across the interval), then the heartbeat repeats it every >=6h.
   setTimeout(() => { __lastPerPostLogSweep = Date.now(); sweepPerPostLogs().catch(() => {}); }, 30000);
-  // STALE-PENDING RECOVERY (2026-06-13): ~60s after boot, ONE forced resweep to back-fill any post a PRIOR run left
-  // live-but-uncommented (a count run that ended before a late approval surfaced, or a crash). With the !force clamp
-  // relaxation in resweepUncommentedFacebookPostsAsync, a FORCED sweep now reaches back the full windowHours instead
-  // of being silently clamped to the (now-stale) run id. Single fire-and-forget; bounded by max + the attribution /
-  // comment-lock / never-twice guards (completes a post's comment, never double-comments, never picks the poster).
-  setTimeout(() => { resweepUncommentedFacebookPostsAsync({ force: true, max: 50, windowHours: 24 }).then((r) => logEvent("boot_stale_pending_resweep_done", { checked: r && r.checked, recommented: r && r.recommented })).catch((err) => logEvent("boot_stale_pending_resweep_error", { error: oneLineField(err.message || String(err), 160) })); }, 60000);
+  // BOOT COMMENT BACK-FILL REMOVED (operator 2026-06-14: "when launching prod, do NOT go back for previous posts to
+  // comment them — no need"). A server start / restart must NEVER auto-comment old posts; the agent comments only
+  // what the CURRENT run posts (the run-scoped tick resweep), finishes the current run's comments at run-end
+  // (autopilotAutoDisarm) and on STOP (stopAllExternalWork's stop-drain). To manually back-fill an old post the
+  // operator uses the explicit "Resweep comments" button (POST /api/posting/resweep-comments, force).
   // AUTO DISCONNECT DETECTION boot-grace: don't let the first health-sweep fire the instant we boot (would
   // storm ixBrowser if the operator re-arms right away). Back-date the clock so the first idle sweep becomes
   // eligible ~10min after boot, then every ~2h while idle.
