@@ -3607,16 +3607,41 @@ async function harvestExtractPhoto(page, ctx) {
     const counts = {}; for (const c of cands) counts[c.t] = (counts[c.t] || 0) + 1;
     const isCaption = (c) => !c.art && counts[c.t] === 1 && !/·|\b(miembros|members|seguidores|followers|متابع|عضو)\b/i.test(c.t);
     let text = (cands.find(isCaption) || {}).t || (cands.find((c) => !c.art) || {}).t || (cands[0] && cands[0].t) || ogDesc || ogTitle || '';
+    // PRODUCT IMAGE ONLY (operator: NEVER the group AVATAR or COVER — of the source OR target group — and SKIP the
+    // post entirely if it has no real product photo). The old whole-document largest-area scan let a wide group
+    // COVER banner or a high-DPI avatar win. Now: (1) SCOPE the scan to the post's OWN media node (photo theater /
+    // post article), not the page chrome where the group avatar+cover live; (2) reject avatar/cover by url/alt/aria,
+    // by extreme aspect ratio (covers are very wide), by the group NAME as its label, or by sitting in the header/
+    // nav/group-link/top strip. Largest-area wins ONLY among genuine in-post product photos.
+    const curFbid = (location.href.match(/[?&]fbid=(\d+)/) || [])[1] || '';
+    const groupName = (ogTitle || '').replace(/\s*[|\-–—]\s*Facebook(\s+groups?)?\s*$/i, '').trim();
+    const mediaVc = Array.from(document.querySelectorAll('[data-visualcompletion="media-vc-image"]'));
+    const rootCand = (curFbid && mediaVc.find((n) => { const a = n.closest('a[href*="fbid="]'); return a && (a.href.match(/fbid=(\d+)/) || [])[1] === curFbid; }))
+      || mediaVc[0]
+      || document.querySelector('[role="dialog"] [aria-label*="photo" i], [role="dialog"]')
+      || document.querySelector('[role="article"]')
+      || document.body;
+    const scope = (rootCand && rootCand.querySelector && rootCand.querySelector('img')) ? rootCand : document;
+    const BAD_IMG = /emoji|avatar|profile|cover|static\.xx|static\.fb|rsrc\.php|spacer|safe_image/i; // (dropped p\d+x\d+: it matched FB's p526x296 LINK-CARD product crop = a valid image; uploaded photos use s<W>x<H>, covers/avatars are caught by the cover/avatar tokens + aspect + scope gates)
+    const inChrome = (im) => {
+      if (im.closest('[role="banner"], header, nav')) return true;
+      if (im.closest('a[href*="/groups/"]') && !im.closest('[data-visualcompletion="media-vc-image"]')) return true;
+      const r = im.getBoundingClientRect(); return (r.top < 120 && r.width < 200);
+    };
     let image = '', max = 0;
-    for (const im of Array.from(document.querySelectorAll('img'))) {
+    for (const im of Array.from(scope.querySelectorAll('img'))) {
       const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
-      if (!(w >= 350 && h >= 200) || /emoji|static|rsrc\.php/i.test(im.src)) continue;
-      // CORRECT IMAGE: take the POST's product photo, NOT an image someone posted in a COMMENT. FB wraps each
-      // comment in role="article" with an aria-label like "Comment by X" / "Comentario de X" — skip images inside
-      // those so a big commenter image can't win over the actual product photo.
+      if (!(w >= 350 && h >= 200)) continue;
+      const combined = (im.currentSrc || im.src || '') + ' ' + (im.alt || '') + ' ' + (im.getAttribute('aria-label') || '');
+      if (BAD_IMG.test(combined)) continue;                                                 // avatar / cover / profile / emoji / chrome
+      const ar = w / h;
+      if (ar >= 2.2 || ar <= 0.33) continue;                                                // extreme-wide = group COVER banner; extreme-tall = chrome strip (0.33 floor leaves margin: real tall portrait product shots reach ~0.46)
       const art = im.closest('[role="article"]');
-      if (art && /\bcomment\b|comentario|commentaire|coment[aá]rio|kommentar|تعليق/i.test(art.getAttribute('aria-label') || '')) continue;
-      if (w * h > max) { max = w * h; image = im.src; }
+      if (art && /\bcomment\b|comentario|commentaire|coment[aá]rio|kommentar|تعليق/i.test(art.getAttribute('aria-label') || '')) continue; // skip commenter images
+      const lbl = ((im.alt || '') + ' ' + (im.getAttribute('aria-label') || '')).trim().toLowerCase();
+      if (groupName && groupName.length >= 5 && lbl && lbl === groupName.toLowerCase()) continue; // alt/aria EXACTLY == GROUP NAME = avatar/cover (exact, not substring, so a product alt that merely contains the group name survives)
+      if (inChrome(im)) continue;                                                           // header / nav / group-link / top-strip chrome
+      if (w * h > max) { max = w * h; image = im.currentSrc || im.src; }
     }
     const META = /facebook\.com|fbcdn|messenger|fb\.me|meta\.(ai|com)|instagram\.com|whatsapp\.com|oculus|threads\.net/i;
     const JUNK = /giphy\.com|tenor\.com|\.(gif|mp4|webm|mov)(\?|$)|imgur\.com|youtu\.?be|youtube\.com|spotify|soundcloud|wikipedia|gph\.is|\/news\/|\/article\/|theguardian\.|nyti\.ms|nytimes\.com|washingtonpost\.|usatoday\.|npr\.org|supercarblondie\.|buzzfeed\.|huffpost\.|dailymail\.|people\.com|wivb\.com|\b(cnn|bbc|foxnews|reuters|apnews|kptv|kgw|kxan|nbcnews|abcnews|cbsnews)\.com/i;
@@ -3652,6 +3677,10 @@ async function harvestExtractPhoto(page, ctx) {
   const dkey = (data.link || '').split(/[?#]/)[0];
   if (!data.link || !dkey || seenLinks.has(dkey)) return null; // PRODUCTS only: no first-comment product link => skip (recipes/news never enter the buffer)
   seenLinks.add(dkey);
+  // NO PRODUCT IMAGE => SKIP the whole post (operator: never post a group avatar/cover/placeholder). The scoped+
+  // filtered picker above returns image='' when the post has no genuine product photo. Placed BEFORE claimProduct
+  // so an image-less post never burns a parallel-dedup claim.
+  if (!data.image) { console.log(JSON.stringify({ step: 'harvest_skip_no_product_image', key: dkey })); return null; }
   // PARALLEL DEDUP: another profile in this round may have already taken this exact product — skip it.
   if (ctx.claimsDir && !claimProduct(ctx.claimsDir, dkey, ctx.profileId)) {
     console.log(JSON.stringify({ step: 'harvest_claimed_by_other', key: dkey }));
@@ -3677,6 +3706,10 @@ async function harvestExtractPhoto(page, ctx) {
       }
     } catch (e) { console.log(JSON.stringify({ step: 'harvest_image_download_failed', error: String((e && e.message) || e).slice(0, 140) })); }
   }
+  // IMAGE SELECTED BUT UN-DOWNLOADABLE => SKIP the post (never emit a record pointing at a missing local file, which
+  // would publish with no/wrong image). data.image is non-empty here (we already skipped otherwise), so an empty
+  // imageLocalPath means the authed fetch failed or returned <2000 bytes.
+  if (!imageLocalPath) { console.log(JSON.stringify({ step: 'harvest_skip_image_fetch_failed', key: dkey })); return null; }
   let productOgTitle = '', productOgDescription = '';
   // EVERY harvested product gets the OG attempt (operator: tags must ALWAYS come from the link's og title) —
   // the old cap of 4/round left ~all records with an empty ogTitle. The budget guard still prevents overruns.
