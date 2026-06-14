@@ -10730,11 +10730,13 @@ function recordPublishedPostCommentIssue({ row, ready, groupUrl, attemptedGroups
 // isn't a member of the group can't comment there anyway). Empty set => no attribution configured for this group =>
 // callers DO NOT restrict (fail-open, so commenting is never hard-blocked by a missing/odd assignment).
 function attributedCommentProfileIdsForGroup(groupUrl, state = readState()) {
-  const targetKey = normalizedFacebookGroupKey(groupUrl);
   const ids = new Set();
-  if (!targetKey) return ids;
+  if (!normalizedFacebookGroupKey(groupUrl)) return ids;
   for (const entry of (Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [])) {
-    if (!entry || normalizedFacebookGroupKey(entry.url) !== targetKey) continue;
+    // vanity<->numeric AWARE match (was exact normalizedFacebookGroupKey ===, which FAILED for the o-group whose
+    // assignment uses the VANITY url (o1498765421290862) while a post/comment carries the NUMERIC group id
+    // (1098414320641851) -> empty set -> fail-open -> a 4854 profile leaked a comment onto an o-group post).
+    if (!entry || !entry.url || !groupsMatchByAlias(groupUrl, entry.url)) continue;
     for (const label of (Array.isArray(entry.profiles) ? entry.profiles : [])) {
       const id = profileIdFromLabel(label);
       if (id) ids.add(id);

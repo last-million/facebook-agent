@@ -84,6 +84,16 @@ group's attributed set is skipped with `comment_recovery_skipped` / error `profi
 FAIL-OPEN: if a group has NO attribution (set size 0) it does NOT restrict, so commenting is never hard-blocked.
 PROVEN LIVE 2026-06-13: a fresh run logged comments IN-GROUP=3, cross-group LEAKS=0. Also a member-only profile is
 the only one that CAN comment, so this is more reliable too. See [[fb-admin-approval-page-identity]].
+VANITY↔NUMERIC LEAK FOUND + FIXED (2026-06-13, same day): a follow-up run then leaked 1 comment — pid 60 (a 4854
+profile) commented on an O-GROUP post. Root cause: `attributedCommentProfileIdsForGroup` matched the comment's
+groupUrl to the assignment with plain `normalizedFacebookGroupKey === `, but the o-group's ASSIGNMENT uses its
+VANITY url (o1498765421290862) while the post/comment carries the NUMERIC group id (1098414320641851) → no match →
+empty set → FAIL-OPEN → the guard let 60 through. (4854 is numeric in both places, so it never leaked.) FIX: the
+helper now uses `groupsMatchByAlias(groupUrl, entry.url)` (server.js ~11995) — vanity↔numeric aware, alias map built
+dynamically from the ledger's groupUrl↔actualGroupUrl/postUrl pairs (`groupKeyAliasSet` ~11972, 5-min cache,
+persists across restarts via the ledger file). LESSON: ANY group-matching for the o-group MUST use groupsMatchByAlias,
+never a raw key compare — the vanity/numeric split is a recurring footgun (see [[fb-admin-approval-page-identity]]
+vanity-gid gaps). Live-validation of THIS fix is still pending (applied via restart, server PID 10880, disarmed).
 
 APPROVAL SCOPING HARDENED (operator 2026-06-12 "he should approve only our posts"): batchApproveAllPublisherPosts
 already approved ONLY posts whose author link is our Page (byUs check), but it paired each Approve button to a post
