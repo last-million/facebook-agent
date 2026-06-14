@@ -172,5 +172,25 @@ contentSources + operator.autopilotMaxPostsPerRun + productDiscovery.reusePosted
 FB-Server-Watchdog`. Node PIDs: 9317=FB server, 59812=Pinterest (NEVER touch), 8088=thumb-server (tools\thumb-server.js).
 Auto-sync task FB-Agent-AutoSync commits+pushes every 30 min, so a fresh server.js edit is usually already committed.
 
+COMMENT-DRAIN TIMING (operator 2026-06-14, said TWICE + emphatic): "when LAUNCHING prod / at boot, do NOT go back
+and comment OLD/previous posts — no need; the agent comments what it posts NOW, not history. But even when we click
+STOP he should FINISH his comments." This matches a pre-existing 2026-06-13 code note (resweep ~L13810: "FOCUS on the
+CURRENT run's posts only — never chase OLD uncommented posts"). FOUR changes shipped + 5-verifier SHIP + pushed
+(commit eb8ecc4): (A) NEW resweep option `ignoreArmedGate` — runs despite a fresh disarm (bypasses the armed-gate bail
++ sets __forcedCommentResweepActive so requireExternalArmed early-RETURNS instead of throwing external_actions_locked)
+BUT keeps the run-cutoff clamp `if (__runStart>0 && !options.force) cutoff=max(cutoff,__runStart)` (force=false), so it
+only finishes the CURRENT run's posts (__runStart = operator.autopilotRunId, set only on a false→true arm, never cleared
+by stop/disarm). Distinct from `force` (which SKIPS the clamp = reaches back to OLD posts — now used ONLY by the manual
+"Resweep comments" button /api/posting/resweep-comments). (B) the run-end finish-drain (autopilotAutoDisarm
+"run_limit_reached") force→ignoreArmedGate = current-run-only. (C) REMOVED the ~60s-after-boot forced resweep
+(boot_stale_pending_resweep) entirely — boot/launch NEVER auto-comments old posts now. (D) stopAllExternalWork, on
+reason operator_stop_all / dashboard_disarm, schedules a delayed (10s, lets the connector-kill + closeAllOpenIxProfiles
+settle) current-run-scoped 5-pass drain so STOP finishes this run's owed comments; the drain starts AFTER
+__externalStopRequested so the SAME stop doesn't abort it (guard `__externalStopRequested > resweepStartedAt`), and a
+SECOND stop DOES abort it (kill-switch). If nothing is owed the drain opens no browser = quiet stop. Watch on first live
+STOP: stop_comment_drain_done fires, comment_resweep_aborted_by_stop only on a 2nd stop, zero external_actions_locked.
+Note: removing the boot resweep means a CRASH mid-run leaves that run's uncommented posts as-is until a manual resweep —
+operator accepts this ("old posts stay as-is"). This REVERSES the swarm's stale-pending boot recovery in [[fb-selfdrive-batch-fixes]].
+
 Connector changes need NO restart (fresh-spawned per run). server.js validation guard loaded via restart
 2026-06-11 (server PID 5040). See [[fb-agent-highscale-pipeline]] and [[fb-no-live-post-without-ok]].
