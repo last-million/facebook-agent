@@ -14488,14 +14488,16 @@ async function runLiveFacebookPostFromPlan(body = {}) {
         // only when confirmed-live AND the only residual errors are comment-step ones.
         const postConfirmedLive = validation.markerPermalinkVerified === true && (!validation.imageRequired || validation.postMediaVerified === true);
         const liveEnoughToComment = postConfirmedLive && (validation.ok || livePostValidationAllowsCommentProfileFallback(validation));
-        // GROUP-AWARE APPROVAL: in an admin-approval group a just-published post is PENDING. The PUBLISHER can
-        // self-view its OWN pending post (own permalink + visible marker), so markerPermalinkVerified===true here
-        // is NOT proof the post is PUBLICLY live -> never skip approval on that basis. ALWAYS attempt approval
-        // exactly once for an approval group; approvePending no-ops for non-approval groups and fast-bails if a
-        // moderator confirms the post is already live. (Approval only ever approves THIS post via its unique
-        // marker / the publisher's author-id — never another member's pending post.)
+        // GROUP-AWARE APPROVAL (operator 2026-06-14: "posts are already live — STOP going to the moderator for
+        // them!"). The PUBLISHER self-view isn't proof of PUBLIC liveness, so we do NOT comment-and-forget when
+        // captured-live; instead we DEFER to the DIFFERENT-PROFILE comment as the public-liveness oracle: a
+        // non-publisher member CANNOT see a still-pending post, so its comment fails (comment_profile_cannot_access
+        // / post_pending) and escalates to the moderator via the proven path (addRequiredFirstComment... ~13663).
+        // => a genuinely-pending post STILL gets approved; a truly-live post just gets commented with ZERO wasted
+        // moderator opens. Only a NOT-live-enough post attempts approval HERE (pre-comment). (Approval only ever
+        // approves THIS post via its unique marker / author-id — never another member's pending post.)
         const groupRequiresApproval = isAdminApprovalEnabledForGroup(groupUrl, readState());
-        if ((!validation.ok && !liveEnoughToComment) || groupRequiresApproval) {
+        if (!liveEnoughToComment && (!validation.ok || groupRequiresApproval)) {
           approvalResult = await approvePendingFacebookPostWithAdminProfiles({
             row,
             ready,
