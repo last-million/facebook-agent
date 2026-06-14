@@ -192,5 +192,18 @@ STOP: stop_comment_drain_done fires, comment_resweep_aborted_by_stop only on a 2
 Note: removing the boot resweep means a CRASH mid-run leaves that run's uncommented posts as-is until a manual resweep —
 operator accepts this ("old posts stay as-is"). This REVERSES the swarm's stale-pending boot recovery in [[fb-selfdrive-batch-fixes]].
 
+"HARVEST AT REST" = THE PROFILE HEALTH SWEEP (operator 2026-06-14, kept seeing ~20 chrome open ~10min after every
+restart while DISARMED, called it "harvest running at rest"). Root cause: it is NOT product harvest — it's
+`runProfileHealthSweep` (server.js ~8200) which opens EVERY assigned profile via a 1-post `runHarvestConnector`
+(hence the `ixbrowser_profile_closed_after_use reason=harvest_done` logs) to check FB login + park logged-out/suspended
+ones. It was triggered in the 1-Hz heartbeat interval (~L18201) gated ONLY on `!active` (a posting/harvest job in
+flight) — NOT on armed — and the boot back-dates its clock so the FIRST sweep fires ~10min after boot, then every ~2h.
+So a disarmed/idle server opened ~all profiles. FIX (commit b706ab6): gated behind opt-in `state.operator.idleHealthSweepEnabled
+=== true` (default absent = OFF) AND the cheap time-check is evaluated FIRST so readState() only runs when the ~2h
+interval is due (not every 1s). Result: a server AT REST opens ZERO browsers. Logged-out profiles still caught INLINE
+during a real run; on-demand check via /api/profiles/health-sweep (GET, ~L18394). NOTE: the actual PRODUCT harvest
+(`harvestContentSourcesAsync`, ~L8896) was ALREADY armed-gated (+ the tick bails not-armed at ~L8865 and the scheduler
+at ~L9286) — it only runs DURING a run, which is correct ("harvest during a run, never at rest").
+
 Connector changes need NO restart (fresh-spawned per run). server.js validation guard loaded via restart
 2026-06-11 (server PID 5040). See [[fb-agent-highscale-pipeline]] and [[fb-no-live-post-without-ok]].
