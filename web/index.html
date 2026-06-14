@@ -847,7 +847,7 @@
                   <label><input type="number" id="contentSourcesReserveRefillAt" min="0" max="999" step="1" placeholder="10"></label>
                 </div>
                 <label>Profiles per group <span style="opacity:.7">(parallel harvest)</span> <input type="number" id="contentSourcesProfilesPerGroup" min="1" max="6" step="1" placeholder="3"></label>
-                <label>Re-use copied products after <input type="number" id="contentSourcesReuseHours" min="1" max="720" step="1" placeholder="26"> hours <span style="opacity:.7">(eligible to re-post after this; never stalls)</span></label>
+                <label>Re-use posted products after <input type="number" id="contentSourcesReuseDays" min="1" max="60" step="1" placeholder="2"> days <span style="opacity:.7">(when the reserve runs low, re-post products older than this — oldest first; fresh harvest is always preferred. Sets BOTH re-use gates.)</span></label>
                 <label>Delete copied images older than <input type="number" id="contentSourcesImageRetentionDays" min="1" max="90" step="1" placeholder="7"> days <span style="opacity:.7">(frees disk; record kept)</span></label>
                 <label class="span2" style="display:none">Post call-to-action <input type="text" id="contentSourcesPostCta"></label>
                 <label class="span2" data-ux-tier="advanced">Content source notes <textarea id="contentSourcesNotes" spellcheck="false" placeholder="Optional notes (e.g. which posts to prefer)."></textarea></label>

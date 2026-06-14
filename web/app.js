@@ -1602,7 +1602,7 @@ function renderState(state) {
   setValue("contentSourcesReserveRefillAt", state.posting.contentSources?.reserveRefillAt);
   setValue("contentSourcesProfilesPerGroup", state.posting.contentSources?.harvestProfilesPerGroup);
   setValue("contentSourcesPostCta", state.posting.contentSources?.postCta);
-  setValue("contentSourcesReuseHours", state.posting.contentSources?.reuseHours);
+  setValue("contentSourcesReuseDays", state.productDiscovery?.reusePostedProductAfterDays || Math.max(1, Math.round((state.posting.contentSources?.reuseHours || 48) / 24)) || 2);
   setValue("contentSourcesImageRetentionDays", state.posting.contentSources?.imageRetentionDays);
   setValue("contentSourceGroupsText", state.posting.contentSources?.groupsText);
   setValue("contentSourcesNotes", state.posting.contentSources?.notes);
@@ -2359,7 +2359,7 @@ function collectState() {
       reserveRefillAt: Number(getValue("contentSourcesReserveRefillAt")) || 10,
       harvestProfilesPerGroup: Number(getValue("contentSourcesProfilesPerGroup")) || 3,
       postCta: getValue("contentSourcesPostCta"),
-      reuseHours: Number(getValue("contentSourcesReuseHours")) || 26,
+      reuseHours: (Number(getValue("contentSourcesReuseDays")) || 2) * 24, // derived from the single "re-use after N days" control (also sets productDiscovery.reusePostedProductAfterDays below so BOTH re-use gates agree)
       imageRetentionDays: Number(getValue("contentSourcesImageRetentionDays")) || 7,
       groupsText: getValue("contentSourceGroupsText"),
       notes: getValue("contentSourcesNotes"),
@@ -2429,6 +2429,7 @@ function collectState() {
     candidateBufferPercent: Number(getValue("discoveryCandidateBufferPercent") || 20),
     targetCandidateCount: Number(getValue("discoveryTargetCandidateCount") || 0),
     rankingRules: getValue("discoveryRankingRules"),
+    reusePostedProductAfterDays: Number(getValue("contentSourcesReuseDays")) || 2, // the dashboard "re-use after N days" control drives this gate too (was a hidden 7-day default that overrode reuseHours)
     notes: getValue("productDiscoveryNotes"),
   };
   state.affiliate = {
