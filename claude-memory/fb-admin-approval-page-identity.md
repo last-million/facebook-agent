@@ -145,5 +145,32 @@ deferred — user stopped): short-circuit the connector's approveOnly flow when 
 forcedSwitchStuck (return BEFORE openGroupReviewSurface) so a stuck moderator benches INSTANTLY instead of burning
 a ~14-min re-walled poll. Then restart to activate the whole feature.
 
+CONFIRM-LIVE-BEFORE-MODERATOR (operator 2026-06-14: "posts are ALREADY published, he goes to moderator to look
+for them but they're already live — when I open the group link I find them!"). FIX = **EDIT 1**, server.js ~L14500:
+the pre-comment approval gate changed from `(!validation.ok && !liveEnoughToComment) || groupRequiresApproval` to
+`!liveEnoughToComment && (!validation.ok || groupRequiresApproval)`. So a captured-live post in the o-group NO
+LONGER opens a moderator pre-comment; it goes straight to the different-profile comment, which IS the public-
+liveness oracle (a non-publisher member can't see/comment a still-pending post → comment fails
+`comment_profile_cannot_access_post_permalink` / `comment_blocked:post_pending_or_unavailable` → the EXISTING
+escalation at ~L13657-13663 fires the moderator + retries the comment 4x). Net: genuinely-pending posts STILL get
+approved (fail-open), live posts get commented with ZERO wasted moderator opens. Truth-tabled + 3-verifier
+adversarial SHIP (only the 2 rows where liveEnoughToComment=true AND groupRequiresApproval=true change; all 6 other
+rows identical). Shipped + pushed (commit b6e60ad) + server restarted (PID 7432), saved-setup fingerprint byte-intact.
+**EDIT 2 DELIBERATELY NOT BUILT** (the swarm's pre-moderator findOnly probe inside approvePendingFacebookPostWithAdminProfilesImpl):
+it called `recoverSubmittedFacebookPostUrl({...profileUseAlreadyAcquired:false})`, but the publisher use-lock is
+ALREADY HELD by the posting flow at that call site (PROOF: the existing call at server.js:14688 passes
+`profileUseAlreadyAcquired:**true**` for exactly this reason) → re-acquiring would deadlock/throw across 5 call
+sites. EDIT 2 was also marginal (approvePending already fast-bails when a moderator sees the post is live). Don't
+re-attempt EDIT 2 without first proving lock ownership at ALL approve callers (13663/14350/14566/14714 + the gate).
+
+RESTART PROCEDURE (validated 2026-06-14, the safe sequence): `Disable-ScheduledTask FB-Server-Watchdog` → kill ONLY
+the 9317 owner after confirming it ≠ the 59812 (Pinterest) owner → `Start-Process node.exe server.js -WorkingDirectory
+<proj> -WindowStyle Hidden -RedirectStandardOutput data\server-stdout.log -RedirectStandardError data\server-stderr.log`
+→ poll `http://127.0.0.1:9317/` until 200 → re-fetch /api/state (header `x-dashboard-token` = data/.dashboard-token)
+and SHA256-compare the saved-setup fields (posting.groups/groupAssignmentMode/equalSplit/groupProfileAssignments/
+contentSources + operator.autopilotMaxPostsPerRun + productDiscovery.reusePostedProductAfterDays) → `Enable-ScheduledTask
+FB-Server-Watchdog`. Node PIDs: 9317=FB server, 59812=Pinterest (NEVER touch), 8088=thumb-server (tools\thumb-server.js).
+Auto-sync task FB-Agent-AutoSync commits+pushes every 30 min, so a fresh server.js edit is usually already committed.
+
 Connector changes need NO restart (fresh-spawned per run). server.js validation guard loaded via restart
 2026-06-11 (server PID 5040). See [[fb-agent-highscale-pipeline]] and [[fb-no-live-post-without-ok]].
