@@ -2927,19 +2927,24 @@ async function dismissForcedAccountSwitch(page) {
         ], { timeout: 5000 });
       }
       if (!clicked) {
-        // last resort: in-page click on any control whose text CONTAINS a Continue variant ("Continue as X",
-        // "Switch and continue", localized). Prefer a real button over a link; skip negative actions.
-        await page.evaluate((src) => {
+        // DURABLE last-resort (operator request — must work in ANY language, even if FB re-words the button):
+        //   (a) click any visible control whose text CONTAINS a Continue variant ("Continue as X", localized);
+        //   (b) if none, click the card's PRIMARY action = the first visible button that is NOT a negative
+        //       action (Not now / Cancel / Back) — the forced_account_switch card has a single main button, so
+        //       this works regardless of its exact wording/language;
+        //   (c) if still nothing clicked, press Enter (that card's default action is Continue).
+        const inPage = await page.evaluate((src) => {
           const re = new RegExp(src, 'i');
-          const neg = /(not now|cancel|go back|annuler|cancelar|abbrechen|إلغاء|لاحقا|later)/i;
-          const els = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a[role="link"], a'));
-          // buttons first, then links
-          els.sort((a, b) => (a.tagName === 'A' ? 1 : 0) - (b.tagName === 'A' ? 1 : 0));
-          for (const el of els) {
-            const t = ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim();
-            if (t && re.test(t) && !neg.test(t)) { el.click(); return; }
-          }
-        }, FORCED_SWITCH_CONTINUE_CONTAINS_RE.source).catch(() => {});
+          const neg = /(not now|cancel|go back|annuler|cancelar|abbrechen|إلغاء|لاحقا|later|nicht jetzt|agora n[aã]o|annulla|anuluj)/i;
+          const vis = (el) => { try { const r = el.getBoundingClientRect(); const st = getComputedStyle(el); return r.width > 2 && r.height > 2 && st.visibility !== 'hidden' && st.display !== 'none'; } catch { return false; } };
+          const els = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a[role="link"]')).filter(vis);
+          els.sort((a, b) => (a.tagName === 'A' ? 1 : 0) - (b.tagName === 'A' ? 1 : 0)); // real buttons before links
+          for (const el of els) { const t = ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim(); if (t && re.test(t) && !neg.test(t)) { el.click(); return 'text-match'; } }
+          for (const el of els) { const t = ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim(); if (t && !neg.test(t)) { el.click(); return 'primary-button'; } } // require real text (skip icon-only buttons)
+          return 'none';
+        }, FORCED_SWITCH_CONTINUE_CONTAINS_RE.source).catch(() => 'none');
+        console.log(JSON.stringify({ step: 'forced_account_switch_fallback_click', method: inPage, attempt }));
+        if (inPage === 'none') { await page.keyboard.press('Enter').catch(() => {}); } // (c) default action = Continue
       }
       await humanPause(2500, 4000); // FB reloads into the confirmed account
       const cleared = !/forced_account_switch|account_switcher/i.test(String(page.url() || ''));

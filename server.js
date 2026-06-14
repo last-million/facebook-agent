@@ -2971,7 +2971,7 @@ function collectProductUrlsForPosting(state, options = {}) {
   if (state.operator?.contentSourcesEnabled === true) {
     const recs = readHarvestedProducts(state);
     const rh = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 26);
-    const onDisk = (r) => r && r.firstCommentUrl && r.imageLocalPath && !r.imageDeleted && fs.existsSync(safeProjectPath(r.imageLocalPath));
+    const onDisk = (r) => r && r.firstCommentUrl && r.imageLocalPath && !r.imageDeleted && imageFileLooksValid(safeProjectPath(r.imageLocalPath));
     const lastMs = (r) => { const s = r.lastPostedAt || r.posted || ""; const t = s ? Date.parse(s) : 0; return Number.isFinite(t) ? t : 0; };
     const fresh = recs.filter((r) => onDisk(r) && !(r.lastPostedAt || r.posted)).map((r) => r.productKey);
     const reeligible = recs.filter((r) => onDisk(r) && (r.lastPostedAt || r.posted) && lastMs(r) > 0 && (Date.now() - lastMs(r)) >= rh * 3600 * 1000).sort((a, b) => lastMs(a) - lastMs(b)).map((r) => r.productKey);
@@ -7829,13 +7829,42 @@ function assetBufferTargetCount(state = readState()) {
 // points here is NOT a product (e.g. the gas-station "free fuel" news article) and must NEVER post.
 const HARVEST_NONPRODUCT_LINK = /theguardian\.|nytimes\.com|nyti\.ms|washingtonpost\.|usatoday\.|reuters\.com|apnews\.|\bbbc\.(com|co)|cnn\.com|foxnews\.|nbcnews\.|abcnews\.|cbsnews\.|npr\.org|kptv\.|kgw\.com|kxan\.|wivb\.|wfla\.|wsvn\.|supercarblondie\.|buzzfeed\.|huffpost\.|dailymail\.|mirror\.co\.uk|people\.com|\/news\/|\/article\//i;
 
+// IMAGE INTEGRITY (operator: never post a corrupt/blank image): a cheap, CACHED check that the file is a real,
+// non-trivial image (size + magic-byte signature), not just that it EXISTS. Cached by path|size|mtime so a
+// healthy image is sniffed only ONCE, not on every readiness tick. Fail-closed: unreadable/unknown => not ready.
+const __imageValidCache = new Map();
+function imageFileLooksValid(absPath) {
+  try {
+    const st = fs.statSync(absPath);
+    if (!st.isFile() || st.size < 512) return false; // zero-byte / truncated download
+    const key = `${absPath}|${st.size}|${st.mtimeMs}`;
+    const cached = __imageValidCache.get(key);
+    if (cached !== undefined) return cached;
+    const fd = fs.openSync(absPath, "r");
+    const buf = Buffer.alloc(16);
+    let n = 0;
+    try { n = fs.readSync(fd, buf, 0, 16, 0); } finally { fs.closeSync(fd); }
+    const b = buf;
+    const ok = n >= 4 && (
+      (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) ||                                                                       // JPEG
+      (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47) ||                                                       // PNG
+      (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) ||                                                                        // GIF
+      (b[0] === 0x42 && b[1] === 0x4d) ||                                                                                         // BMP
+      (n >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) // WEBP (RIFF....WEBP)
+    );
+    if (__imageValidCache.size > 5000) __imageValidCache.clear(); // bound memory
+    __imageValidCache.set(key, ok);
+    return ok;
+  } catch (_e) { return false; }
+}
+
 function productHasReadyAssets(product, state = readState(), reviewImages = null) {
   if (!product) return false;
   // HARVESTED products: ready when the record has its downloaded image (still on disk) + the first-comment
   // link, and it has NOT been posted yet. No ShopYourLikes shortlink needed (link = the harvested url).
   if (String(product.key || "").startsWith("harvested:")) {
     const rec = harvestedRecordForKey(product.key, state);
-    if (!rec || !rec.firstCommentUrl || !rec.imageLocalPath || rec.imageDeleted || !fs.existsSync(safeProjectPath(rec.imageLocalPath))) return false;
+    if (!rec || !rec.firstCommentUrl || !rec.imageLocalPath || rec.imageDeleted || !imageFileLooksValid(safeProjectPath(rec.imageLocalPath))) return false;
     if (HARVEST_NONPRODUCT_LINK.test(String(rec.firstCommentUrl))) return false; // junk (news/blog) link -> never post
     // RE-USE WINDOW: ready if image-on-disk AND (never posted OR last post older than reuseHours). Lets a posted
     // product rotate back in after reuseHours so production never stalls. (lastPostedAt||posted for back-compat.)
@@ -19228,6 +19257,18 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// ORPHAN CLEANUP helper (see boot callback). SAFE: targets ONLY chrome whose command line is ixBrowser-managed
+// (never the operator's own chrome, NEVER the co-resident Pinterest agent which uses msedge), and the caller runs
+// it only at boot when no run is armed — so there is never a live post to interrupt.
+function cleanOrphanIxBrowserChromeAtBoot() {
+  try {
+    const ps = "Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | Where-Object { $_.CommandLine -match 'ixBrowser' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }";
+    require("child_process").execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true, timeout: 30000 }, (err) => {
+      logEvent("boot_orphan_ixbrowser_chrome_cleanup", { ok: !err, error: err ? oneLineField(err.message || String(err), 140) : "" });
+    });
+  } catch (e) { logEvent("boot_orphan_cleanup_error", { error: oneLineField(e.message || String(e), 140) }); }
+}
+
 server.listen(PORT, HOST, () => {
   logEvent("dashboard_started", { url: `http://${HOST}:${PORT}` });
   console.log(`Facebook Agent dashboard: http://${HOST}:${PORT}`);
@@ -19244,6 +19285,9 @@ server.listen(PORT, HOST, () => {
   // If a prod run was interrupted by this restart, record it for the Prod-tab banner and
   // disarm BEFORE the scheduler starts — the operator chooses Continue / Relaunch / Dismiss.
   detectIncompleteRunAtBoot();
+  // ORPHAN CLEANUP: a few seconds after boot (and ONLY if no run got armed in the meantime), kill leftover
+  // ixBrowser chrome from the prior/crashed process so it can't wedge ixBrowser or hog RAM. Targeted + safe.
+  setTimeout(() => { try { const __st = readState(); if (!(__st.operator?.autopilotEnabled && __st.operator?.armedForExternalActions)) cleanOrphanIxBrowserChromeAtBoot(); else logEvent("boot_orphan_cleanup_skipped_armed", {}); } catch (_) {} }, 4000);
   // Stage 3 autonomous publisher. Dormant unless operator.autopilotEnabled +
   // armed; dry-run by default (logs decisions, never posts) until
   // operator.autopilotDryRun is set false.
