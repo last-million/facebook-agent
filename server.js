@@ -9248,7 +9248,15 @@ function startAutopilotScheduler() {
       // gap is deliberate throttle-safety) or terminal states (done / limit reached / window closed).
       const waitingOnAssets = __autopilotLastDecision && /^(fill_then_wait|no_ready_row|plan_unavailable)$/.test(String(__autopilotLastDecision.action || ""));
       const armed = op.autopilotEnabled && op.armedForExternalActions;
-      const secs = (armed && waitingOnAssets) ? clampNumber(op.autopilotFastRetrySeconds, 10, 120, 25) : normalSecs;
+      // SELF-DRIVE a COUNT run: after a published batch, if a "stop after N" run still has posts remaining,
+      // re-tick fast (~25s) instead of waiting the full ~120s — so the run drains itself to N instead of
+      // stalling between batches (the count-mode pause the operator hit). Gated to __countLimit>0 (count runs
+      // ONLY) so time/unlimited runs keep the proven ~120s cadence. MUST use op.autopilotPostsThisRun — a bare
+      // `postsThisRun` here throws ReferenceError in this finally and would strand the scheduler timer entirely.
+      const __countLimit = clampNumber(op.autopilotMaxPostsPerRun, 0, 1000000, 0);
+      const __countDone = __countLimit > 0 && clampNumber(op.autopilotPostsThisRun, 0, 1000000, 0) >= __countLimit;
+      const __justPublished = __autopilotLastDecision && /^(published|publishing)$/.test(String(__autopilotLastDecision.action || ""));
+      const secs = (armed && (waitingOnAssets || (__justPublished && __countLimit > 0 && !__countDone))) ? clampNumber(op.autopilotFastRetrySeconds, 10, 120, 25) : normalSecs;
       __autopilotSchedulerTimer = setTimeout(tick, secs * 1000);
     }
   };
@@ -18355,6 +18363,7 @@ const server = http.createServer(async (req, res) => {
     const body = await readJson(req);
     const incoming = body.state || {};
     let __disarmTransition = false; // operator just turned a run OFF -> trigger a real STOP (kill in-flight work)
+    let __armTransition = false; // operator just turned a run ON (false->true) -> kick an immediate tick so batch 1 fires NOW
     // ARM = a fresh run: when the operator transitions autopilotEnabled false->true, reset the
     // per-run post counter so the hard limiter (autopilotMaxPostsPerRun) counts THIS run only.
     try {
@@ -18366,6 +18375,7 @@ const server = http.createServer(async (req, res) => {
       if ((wasArmed && incoming.operator?.armedForExternalActions === false) || (wasEnabled && incoming.operator?.autopilotEnabled === false)) __disarmTransition = true;
       incoming.operator = incoming.operator || {};
       if (!wasEnabled && nowEnabled) {
+        __armTransition = true; // false->true arm: kick an immediate tick after writeState (below) so batch 1 doesn't wait ~120s
         incoming.operator.autopilotPostsThisRun = 0; // fresh arm => count THIS run only
         incoming.operator.autopilotRunId = String(Date.now()); // fresh per-run product-claim namespace (no cross-run carryover)
         try { const cr = path.join(DATA_DIR, "post-claims"); for (const d of (fs.existsSync(cr) ? fs.readdirSync(cr) : [])) { try { fs.rmSync(path.join(cr, d), { recursive: true, force: true }); } catch (_) {} } } catch (_) {} // drop stale claim dirs
@@ -18382,6 +18392,13 @@ const server = http.createServer(async (req, res) => {
     // controlWrite:true => the operator's explicit values for the protected control flags win.
     const state = writeState(incoming, { controlWrite: true });
     logEvent("workflow_state_saved");
+    // #1b SELF-DRIVE: on a fresh arm (false->true), kick an immediate single-flight tick so the first batch
+    // launches NOW instead of waiting up to the full scheduler interval (~120s). autopilotTickAsync is
+    // single-flight (__autopilotTickInFlight) and early-returns when not armed, so it can never double-run
+    // with the scheduled tick. Gate on the POST-write `state` (wasEnabled is const-scoped inside the try above).
+    if (__armTransition && state.operator?.autopilotEnabled === true && state.operator?.armedForExternalActions === true) {
+      setTimeout(() => { autopilotTickAsync().catch(() => {}); }, 0);
+    }
     // REAL STOP: if this PUT turned a run OFF, kill in-flight connectors + recovery + close profiles now
     // (fire-and-forget so the dashboard Stop returns instantly). A flag flip alone would let work grind on.
     if (__disarmTransition) { stopAllExternalWork("dashboard_disarm").catch(() => {}); }
