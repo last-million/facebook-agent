@@ -1641,7 +1641,16 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
       // the live pathname STILL matches the expected group+post id (re-checked inside). The downstream insertText +
       // waitForPublishedCommentText still gates success, so a misfire becomes "not commented", never a wrong comment.
       let foldedClicked = false;
-      if (urlConfirmsRightPost && expectedPostParts) {
+      // FOLDED FALLBACK DISABLED (2026-06-15, brutal-verify finding): production logs showed foldedBox.clicked=true
+      // 38x -> 0 verified comments; 38/38 navigated to an UNRELATED post (it clicks a "Comment" <a>/related-post
+      // affordance, not the target composer). The downstream permalink-mismatch guard made every misfire SAFE (never
+      // a wrong-post comment) but it NEVER lands a comment AND burns a full ~1-2 min profile-open each time, amplifying
+      // exactly the profile-churn the memory/CPU caps then have to absorb. The proven composerFocused fast path already
+      // lands ~all comments; a post the fast path can't reach is left "not commented" for the resweep to retry with a
+      // different profile (no worse than before, minus the wasted open). Re-enable ONLY after the click-target bug is
+      // fixed and re-validated live on a real folded ES/AR post.
+      const ENABLE_FOLDED_COMMENT_FALLBACK = false;
+      if (ENABLE_FOLDED_COMMENT_FALLBACK && urlConfirmsRightPost && expectedPostParts) {
         const foldedBox = await page.evaluate(async ({ gid, pid }) => {
           const m = (location.pathname || '').match(/\/groups\/([0-9]+)\/(?:permalink|posts)\/([0-9]+)/i);
           if (!m || m[1] !== String(gid) || m[2] !== String(pid)) return { clicked: false, reason: 'folded_fallback_url_not_exact_expected_post' };
@@ -2232,7 +2241,9 @@ async function commentTargetPreflight(page, postUrl, marker) {
       const cleanMarker = normalize(marker);
       return cleanMarker.length >= 12 && normalize(value).includes(cleanMarker);
     };
-    const unavailable = /content isn't available|content is not available|post unavailable|this post isn't available|post is pending|pending approval/i.test(text);
+    // PENDING/UNAVAILABLE detection — multilingual (these profiles run FB in ES/AR; EN-only let a localized pending
+    // post pass preflight and try to comment on a not-yet-approved post). Covers EN/FR/ES/PT/DE + Arabic.
+    const unavailable = /content isn't available|content is not available|post unavailable|this post isn't available|post is pending|pending approval|awaiting approval|en attente d.approbation|en cours d.examen|publication est en attente|contenu non disponible|cette publication n.est pas disponible|pendiente de aprobaci[oó]n|publicaci[oó]n est[aá] pendiente|en espera de aprobaci[oó]n|contenido no (?:est[aá] )?disponible|esta publicaci[oó]n no est[aá] disponible|aguardando aprova[cç][aã]o|pendente de aprova[cç][aã]o|conte[uú]do (?:n[aã]o dispon[ií]vel|indispon[ií]vel)|ausstehende genehmigung|wartet auf genehmigung|inhalt nicht verf[uü]gbar|في انتظار الموافقة|بانتظار الموافقة|قيد المراجعة|بانتظار المراجعة|غير متاح|غير متوفر|هذا المحتوى غير متاح/i.test(text);
     const markerArticles = [...document.querySelectorAll('[role="article"]')]
       .filter((el) => visible(el) && matches(el.innerText || ''));
     const markerRoots = [...document.querySelectorAll('[role="article"], div')]

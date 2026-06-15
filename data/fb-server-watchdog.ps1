@@ -18,6 +18,9 @@ $failFile      = Join-Path $proj 'data\watchdog-fail-count.txt'
 $port          = 9317
 $pinterestPort = 59812
 $RESTART_AFTER_FAILS = 3   # consecutive failed watchdog runs (~3 min) before a restart -> survives posting blips
+$busyFile      = Join-Path $proj 'data\watchdog-busy-count.txt'
+$BUSY_CPU_PERCENT  = 85    # GET / unresponsive WHILE system CPU >= this% = the box is BUSY (tolerate), not frozen
+$MAX_BUSY_TOLERATE = 6     # after this many consecutive busy-tolerations (~minutes pinned) restart anyway
 
 function Write-WatchdogLog($msg) {
   $line = "{0}`tserver_watchdog`t{1}" -f (Get-Date).ToString('o'), $msg
@@ -29,6 +32,22 @@ function Get-PortOwnerPid($p) {
 function Get-FailCount { if (Test-Path $failFile) { try { return [int]((Get-Content $failFile -ErrorAction SilentlyContinue) | Select-Object -First 1) } catch { return 0 } } return 0 }
 function Set-FailCount($n) { Set-Content -Path $failFile -Value ([string]$n) }
 function Clear-FailCount { Remove-Item $failFile -ErrorAction SilentlyContinue }
+function Get-BusyCount { if (Test-Path $busyFile) { try { return [int]((Get-Content $busyFile -ErrorAction SilentlyContinue) | Select-Object -First 1) } catch { return 0 } } return 0 }
+function Set-BusyCount($n) { Set-Content -Path $busyFile -Value ([string]$n) }
+function Clear-BusyCount { Remove-Item $busyFile -ErrorAction SilentlyContinue }
+# OS-measured total CPU. Does NOT depend on the Node event loop, so it stays accurate even when the loop is
+# wedged (unlike events.log, which logEvent writes synchronously ON the loop). Get-Counter is the accurate
+# source; fall back to WMI; if BOTH fail return 0 so the caller treats it as "not pinned" -> frozen -> restart
+# (the safe default that matches the old kill-on-unresponsive behaviour).
+function Get-SystemCpuPercent {
+  try {
+    $c = Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop
+    return [int]([math]::Round($c.CounterSamples[0].CookedValue))
+  } catch {
+    try { $v = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property LoadPercentage -Average).Average; if ($v -ne $null) { return [int]$v } } catch {}
+    return 0
+  }
+}
 function Start-FbServer($reason) {
   $exe = $node
   if (-not (Test-Path $exe)) { $c = Get-Command node.exe -ErrorAction SilentlyContinue; if ($c) { $exe = $c.Source } }
@@ -53,12 +72,12 @@ function Test-FbHealthy() {
 }
 
 # 1) Not listening at all -> start it (and reset the failure counter).
-if (-not (Get-PortOwnerPid $port)) { Clear-FailCount; Start-FbServer 'port_9317_not_listening'; return }
+if (-not (Get-PortOwnerPid $port)) { Clear-FailCount; Clear-BusyCount; Start-FbServer 'port_9317_not_listening'; return }
 
 # 2) Listening -> must also RESPOND. Two in-run probes (4s apart). Healthy -> reset counter + done.
-if (Test-FbHealthy) { Clear-FailCount; return }
+if (Test-FbHealthy) { Clear-FailCount; Clear-BusyCount; return }
 Start-Sleep -Seconds 4
-if (Test-FbHealthy) { Clear-FailCount; return }
+if (Test-FbHealthy) { Clear-FailCount; Clear-BusyCount; return }
 
 # 3) Unresponsive THIS run. Only restart after $RESTART_AFTER_FAILS consecutive failed runs (a posting batch
 #    busies the loop for ~10-20s -> at most ONE failed run -> recovers next run -> counter resets, no restart).
@@ -66,16 +85,29 @@ $fails = (Get-FailCount) + 1
 Set-FailCount $fails
 if ($fails -lt $RESTART_AFTER_FAILS) { Write-WatchdogLog ("action=unhealthy_tolerating`tfails={0}/{1}" -f $fails, $RESTART_AFTER_FAILS); return }
 
-# 3b) ALIVE-BUT-BUSY GUARD (operator 2026-06-15): a CPU-saturated run can make GET / time out for several checks even
-#     while the server is WORKING — that is what got it killed + auto-resume-looped (4x). If events.log was written in
-#     the last ~120s, the Node event loop IS alive (just CPU-starved on the HTTP probe) -> do NOT kill; tolerate + reset.
-#     Only a TRULY frozen server (no event-log activity for >120s) falls through to the restart below.
-$evLog = Join-Path $proj 'data\events.log'
-$evFresh = $false
-try { if (Test-Path $evLog) { $evFresh = ((New-TimeSpan -Start (Get-Item $evLog).LastWriteTime -End (Get-Date)).TotalSeconds -lt 120) } } catch {}
-if ($evFresh) { Write-WatchdogLog ("action=tolerating_alive_busy`treason=events_log_fresh_not_frozen`tfails={0}" -f $fails); Clear-FailCount; return }
+# 3b) BUSY-vs-FROZEN via OS-MEASURED CPU (operator 2026-06-15, REPLACES the broken events.log heuristic).
+#     The previous guard keyed on events.log freshness, but logEvent writes it via SYNCHRONOUS fs.appendFileSync
+#     ON the Node event loop — so a CPU-wedged loop (the very failure it defended) ALSO stops writing events.log
+#     -> it could never tell "busy" from "frozen" and fired 0/227 times while 4 real kills landed in one day.
+#     OS CPU does NOT depend on the Node loop, so it is a reliable busy signal:
+#       * unresponsive WHILE system CPU is pinned (>= BUSY_CPU_PERCENT) => BUSY (heavy renders starving the loop
+#         of a time-slice). Killing just triggers auto-resume -> re-wedge (the kill loop). TOLERATE — but bounded:
+#         after MAX_BUSY_TOLERATE consecutive busy ticks (~minutes pinned + unresponsive) restart anyway.
+#       * unresponsive while CPU is NOT pinned => genuinely FROZEN/deadlocked -> restart now.
+$cpu = Get-SystemCpuPercent
+if ($cpu -ge $BUSY_CPU_PERCENT) {
+  $busy = (Get-BusyCount) + 1
+  Set-BusyCount $busy
+  if ($busy -lt $MAX_BUSY_TOLERATE) {
+    Write-WatchdogLog ("action=tolerating_alive_busy`treason=system_cpu_pinned`tcpu={0}`tbusy={1}/{2}`tfails={3}" -f $cpu, $busy, $MAX_BUSY_TOLERATE, $fails)
+    return
+  }
+  Write-WatchdogLog ("action=restart_busy_too_long`tcpu={0}`tbusy={1}`tfails={2}" -f $cpu, $busy, $fails)
+} else {
+  Write-WatchdogLog ("action=frozen_low_cpu`tcpu={0}`tfails={1}" -f $cpu, $fails)
+}
 
-# 4) Sustained unresponsiveness AND no recent event-log activity (TRULY frozen) -> restart ONLY the 9317 owner.
+# 4) Either genuinely FROZEN (low CPU) or BUSY-too-long -> restart ONLY the 9317 owner.
 $owner = Get-PortOwnerPid $port
 $pin   = Get-PortOwnerPid $pinterestPort
 if ($owner -and $owner -ne $pin) {
@@ -83,8 +115,8 @@ if ($owner -and $owner -ne $pin) {
   Write-WatchdogLog ("action=killed_unresponsive`tpid={0}`tafter_fails={1}" -f $owner, $fails)
   Start-Sleep -Seconds 2
   Start-FbServer 'unresponsive_health_check'
-  Clear-FailCount
+  Clear-FailCount; Clear-BusyCount
 } else {
   Write-WatchdogLog ("action=skipped_kill`treason=owner_missing_or_equals_pinterest`towner={0}`tpinterest={1}" -f $owner, $pin)
-  Clear-FailCount
+  Clear-FailCount; Clear-BusyCount
 }

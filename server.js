@@ -11123,6 +11123,16 @@ async function runLiveFacebookPostScript(payload, options = {}) {
   // live posting regardless of when the disarm arrives relative to the caller's earlier checks —
   // closing the race where ~hundreds of lines of logic run between an entry check and the spawn.
   requireExternalArmed();
+  // CPU SATURATION BRAKE (2026-06-15): this is the SOLE connector-spawn funnel, so gating here paces EVERY
+  // heavy chrome render — autopilot publish, comment-recovery, approval, URL-recovery — on real CPU/RAM
+  // headroom. The prior wedge fix only lowered the worker cap (5->3) and added a watchdog guard; it did NOT
+  // stop 3 renders + harvest + resweep firing back-to-back with zero spacing, which pinned CPU and wedged the
+  // event loop (the "unresponsive" restarts). waitForCpuHeadroom is a NO-OP when the box is healthy (returns
+  // instantly) and only brakes when CPU/RAM is actually pegged; bounded by maxWaitMs so it can never deadlock.
+  // Wrapped so a governor hiccup can never abort a post.
+  if (options.skipCpuGate !== true) {
+    try { await waitForCpuHeadroom({ label: oneLineField(options.cpuLabel || "connector_spawn", 60) }); } catch {}
+  }
   const scriptPath = liveFacebookPostingScriptPath();
   const fileName = `fb-live-post-payload-${Date.now()}-${crypto.randomBytes(3).toString("hex")}.json`;
   const payloadRelative = path.join("data", fileName).replace(/\\/g, "/");
@@ -18300,6 +18310,157 @@ setInterval(() => {
   };
 }, 1000);
 
+// ============================================================================
+// AUTOMATIC RUN REPORTS — NO AI, pure log parsing. Feeds GET /api/reports/runs,
+// rendered by web/report.html (linked from the Prod tab). The operator wanted a
+// report that ALWAYS shows the last run + all runs without asking the model each
+// time. Source of truth = the post LEDGER (facebook-live-posts.jsonl); chrome /
+// restart stats are best-effort from events.log + server-watchdog.log. Cached 60s
+// because the ledger can be large (20k lines).
+// ============================================================================
+const __runReportCache = { at: 0, body: null };
+const RUN_REPORT_TTL_MS = 60 * 1000;
+const RUN_SPLIT_GAP_MS = 2 * 60 * 60 * 1000; // a >2h gap between posts starts a new "run"
+
+function __reportGroupName(url) {
+  const s = String(url || "");
+  if (/o?1498765421290862|1098414320641851/.test(s)) return "o-group";
+  if (/4854972804605257/.test(s)) return "4854";
+  const m = s.match(/groups\/([A-Za-z0-9.]+)/);
+  return m ? m[1].slice(0, 18) : "autre";
+}
+function __reportMedian(nums) {
+  if (!nums.length) return 0;
+  const a = nums.slice().sort((x, y) => x - y);
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : Math.round((a[m - 1] + a[m]) / 2);
+}
+function __reportPct(n, d) { return d > 0 ? Math.round((n / d) * 100) : 0; }
+
+function buildRunReports(force = false) {
+  if (!force && __runReportCache.body && Date.now() - __runReportCache.at < RUN_REPORT_TTL_MS) {
+    return __runReportCache.body;
+  }
+  let rows = [];
+  try { rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 20000 }); } catch { rows = []; }
+  const PUB = new Set(["published", "published_after_admin_approval"]);
+  // earliest VERIFIED, DIFFERENT-profile comment per postUrl (mirrors latestDifferentProfileVerifiedCommentForPost)
+  const commentByUrl = new Map();
+  const pubsByUrl = new Map(); // postUrl -> publisher profileId (to exclude self-comments)
+  const pubs = [];
+  for (const r of rows) {
+    if (!r || !r.at) continue;
+    const ev = String(r.event || "");
+    if (PUB.has(ev) && r.postUrl) { pubs.push(r); if (!pubsByUrl.has(r.postUrl)) pubsByUrl.set(r.postUrl, Number(r.profileId || 0)); continue; }
+    if (ev === "comment_recovery_finished" && r.postUrl &&
+        ["published", "published_with_warning"].includes(String(r.status || "")) &&
+        !(r.validation && r.validation.commentVerified === false)) {
+      const t = Date.parse(r.at);
+      if (!Number.isFinite(t)) continue;
+      const ex = commentByUrl.get(r.postUrl);
+      if (!ex || t < ex.t) commentByUrl.set(r.postUrl, { t, at: r.at, profileId: Number(r.profileId || 0) });
+    }
+  }
+  // drop self-comments (publisher == commenter): not a valid different-profile comment
+  for (const [url, c] of commentByUrl) { const pub = pubsByUrl.get(url); if (pub && c.profileId && pub === c.profileId) commentByUrl.delete(url); }
+  // dedup published rows by planId:sequence:url, keep EARLIEST, chronological
+  const seen = new Map();
+  for (const p of pubs) {
+    const t = Date.parse(p.at);
+    if (!Number.isFinite(t)) continue;
+    const id = (p.planId || "") + ":" + (p.sequence || 0) + ":" + (p.postUrl || "");
+    if (!seen.has(id) || t < seen.get(id)._t) seen.set(id, { ...p, _t: t });
+  }
+  const posts = Array.from(seen.values()).sort((a, b) => a._t - b._t);
+  // cluster into runs (>2h gap = new run)
+  const runsRaw = [];
+  let cur = null;
+  for (const p of posts) {
+    if (!cur || p._t - cur.lastT > RUN_SPLIT_GAP_MS) { cur = { posts: [], startT: p._t, lastT: p._t }; runsRaw.push(cur); }
+    cur.lastT = p._t;
+    cur.posts.push(p);
+  }
+  // best-effort chrome peak / min free-RAM. Governor events live in events.log (rolling 600 lines) AND in the
+  // DURABLE per-day audit log; merge both so the peak survives after events.log has rolled past it on a long run.
+  // NOTE: logEvent stores the name under `message`, NOT `event` — filtering on `event` (the old bug) matched nothing.
+  const gov = [];
+  const __govSeen = new Set();
+  const __addGov = (arr) => {
+    for (const e of arr) {
+      if (!e || !e.at) continue;
+      const m = String(e.message || e.event || "");
+      if (m !== "cpu_governor_waiting" && m !== "cpu_governor_resumed") continue;
+      const k = e.at + "|" + (e.chrome != null ? e.chrome : "");
+      if (__govSeen.has(k)) continue;
+      __govSeen.add(k);
+      gov.push(e);
+    }
+  };
+  try { __addGov(readJsonlAbsoluteFile(LOG_FILE, { limit: 8000 })); } catch {}
+  try {
+    const auditFiles = fs.readdirSync(AUDIT_DIR).filter((n) => /^audit-\d{4}-\d{2}-\d{2}\.log$/.test(n)).sort().slice(-2);
+    for (const f of auditFiles) { try { __addGov(readJsonlAbsoluteFile(path.join(AUDIT_DIR, f), { limit: 40000 })); } catch {} }
+  } catch {}
+  let wdLines = [];
+  try { wdLines = String(fs.readFileSync(path.join(DATA_DIR, "server-watchdog.log"), "utf8") || "").split(/\r?\n/).filter(Boolean).slice(-5000); } catch {}
+  const out = runsRaw.map((run, idx) => {
+    const groups = {};
+    const gaps = [];
+    const detail = [];
+    let commented = 0;
+    for (const p of run.posts) {
+      const g = __reportGroupName(p.groupUrl || p.actualGroupUrl || p.postUrl);
+      const gg = groups[g] || (groups[g] = { posts: 0, commented: 0, gaps: [] });
+      gg.posts += 1;
+      const c = commentByUrl.get(p.postUrl);
+      let gapSec = null;
+      if (c && c.t >= p._t) { gapSec = Math.round((c.t - p._t) / 1000); gaps.push(gapSec); gg.gaps.push(gapSec); gg.commented += 1; commented += 1; }
+      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profileCom: c ? c.profileId : null });
+    }
+    const byGroup = {};
+    for (const [g, v] of Object.entries(groups)) byGroup[g] = { posts: v.posts, commented: v.commented, commentRate: __reportPct(v.commented, v.posts), gapMedianSec: __reportMedian(v.gaps) };
+    const winGov = gov.filter((e) => { const t = Date.parse(e.at || 0); return Number.isFinite(t) && t >= run.startT - 60000 && t <= run.lastT + 600000; });
+    const chromePeak = winGov.reduce((m, e) => Math.max(m, Number(e.chrome != null ? e.chrome : e.chromeProcs || 0)), 0);
+    const ramVals = winGov.map((e) => Number(e.freeRam != null ? e.freeRam : e.freeRamPercent)).filter((n) => Number.isFinite(n));
+    const minRam = ramVals.length ? Math.min(...ramVals) : null;
+    const restarts = wdLines.filter((l) => { const m = l.match(/^(\S+)\t/); if (!m) return false; const t = Date.parse(m[1]); return Number.isFinite(t) && t >= run.startT && t <= run.lastT + 600000 && (l.includes("action=restarted") || l.includes("action=killed_unresponsive")); }).length;
+    const gapStats = gaps.length
+      ? { minSec: Math.min(...gaps), medianSec: __reportMedian(gaps), avgSec: Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length), maxSec: Math.max(...gaps) }
+      : { minSec: 0, medianSec: 0, avgSec: 0, maxSec: 0 };
+    return {
+      index: idx,
+      startedAt: run.posts[0].at,
+      endedAt: run.posts[run.posts.length - 1].at,
+      durationMin: Math.round((run.lastT - run.startT) / 60000),
+      posts: run.posts.length,
+      commented,
+      uncommented: run.posts.length - commented,
+      commentRate: __reportPct(commented, run.posts.length),
+      byGroup,
+      gap: gapStats,
+      chromePeak: chromePeak || null,
+      minRamPct: minRam,
+      restarts,
+      detail,
+    };
+  }).reverse(); // most recent run first
+  const body = { generatedAt: new Date().toISOString(), runCount: out.length, latest: out[0] || null, runs: out.slice(0, 30) };
+  __runReportCache.at = Date.now();
+  __runReportCache.body = body;
+  return body;
+}
+
+// Serve the standalone report page with the dashboard token injected (same mechanism as serveIndex)
+// so its in-page fetch to the token-gated /api/reports/runs is authorized.
+function serveReport(res) {
+  fs.readFile(path.join(ROOT, "web", "report.html"), "utf8", (err, data) => {
+    if (err) { res.writeHead(404); res.end("Not found"); return; }
+    const html = String(data).replace(/__DASHBOARD_TOKEN__/g, SESSION_TOKEN);
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
+    res.end(html);
+  });
+}
+
 function serveStatic(res, filePath, contentType) {
   fs.readFile(filePath, (err, data) => {
     if (err) {
@@ -18346,6 +18507,16 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/app.js") {
     return serveStatic(res, path.join(ROOT, "web", "app.js"), "application/javascript; charset=utf-8");
+  }
+  if (req.method === "GET" && (url.pathname === "/report" || url.pathname === "/report.html")) {
+    return serveReport(res);
+  }
+  if (req.method === "GET" && url.pathname === "/api/reports/runs") {
+    try {
+      return json(res, 200, buildRunReports(url.searchParams.get("force") === "1"));
+    } catch (e) {
+      return json(res, 500, { ok: false, error: oneLineField((e && e.message) || String(e), 200) });
+    }
   }
 
   if (req.method === "GET" && url.pathname === "/api/status") {
