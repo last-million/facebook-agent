@@ -40,9 +40,15 @@ function Clear-BusyCount { Remove-Item $busyFile -ErrorAction SilentlyContinue }
 # source; fall back to WMI; if BOTH fail return 0 so the caller treats it as "not pinned" -> frozen -> restart
 # (the safe default that matches the old kill-on-unresponsive behaviour).
 function Get-SystemCpuPercent {
+  # Sample 3x over ~3s and return the MAX, NOT a single 1s sample. A genuinely pinned (busy) box can briefly dip
+  # below the busy line for one noisy sample; with a single sample that dip would flip it into the "frozen" branch
+  # and KILL a working server (the operator's exact complaint). MAX favors tolerating a busy box, while the
+  # MAX_BUSY_TOLERATE cap still bounds a truly stuck-but-pinned one. A real freeze reads consistently low -> max low.
   try {
-    $c = Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop
-    return [int]([math]::Round($c.CounterSamples[0].CookedValue))
+    $c = Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 1 -MaxSamples 3 -ErrorAction Stop
+    $vals = @($c.CounterSamples | ForEach-Object { $_.CookedValue })
+    if ($vals.Count -gt 0) { return [int]([math]::Round(($vals | Measure-Object -Maximum).Maximum)) }
+    return 0
   } catch {
     try { $v = (Get-CimInstance Win32_Processor -ErrorAction SilentlyContinue | Measure-Object -Property LoadPercentage -Average).Average; if ($v -ne $null) { return [int]$v } } catch {}
     return 0
