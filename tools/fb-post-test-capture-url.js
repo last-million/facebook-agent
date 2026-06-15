@@ -1633,19 +1633,24 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
           if (!m || m[1] !== String(gid) || m[2] !== String(pid)) return { clicked: false, reason: 'folded_fallback_url_not_exact_expected_post' };
           const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
           const labelOf = (el) => (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').replace(/\s+/g, ' ').trim();
-          const boxes = [...document.querySelectorAll('[contenteditable="true"],[role="textbox"],textarea,[aria-label*="Comment as" i],[aria-label*="Write a comment" i],[aria-label*="commenter" i]')]
+          // LANGUAGE-INDEPENDENT box pick (these o-group profiles run FB in ES/AR — label-only matching missed the
+          // comment box -> folded_fallback_no_comment_box). On a single-post permalink the comment composer is the main
+          // contenteditable: EXCLUDE the top search box + create-post box (multilingual + by landmark), prefer a
+          // comment-labelled box (multilingual), else take the TOP-most remaining composer (the target post's, above
+          // any related-post boxes). The exact-postId URL gate + verify backstop still prevent any wrong-post comment.
+          const COMMENT = /comment|commenter|comenta|coment|تعليق|kommentar|commenta|responder|répond|reply/i;
+          const BAD = /search|buscar|recherche|بحث|suchen|cerca|pesquisar|what.*mind|piensas|pensando|pensez|create post|crea\b|cr[ée]er|publica/i;
+          const inBad = (el) => !!(el.closest && el.closest('[role="search"],[role="banner"],[role="navigation"],nav'));
+          const boxes = [...document.querySelectorAll('[contenteditable="true"],[role="textbox"],textarea')]
             .filter(visible)
-            .map((el) => { const lower = labelOf(el).toLowerCase(); let score = 0;
-              if (/comment as|write a comment|commenter/.test(lower)) score += 130; else if (/\bcomment\b|leave a comment/.test(lower)) score += 85;
-              if (/what.*mind|write something|create post|search facebook/.test(lower)) score -= 180;
-              return { el, score, top: Math.round(el.getBoundingClientRect().top) }; })
-            .filter((b) => b.score >= 85)
-            .sort((a, b) => (b.score - a.score) || (a.top - b.top));
+            .filter((el) => !inBad(el) && !BAD.test(labelOf(el).toLowerCase()))
+            .map((el) => ({ el, labeled: COMMENT.test(labelOf(el).toLowerCase()), top: Math.round(el.getBoundingClientRect().top) }))
+            .sort((a, b) => (Number(b.labeled) - Number(a.labeled)) || (a.top - b.top));
           const best = boxes[0];
           if (!best) return { clicked: false, reason: 'folded_fallback_no_comment_box' };
           best.el.scrollIntoView({ block: 'center', inline: 'center' });
           best.el.click();
-          return { clicked: true, score: best.score, top: best.top, foldedFallback: true };
+          return { clicked: true, top: best.top, labeled: best.labeled, foldedFallback: true };
         }, { gid: expectedPostParts.groupId, pid: expectedPostParts.postId }).catch((err) => ({ clicked: false, reason: err.message || String(err) }));
         result.foldedBox = foldedBox;
         foldedClicked = Boolean(foldedBox.clicked);
