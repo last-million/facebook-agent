@@ -84,6 +84,10 @@
   .hist td{cursor:pointer}
   .empty{padding:46px 20px;text-align:center;color:var(--mut)}
   .err{background:rgba(240,98,90,.1);border:1px solid rgba(240,98,90,.35);color:#ffb4ae;border-radius:12px;padding:14px 16px;margin:14px 0;font-size:.86rem}
+  .reco{border-radius:11px;padding:11px 15px;margin:2px 0 14px;font-size:.86rem;font-weight:500}
+  .reco.warn{background:rgba(214,165,49,.12);border:1px solid rgba(214,165,49,.4);color:#f0cd72}
+  .reco.ok{background:rgba(63,185,80,.1);border:1px solid rgba(63,185,80,.32);color:#7ee08a}
+  .reco b{font-weight:800}
   .foot{color:var(--dim);font-size:.74rem;text-align:center;margin-top:26px}
   .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--blue);border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
   @keyframes s{to{transform:rotate(360deg)}}
@@ -116,6 +120,7 @@
 
   <div id="err"></div>
   <div class="chips" id="chips"></div>
+  <div id="reco"></div>
   <div id="body"><div class="empty"><span class="spin"></span> Chargement du rapport…</div></div>
 
   <div class="foot" id="foot"></div>
@@ -159,6 +164,17 @@ function render(){
       + '<div class="cc '+(rate>=90?"ok":rate>=70?"slow":"no")+'">'+rate+'% commentés</div></div>';
   }).join("");
   document.getElementById("chips").innerHTML = ch || "";
+  // kill-mid-post reconcile banner (silent-loss guard visibility)
+  var rc = DATA.reconcile || {};
+  var recoEl = document.getElementById("reco");
+  var bits = [];
+  if (rc.pending) bits.push('<b>'+rc.pending+'</b> interrompu(s), reprise en cours');
+  if (rc.needsReview) bits.push('<b>'+rc.needsReview+'</b> à vérifier manuellement');
+  if (rc.recovered) bits.push('<b>'+rc.recovered+'</b> récupéré(s)');
+  if (rc.released) bits.push('<b>'+rc.released+'</b> relancé(s)');
+  if (rc.pending || rc.needsReview) recoEl.innerHTML = '<div class="reco warn">⚠ Reprise après interruption (kill mid-post) : ' + bits.join(' · ') + '</div>';
+  else if (rc.recovered || rc.released) recoEl.innerHTML = '<div class="reco ok">✓ Reprise auto après interruption : ' + bits.join(' · ') + ' — aucune perte silencieuse</div>';
+  else recoEl.innerHTML = '';
   var r = runs[SEL];
   var b = document.getElementById("body");
   if(!r){ b.innerHTML='<div class="tablecard"><div class="empty">Aucune run enregistrée pour le moment.<br>Le rapport se remplira dès le premier post.</div></div>'; return; }

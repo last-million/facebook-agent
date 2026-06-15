@@ -8927,6 +8927,14 @@ async function autopilotTickAsync(options = {}) {
         && !__commentResweepInFlight && (Date.now() - __lastCommentResweepAt) > 90000) {
       resweepUncommentedFacebookPostsAsync({ max: 5 }).catch(() => {});
     }
+    // KILL-MID-POST RECONCILE: recover any post interrupted by a watchdog kill (a publish_intent with no
+    // resolution) — marker-scan FB to RECORD a landed-but-unrecorded post (the resweep then comments it) or
+    // RELEASE its claim to retry. Closes the silent-post-loss hole. Fire-and-forget, single-flight, armed-gated,
+    // throttled to once / 5 min, bounded 3/pass (so it never floods the profile budget during active posting).
+    if (!dryRun && state.operator?.armedForExternalActions
+        && !__reconcileIntentsInFlight && (Date.now() - __lastIntentReconcileAt) > 300000) {
+      reconcilePendingPublishIntentsAsync({ max: 3 }).catch(() => {});
+    }
     // CONTENT-SOURCE HARVEST (default OFF): fire-and-forget, single-flight, armed-gated, ~1-min re-scan
     // cadence (__harvestNextAt). Harvests source groups' posts (text + image + first-comment link) into
     // the buffer in parallel 4-by-4. When contentSourcesEnabled is off this never fires.
@@ -9185,10 +9193,29 @@ async function autopilotTickAsync(options = {}) {
         logEvent("autopilot_worker_skipped_product_already_used_this_run", { profileId: Number(r.profileId || 0), productKey: __prodKey.slice(0, 80) });
         return { profileId: Number(r.profileId || 0), ok: false, postUrl: "", error: "product_already_used_this_run" };
       }
+      // SILENT-LOSS GUARD (kill-mid-post): write a DURABLE publish-intent BEFORE the post, and an in-process
+      // publish_intent_resolved in the finally. The finally runs on success/failure/throw — the ONLY thing that
+      // skips it is a hard process kill (watchdog Stop-Process) between FB-publish and the in-process `published`
+      // record. So at next boot, an intent with NO resolution == a post interrupted mid-flight; reconcilePending
+      // PublishIntentsAsync then marker-scans FB to RECOVER the landed post (record+count -> resweep comments it)
+      // or RELEASE the claim to retry. A kill can no longer silently lose a live post. These are append-only
+      // ledger rows (appendFacebookLivePostLedger is fail-safe) so they CANNOT affect the post itself.
+      const __claimHash = crypto.createHash("sha1").update(__prodKey).digest("hex");
+      const __intentId = crypto.randomBytes(8).toString("hex");
+      const __intentRunId = String(state.operator?.autopilotRunId || "");
+      appendFacebookLivePostLedger({ event: "publish_intent", key: __intentId, planId: r.planId, sequence: r.sequence, profileId: Number(r.profileId || 0), profile: r.profile || "", groupUrl: r.groupUrl || "", status: "in_flight", message: `${__intentRunId}|${__claimHash}` });
+      let __intentResolved = false;
+      let __intentOutcome = "interrupted";
+      let __intentUrl = "";
+      const __resolveIntent = () => {
+        if (__intentResolved) return; __intentResolved = true;
+        try { appendFacebookLivePostLedger({ event: "publish_intent_resolved", key: __intentId, planId: r.planId, sequence: r.sequence, profileId: Number(r.profileId || 0), groupUrl: r.groupUrl || "", postUrl: __intentUrl, status: __intentOutcome, message: `${__intentRunId}|${__claimHash}` }); } catch (_) {}
+      };
       try {
         const v = await runLiveFacebookPostFromPlan({ fullRun: true, autopilot: true, planId: r.planId, sequence: r.sequence, countTowardRun: true });
         if (!(v && v.ok)) releasePostProductForRun(state, __prodKey); // post did not land -> free the product for retry
         autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", errorText: (v && (v.error || v.reason)) || "", validation: v && v.validation, source: "autopilot" });
+        __intentOutcome = (v && v.ok) ? "completed_published" : "completed_not_landed"; __intentUrl = (v && v.postUrl) || "";
         // The per-run counter is now bumped at the RECORD moment inside completeVerifiedFacebookPostWithComment
         // (gated by ready.__autopilotRunPost = body.countTowardRun), so a post that LANDS but whose comment/
         // cleanup errors afterward is STILL counted exactly once — fixing the rare under-count where
@@ -9197,7 +9224,10 @@ async function autopilotTickAsync(options = {}) {
       } catch (err) {
         releasePostProductForRun(state, __prodKey); // post threw -> free the product so the run can retry it
         autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: false, postUrl: "", errorText: oneLineField((err && (err.profileFailureReason || err.message)) || String(err), 240), profileRetryable: !!(err && err.profileRetryable), validation: err && err.livePostValidation, source: "autopilot" });
+        __intentOutcome = "completed_error";
         return { profileId: Number(r.profileId || 0), ok: false, postUrl: "", error: oneLineField((err && err.message) || String(err), 200) };
+      } finally {
+        __resolveIntent();
       }
     };
     // Mark live posting IN FLIGHT for the whole dispatch so PREP yields to it (priority).
@@ -11409,6 +11439,104 @@ async function recoverSubmittedFacebookPostUrl({
     }
     if (acquiredProfileUse) releaseProfileUse();
   }
+}
+
+// ============================================================================
+// SILENT-LOSS RECOVERY (kill-mid-post): reconcile orphaned publish-intents.
+// A publish_intent with NO matching publish_intent_resolved == the server was hard-killed
+// (watchdog Stop-Process) between FB-publish and the in-process record. We marker-scan the
+// group feed (the SAME tested findOnly path as submitted-URL recovery) to decide safely:
+//   * post FOUND on FB -> record it as published so the resweep comments it  (no silent loss)
+//   * post NOT found   -> release the per-run product claim so it is re-posted (no duplicate)
+// Runs ONLY when armed (the scan spawns the connector) and is bounded + single-flight.
+// ============================================================================
+function findOrphanedPublishIntents(options = {}) {
+  const windowMs = clampNumber(options.windowHours, 1, 168, 24) * 3600 * 1000;
+  const cutoff = Date.now() - windowMs;
+  let rows = [];
+  try { rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 30000 }); } catch { return []; }
+  const resolved = new Set();
+  const intents = new Map(); // intentId(key) -> latest intent row
+  for (const r of rows) {
+    if (!r || !r.key) continue;
+    if (r.event === "publish_intent_resolved") { resolved.add(String(r.key)); continue; }
+    if (r.event === "publish_intent") {
+      const t = Date.parse(r.at || 0);
+      if (Number.isFinite(t) && t >= cutoff) intents.set(String(r.key), r);
+    }
+  }
+  const orphans = [];
+  for (const [id, it] of intents) { if (!resolved.has(id)) orphans.push(it); }
+  return orphans;
+}
+
+let __reconcileIntentsInFlight = null;
+let __lastIntentReconcileAt = 0;
+async function reconcilePendingPublishIntentsAsync(options = {}) {
+  if (__reconcileIntentsInFlight) return __reconcileIntentsInFlight;
+  __reconcileIntentsInFlight = (async () => {
+    const summary = { orphans: 0, recovered: 0, released: 0, flagged: 0, errors: 0 };
+    try {
+      const orphans = findOrphanedPublishIntents({ windowHours: options.windowHours || 24 });
+      summary.orphans = orphans.length;
+      if (!orphans.length) return summary;
+      logEvent("publish_intent_reconcile_started", { orphans: orphans.length });
+      const max = clampNumber(options.max, 1, 20, 5);
+      const planRows = latestPostingPlanRows();
+      let done = 0;
+      for (const it of orphans) {
+        if (done >= max) break;
+        done += 1;
+        const planId = String(it.planId || "");
+        const sequence = Number(it.sequence || 0);
+        const profileId = Number(it.profileId || 0);
+        const groupUrl = String(it.groupUrl || "");
+        const parts = String(it.message || "").split("|");
+        const runId = parts[0] || "";
+        const claimHash = parts[1] || "";
+        const writeResolved = (status, postUrl) => { try { appendFacebookLivePostLedger({ event: "publish_intent_resolved", key: it.key, planId, sequence, profileId, groupUrl, postUrl: postUrl || "", status, message: String(it.message || "") }); } catch (_) {} };
+        const releaseClaim = () => { try { if (claimHash) { const safe = String(runId).replace(/[^a-z0-9_-]/gi, "") || "default"; fs.rmSync(path.join(DATA_DIR, "post-claims", safe, claimHash + ".claim"), { force: true }); } } catch (_) {} };
+        const row = planRows.find((pr) => pr.planId === planId && Number(pr.sequence) === sequence) || (sequence ? planRows.find((pr) => Number(pr.sequence) === sequence) : null);
+        if (!row || !groupUrl || !profileId) {
+          // Cannot marker-scan without the plan row/group/profile. Do NOT blind-release (a landed post would then
+          // be re-posted = duplicate). Flag for manual review + keep the claim; the report surfaces it.
+          writeResolved("needs_manual_review", "");
+          logEvent("publish_intent_reconcile_flagged", { planId, sequence, profileId, reason: !row ? "plan_row_missing" : (!groupUrl ? "group_missing" : "profile_missing") });
+          summary.flagged += 1;
+          continue;
+        }
+        try {
+          const rec = await recoverSubmittedFacebookPostUrl({ row, ready: { profileId }, groupUrl, ledgerKey: `reconcile:${it.key}`, reason: "kill-mid-post reconcile: scan whether the interrupted post actually landed" });
+          if (rec && rec.ok && rec.postUrl) {
+            // POST LANDED -> record it as published so the resweep comments it (no silent loss).
+            const actualGroupUrl = facebookGroupUrlFromPostUrl(rec.postUrl) || groupUrl;
+            try { recordPublishedFacebookPostUrl({ postUrl: rec.postUrl, row, planId, sequence, profile: row.profile || profileId, groupUrl: actualGroupUrl }); } catch (_) {}
+            appendFacebookLivePostLedger({ event: "published", key: it.key, planId, sequence, profileId, profile: row.profile || "", groupUrl, actualGroupUrl, postUrl: rec.postUrl, status: "published", message: "recovered after kill-mid-post (publish_intent reconcile)", validation: rec.validation || null });
+            writeResolved("recovered_landed", rec.postUrl);
+            logEvent("publish_intent_reconcile_recovered", { planId, sequence, profileId, postUrl: rec.postUrl });
+            summary.recovered += 1;
+          } else {
+            // POST DID NOT LAND -> free the product so the run re-posts it (no duplicate).
+            releaseClaim();
+            writeResolved("released_not_landed", "");
+            logEvent("publish_intent_reconcile_released", { planId, sequence, profileId });
+            summary.released += 1;
+          }
+        } catch (err) {
+          // Transient scan error -> leave UNRESOLVED so it retries next pass (bounded by max + single-flight).
+          logEvent("publish_intent_reconcile_error", { planId, sequence, profileId, error: oneLineField((err && err.message) || String(err), 200) });
+          summary.errors += 1;
+        }
+      }
+      logEvent("publish_intent_reconcile_finished", summary);
+    } catch (err) {
+      logEvent("publish_intent_reconcile_fatal", { error: oneLineField((err && err.message) || String(err), 200) });
+    } finally {
+      __lastIntentReconcileAt = Date.now();
+    }
+    return summary;
+  })();
+  try { return await __reconcileIntentsInFlight; } finally { __reconcileIntentsInFlight = null; }
 }
 
 function livePostingBatchesByUniqueProfile(rows, maxConcurrentProfiles) {
@@ -18444,7 +18572,27 @@ function buildRunReports(force = false) {
       detail,
     };
   }).reverse(); // most recent run first
-  const body = { generatedAt: new Date().toISOString(), runCount: out.length, latest: out[0] || null, runs: out.slice(0, 30) };
+  // KILL-MID-POST RECONCILE STATUS (silent-loss guard visibility): an intent with no resolution older than
+  // 10 min == a post interrupted by a kill and not yet reconciled; the others are the reconcile outcomes.
+  const reconcile = { pending: 0, recovered: 0, released: 0, needsReview: 0 };
+  try {
+    const resolvedStatus = new Map();
+    const intentAt = new Map();
+    for (const r of rows) {
+      if (!r || !r.key) continue;
+      if (r.event === "publish_intent_resolved") resolvedStatus.set(String(r.key), String(r.status || ""));
+      else if (r.event === "publish_intent") intentAt.set(String(r.key), Date.parse(r.at || 0));
+    }
+    const ageCut = Date.now() - 10 * 60 * 1000;
+    for (const [k, t] of intentAt) {
+      const st = resolvedStatus.get(k);
+      if (!st) { if (Number.isFinite(t) && t < ageCut) reconcile.pending += 1; }
+      else if (st === "recovered_landed") reconcile.recovered += 1;
+      else if (st === "released_not_landed") reconcile.released += 1;
+      else if (st === "needs_manual_review") reconcile.needsReview += 1;
+    }
+  } catch {}
+  const body = { generatedAt: new Date().toISOString(), runCount: out.length, latest: out[0] || null, runs: out.slice(0, 30), reconcile };
   __runReportCache.at = Date.now();
   __runReportCache.body = body;
   return body;
