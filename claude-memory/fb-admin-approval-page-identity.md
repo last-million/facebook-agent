@@ -205,5 +205,28 @@ during a real run; on-demand check via /api/profiles/health-sweep (GET, ~L18394)
 (`harvestContentSourcesAsync`, ~L8896) was ALREADY armed-gated (+ the tick bails not-armed at ~L8865 and the scheduler
 at ~L9286) — it only runs DURING a run, which is correct ("harvest during a run, never at rest").
 
+RUN-31/100 CRASH + COMMENT-FOLDED + AUTO-RESUME (2026-06-15, big session). A 100-post run stopped at 31 — root cause
+(swarm-verified from logs): NOT product supply (0 reuse, buffer 42→13 never empty; config is 50/50 share, 23 profiles
+each — the 23/8 split was just the incomplete run + 4854 lagging). The chain: the COMMENT connector hard-failed on
+FOLDED posts ("See more" hides the #marker) → burned 13-18 profiles/post → 130-188 chrome procs, freeRam 1-5% → a
+SILENT OOM crash at 21:58 → watchdog restarted → boot DISARMED the run → halt at 31. Fixes shipped+pushed:
+- **A — FOLDED-POST COMMENT (connector, VALIDATED LIVE, language-independent):** the comment composer is LAZY (renders
+  only AFTER the post's "Comment" action button is clicked) and the old finder was marker-scoped(innerText) + EN/FR-only.
+  Fix in submitCommentOnVisiblePost: (1) `__commentEligible` += `|| urlConfirmsRightPost` (so it runs on a folded
+  permalink), (2) findAndClickCommentBtn matches the marker via `el.textContent` when on the exact permalink (folded
+  text is in the DOM, not innerText) + a MULTILINGUAL `COMMENT_BTN` regex (EN/FR/ES/AR/DE/IT/PT) + scopedRoots falls
+  back to [role=main] on permalink, (3) after the button click, if `document.activeElement` is an editable, treat the
+  box as found and insertText into the FOCUSED composer (language-independent fast path). PROVEN: recovered a folded
+  ES/AR post (verified:true). The o-group profiles run FB in ES/AR — that's why EN/FR-only failed. (operator wish: also
+  use Hermes/LLM as a fallback for a NEW unknown language — NOT yet built, future enhancement.)
+- **B — CRASH AUTO-RESUME (server.js detectIncompleteRunAtBoot, 3-verifier SHIP):** opt-in `operator.autopilotAutoResumeEnabled`
+  (default OFF; ENABLED 2026-06-15 per operator). On reason==="run_active_at_restart" (a real crash, wasActive) +
+  count-run (max>0) + posted<max + runId<8h + <=3 crash-resumes/run (keyed to autopilotRunId, anti-OOM-loop), it
+  re-arms like /api/autopilot/resume "continue" (max=max-posted, postsThisRun=0) KEEPING autopilotRunId so the product
+  claim-namespace (post-claims/<runId>) persists → NEVER double-posts. Clean stop / normal boot / stale flag never
+  resume. Crash recovery for comments stays via FIX 3 (boot, status=pending) OR the resumed run's own pipeline.
+GOTCHA: to set an operator flag via the API, PUT `{ state: { operator: {...} } }` (the handler reads `body.state`);
+a bare `{operator:...}` is silently ignored. writeState deepMerges so a new operator key persists once on disk.
+
 Connector changes need NO restart (fresh-spawned per run). server.js validation guard loaded via restart
 2026-06-11 (server PID 5040). See [[fb-agent-highscale-pipeline]] and [[fb-no-live-post-without-ok]].
