@@ -1628,29 +1628,37 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
       // waitForPublishedCommentText still gates success, so a misfire becomes "not commented", never a wrong comment.
       let foldedClicked = false;
       if (urlConfirmsRightPost && expectedPostParts) {
-        const foldedBox = await page.evaluate(({ gid, pid }) => {
+        const foldedBox = await page.evaluate(async ({ gid, pid }) => {
           const m = (location.pathname || '').match(/\/groups\/([0-9]+)\/(?:permalink|posts)\/([0-9]+)/i);
           if (!m || m[1] !== String(gid) || m[2] !== String(pid)) return { clicked: false, reason: 'folded_fallback_url_not_exact_expected_post' };
           const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
-          const labelOf = (el) => (el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').replace(/\s+/g, ' ').trim();
-          // LANGUAGE-INDEPENDENT box pick (these o-group profiles run FB in ES/AR — label-only matching missed the
-          // comment box -> folded_fallback_no_comment_box). On a single-post permalink the comment composer is the main
-          // contenteditable: EXCLUDE the top search box + create-post box (multilingual + by landmark), prefer a
-          // comment-labelled box (multilingual), else take the TOP-most remaining composer (the target post's, above
-          // any related-post boxes). The exact-postId URL gate + verify backstop still prevent any wrong-post comment.
-          const COMMENT = /comment|commenter|comenta|coment|تعليق|kommentar|commenta|responder|répond|reply/i;
+          const lab = (el) => (el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.innerText || '').replace(/\s+/g, ' ').trim().toLowerCase();
           const BAD = /search|buscar|recherche|بحث|suchen|cerca|pesquisar|what.*mind|piensas|pensando|pensez|create post|crea\b|cr[ée]er|publica/i;
           const inBad = (el) => !!(el.closest && el.closest('[role="search"],[role="banner"],[role="navigation"],nav'));
-          const boxes = [...document.querySelectorAll('[contenteditable="true"],[role="textbox"],textarea')]
-            .filter(visible)
-            .filter((el) => !inBad(el) && !BAD.test(labelOf(el).toLowerCase()))
-            .map((el) => ({ el, labeled: COMMENT.test(labelOf(el).toLowerCase()), top: Math.round(el.getBoundingClientRect().top) }))
-            .sort((a, b) => (Number(b.labeled) - Number(a.labeled)) || (a.top - b.top));
-          const best = boxes[0];
-          if (!best) return { clicked: false, reason: 'folded_fallback_no_comment_box' };
-          best.el.scrollIntoView({ block: 'center', inline: 'center' });
-          best.el.click();
-          return { clicked: true, top: best.top, labeled: best.labeled, foldedFallback: true };
+          // The comment composer is the TOP-most visible editable on a single-post permalink (exclude the nav search +
+          // create-post box). KEY (proven by a live test: ceTotal:0): on FB the composer is LAZY-rendered — it is NOT
+          // in the DOM until the post's "Comment" ACTION button is clicked. The marker-scoped + EN/FR-only finder above
+          // can't locate that button on a folded ES/AR post, so do it here, language-independently.
+          const findBox = () => [...document.querySelectorAll('[contenteditable="true"],[role="textbox"],textarea')]
+            .filter(visible).filter((el) => !inBad(el) && !BAD.test(lab(el)))
+            .sort((a, c) => a.getBoundingClientRect().top - c.getBoundingClientRect().top)[0] || null;
+          let box = findBox();
+          if (!box) {
+            // Click the COMMENT action button (multilingual EN/FR/ES/AR/DE/IT/PT) to reveal the composer; NOT
+            // share/like/reply and NOT the "N comments" count (excluded via the digit test). Top-most match = the
+            // post action bar (above the comments list). Then re-find the now-rendered composer.
+            const ACTION = /^comment$|^comentar$|^commenter$|^تعليق$|^kommentar$|^commenta$|^comente$|^comentario$|leave a comment|write a comment|comment as|escribe un comentario|haz un comentario|deja un comentario|اكتب تعليق|كتابة تعليق/i;
+            const NOT = /share|partag|compart|teilen|condivi|\blike\b|j.?aime|me gusta|reply|répond|responder|rispondi/i;
+            const btn = [...document.querySelectorAll('[role="button"],button,a')]
+              .filter(visible)
+              .filter((el) => { const l = lab(el); return ACTION.test(l) && !NOT.test(l) && !/\d/.test(l); })
+              .sort((a, c) => a.getBoundingClientRect().top - c.getBoundingClientRect().top)[0];
+            if (btn) { btn.scrollIntoView({ block: 'center' }); btn.click(); await new Promise((r) => setTimeout(r, 1800)); box = findBox(); }
+            if (!box) return { clicked: false, reason: 'folded_fallback_no_composer_after_action', actionClicked: !!btn, btnLabel: btn ? lab(btn).slice(0, 40) : '', ceTotal: document.querySelectorAll('[contenteditable="true"],[role="textbox"],textarea').length };
+          }
+          box.scrollIntoView({ block: 'center', inline: 'center' });
+          box.click();
+          return { clicked: true, top: Math.round(box.getBoundingClientRect().top), foldedFallback: true };
         }, { gid: expectedPostParts.groupId, pid: expectedPostParts.postId }).catch((err) => ({ clicked: false, reason: err.message || String(err) }));
         result.foldedBox = foldedBox;
         foldedClicked = Boolean(foldedBox.clicked);

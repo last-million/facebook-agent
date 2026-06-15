@@ -9278,18 +9278,48 @@ function detectIncompleteRunAtBoot() {
     const prior = op.lastIncompleteRun;
     if (!wasActive && prior && prior.status && prior.status !== "pending"
         && Number(prior.posted) === posted && Number(prior.max) === max) return;
+    const __reason = wasActive ? "run_active_at_restart" : "run_counter_incomplete_at_restart";
+    // AUTO-RESUME AFTER A CRASH (operator opt-in 2026-06-15: "during prod we don't want a crash to stop the run").
+    // A "stop after N" COUNT-run the server CRASHED mid-flight (reason run_active_at_restart) CONTINUES to N instead
+    // of dead-stopping. Mirrors the /api/autopilot/resume "continue" path (arm for the REMAINING posts, keep the
+    // SAME autopilotRunId so the product-claim namespace persists -> no resumed post double-publishes). BOUNDED:
+    //   - opt-in flag autopilotAutoResumeEnabled (default OFF — never silently re-arms FB),
+    //   - COUNT runs only (max>0; never unlimited/time runs),
+    //   - posted<max (something left to do),
+    //   - RECENT run: armed <8h ago, so a STALE armed flag on a random reboot days later can't re-arm,
+    //   - <=3 consecutive crash-resumes for the SAME run (crash-loop cap): a run that keeps OOM-crashing gives up
+    //     after 3 and leaves the pending banner for a human (attempts are keyed to autopilotRunId, so a fresh run
+    //     auto-resets the counter).
+    const __runId = Number(op.autopilotRunId) || 0;
+    const __runRecent = __runId > 0 && (Date.now() - __runId) < 8 * 3600 * 1000;
+    const __attempts = (__runId > 0 && String(op.autopilotCrashResumeRunId || "") === String(__runId)) ? (Number(op.autopilotCrashResumeAttempts) || 0) : 0;
+    const __canAutoResume = op.autopilotAutoResumeEnabled === true && __reason === "run_active_at_restart"
+      && max > 0 && posted < max && __runRecent && __attempts < 3;
+    if (__canAutoResume) {
+      state.operator.lastIncompleteRun = { at: new Date().toISOString(), posted, max, reason: __reason, status: "auto_resumed", resolvedAt: new Date().toISOString() };
+      state.operator.autopilotCrashResumeRunId = String(__runId);
+      state.operator.autopilotCrashResumeAttempts = __attempts + 1;
+      state.operator.autopilotMaxPostsPerRun = Math.max(1, max - posted); // continue toward the same N total
+      state.operator.autopilotPostsThisRun = 0;
+      state.operator.autopilotEnabled = true;
+      state.operator.armedForExternalActions = true;
+      state.operator.autopilotDryRun = false;
+      writeState(state, { controlWrite: true });
+      logEvent("autopilot_auto_resumed_after_crash", { posted, max, remaining: Math.max(1, max - posted), attempt: __attempts + 1, runId: String(__runId) });
+      return;
+    }
     state.operator.lastIncompleteRun = {
       at: new Date().toISOString(),
       posted,
       max,
-      reason: wasActive ? "run_active_at_restart" : "run_counter_incomplete_at_restart",
+      reason: __reason,
       status: "pending",
     };
     state.operator.autopilotEnabled = false;
     state.operator.armedForExternalActions = false;
     // controlWrite: the clobber guard would otherwise resurrect the pre-restart armed flags.
     writeState(state, { controlWrite: true });
-    logEvent("incomplete_run_detected_at_boot", { posted, max, reason: state.operator.lastIncompleteRun.reason });
+    logEvent("incomplete_run_detected_at_boot", { posted, max, reason: __reason });
   } catch (err) {
     logEvent("incomplete_run_boot_check_error", { error: oneLineField(err.message || String(err), 200) });
   }
