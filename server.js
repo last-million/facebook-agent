@@ -8055,8 +8055,11 @@ function computeMachineParallelCap() {
   const RESERVED_CORES = 2;             // OS + Pinterest floor
   const RESERVED_GB = 4;                // keep this much RAM free for OS + Pinterest
   const PINTEREST_HEADROOM_FRAC = 0.25; // hand ~25% of usable cores to the other agent
-  const CORES_PER_PROFILE = 1.0;        // empirical: this box ran ~6 concurrent profiles without locking;
-                                        // a render peaks ~1 core averaged — the LIVE cpu governor throttles real spikes
+  const CORES_PER_PROFILE = 1.5;        // operator 2026-06-15: 1.0 (=cap 5) was too optimistic — a real run (posting +
+                                        // commenting + harvest all spawning chrome) pegged CPU to 99-100% and the server
+                                        // went UNRESPONSIVE (watchdog killed it 4x). chrome is multi-process; each active
+                                        // profile averages ~1.5 cores under load. 1.5 -> cap 3 = STABLE on this shared box
+                                        // (this is ALSO the sticky ceiling the dashboard's maxConcurrentProfiles clamps to).
   const GB_PER_PROFILE = 1.5;           // ~1.5 GiB resident per active ixBrowser profile
   const HARD_CEILING = 8;               // never auto-scale past this without operator review
   const usableCores = Math.max(1, (cores - RESERVED_CORES) * (1 - PINTEREST_HEADROOM_FRAC));

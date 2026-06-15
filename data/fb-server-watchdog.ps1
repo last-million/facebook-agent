@@ -66,7 +66,16 @@ $fails = (Get-FailCount) + 1
 Set-FailCount $fails
 if ($fails -lt $RESTART_AFTER_FAILS) { Write-WatchdogLog ("action=unhealthy_tolerating`tfails={0}/{1}" -f $fails, $RESTART_AFTER_FAILS); return }
 
-# 4) Sustained unresponsiveness -> restart ONLY the 9317 owner, never the Pinterest agent. Reset counter.
+# 3b) ALIVE-BUT-BUSY GUARD (operator 2026-06-15): a CPU-saturated run can make GET / time out for several checks even
+#     while the server is WORKING — that is what got it killed + auto-resume-looped (4x). If events.log was written in
+#     the last ~120s, the Node event loop IS alive (just CPU-starved on the HTTP probe) -> do NOT kill; tolerate + reset.
+#     Only a TRULY frozen server (no event-log activity for >120s) falls through to the restart below.
+$evLog = Join-Path $proj 'data\events.log'
+$evFresh = $false
+try { if (Test-Path $evLog) { $evFresh = ((New-TimeSpan -Start (Get-Item $evLog).LastWriteTime -End (Get-Date)).TotalSeconds -lt 120) } } catch {}
+if ($evFresh) { Write-WatchdogLog ("action=tolerating_alive_busy`treason=events_log_fresh_not_frozen`tfails={0}" -f $fails); Clear-FailCount; return }
+
+# 4) Sustained unresponsiveness AND no recent event-log activity (TRULY frozen) -> restart ONLY the 9317 owner.
 $owner = Get-PortOwnerPid $port
 $pin   = Get-PortOwnerPid $pinterestPort
 if ($owner -and $owner -ne $pin) {
