@@ -72,7 +72,16 @@ const MAX_EVENTS_BYTES = 500000;
 // each ixBrowser profile spawns ~10-20 chrome procs, so 7 posting + 3 harvest = ~150+ chrome processes at once,
 // and with the Pinterest agent sharing the box Chrome crashed ("application error"). Half-cores is stable. 9 vCPU -> 4.
 const MAX_CONCURRENT_NORMAL_IX_PROFILES = Math.max(3, Math.min(6, Math.floor(((os.cpus() || []).length || 4) / 2)));
-const MAX_COMMENT_FALLBACK_PROFILES = 40; // try EVERY profile allocated to the group for the first comment (was 6) — keep going until one lands; the loop stops as soon as a comment succeeds, so this is just the ceiling.
+// HARD CEILING on TOTAL concurrent open ixBrowser profiles across ALL paths (posting + comment-recovery + harvest +
+// approval). acquireNormalIxProfileUse only locked PER-profile, never the TOTAL -> dozens piled up = the overnight
+// memory crash (201 chrome procs @ freeRam 1%). Now the (N+1)th open is refused so the caller defers/retries until a
+// slot frees (the operator's "don't open more than ~10, close+relaunch" rule). 8 leaves room for ~3 posters + their
+// comments + an approval, well under the ~30-50 profiles that crashed. (operator 2026-06-15)
+const GLOBAL_MAX_OPEN_PROFILES = 8;
+const MAX_COMMENT_FALLBACK_PROFILES = 8; // CEILING of profiles tried for the first comment. Was 40 -> on a STUCK post
+// (e.g. pending approval / not yet visible) it opened 40 browsers in a row, the #1 driver of the overnight memory crash
+// (201 chrome procs, freeRam 1%). A good post succeeds on the first profile, so 8 doesn't hurt normal posts; a post that
+// 8 distinct profiles can't comment is genuinely stuck (re-tried later by the resweep once it goes live). (operator 2026-06-15)
 const FACEBOOK_LIVE_POST_TIMEOUT_MS = 600000;
 // 18 min: the pending-queue propagation is 10-30 min (measured live 2026-06-12), and the connector now POLLS
 // the queue in ONE patient session (~14 min max) instead of burning a fresh ~3-min session per retry across
@@ -6193,6 +6202,15 @@ function acquireNormalIxProfileUse(profileId, purpose) {
     const err = new Error(`IXBrowser profile ${numericProfileId} is already busy with ${existing.purpose}. Wait for that run to finish, or click Stop / Clear Test.`);
     err.statusCode = 409;
     err.publicError = "ixbrowser_profile_busy";
+    throw err;
+  }
+  // GLOBAL hard cap: never let the TOTAL concurrent open profiles exceed GLOBAL_MAX_OPEN_PROFILES (prevents the
+  // chrome/RAM runaway crash). The (N+1)th caller gets a typed, retryable error -> it defers and retries when a
+  // profile closes (a free slot opens). This is the operator's "max ~10 open, then close+relaunch" safeguard.
+  if (normalIxProfileUseLocks.size >= GLOBAL_MAX_OPEN_PROFILES) {
+    const err = new Error(`Too many ixBrowser profiles open (${normalIxProfileUseLocks.size}/${GLOBAL_MAX_OPEN_PROFILES}); deferring this open to avoid a memory crash.`);
+    err.statusCode = 503;
+    err.publicError = "ixbrowser_profile_budget_exceeded";
     throw err;
   }
   normalIxProfileUseLocks.set(key, { purpose: oneLineField(purpose || "workflow", 120), startedAt: new Date().toISOString() });
@@ -13862,6 +13880,11 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
 // Single-flight, armed-gated, throttled, yields to active posting, budget-bounded.
 let __commentResweepInFlight = null;
 let __lastCommentResweepAt = 0;
+// Per-post comment-recovery BACKOFF (operator 2026-06-15): a post that just failed its recovery (e.g. pending
+// approval / not yet visible) must NOT be re-cycled through profiles every 90s sweep — that was the overnight profile
+// churn (a stuck post burning profiles repeatedly). Skip it for ~20min, then retry (in case it went live/approved).
+const __commentRecoveryBackoff = new Map(); // postUrl -> last-attempt ms
+const COMMENT_RECOVERY_BACKOFF_MS = 20 * 60 * 1000;
 async function resweepUncommentedFacebookPostsAsync(options = {}) {
   if (__commentResweepInFlight) return __commentResweepInFlight;
   __commentResweepInFlight = (async () => {
@@ -13916,8 +13939,12 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         const row = postingPlanRowForRecord({ planId: ev.planId, sequence: ev.sequence });
         const commentText = String(row?.commentTextPreview || row?.link || "").trim();
         if (!row || !commentText) { summary.stillMissing += 1; continue; } // cannot reconstruct the comment
+        const __boAt = __commentRecoveryBackoff.get(postUrl) || 0;
+        if (Date.now() - __boAt < COMMENT_RECOVERY_BACKOFF_MS) { summary.stillMissing += 1; continue; } // tried recently + still uncommented -> defer (don't re-cycle profiles on a stuck/pending post)
         await waitForPostingIdle({ label: "comment_resweep" });
         if (latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) continue; // a concurrent post may have just commented it
+        __commentRecoveryBackoff.set(postUrl, Date.now()); // record this attempt (set BEFORE attempting so a timeout/crash still backs off)
+        if (__commentRecoveryBackoff.size > 3000) { const cut = Date.now() - 2 * COMMENT_RECOVERY_BACKOFF_MS; for (const [k, v] of __commentRecoveryBackoff) if (v < cut) __commentRecoveryBackoff.delete(k); } // bound memory
         summary.checked += 1;
         const groupUrl = facebookGroupUrlFromPostUrl(postUrl) || ev.actualGroupUrl || ev.groupUrl || row.groupUrl;
         const ready = { profileId: publisherId, imagePath: row.imagePath || ev.imagePath || "" };
