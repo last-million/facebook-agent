@@ -1397,7 +1397,7 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
     return result;
   }
   if (!(await ensureExpectedPostLoaded('before_comment_button_click'))) return result;
-  const __commentEligible = (markerVisibleBeforeComment || exactPermalinkFallbackAllowed || onExpectedPermalinkWithMarker);
+  const __commentEligible = (markerVisibleBeforeComment || exactPermalinkFallbackAllowed || onExpectedPermalinkWithMarker || urlConfirmsRightPost);
   const findAndClickCommentBtn = () => page.evaluate(({ marker, allowTitleFallback }) => {
     const normalize = (input) => String(input || '')
       .normalize('NFD')
@@ -1418,14 +1418,20 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
       return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
     };
     const buttonLabel = (el) => (el.getAttribute('aria-label') || el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+    // LANGUAGE-INDEPENDENT: on the exact single-post permalink, match the marker against textContent (FB folds long
+    // posts with "See more" so the hashtag marker is in the DOM but NOT in innerText), and match the comment ACTION
+    // button MULTILINGUALLY (EN/FR/ES/AR/DE/IT/PT) instead of EN/FR-only.
+    const onPerma = /\/groups\/[0-9]+\/(?:permalink|posts)\/[0-9]+/i.test(location.pathname || '');
+    const txt = (el) => (onPerma ? (el.textContent || '') : (el.innerText || ''));
+    const COMMENT_BTN = /leave a comment|write a comment|comment as|\bcomment\b|commenter|comenta|comentar|comentário|comentario|تعليق|اكتب تعليق|أضف تعليق|kommentar|kommentieren|commenta|scrivi un commento/i;
     const articleRoots = [...document.querySelectorAll('[role="article"]')]
-      .filter(el => visible(el) && marker && matches(el.innerText || ''));
+      .filter(el => visible(el) && marker && matches(txt(el)));
     const markerRoots = [...document.querySelectorAll('[role="article"], [data-pagelet], div')]
-      .filter((el) => visible(el) && marker && matches(el.innerText || ''))
+      .filter((el) => visible(el) && marker && matches(txt(el)))
       .map((el) => {
         const textLength = (el.innerText || '').length;
         const hasCommentControl = [...el.querySelectorAll('[role="button"],button,a,[contenteditable="true"],[role="textbox"],textarea')]
-          .some((control) => visible(control) && /Leave a comment|Write a comment|Comment as|Commenter|\bComment\b/i.test(buttonLabel(control)));
+          .some((control) => visible(control) && COMMENT_BTN.test(buttonLabel(control)));
         return { el, textLength, hasCommentControl };
       })
       .filter((item) => item.textLength < 30000)
@@ -1443,14 +1449,14 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
         current = current.parentElement;
       }
     }
-    if (!scopedRoots.length && allowTitleFallback) scopedRoots.push(document.querySelector('[role="main"]') || document.body);
+    if (!scopedRoots.length && (allowTitleFallback || onPerma)) scopedRoots.push(document.querySelector('[role="main"]') || document.body);
     for (const root of scopedRoots) {
       const buttons = [...root.querySelectorAll('[role="button"],button,a')]
         .filter(visible)
         .map((el) => ({ el, label: buttonLabel(el) }))
-        .filter((item) => /Leave a comment|Write a comment|Comment|Commenter/i.test(item.label));
+        .filter((item) => COMMENT_BTN.test(item.label) && !/reply|répond|responder|rispondi|\bshare\b|partag|compart|teilen|condivi|مشاركة|\blike\b|j.?aime|me gusta|إعجاب|story|قصة|crea\b|cr[ée]er|إنشاء|\d/i.test(item.label));
       const btn = buttons[0]?.el;
-      if (btn) { btn.click(); return true; }
+      if (btn) { btn.scrollIntoView({ block: 'center' }); btn.click(); return true; }
     }
     return false;
   }, { marker, allowTitleFallback: exactPermalinkFallbackAllowed }).catch(() => false);
@@ -1474,7 +1480,15 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
   result.clicked = true;
   await humanPause(400, 800);
   if (!(await ensureExpectedPostLoaded('after_comment_button_click'))) return result;
-  const markerScopedBox = await page.evaluate((marker) => {
+  // FAST PATH (language-independent): clicking the comment button FOCUSES the composer. The marker-scoped box finders
+  // below can't locate it on a folded ES/AR post, so if a real editable is now focused, treat the box as found and
+  // let the insert+verify path below type into it directly (it inserts into the focused element).
+  const composerFocused = clickedByMarker && await page.evaluate(() => {
+    const ae = document.activeElement; if (!ae) return false;
+    const ed = ae.isContentEditable || (ae.matches && ae.matches('[role="textbox"],textarea')); if (!ed) return false;
+    const r = ae.getBoundingClientRect(); return r.width > 0 && r.height > 0;
+  }).catch(() => false);
+  const markerScopedBox = composerFocused ? { clicked: true, composerFocused: true } : await page.evaluate((marker) => {
     const visible = (el) => {
       const rect = el.getBoundingClientRect();
       const style = getComputedStyle(el);
