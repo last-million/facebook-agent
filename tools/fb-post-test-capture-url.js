@@ -1639,23 +1639,39 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
           // create-post box). KEY (proven by a live test: ceTotal:0): on FB the composer is LAZY-rendered — it is NOT
           // in the DOM until the post's "Comment" ACTION button is clicked. The marker-scoped + EN/FR-only finder above
           // can't locate that button on a folded ES/AR post, so do it here, language-independently.
-          const findBox = () => [...document.querySelectorAll('[contenteditable="true"],[role="textbox"],textarea')]
+          // SCOPE to the target post = the FIRST [role="article"] (above comments + related posts). Avoids the top
+          // nav buttons, the "create post/story" composer (the AR false match), and a RELATED post's composer (the
+          // earlier wrong top:926/968 boxes). The composer can be a sibling below the article, so the box search uses
+          // the article's [role="main"] container.
+          const art = document.querySelector('div[role="article"]');
+          const scope = art ? (art.closest('[role="main"]') || art.parentElement || art) : document.body;
+          const findBox = (root) => [...root.querySelectorAll('[contenteditable="true"],[role="textbox"],textarea')]
             .filter(visible).filter((el) => !inBad(el) && !BAD.test(lab(el)))
             .sort((a, c) => a.getBoundingClientRect().top - c.getBoundingClientRect().top)[0] || null;
-          let box = findBox();
-          if (!box) {
-            // Click the COMMENT action button (multilingual EN/FR/ES/AR/DE/IT/PT) to reveal the composer; NOT
-            // share/like/reply and NOT the "N comments" count (excluded via the digit test). Top-most match = the
-            // post action bar (above the comments list). Then re-find the now-rendered composer.
-            const ACTION = /^comment$|^comentar$|^commenter$|^تعليق$|^kommentar$|^commenta$|^comente$|^comentario$|leave a comment|write a comment|comment as|escribe un comentario|haz un comentario|deja un comentario|اكتب تعليق|كتابة تعليق/i;
-            const NOT = /share|partag|compart|teilen|condivi|\blike\b|j.?aime|me gusta|reply|répond|responder|rispondi/i;
-            const btn = [...document.querySelectorAll('[role="button"],button,a')]
+          let box = art ? findBox(art) : null;
+          if (!box && art) {
+            // Click the post's COMMENT action button WITHIN the target article (not nav / not create-post / not
+            // share/like/reply). Multilingual contains-match; FB focuses the composer after the click.
+            const ACTION = /comment|comenta|تعليق|kommentar|commenta|comentário|kommentieren/i;
+            const NOT = /share|partag|compart|teilen|condivi|مشاركة|\blike\b|إعجاب|j.?aime|me gusta|\breply\b|répond|responder|rispondi|antworten|story|قصة|إنشاء/i;
+            const btn = [...art.querySelectorAll('[role="button"],button,a')]
               .filter(visible)
               .filter((el) => { const l = lab(el); return ACTION.test(l) && !NOT.test(l) && !/\d/.test(l); })
               .sort((a, c) => a.getBoundingClientRect().top - c.getBoundingClientRect().top)[0];
-            if (btn) { btn.scrollIntoView({ block: 'center' }); btn.click(); await new Promise((r) => setTimeout(r, 1800)); box = findBox(); }
-            if (!box) return { clicked: false, reason: 'folded_fallback_no_composer_after_action', actionClicked: !!btn, btnLabel: btn ? lab(btn).slice(0, 40) : '', ceTotal: document.querySelectorAll('[contenteditable="true"],[role="textbox"],textarea').length };
+            if (btn) {
+              btn.scrollIntoView({ block: 'center' }); btn.click();
+              await new Promise((r) => setTimeout(r, 1800));
+              const ae = document.activeElement;
+              if (ae && (ae.isContentEditable || (ae.matches && ae.matches('[role="textbox"],textarea')))) box = ae; else box = findBox(scope);
+            }
+            if (!box) {
+              // DIAGNOSTIC: dump the TARGET ARTICLE's button labels so a test reveals the exact "Comment" label (AR/DE/ES).
+              const artBtns = [...art.querySelectorAll('[role="button"],button,a')].filter(visible).map((el) => lab(el)).filter((l) => l && l.length > 0 && l.length < 40).slice(0, 24);
+              return { clicked: false, reason: 'folded_fallback_no_composer_after_action', actionClicked: !!btn, btnLabel: btn ? lab(btn).slice(0, 40) : '', ceTotal: art.querySelectorAll('[contenteditable="true"],[role="textbox"],textarea').length, artBtns };
+            }
           }
+          if (!box) box = findBox(scope);
+          if (!box) return { clicked: false, reason: 'folded_fallback_no_box_in_article', hasArticle: !!art };
           box.scrollIntoView({ block: 'center', inline: 'center' });
           box.click();
           return { clicked: true, top: Math.round(box.getBoundingClientRect().top), foldedFallback: true };
