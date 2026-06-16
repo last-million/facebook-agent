@@ -18566,6 +18566,14 @@ setInterval(() => {
     __lastHealthSweepAt = Date.now();
     runProfileHealthSweep({ concurrency: 2 }).catch((err) => logEvent("profile_health_sweep_interval_error", { error: oneLineField(err.message || String(err), 200) }));
   }
+  // PROACTIVE FINISHED-PROFILE CLEANUP (operator 2026-06-16: "close old/unused profiles to avoid freezing"):
+  // ALWAYS-ON (armed OR idle) — close ixBrowser profiles we opened that are no longer in use, every ~90s, so a
+  // finished/leaked profile can NEVER linger and pile up to choke the ixBrowser desktop (the freeze cause). The
+  // `size > 0` guard makes it a true no-op when nothing is open, so a server AT REST still opens ZERO browsers
+  // (this only CLOSES). Skips in-use + the dedicated SYL profile; single-flight; idempotent.
+  if (__everOpenedIxProfiles.size > 0 && !__closeFinishedSweepInFlight && Date.now() - __lastCloseFinishedSweepAt > 90000) {
+    closeFinishedIxProfilesSweep({ max: 12 }).catch(() => {});
+  }
   const state = readState();
   const intervalMs = clampNumber(state.triggers?.heartbeatSeconds, 3, 120, 3) * 1000;
   if (Date.now() - lastHeartbeatTick < intervalMs) return;
