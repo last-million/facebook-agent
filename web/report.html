@@ -121,6 +121,7 @@
   <div id="err"></div>
   <div class="chips" id="chips"></div>
   <div id="reco"></div>
+  <div id="probprof"></div>
   <div id="body"><div class="empty"><span class="spin"></span> Chargement du rapport…</div></div>
 
   <div class="foot" id="foot"></div>
@@ -175,6 +176,19 @@ function render(){
   if (rc.pending || rc.needsReview) recoEl.innerHTML = '<div class="reco warn">⚠ Reprise après interruption (kill mid-post) : ' + bits.join(' · ') + '</div>';
   else if (rc.recovered || rc.released) recoEl.innerHTML = '<div class="reco ok">✓ Reprise auto après interruption : ' + bits.join(' · ') + ' — aucune perte silencieuse</div>';
   else recoEl.innerHTML = '';
+  // COMPTES À PROBLÈME (vrais échecs, hors victimes du quota ixBrowser 1018/1004)
+  var pp = DATA.problemProfiles || [];
+  var ppEl = document.getElementById("probprof");
+  if (pp.length) {
+    var ppRows = pp.map(function (p) {
+      return '<tr><td><b>p' + p.profileId + '</b></td><td class="no">' + p.realFails + '</td><td class="' + (p.unblocks ? 'slow' : '') + '">' + (p.unblocks || 0) + '</td><td>' + esc(p.lastReal || '—') + '</td></tr>';
+    }).join("");
+    ppEl.innerHTML = '<h2>⚠ Comptes à problème (font perdre du temps) <span class="ln"></span></h2>'
+      + '<div class="reco warn" style="margin:0 0 8px">Vrais échecs (accès groupe / blocage compte) sur 24h — <b>PAS</b> les victimes du quota ixBrowser (1018/1004). À vérifier ou libérer depuis le dashboard.</div>'
+      + '<div class="tablecard"><table><thead><tr><th>Profil</th><th>Échecs réels</th><th>Déblocages</th><th>Dernière raison</th></tr></thead><tbody>' + ppRows + '</tbody></table></div>';
+  } else {
+    ppEl.innerHTML = '';
+  }
   var r = runs[SEL];
   var b = document.getElementById("body");
   if(!r){ b.innerHTML='<div class="tablecard"><div class="empty">Aucune run enregistrée pour le moment.<br>Le rapport se remplira dès le premier post.</div></div>'; return; }
