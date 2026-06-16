@@ -13629,13 +13629,14 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
       }
     }
     // POST-LEVEL DEAD-END: "target unavailable / pending" = the POST itself isn't live/commentable yet (an
-    // approval-group post FB hasn't finished making public after approval). This fails IDENTICALLY for every
-    // profile, so trying all 40 is pointless + slow. Stop after 3 and let the resweep re-comment once the post
-    // propagates — instead of burning the whole roster (the 30-min waste seen in the 5-post run).
+    // approval-group post FB hasn't finished making public after approval). This fails IDENTICALLY for EVERY
+    // profile, so cycling more profiles is pure waste. STOP ON THE FIRST detection (operator 2026-06-16: stop
+    // burning profiles on a pending post) — the ~22-min comment-recovery backoff then re-checks it later, by which
+    // time FB has had time to approve it -> it gets approved + commented on a LATER pass instead of hammered now.
     if (/comment_target_unavailable_or_pending|post_pending_or_unavailable|comment_target_not_ready|comment_target_pending|comment_target_unavailable/.test(failStr)) {
       postNotReadyCount += 1;
-      if (postNotReadyCount >= 3) {
-        logEvent("comment_recovery_post_not_ready_break", { postNotReadyCount, tried: attempts.length, postUrl, reason: "post_not_yet_commentable_pending_or_propagating_resweep_will_retry" });
+      if (postNotReadyCount >= 1) {
+        logEvent("comment_recovery_post_not_ready_break", { postNotReadyCount, tried: attempts.length, postUrl, reason: "post_pending_break_on_first_detection_recheck_after_backoff" });
         break;
       }
     }
@@ -14167,7 +14168,7 @@ let __lastCommentResweepAt = 0;
 // approval / not yet visible) must NOT be re-cycled through profiles every 90s sweep — that was the overnight profile
 // churn (a stuck post burning profiles repeatedly). Skip it for ~20min, then retry (in case it went live/approved).
 const __commentRecoveryBackoff = new Map(); // postUrl -> last-attempt ms
-const COMMENT_RECOVERY_BACKOFF_MS = 20 * 60 * 1000;
+const COMMENT_RECOVERY_BACKOFF_MS = 22 * 60 * 1000; // operator 2026-06-16: re-check a pending post after ~22 min (FB approval window) instead of re-cycling it sooner — gives the moderator-approval time, then it gets approved + commented on the later pass
 async function resweepUncommentedFacebookPostsAsync(options = {}) {
   if (__commentResweepInFlight) return __commentResweepInFlight;
   __commentResweepInFlight = (async () => {
