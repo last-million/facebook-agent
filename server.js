@@ -7902,6 +7902,13 @@ function productHasReadyAssets(product, state = readState(), reviewImages = null
     const rec = harvestedRecordForKey(product.key, state);
     if (!rec || !rec.firstCommentUrl || !rec.imageLocalPath || rec.imageDeleted || !imageFileLooksValid(safeProjectPath(rec.imageLocalPath))) return false;
     if (HARVEST_NONPRODUCT_LINK.test(String(rec.firstCommentUrl))) return false; // junk (news/blog) link -> never post
+    // ALREADY CLAIMED/POSTED THIS RUN -> never "ready" again this run. The per-run claim is the authoritative
+    // "used this run" signal; lastPostedAt below can LAG (set after the claim, or skipped when a kill interrupts
+    // the record path), and a re-offered just-posted product is exactly what stalled the run on repeated
+    // skipped_already_used. Excluding it here drops it from the buffer reserve, the plan rebuild AND the picker in
+    // ONE place, so the rebuild brings only fresh/unclaimed products and the run advances through the whole buffer.
+    // (A FAILED post releases its claim -> the product is ready again to retry. A new run = new runId, no claims.)
+    if (isProductClaimedForRun(state, product.key)) return false;
     // RE-USE WINDOW: ready if image-on-disk AND (never posted OR last post older than reuseHours). Lets a posted
     // product rotate back in after reuseHours so production never stalls. (lastPostedAt||posted for back-compat.)
     const reuseHours = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 26);
@@ -8214,6 +8221,17 @@ function claimPostProductForRun(state, productKey) {
 }
 function releasePostProductForRun(state, productKey) {
   try { if (!productKey) return; const f = path.join(postClaimDirForRun(state), crypto.createHash("sha1").update(String(productKey).toLowerCase()).digest("hex") + ".claim"); fs.rmSync(f, { force: true }); } catch (_) {}
+}
+// Is this product ALREADY claimed (posted or in-flight) THIS run? The picker uses this to SKIP it at pick time
+// instead of picking it and letting claimPostProductForRun reject it later — otherwise the batch fills with
+// sure-skips (the same already-posted products that rank "fresh" because they aren't marked used in the rebuilt
+// plan), and the run stalls without ever reaching the unclaimed rows. (Released claims = retryable, stay pickable.)
+function isProductClaimedForRun(state, productKey) {
+  try {
+    if (!productKey) return false;
+    const f = path.join(postClaimDirForRun(state), crypto.createHash("sha1").update(String(productKey).toLowerCase()).digest("hex") + ".claim");
+    return fs.existsSync(f);
+  } catch (_) { return false; }
 }
 
 // Close ALL prod-eligible ixBrowser profiles (cleanup leaked/open windows). Idempotent (already-closed = ok);
@@ -9123,6 +9141,7 @@ async function autopilotTickAsync(options = {}) {
         if (enforceGroupCap && (__pickedByGroup.get(gKey) || 0) >= __perGroupCap) continue; // hold this group at its fair share on the first pass
         const prodKey = String(row.productKey || row.productUrl || row.link || "").toLowerCase();
         if (prodKey && usedProductKeys.has(prodKey)) continue; // each post must use a UNIQUE product
+        if (prodKey && isProductClaimedForRun(state, prodKey)) continue; // ALREADY claimed/posted this run -> skip at PICK time (don't fill the batch with sure-skips; advance to a fresh row)
         // CONCURRENCY SAFETY: two products whose markers are the same OR variant SIBLINGS (shared long title
         // prefix, e.g. RC Lambo "...- Red" vs "...- White") must NOT be in the same parallel batch — their
         // near-identical captions make feed-capture ambiguous. Skip siblings.
