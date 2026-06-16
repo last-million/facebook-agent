@@ -19870,28 +19870,14 @@ server.listen(PORT, HOST, () => {
   // If a prod run was interrupted by this restart, record it for the Prod-tab banner and
   // disarm BEFORE the scheduler starts — the operator chooses Continue / Relaunch / Dismiss.
   detectIncompleteRunAtBoot();
-  // CRASH-SCOPED COMMENT RECOVERY (2026-06-14): if THIS restart interrupted an ACTIVE run (a crash — reason
-  // run_active_at_restart, NOT a clean stop), the run's in-flight first comments never finished (no clean auto-disarm
-  // / stop drain ran), leaving posts published-but-uncommented. Fire ONE comment drain SCOPED TO THE CRASHED RUN's
-  // posts: ignoreArmedGate keeps the run-cutoff clamp (cutoff = max(cutoff, autopilotRunId)), so it can NEVER
-  // back-fill OLD posts (honors the operator's no-old-back-fill rule) — only the just-crashed run's own posts.
-  // Posting stays DISARMED (comments only); a real operator STOP still aborts it. ~90s after boot so the box settles.
-  setTimeout(() => {
-    try {
-      const __ir = readState().operator?.lastIncompleteRun;
-      if (__ir && __ir.reason === "run_active_at_restart" && __ir.status === "pending") {
-        logEvent("crash_run_comment_recovery_start", { posted: __ir.posted, max: __ir.max });
-        (async () => {
-          for (let pass = 0; pass < 5; pass += 1) {
-            const r = await resweepUncommentedFacebookPostsAsync({ ignoreArmedGate: true, max: 50, windowHours: 24 }).catch(() => null);
-            if (!r || (r.checked === 0 && r.recommented === 0)) break;
-            await sleep(5000);
-          }
-          logEvent("crash_run_comment_recovery_done", {});
-        })().catch(() => {});
-      }
-    } catch (_) {}
-  }, 90000);
+  // CRASH-SCOPED COMMENT RECOVERY — DISABLED (operator 2026-06-16: "no need to finish late comments AT REST — finish
+  // them when I LAUNCH prod"). Running a comment drain at boot churned through profiles on an IDLE server (opened
+  // p72/74/83… to comment posts that were pending-approval -> couldn't -> closed), which is browser activity at rest
+  // and violates "a server at rest opens ZERO browsers". Owed comments are still finished at the RIGHT time, never at
+  // rest: (1) when prod RUNS — the armed, run-scoped tick resweep (autopilotTickAsync) drains the current run's owed
+  // comments; on AUTO-RESUME it keeps the same runId so the resumed run finishes its own posts' comments; and
+  // (2) on STOP — stopAllExternalWork's stop-drain. A disarmed/given-up run's owed comments simply WAIT until the
+  // operator launches/resumes prod. (boot crash-recovery setTimeout intentionally removed.)
   // ORPHAN CLEANUP: a few seconds after boot (and ONLY if no run got armed in the meantime), kill leftover
   // ixBrowser chrome from the prior/crashed process so it can't wedge ixBrowser or hog RAM. Targeted + safe.
   setTimeout(() => { try { const __st = readState(); if (!(__st.operator?.autopilotEnabled && __st.operator?.armedForExternalActions)) cleanOrphanIxBrowserChromeAtBoot(); else logEvent("boot_orphan_cleanup_skipped_armed", {}); } catch (_) {} }, 4000);
