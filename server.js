@@ -7483,6 +7483,24 @@ function isProfileBlockedForPosting(label, state, groupUrl = "") {
   return /status=(cannot_comment|cannot_post_in_any_group)|action=quarantined|skip_profile/i.test(latest);
 }
 
+// Is this profile's CURRENT bench an AUTO-BLACKLIST for repeated posting failures (auto_blocked=1 /
+// auto_blacklist_repeated_blocking_failures), or a leftover ixBrowser-1018 quota line? The ixBrowser reconcile
+// PASS 2 must NOT auto-unbench these (doing so created the blacklist<->unblock churn that produced 95% failures);
+// they stay parked until the operator Releases them or the bench ages out. A later unblock/resolve clears it.
+function isAutoBlacklistedStickyBench(profileId, state) {
+  try {
+    const pid = Number(profileId);
+    if (!pid) return false;
+    const lines = [String(state.posting?.facebookProfileStatus || ""), String(state.ixbrowser?.failedProfiles || "")]
+      .join("\n").toLowerCase().split(/\r?\n/).filter((l) => l.includes(`profile_id=${pid}`));
+    const latest = lines[lines.length - 1] || "";
+    if (!latest) return false;
+    if (/action=(profile_unblocked|profile_group_unblocked)|status=(resolved|approved|cleared|ignored)/i.test(latest)) return false;
+    if (postingFailureLineExceededAgeBudget(latest)) return false; // aged-out benches are fine to clear
+    return /auto_blocked=1|auto_blacklist_repeated_blocking_failures|opening times per day|error 1018|daily.*open.*quota/i.test(latest);
+  } catch (_) { return false; }
+}
+
 function isFacebookProfileQuarantinedForFacebook(label, state = readState(), groupUrl = "") {
   const text = String(label || "").trim();
   if (!text) return false;
@@ -8948,6 +8966,10 @@ function autopilotMayPostNow() {
   if (s.operator?.autopilotEnabled !== true) return { ok: false, reason: "disabled" };
   if (s.operator?.armedForExternalActions !== true) return { ok: false, reason: "disarmed" };
   if (s.operator?.paused === true) return { ok: false, reason: "paused" }; // PAUSED: stay armed, make no NEW posts until resumed
+  // ixBrowser DAILY OPEN-QUOTA pause (error 1018): the account's profile-open quota is exhausted — NO profile can
+  // open until it resets. Stay ARMED (so the run resumes toward N when the quota resets / the latch expires + re-
+  // probes) but make no new opens. This replaces the old behaviour of churning every profile against 1018 for hours.
+  if (ixOpenQuotaLatchedUntil(s) > Date.now()) return { ok: false, reason: "ix_open_cap_reached" };
   const lim = autopilotRunLimit(s);
   if (lim > 0 && autopilotPostsThisRunCount(s) >= lim) return { ok: false, reason: "run_limit_reached" };
   return { ok: true };
@@ -11729,6 +11751,10 @@ function isFacebookGroupMembershipFailure(message = "") {
 }
 
 function isFacebookProfileOpenOrLoginFailure(message = "") {
+  // EXCLUDE the ixBrowser daily open-quota (1018): it contains "ixbrowser ... error" so it WOULD match below and be
+  // mis-treated as a per-profile open/login failure (-> group_issue + blacklist churn). It is account-wide infra,
+  // handled as a run-level pause elsewhere; never a per-profile failure.
+  if (isIxBrowserDailyOpenQuotaExhausted(message)) return false;
   return /ixbrowser.*(?:profile-open|profile open|timeout|timed out|login|required|error)|profile-open.*(?:timeout|timed out|error)|facebook_login_required_for_profile|facebook login required|checkpoint|two-factor|two factor|connectovercdp|cdp.*(?:timeout|timed out|refused|closed)|target page|browser has been closed/i.test(String(message || ""));
 }
 
@@ -16217,6 +16243,24 @@ function maybeParkPersistentOpen1004(pid, profile, errorText, opts = {}) {
   } catch (_e) { /* never break a posting flow */ }
 }
 
+// ixBrowser DAILY OPEN-QUOTA latch (error 1018): when the account's per-day profile-open quota is exhausted, NO
+// profile can open until it resets. Instead of CHURNING (the 95%-fail blacklist/unblock loop), PAUSE new opens,
+// keep the run ARMED (so it resumes toward N when the quota resets), and re-probe after the pause. Persisted in
+// operator.ixOpenCapHitUntil (survives restart). Cleared early by any successful open.
+let __ixOpenQuotaExhaustedUntil = 0;
+function markIxBrowserOpenQuotaExhausted(reason = "") {
+  const until = Date.now() + 60 * 60 * 1000; // pause ~60 min then re-probe; cleared early by a successful open
+  __ixOpenQuotaExhaustedUntil = until;
+  try { const s = readState(); s.operator = s.operator || {}; s.operator.ixOpenCapHitUntil = until; writeState(s, { controlWrite: true }); } catch (_) {}
+  if (!markIxBrowserOpenQuotaExhausted.__t || Date.now() - markIxBrowserOpenQuotaExhausted.__t > 120000) { try { logEvent("ixbrowser_daily_open_quota_exhausted", { reason: oneLineField(reason, 80), pauseMin: 60 }); } catch (_) {} markIxBrowserOpenQuotaExhausted.__t = Date.now(); }
+}
+function ixOpenQuotaLatchedUntil(state) { return Math.max(__ixOpenQuotaExhaustedUntil, Number((state || readState()).operator?.ixOpenCapHitUntil || 0)); }
+function clearIxOpenQuotaLatchOnSuccess() {
+  if (__ixOpenQuotaExhaustedUntil === 0) { try { if (!Number(readState().operator?.ixOpenCapHitUntil || 0)) return; } catch (_) { return; } }
+  __ixOpenQuotaExhaustedUntil = 0;
+  try { const s = readState(); if (Number(s.operator?.ixOpenCapHitUntil || 0)) { s.operator.ixOpenCapHitUntil = 0; writeState(s, { controlWrite: true }); logEvent("ixbrowser_daily_open_quota_cleared", { reason: "successful_open" }); } } catch (_) {}
+}
+
 // Records the outcome of a single profile's post attempt and auto-blacklists the
 // profile when it is genuinely blocked/restricted. NEVER throws (health tracking
 // must not break a posting flow).
@@ -16226,8 +16270,17 @@ function autoBlacklistProfileIfNeeded(opts = {}) {
     const pid = Number(opts.profileId || profileIdFromLabel(profile) || 0);
     if (!pid) return;
     const ok = Boolean(opts.ok || opts.postUrl); // a captured permalink proves the profile CAN post
-    if (ok) { __profileBlockStreak[pid] = 0; return; }
+    if (ok) { __profileBlockStreak[pid] = 0; clearIxOpenQuotaLatchOnSuccess(); return; }
     const errorText = String(opts.errorText || opts.error || "");
+    // ixBrowser DAILY OPEN-QUOTA (1018): account-wide infra, NOT this profile's fault. NEVER bench/blacklist it
+    // (cycling profiles can't help — the whole account is capped). Set the run-level pause latch (autopilotMayPostNow
+    // halts new opens until the quota resets) + return. The profile stays clean and re-enters rotation after reset.
+    const __valErr = (opts.validation && Array.isArray(opts.validation.errors)) ? opts.validation.errors.join(" ") : "";
+    if (isIxBrowserDailyOpenQuotaExhausted(errorText) || isIxBrowserDailyOpenQuotaExhausted(__valErr)) {
+      markIxBrowserOpenQuotaExhausted("post_attempt_failed_1018");
+      __profileBlockStreak[pid] = 0;
+      return;
+    }
     const hard = isHardAccountBlockOutcome(errorText, opts.validation);
     // INFRA, NOT ACCOUNT HEALTH: a pure ixBrowser PROFILE-OPEN / connection failure (1004 "Profile Open
     // Failed", could-not-open, cdp/connect, window closed, server busy) is ixBrowser's fault — NEVER bench the
@@ -16457,7 +16510,12 @@ async function reconcileProfilesWithIxBrowser(options = {}) {
       if (isReservedReconcileProfile(id, label, state)) continue;
       if (isFacebookProfileQuarantinedForFacebook(String(id), state, "")) continue; // genuine suspension stays
       if (!isProfileBlockedForPosting(String(id), state, "")) { summary.kept += 1; continue; }
-      // Benched, but NOT a genuine suspension => automation-only bench. Clear it.
+      // STICKY (operator 2026-06-16): do NOT auto-unbench a profile AUTO-BLACKLISTED for repeated posting failures
+      // (or a leftover ixBrowser-1018 quota line). Un-benching these every ~60s is exactly what created the
+      // blacklist<->unblock churn (95% failures). They stay parked until the operator Releases them (Prod tab) or
+      // the bench ages out. Only TRANSIENT automation benches (composer-not-found, single open hiccup) clear here.
+      if (isAutoBlacklistedStickyBench(id, state)) { try { logEvent("ixbrowser_reconcile_unbench_skipped_sticky", { profileId: id }); } catch (_) {} summary.kept += 1; continue; }
+      // Benched, but NOT a genuine suspension or a sticky auto-blacklist => automation-only bench. Clear it.
       try {
         const result = unblockPostingProfile({ profileId: String(id), profileLabel: label, reason: "ixbrowser reconcile: automation-only bench cleared (profile still exists)" });
         // unblockPostingProfile persists immediately; refresh our working copy so PASS-1 edits
@@ -17801,7 +17859,13 @@ function ixBrowserError(error) {
   const loginRequired = code === 10002 || /重新登录|請重新登入|请重新登录|login/i.test(rawMessage);
   const profileMissing = code === 2007 || /profile does not exist|profile not found|配置文件不存在/i.test(rawMessage);
   const profileOpenFailed = code === 1004 || /profile open failed|配置文件打开失败/i.test(rawMessage);
-  const message = loginRequired
+  // ixBrowser PLAN daily OPEN-QUOTA (error 1018): "The N profile opening times per day for the current plan have
+  // been used up." This is ACCOUNT-WIDE INFRA — NOT a per-profile/group failure. It must NEVER bench/blacklist/
+  // group-issue a profile or count toward auto-approval; cycling profiles can't help (the whole account is capped).
+  const quotaExhausted = code === 1018 || /opening times per day|times per day.*(?:used up|exceed)|daily.*open.*(?:limit|quota)|每日.*打开.*次数/i.test(rawMessage);
+  const message = quotaExhausted
+    ? `IXBrowser DAILY PROFILE-OPEN QUOTA exhausted (error ${code}): the plan's profile-open-per-day limit is used up. No profile can open until the quota resets (~24h) or the plan is upgraded.`
+    : loginRequired
     ? "IXBrowser login required. Open the IXBrowser desktop app, log in again, keep it running, then click Test IXBrowser or Load IXBrowser Profiles."
     : profileMissing
       ? `IXBrowser profile no longer exists (error ${code}). Remove this profile from posting assignments and reload IXBrowser profiles.`
@@ -17809,8 +17873,10 @@ function ixBrowserError(error) {
         ? `IXBrowser could not open this profile (error ${code}). It may be locked by another open window or iX desktop is glitched. The system will try the next profile.`
         : `IXBrowser error ${code}: ${rawMessage}`;
   const err = new Error(message);
-  err.statusCode = loginRequired ? 409 : profileMissing ? 404 : 502;
-  err.publicError = loginRequired
+  err.statusCode = quotaExhausted ? 429 : loginRequired ? 409 : profileMissing ? 404 : 502;
+  err.publicError = quotaExhausted
+    ? "ixbrowser_daily_open_quota_exhausted"
+    : loginRequired
     ? "ixbrowser_login_required"
     : profileMissing
       ? "ixbrowser_profile_missing"
@@ -17818,7 +17884,20 @@ function ixBrowserError(error) {
         ? "ixbrowser_profile_open_failed"
         : "ixbrowser_error";
   err.ixBrowserCode = code;
+  err.ixBrowserQuotaExhausted = quotaExhausted;
   return err;
+}
+// True for the ixBrowser daily profile-open-quota error (1018). Account-wide infra: callers must treat it as a
+// run-level PAUSE (no profile can open), NOT a per-profile failure (never bench/blacklist/group-issue/auto-approve).
+function isIxBrowserDailyOpenQuotaExhausted(messageOrErr) {
+  if (!messageOrErr) return false;
+  if (typeof messageOrErr === "object") {
+    if (messageOrErr.ixBrowserQuotaExhausted === true) return true;
+    if (Number(messageOrErr.ixBrowserCode) === 1018) return true;
+    if (messageOrErr.publicError === "ixbrowser_daily_open_quota_exhausted") return true;
+  }
+  const s = String((messageOrErr && messageOrErr.message) || messageOrErr || "");
+  return /\b1018\b|opening times per day|times per day.*(?:used up|exceed)|daily.*open.*(?:limit|quota)|每日.*打开.*次数/i.test(s);
 }
 
 function ixBrowserProfileRows(payload) {
