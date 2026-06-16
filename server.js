@@ -6193,6 +6193,10 @@ async function withIxBrowserProfileOpenLock(profileId, work) {
   }
 }
 
+// Profiles we've OPENED this session (added on acquire). closeFinishedIxProfilesSweep closes the ones no longer
+// in use (post/comment finished) — the safety net for a close-after-use that lagged/failed, so a lingering
+// profile can't pile up and choke the ixBrowser desktop app (the overnight freeze/crash).
+const __everOpenedIxProfiles = new Set();
 function acquireNormalIxProfileUse(profileId, purpose) {
   const numericProfileId = Number(profileId);
   if (!numericProfileId || isDedicatedShopYourLikesIxProfile(numericProfileId)) return () => {};
@@ -6214,6 +6218,7 @@ function acquireNormalIxProfileUse(profileId, purpose) {
     throw err;
   }
   normalIxProfileUseLocks.set(key, { purpose: oneLineField(purpose || "workflow", 120), startedAt: new Date().toISOString() });
+  __everOpenedIxProfiles.add(key); // track for the finished-profile cleanup sweep
   return () => {
     if (normalIxProfileUseLocks.get(key)?.purpose === oneLineField(purpose || "workflow", 120)) {
       normalIxProfileUseLocks.delete(key);
@@ -8250,6 +8255,41 @@ async function closeAllOpenIxProfiles() {
   return { total: ids.size, closed, alreadyClosed, failed };
 }
 
+// PROACTIVE FINISHED-PROFILE CLEANUP (operator 2026-06-16: "close tabs/profiles that finished work to avoid
+// freezing"): close ixBrowser profiles we OPENED that are no longer in use (their post/comment finished). The
+// per-op close-after-use already does this on the happy path; this is the SAFETY NET for a close that lagged/
+// failed, so a finished profile can't linger + pile up and choke the ixBrowser desktop into the freeze/crash seen
+// overnight. SKIPS profiles currently locked (in use); ixBrowserCloseAfterUse no-ops the dedicated SYL profile.
+// Bounded + single-flight; closing is idempotent (already_closed = harmless).
+let __closeFinishedSweepInFlight = false;
+let __lastCloseFinishedSweepAt = 0;
+async function closeFinishedIxProfilesSweep(options = {}) {
+  if (__closeFinishedSweepInFlight) return { skipped: "in_flight" };
+  __closeFinishedSweepInFlight = true;
+  const summary = { checked: 0, closed: 0, alreadyClosed: 0, failed: 0 };
+  try {
+    const max = clampNumber(options.max, 1, 30, 12);
+    const candidates = [...__everOpenedIxProfiles].filter((k) => !normalIxProfileUseLocks.has(k)).slice(0, max);
+    for (const key of candidates) {
+      if (normalIxProfileUseLocks.has(key)) continue; // re-check: skip if it got re-acquired mid-sweep (in use)
+      summary.checked += 1;
+      try {
+        const r = await ixBrowserCloseAfterUse(Number(key), "close_finished_profile_sweep");
+        const handled = r.status === "closed" || r.status === "already_closed" || r.status === "kept_open_dedicated_shopyourlikes_profile";
+        if (r.status === "closed") summary.closed += 1; else if (handled) summary.alreadyClosed += 1; else summary.failed += 1;
+        if (handled) __everOpenedIxProfiles.delete(key); // confirmed handled -> drop; a future open re-adds it. Keep on FAILURE so the next sweep retries.
+      } catch (_) { summary.failed += 1; }
+    }
+    if (summary.closed > 0 || summary.failed > 0) logEvent("close_finished_ix_profiles_sweep", summary);
+  } catch (err) {
+    logEvent("close_finished_ix_profiles_sweep_error", { error: oneLineField((err && err.message) || String(err), 160) });
+  } finally {
+    __lastCloseFinishedSweepAt = Date.now();
+    __closeFinishedSweepInFlight = false;
+  }
+  return summary;
+}
+
 // PRE-FLIGHT PROFILE HEALTH SWEEP: open every prod-eligible profile (resource-guarded, small concurrency),
 // check its Facebook state (logged in / needs-login / suspended — EN/FR/AR + the language-independent
 // password-field+URL fallback) and PARK the bad ones, so the next prod run only uses healthy accounts.
@@ -8953,6 +8993,12 @@ async function autopilotTickAsync(options = {}) {
         && !__reconcileIntentsInFlight && (Date.now() - __lastIntentReconcileAt) > 300000) {
       reconcilePendingPublishIntentsAsync({ max: 3 }).catch(() => {});
     }
+    // PROACTIVE PROFILE CLEANUP: close profiles that finished their work so they can't pile up and choke the
+    // ixBrowser desktop (the overnight freeze). Fire-and-forget, single-flight, throttled ~2 min. Closing only;
+    // never opens a browser, skips in-use + the dedicated SYL profile.
+    if (!dryRun && !__closeFinishedSweepInFlight && (Date.now() - __lastCloseFinishedSweepAt) > 120000) {
+      closeFinishedIxProfilesSweep({ max: 12 }).catch(() => {});
+    }
     // CONTENT-SOURCE HARVEST (default OFF): fire-and-forget, single-flight, armed-gated, ~1-min re-scan
     // cadence (__harvestNextAt). Harvests source groups' posts (text + image + first-comment link) into
     // the buffer in parallel 4-by-4. When contentSourcesEnabled is off this never fires.
@@ -9362,20 +9408,31 @@ function detectIncompleteRunAtBoot() {
     //     auto-resets the counter).
     const __runId = Number(op.autopilotRunId) || 0;
     const __runRecent = __runId > 0 && (Date.now() - __runId) < 8 * 3600 * 1000;
-    const __attempts = (__runId > 0 && String(op.autopilotCrashResumeRunId || "") === String(__runId)) ? (Number(op.autopilotCrashResumeAttempts) || 0) : 0;
+    const __sameRun = __runId > 0 && String(op.autopilotCrashResumeRunId || "") === String(__runId);
+    // PROGRESS-AWARE crash-loop cap (operator 2026-06-16: a 100-post run STOPPED at 36 because the flat
+    // "3 resumes then give up" cap fired even though EVERY segment was POSTING — an intermittent ixBrowser
+    // desktop hiccup, NOT a tight loop). Now a crashed segment that published >=1 post means the run is
+    // ADVANCING -> reset the zero-progress counter; only 3 CONSECUTIVE crashes that posted NOTHING (a true
+    // tight loop / dead dependency) give up and leave the pending banner. An absolute 40-resume/run bound
+    // still prevents a true infinite loop. `posted` here is this crashed segment's count (reset to 0 each resume).
+    const __madeProgress = posted >= 1;
+    const __priorNoProgress = __sameRun ? (Number(op.autopilotCrashResumeNoProgress) || 0) : 0;
+    const __noProgressNow = __madeProgress ? 0 : (__priorNoProgress + 1);
+    const __totalResumes = __sameRun ? (Number(op.autopilotCrashResumeAttempts) || 0) : 0;
     const __canAutoResume = op.autopilotAutoResumeEnabled === true && __reason === "run_active_at_restart"
-      && max > 0 && posted < max && __runRecent && __attempts < 3;
+      && max > 0 && posted < max && __runRecent && __noProgressNow < 3 && __totalResumes < 40;
     if (__canAutoResume) {
       state.operator.lastIncompleteRun = { at: new Date().toISOString(), posted, max, reason: __reason, status: "auto_resumed", resolvedAt: new Date().toISOString() };
       state.operator.autopilotCrashResumeRunId = String(__runId);
-      state.operator.autopilotCrashResumeAttempts = __attempts + 1;
+      state.operator.autopilotCrashResumeAttempts = __totalResumes + 1;
+      state.operator.autopilotCrashResumeNoProgress = __noProgressNow;
       state.operator.autopilotMaxPostsPerRun = Math.max(1, max - posted); // continue toward the same N total
       state.operator.autopilotPostsThisRun = 0;
       state.operator.autopilotEnabled = true;
       state.operator.armedForExternalActions = true;
       state.operator.autopilotDryRun = false;
       writeState(state, { controlWrite: true });
-      logEvent("autopilot_auto_resumed_after_crash", { posted, max, remaining: Math.max(1, max - posted), attempt: __attempts + 1, runId: String(__runId) });
+      logEvent("autopilot_auto_resumed_after_crash", { posted, max, remaining: Math.max(1, max - posted), totalResumes: __totalResumes + 1, consecutiveNoProgress: __noProgressNow, madeProgress: __madeProgress, runId: String(__runId) });
       return;
     }
     state.operator.lastIncompleteRun = {
