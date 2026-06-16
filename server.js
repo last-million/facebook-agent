@@ -11470,6 +11470,27 @@ function findOrphanedPublishIntents(options = {}) {
   return orphans;
 }
 
+// Did the marker-scan ABORT (timeout / budget-exceeded / nav-or-render failure) rather than COMPLETE-and-find-
+// nothing? recoverSubmittedFacebookPostUrl returns ok:false for BOTH; only a CLEAN completed not-found is a
+// trustworthy "didn't land". Releasing a claim on an inconclusive scan can re-post a LANDED post (duplicate),
+// so the reconciler must treat inconclusive as "unknown -> retry/flag, never release". Leans conservative:
+// when unsure, return true (prefer under-deliver-and-flag over duplicate).
+function reconcileScanWasInconclusive(rec) {
+  if (!rec) return true;
+  try {
+    const errs = (rec.validation && Array.isArray(rec.validation.errors)) ? rec.validation.errors.map(String) : [];
+    if (errs.some((e) => /connector_error|timeout|timed_?out|budget|navigation|render/i.test(e))) return true;
+    const objs = Array.isArray(rec.objects) ? rec.objects : [];
+    for (const o of objs) {
+      if (!o) continue;
+      if (o.findOnlyBudgetExceeded === true || o.budgetExceeded === true) return true;
+      const s = String((o && (o.step || o.event || o.reason || o.error)) || "");
+      if (/budget_exceeded|timed_?out|timeout|navigation_failed|render_failed|group_render/i.test(s)) return true;
+    }
+  } catch (_) {}
+  return false;
+}
+
 let __reconcileIntentsInFlight = null;
 let __lastIntentReconcileAt = 0;
 const __intentScanAttempts = new Map(); // intentId -> consecutive not-found/inconclusive scans (in-memory; reset on restart = a few extra safe scans)
@@ -11542,30 +11563,29 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
             logEvent("publish_intent_reconcile_recovered", { planId, sequence, profileId, postUrl: rec.postUrl });
             summary.recovered += 1;
           } else {
-            // NOT-FOUND or INCONCLUSIVE. recoverSubmittedFacebookPostUrl returns ok:false for a genuine not-landed
-            // AND for a timeout/budget-exceeded/feed-lag scan, AND an approval-gated post that LANDED is pending +
-            // feed-INVISIBLE to the author -> a false negative. So a single ok:false is NOT authoritative; NEVER
-            // release on it (that is the duplicate-post regression). Retry across passes:
-            //  * approval-required group: NEVER auto-release (a pending landed post would be re-posted then both
-            //    approved = duplicate). Re-scan over a window covering approval propagation (~30 min); if still
-            //    not found, flag for manual review and KEEP the claim.
-            //  * non-approval group: a landed post is immediately visible, so a persistent not-found is reliable ->
-            //    release after a couple retries (absorbs transient feed-lag).
+            // ok:false = NOT-FOUND or INCONCLUSIVE. recover returns ok:false for a genuine not-landed AND for a
+            // timeout/budget-exceeded/render-failed scan (which knows NOTHING), AND an approval-pending post is
+            // feed-INVISIBLE -> false negative. Releasing a claim on any non-clean signal re-posts a landed post
+            // = duplicate. So release the claim ONLY when ALL hold: NON-approval group + the scan COMPLETED CLEANLY
+            // (not inconclusive) + it has found nothing across >=2 passes (a landed non-approval post is instantly
+            // visible, so a clean repeated not-found is trustworthy). Everything else — approval group, OR any
+            // inconclusive/aborted scan — is retried, then FLAGGED with the claim KEPT. Never re-posted -> no dup.
             const attempts = (__intentScanAttempts.get(String(it.key)) || 0) + 1;
             __intentScanAttempts.set(String(it.key), attempts);
-            const maxAttempts = approvalGroup ? 6 : 2; // 6 x 5min covers the 10-30min approval queue; 2 covers feed-lag
-            if (attempts < maxAttempts) {
-              logEvent("publish_intent_reconcile_retry", { planId, sequence, profileId, attempts, maxAttempts, approvalGroup });
-              summary.retried += 1; // leave UNRESOLVED -> re-scanned next pass
-            } else if (approvalGroup) {
-              writeResolved("needs_manual_review", "");
-              logEvent("publish_intent_reconcile_flagged", { planId, sequence, profileId, reason: "approval_group_not_found_keep_claim", attempts });
-              summary.flagged += 1;
-            } else {
+            const inconclusive = reconcileScanWasInconclusive(rec);
+            const giveUpAttempts = 6; // ~30 min of 5-min retries before we stop and flag (claim kept)
+            if (!approvalGroup && !inconclusive && attempts >= 2) {
               releaseClaim();
               writeResolved("released_not_landed", "");
               logEvent("publish_intent_reconcile_released", { planId, sequence, profileId, attempts });
               summary.released += 1;
+            } else if (attempts >= giveUpAttempts) {
+              writeResolved("needs_manual_review", "");
+              logEvent("publish_intent_reconcile_flagged", { planId, sequence, profileId, reason: approvalGroup ? "approval_not_found_keep_claim" : "inconclusive_or_unconfirmed_keep_claim", attempts, inconclusive });
+              summary.flagged += 1;
+            } else {
+              logEvent("publish_intent_reconcile_retry", { planId, sequence, profileId, attempts, approvalGroup, inconclusive });
+              summary.retried += 1; // leave UNRESOLVED -> re-scanned next pass
             }
           }
         } catch (err) {
