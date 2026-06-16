@@ -18695,6 +18695,41 @@ function __reportMedian(nums) {
 }
 function __reportPct(n, d) { return d > 0 ? Math.round((n / d) * 100) : 0; }
 
+// Prod-tab "accounts with the MOST issues that waste time": aggregate GENUINE per-profile posting failures over the
+// last windowHours, EXCLUDING ixBrowser infra/quota (1018 daily-open-quota + 1004 open-fail + connect/cdp) — those
+// are NOT bad accounts (e.g. the 1018 victims 70/71/84/78 that just posted the most early). Surfaces real group-
+// access / account blocks + the blacklist churn, sorted by a waste score. Reads events.log + the durable audit.
+function buildProblemProfiles(options = {}) {
+  const windowMs = clampNumber(options.windowHours, 1, 168, 24) * 3600 * 1000;
+  const cutoff = Date.now() - windowMs;
+  const byPid = new Map();
+  const seen = new Set();
+  const WANT = /^(profile_auto_blacklisted|facebook_live_post_group_failed|facebook_live_post_profile_failed_try_next_profile|posting_profile_unblocked|attempt_failed_no_fallback|profile_account_error_parked|profile_disconnected_parked)$/;
+  const INFRA = /\b1018\b|\b1004\b|opening times per day|daily.*open|profile[ _-]?open[ _-]?failed|could not open|cdp|connectovercdp|websocket|server busy|connection (?:closed|refused)|ECONN|socket hang|timed out|timeout/i;
+  const consume = (arr) => {
+    for (const e of arr) {
+      if (!e || !e.at) continue;
+      const t = Date.parse(e.at); if (!Number.isFinite(t) || t < cutoff) continue;
+      const m = String(e.message || e.event || ""); if (!WANT.test(m)) continue;
+      const pid = Number(e.profileId || 0); if (!pid) continue;
+      const k = e.at + "|" + m + "|" + pid; if (seen.has(k)) continue; seen.add(k);
+      const lastError = String(e.lastError || e.error || e.reason || "");
+      const rec = byPid.get(pid) || { profileId: pid, realFails: 0, unblocks: 0, infraFails: 0, lastReal: "", lastAt: "" };
+      if (m === "posting_profile_unblocked") rec.unblocks += 1;
+      else if (INFRA.test(lastError) || INFRA.test(m)) rec.infraFails += 1;
+      else { rec.realFails += 1; if (lastError) { rec.lastReal = oneLineField(lastError, 120); rec.lastAt = e.at; } }
+      byPid.set(pid, rec);
+    }
+  };
+  try { consume(readJsonlAbsoluteFile(LOG_FILE, { limit: 8000 })); } catch {}
+  try { const files = fs.readdirSync(AUDIT_DIR).filter((n) => /^audit-\d{4}-\d{2}-\d{2}\.log$/.test(n)).sort().slice(-2); for (const f of files) { try { consume(readJsonlAbsoluteFile(path.join(AUDIT_DIR, f), { limit: 40000 })); } catch {} } } catch {}
+  return [...byPid.values()]
+    .filter((r) => r.realFails > 0) // EXCLUDE pure-infra (1018/1004) victims — not bad accounts
+    .map((r) => ({ ...r, wasteScore: r.realFails + 2 * r.unblocks }))
+    .sort((a, b) => b.wasteScore - a.wasteScore)
+    .slice(0, 20);
+}
+
 function buildRunReports(force = false) {
   if (!force && __runReportCache.body && Date.now() - __runReportCache.at < RUN_REPORT_TTL_MS) {
     return __runReportCache.body;
@@ -18822,7 +18857,9 @@ function buildRunReports(force = false) {
       else if (st === "needs_manual_review") reconcile.needsReview += 1;
     }
   } catch {}
-  const body = { generatedAt: new Date().toISOString(), runCount: out.length, latest: out[0] || null, runs: out.slice(0, 30), reconcile };
+  let problemProfiles = [];
+  try { problemProfiles = buildProblemProfiles({ windowHours: 24 }); } catch {}
+  const body = { generatedAt: new Date().toISOString(), runCount: out.length, latest: out[0] || null, runs: out.slice(0, 30), reconcile, problemProfiles };
   __runReportCache.at = Date.now();
   __runReportCache.body = body;
   return body;
