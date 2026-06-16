@@ -4161,7 +4161,20 @@ async function main() {
     });
     console.log(JSON.stringify({ step: 'cpu_saver_route', blocked: 'media,font,video' }));
   } catch (e) { console.log(JSON.stringify({ step: 'cpu_saver_route_skipped', error: String(e.message || e).slice(0, 120) })); }
-  const page = context.pages().find(p => !p.isClosed()) || await context.newPage();
+  const __openTabs = context.pages().filter(p => !p.isClosed());
+  const page = __openTabs[0] || await context.newPage();
+  // KEEP-OPEN TAB DISCIPLINE (operator 2026-06-16: HARD CAP 2 tabs/profile). On a REUSED already-open profile, a
+  // prior run that was killed mid-verify can leave orphan verify/OG/probe tabs in this shared context; over a 5-post
+  // keep-open session those would pile up and risk the 201-chrome memory crash. Reuse the posting page (the oldest
+  // surviving tab) and close every OTHER surviving tab (oldest-first) beyond ONE scratch slot. NEVER closes the
+  // posting page, so it cannot break the post/comment flow. Best-effort; never throws.
+  try {
+    const __others = __openTabs.slice(1);
+    const __MAX_TABS = 2; // posting page + at most ONE scratch tab
+    const __toClose = __others.slice(0, Math.max(0, (__others.length + 1) - __MAX_TABS));
+    for (const __t of __toClose) { try { await __t.close(); } catch (_) {} }
+    if (__toClose.length) console.log(JSON.stringify({ step: 'tab_cap_trim', closed: __toClose.length, max: __MAX_TABS }));
+  } catch (_) {}
 
   if (!String(payload.facebookUserId || '').replace(/\D+/g, '')) {
     let detected = '';
