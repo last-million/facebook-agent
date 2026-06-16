@@ -11472,10 +11472,11 @@ function findOrphanedPublishIntents(options = {}) {
 
 let __reconcileIntentsInFlight = null;
 let __lastIntentReconcileAt = 0;
+const __intentScanAttempts = new Map(); // intentId -> consecutive not-found/inconclusive scans (in-memory; reset on restart = a few extra safe scans)
 async function reconcilePendingPublishIntentsAsync(options = {}) {
   if (__reconcileIntentsInFlight) return __reconcileIntentsInFlight;
   __reconcileIntentsInFlight = (async () => {
-    const summary = { orphans: 0, recovered: 0, released: 0, flagged: 0, errors: 0 };
+    const summary = { orphans: 0, recovered: 0, released: 0, flagged: 0, errors: 0, retried: 0 };
     try {
       const orphans = findOrphanedPublishIntents({ windowHours: options.windowHours || 24 });
       summary.orphans = orphans.length;
@@ -11483,6 +11484,7 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
       logEvent("publish_intent_reconcile_started", { orphans: orphans.length });
       const max = clampNumber(options.max, 1, 20, 5);
       const planRows = latestPostingPlanRows();
+      const reconState = readState();
       let done = 0;
       for (const it of orphans) {
         if (done >= max) break;
@@ -11494,17 +11496,27 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
         const parts = String(it.message || "").split("|");
         const runId = parts[0] || "";
         const claimHash = parts[1] || "";
-        const writeResolved = (status, postUrl) => { try { appendFacebookLivePostLedger({ event: "publish_intent_resolved", key: it.key, planId, sequence, profileId, groupUrl, postUrl: postUrl || "", status, message: String(it.message || "") }); } catch (_) {} };
+        const writeResolved = (status, postUrl) => { try { appendFacebookLivePostLedger({ event: "publish_intent_resolved", key: it.key, planId, sequence, profileId, groupUrl, postUrl: postUrl || "", status, message: String(it.message || "") }); } catch (_) {} __intentScanAttempts.delete(String(it.key)); };
         const releaseClaim = () => { try { if (claimHash) { const safe = String(runId).replace(/[^a-z0-9_-]/gi, "") || "default"; fs.rmSync(path.join(DATA_DIR, "post-claims", safe, claimHash + ".claim"), { force: true }); } } catch (_) {} };
-        const row = planRows.find((pr) => pr.planId === planId && Number(pr.sequence) === sequence) || (sequence ? planRows.find((pr) => Number(pr.sequence) === sequence) : null);
+        // EXACT planId+sequence ONLY. A sequence-only fallback would scan with a DIFFERENT product's marker
+        // (every tick regenerates planId + fully overwrites the plan), risking a wrong-post record OR a wrong
+        // release (-> duplicate). If the exact row is gone, flag + KEEP the claim (never blind-release).
+        const row = planRows.find((pr) => pr.planId === planId && Number(pr.sequence) === sequence);
         if (!row || !groupUrl || !profileId) {
-          // Cannot marker-scan without the plan row/group/profile. Do NOT blind-release (a landed post would then
-          // be re-posted = duplicate). Flag for manual review + keep the claim; the report surfaces it.
           writeResolved("needs_manual_review", "");
-          logEvent("publish_intent_reconcile_flagged", { planId, sequence, profileId, reason: !row ? "plan_row_missing" : (!groupUrl ? "group_missing" : "profile_missing") });
+          logEvent("publish_intent_reconcile_flagged", { planId, sequence, profileId, reason: !row ? "exact_plan_row_gone" : (!groupUrl ? "group_missing" : "profile_missing") });
           summary.flagged += 1;
           continue;
         }
+        // Already recorded? (kill landed AFTER the in-process `published` record but before the finally) -> resolve,
+        // never re-scan/release. Cheap ledger check, prevents a needless scan + any release of a recorded post.
+        const already = latestPublishedFacebookLivePostForRow(row, profileId);
+        if (already && already.postUrl) {
+          writeResolved("already_recorded", already.postUrl);
+          logEvent("publish_intent_reconcile_already_recorded", { planId, sequence, profileId, postUrl: already.postUrl });
+          continue;
+        }
+        const approvalGroup = isAdminApprovalEnabledForGroup(groupUrl, reconState);
         try {
           const rec = await recoverSubmittedFacebookPostUrl({ row, ready: { profileId }, groupUrl, ledgerKey: `reconcile:${it.key}`, reason: "kill-mid-post reconcile: scan whether the interrupted post actually landed" });
           if (rec && rec.ok && rec.postUrl) {
@@ -11512,18 +11524,52 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
             const actualGroupUrl = facebookGroupUrlFromPostUrl(rec.postUrl) || groupUrl;
             try { recordPublishedFacebookPostUrl({ postUrl: rec.postUrl, row, planId, sequence, profile: row.profile || profileId, groupUrl: actualGroupUrl }); } catch (_) {}
             appendFacebookLivePostLedger({ event: "published", key: it.key, planId, sequence, profileId, profile: row.profile || "", groupUrl, actualGroupUrl, postUrl: rec.postUrl, status: "published", message: "recovered after kill-mid-post (publish_intent reconcile)", validation: rec.validation || null });
+            // COUNT it toward the run if it belongs to the CURRENT run (parity with the live counter bump), so a
+            // recovered landed post doesn't make a "stop at N" run over-publish by 1.
+            try {
+              const sNow = readState();
+              if (runId && String(sNow.operator?.autopilotRunId || "") === String(runId)) {
+                const newCount = autopilotPostsThisRunCount(sNow) + 1;
+                sNow.operator = sNow.operator || {};
+                sNow.operator.autopilotPostsThisRun = newCount;
+                writeState(sNow, { controlWrite: true });
+                logEvent("autopilot_post_counted", { postsThisRun: newCount, source: "reconcile_recovered" });
+                const lim = autopilotRunLimit(sNow);
+                if (lim > 0 && newCount >= lim) autopilotAutoDisarm("run_limit_reached", `posted ${newCount}/${lim} (incl. recovered)`);
+              }
+            } catch (_) {}
             writeResolved("recovered_landed", rec.postUrl);
             logEvent("publish_intent_reconcile_recovered", { planId, sequence, profileId, postUrl: rec.postUrl });
             summary.recovered += 1;
           } else {
-            // POST DID NOT LAND -> free the product so the run re-posts it (no duplicate).
-            releaseClaim();
-            writeResolved("released_not_landed", "");
-            logEvent("publish_intent_reconcile_released", { planId, sequence, profileId });
-            summary.released += 1;
+            // NOT-FOUND or INCONCLUSIVE. recoverSubmittedFacebookPostUrl returns ok:false for a genuine not-landed
+            // AND for a timeout/budget-exceeded/feed-lag scan, AND an approval-gated post that LANDED is pending +
+            // feed-INVISIBLE to the author -> a false negative. So a single ok:false is NOT authoritative; NEVER
+            // release on it (that is the duplicate-post regression). Retry across passes:
+            //  * approval-required group: NEVER auto-release (a pending landed post would be re-posted then both
+            //    approved = duplicate). Re-scan over a window covering approval propagation (~30 min); if still
+            //    not found, flag for manual review and KEEP the claim.
+            //  * non-approval group: a landed post is immediately visible, so a persistent not-found is reliable ->
+            //    release after a couple retries (absorbs transient feed-lag).
+            const attempts = (__intentScanAttempts.get(String(it.key)) || 0) + 1;
+            __intentScanAttempts.set(String(it.key), attempts);
+            const maxAttempts = approvalGroup ? 6 : 2; // 6 x 5min covers the 10-30min approval queue; 2 covers feed-lag
+            if (attempts < maxAttempts) {
+              logEvent("publish_intent_reconcile_retry", { planId, sequence, profileId, attempts, maxAttempts, approvalGroup });
+              summary.retried += 1; // leave UNRESOLVED -> re-scanned next pass
+            } else if (approvalGroup) {
+              writeResolved("needs_manual_review", "");
+              logEvent("publish_intent_reconcile_flagged", { planId, sequence, profileId, reason: "approval_group_not_found_keep_claim", attempts });
+              summary.flagged += 1;
+            } else {
+              releaseClaim();
+              writeResolved("released_not_landed", "");
+              logEvent("publish_intent_reconcile_released", { planId, sequence, profileId, attempts });
+              summary.released += 1;
+            }
           }
         } catch (err) {
-          // Transient scan error -> leave UNRESOLVED so it retries next pass (bounded by max + single-flight).
+          // Connector/scan error -> leave UNRESOLVED so it retries next pass (bounded by single-flight + max).
           logEvent("publish_intent_reconcile_error", { planId, sequence, profileId, error: oneLineField((err && err.message) || String(err), 200) });
           summary.errors += 1;
         }
