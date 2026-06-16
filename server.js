@@ -8188,6 +8188,7 @@ let __externalStopRequested = 0;
 async function stopAllExternalWork(reason) {
   __externalStopRequested = Date.now(); // in-flight loops compare their start time to this and abort
   try { if (typeof __forcedCommentResweepActive !== "undefined") __forcedCommentResweepActive = false; } catch (_) {}
+  try { await closeAllKeepOpenSessions("stop_" + oneLineField(reason || "", 24)); } catch (_) {} // close every kept-open posting session
   try {
     const s = readState();
     s.operator.armedForExternalActions = false;
@@ -8941,6 +8942,8 @@ function autopilotAutoDisarm(reason, detail) {
   s.operator.armedForExternalActions = false;
   writeState(s, { controlWrite: true });
   logEvent("autopilot_auto_disarmed", { reason, detail });
+  // KEEP-OPEN: the run ended -> close + release every kept-open posting session (no posting -> no reuse -> free them).
+  closeAllKeepOpenSessions("auto_disarm").catch(() => {});
   // 100% COMMENTS to the very end: a count run disarms the instant it hits N, which would otherwise
   // stop the armed-gated comment resweep — leaving a tail post (whose posters were still busy at
   // inline-comment time) uncommented. Kick a few CURRENT-RUN-scoped resweeps (ignoreArmedGate, NOT force:
@@ -14611,6 +14614,36 @@ function anyCommenterFreeForPost(row, groupUrl, excludeProfileId, state = readSt
   }
   return { free: false, candidates: candidates.length, soonestFreeSec: Number.isFinite(soonest) ? Math.ceil(soonest / 1000) : Infinity };
 }
+// ============================================================================
+// KEEP-OPEN SESSIONS (ixBrowser open-quota optimization 2026-06-16). Open a profile ONCE, drive up to
+// KEEP_OPEN_MAX_POSTS posts over the kept-open CDP session — a connectOverCDP reconnect does NOT count against the
+// ixBrowser 100-opens/day quota (only profile-open does) — then close once. Cuts ~5 opens/post -> ~1-2 => ~3-4x more
+// posts/day on the same plan. The connector already honours payload.keepBrowserOpen (skip browser.close) +
+// payload.reuseCdpEndpoint (skip profile-open); the HARD CAP of 2 tabs/profile is enforced in the connector. A
+// session HOLDS the acquireNormalIxProfileUse lock for its whole life (so GLOBAL_MAX_OPEN_PROFILES=8 still bounds
+// memory) and is reaped on stop/disarm or after KEEP_OPEN_MAX_MS by closeStaleKeepOpenSessions. GATED OFF by default
+// (operator.keepOpenSessionEnabled===true) so a deploy never changes posting until the operator opts in after a test.
+const __keepOpenSession = new Map(); // profileId -> { endpoint, postsUsed, openedAt, release }
+const KEEP_OPEN_MAX_POSTS = 5;
+const KEEP_OPEN_MAX_MS = 12 * 60 * 1000;
+function keepOpenEnabled() { try { return readState().operator?.keepOpenSessionEnabled === true; } catch (_) { return false; } }
+async function closeAllKeepOpenSessions(reason = "") {
+  for (const [pid, sess] of [...__keepOpenSession.entries()]) {
+    __keepOpenSession.delete(pid);
+    try { await ixBrowserCloseAfterUse(Number(pid), "keepopen_close_" + oneLineField(reason, 24)); } catch (_) {}
+    try { sess.release && sess.release(); } catch (_) {}
+  }
+}
+function closeStaleKeepOpenSessions() {
+  for (const [pid, sess] of [...__keepOpenSession.entries()]) {
+    if (Date.now() - (sess.openedAt || 0) > KEEP_OPEN_MAX_MS || sess.postsUsed >= KEEP_OPEN_MAX_POSTS) {
+      __keepOpenSession.delete(pid);
+      ixBrowserCloseAfterUse(Number(pid), "keepopen_stale").catch(() => {});
+      try { sess.release && sess.release(); } catch (_) {}
+    }
+  }
+}
+
 async function runLiveFacebookPostFromPlan(body = {}) {
   requireExternalArmed();
   const state = readState();
@@ -14802,18 +14835,37 @@ async function runLiveFacebookPostFromPlan(body = {}) {
     // Publisher POSTS ONLY — never comments in its own session. The first comment is always
   // made afterwards by a DIFFERENT, random profile with group access (realism requirement).
   const payload = livePostPayloadForRow(row, groupUrl, ready.imagePath, ready.profileId, { includeComment: false });
-    const releaseProfileUse = acquireNormalIxProfileUse(ready.profileId, "facebook_live_post");
+    // KEEP-OPEN: reuse this profile's already-open CDP session (0 extra ix opens) if alive + under the post/age caps.
+    const __ko = keepOpenEnabled();
+    let __sess = __ko ? __keepOpenSession.get(ready.profileId) : null;
+    let __reuse = false;
+    if (__sess && __sess.endpoint && __sess.postsUsed < KEEP_OPEN_MAX_POSTS && (Date.now() - (__sess.openedAt || 0)) < KEEP_OPEN_MAX_MS) {
+      __reuse = await isCachedCdpEndpointAlive(__sess.endpoint).catch(() => false);
+    }
+    if (__sess && !__reuse) { // stale/maxed/dead session -> close + release before a fresh open
+      __keepOpenSession.delete(ready.profileId);
+      try { await ixBrowserCloseAfterUse(ready.profileId, "keepopen_rotate"); } catch (_) {}
+      try { __sess.release && __sess.release(); } catch (_) {}
+      __sess = null;
+    }
+    const __postsBefore = __reuse ? __sess.postsUsed : 0;
+    const __wantKeepOpen = __ko && (__postsBefore + 1) < KEEP_OPEN_MAX_POSTS;
+    if (__reuse) payload.reuseCdpEndpoint = __sess.endpoint;
+    if (__wantKeepOpen) payload.keepBrowserOpen = true;
+    // On REUSE the session already holds the per-profile lock; do NOT re-acquire (would 409 "profile busy").
+    const releaseProfileUse = __reuse ? (() => {}) : acquireNormalIxProfileUse(ready.profileId, "facebook_live_post");
+    let __keepProfileOpenAfter = false;
     let scriptResult = null;
     try {
       let preOpenClose = null;
-      // If warmup pre-opened THIS exact profile recently, reuse it: skip the
-      // pre-open close so the connector's profile-open reuses the already-open
-      // window (no close/reopen churn). Consume once so retries still get a
-      // clean close.
+      // If warmup pre-opened THIS exact profile recently, OR we are REUSING a kept-open session, skip the pre-open
+      // close so the connector reuses the already-open window (no close/reopen churn, no extra ix open).
       const warmedReuse = __warmupPostingSlot
         && Number(__warmupPostingSlot.profileId) === Number(ready.profileId)
         && (Date.now() - Number(__warmupPostingSlot.at || 0)) < 10 * 60 * 1000;
-      if (warmedReuse) {
+      if (__reuse) {
+        logEvent("ix_keepopen_reuse", { planId: row.planId, sequence: row.sequence, profileId: ready.profileId, postsUsed: __postsBefore, groupUrl });
+      } else if (warmedReuse) {
         __warmupPostingSlot = null;
         logEvent("facebook_live_post_reusing_warmed_profile", { planId: row.planId, sequence: row.sequence, profileId: ready.profileId, groupUrl });
       } else {
@@ -14882,6 +14934,16 @@ async function runLiveFacebookPostFromPlan(body = {}) {
       }
       const postUrl = scriptResult.postUrl;
       if (postUrl) {
+        // KEEP-OPEN: the post LANDED on this profile -> keep its window open for the next post (up to the cap), so
+        // the next post on this profile reconnects over CDP (0 extra ix open). The session owns the lock + window.
+        if (__wantKeepOpen) {
+          const __ep = (scriptResult && scriptResult.cdpEndpoint) || (__reuse && __sess ? __sess.endpoint : "");
+          if (__ep) {
+            if (__reuse && __sess) { __sess.postsUsed = __postsBefore + 1; __sess.endpoint = __ep; }
+            else { __keepOpenSession.set(ready.profileId, { endpoint: __ep, postsUsed: 1, openedAt: Date.now(), release: releaseProfileUse }); }
+            __keepProfileOpenAfter = true;
+          }
+        }
         let validation = scriptResult.validation || livePostLogValidation(scriptResult.objects, payload);
         let finalPostUrl = postUrl;
         let approvalResult = null;
@@ -15548,20 +15610,29 @@ async function runLiveFacebookPostFromPlan(body = {}) {
         payloadFile: err.payloadFile || "",
       });
     } finally {
-      const closeResult = await ixBrowserCloseAfterUse(ready.profileId, "facebook_live_post_attempt_finished");
-      closeResults.push(closeResult);
-      appendFacebookLivePostLedger({
-        event: "browser_closed_after_attempt",
-        key: ledgerKey,
-        planId: row.planId,
-        sequence: row.sequence,
-        profileId: ready.profileId,
-        profile: row.profile || "",
-        groupUrl,
-        status: closeResult?.ok ? "closed" : "close_failed",
-        closeResult,
-      });
-      releaseProfileUse();
+      if (__keepProfileOpenAfter) {
+        // KEEP-OPEN: the session owns the window + the per-profile lock — do NOT close or release here. It is reaped
+        // after KEEP_OPEN_MAX_POSTS / KEEP_OPEN_MAX_MS (closeStaleKeepOpenSessions) or on stop (closeAllKeepOpenSessions).
+        try { logEvent("ix_keepopen_session_held", { profileId: ready.profileId, postsUsed: (__keepOpenSession.get(ready.profileId) || {}).postsUsed || 0, groupUrl }); } catch (_) {}
+      } else {
+        const closeResult = await ixBrowserCloseAfterUse(ready.profileId, "facebook_live_post_attempt_finished");
+        closeResults.push(closeResult);
+        appendFacebookLivePostLedger({
+          event: "browser_closed_after_attempt",
+          key: ledgerKey,
+          planId: row.planId,
+          sequence: row.sequence,
+          profileId: ready.profileId,
+          profile: row.profile || "",
+          groupUrl,
+          status: closeResult?.ok ? "closed" : "close_failed",
+          closeResult,
+        });
+        // On a REUSE that did NOT keep open (cap reached / failure), the SESSION holds the real lock -> release it +
+        // drop the session. On a fresh open, releaseProfileUse IS the real release.
+        if (__reuse && __sess) { try { __sess.release && __sess.release(); } catch (_) {} __keepOpenSession.delete(ready.profileId); }
+        else releaseProfileUse();
+      }
     }
   }
   // A GROUP that won't render is a GROUP problem, not a profile-health problem. If
@@ -18654,6 +18725,8 @@ setInterval(() => {
   if (__everOpenedIxProfiles.size > 0 && !__closeFinishedSweepInFlight && Date.now() - __lastCloseFinishedSweepAt > 90000) {
     closeFinishedIxProfilesSweep({ max: 12 }).catch(() => {});
   }
+  // KEEP-OPEN reaper: close + release any kept-open session past its post/age cap so a held window can't linger.
+  if (__keepOpenSession.size > 0) { try { closeStaleKeepOpenSessions(); } catch (_) {} }
   const state = readState();
   const intervalMs = clampNumber(state.triggers?.heartbeatSeconds, 3, 120, 3) * 1000;
   if (Date.now() - lastHeartbeatTick < intervalMs) return;
