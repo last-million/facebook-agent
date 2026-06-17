@@ -18977,12 +18977,14 @@ setInterval(() => {
   // KEEP-OPEN reaper: close + release any kept-open session past its post/age cap so a held window can't linger.
   if (__keepOpenSession.size > 0) { try { closeStaleKeepOpenSessions(); } catch (_) {} }
   const state = readState();
-  // CONTINUOUS HARVEST (operator 2026-06-16: "harvest ALL DAY no matter the posts/day"): run the source-group harvest
-  // on the ALWAYS-ON heartbeat — DECOUPLED from posting/armed (the autopilot tick is armed-gated and returns early when
-  // stopped, so harvest must NOT live only there). Opt-in via contentSourcesEnabled (the operator turned it ON) + bounded
-  // to the posting WINDOW (autopilotPostingWindowOpen) so a server with harvest OFF or outside the window opens ZERO
-  // browsers. Single-flight (__harvestSourcesInFlight) + cadence via __harvestNextAt; fires NEW-then-older every round.
-  if (state.operator?.contentSourcesEnabled === true && autopilotPostingWindowOpen(state)
+  // CONTINUOUS HARVEST (operator 2026-06-16: "keep arming himself to maximum even AFTER the posting stop time; if prod
+  // runs low, get more to continue"): run the source-group harvest on the ALWAYS-ON heartbeat, DECOUPLED from posting AND
+  // from the posting window — it must KEEP digging the backlog overnight / after the posting stop time to STOCKPILE the
+  // pool to its max (poolTarget, default 2000), so the next posting session always has a full reserve. The pool gate
+  // inside harvestContentSourcesAsync pauses it (opens ZERO browsers) once the pool is full, and resumes when posting +
+  // 15-day image-retention drain it below target — so it self-maintains at max and prod never starves. Opt-in via
+  // contentSourcesEnabled (default OFF -> a server with harvest off opens nothing). Single-flight + cadence (__harvestNextAt).
+  if (state.operator?.contentSourcesEnabled === true
       && !__harvestSourcesInFlight && Date.now() >= __harvestNextAt) {
     harvestContentSourcesAsync({}).catch(() => {});
   }
