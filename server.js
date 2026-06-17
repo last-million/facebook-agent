@@ -18977,6 +18977,15 @@ setInterval(() => {
   // KEEP-OPEN reaper: close + release any kept-open session past its post/age cap so a held window can't linger.
   if (__keepOpenSession.size > 0) { try { closeStaleKeepOpenSessions(); } catch (_) {} }
   const state = readState();
+  // CONTINUOUS HARVEST (operator 2026-06-16: "harvest ALL DAY no matter the posts/day"): run the source-group harvest
+  // on the ALWAYS-ON heartbeat — DECOUPLED from posting/armed (the autopilot tick is armed-gated and returns early when
+  // stopped, so harvest must NOT live only there). Opt-in via contentSourcesEnabled (the operator turned it ON) + bounded
+  // to the posting WINDOW (autopilotPostingWindowOpen) so a server with harvest OFF or outside the window opens ZERO
+  // browsers. Single-flight (__harvestSourcesInFlight) + cadence via __harvestNextAt; fires NEW-then-older every round.
+  if (state.operator?.contentSourcesEnabled === true && autopilotPostingWindowOpen(state)
+      && !__harvestSourcesInFlight && Date.now() >= __harvestNextAt) {
+    harvestContentSourcesAsync({}).catch(() => {});
+  }
   const intervalMs = clampNumber(state.triggers?.heartbeatSeconds, 3, 120, 3) * 1000;
   if (Date.now() - lastHeartbeatTick < intervalMs) return;
   lastHeartbeatTick = Date.now();
