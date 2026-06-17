@@ -7980,9 +7980,15 @@ function assetBufferStatus(state = readState(), registers = readRegisters()) {
   const pending = [];
   for (const product of collectProductUrlsForPosting(state)) {
     const key = String(product.key || "").toLowerCase();
+    // HARVESTED products are gated by their OWN reuse window — productHasReadyAssets checks the harvested record's
+    // lastPostedAt vs contentSources.reuseHours (default 48h) + per-run claim + on-disk image. They must NOT be subject
+    // to the web-discovery used-products register (usedProductReuseWindowDays default 7d) or the no-review-photo register
+    // (those track RETAILER products). Checking usedKeys/noPhotoKeys first wrongly held harvested products out for 7 days
+    // even though their 48h reuse re-included them -> the ready pool starved (~44 of ~189) and posting stalled in idle
+    // gaps. Gate harvested FIRST so they rotate back at their intended window. (web-discovery products keep both checks.)
+    if (key.startsWith("harvested:")) { if (productHasReadyAssets(product, state, reviewImages)) ready.push(product); else pending.push(product); continue; }
     if (usedKeys.has(key)) continue;
     if (noPhotoKeys.has(key)) continue; // reliable scrape confirmed no review photos — skip until retry window
-    if (key.startsWith("harvested:")) { if (productHasReadyAssets(product, state, reviewImages)) ready.push(product); else pending.push(product); continue; }
     if (approvedKeys.has(key) && shortlinkKeys.has(key)) ready.push(product);
     else pending.push(product);
   }
@@ -8607,7 +8613,12 @@ async function fillAssetBufferAsync(options = {}) {
         const status = assetBufferStatus();
         const remaining = targetOverride ? (targetOverride - status.readyCount) : status.shortfall;
         if (remaining <= 0) { summary.stoppedReason = "buffer_full"; break; }
-        const batch = status.nextPendingUrls.filter((url) => !tried.has(url)).slice(0, batchSize);
+        // HARVESTED products cannot be "prepared" by this loop — their image + first-comment link come from the harvest
+        // step, not from SYL link-gen or review-image extraction, and their readiness is intrinsic (productHasReadyAssets).
+        // Sending their "harvested:<hash>" pseudo-URL through generateShopYourLikesExtensionLinks only throws ("must be HTTP
+        // or HTTPS") and wastes a dedicated-SYL profile-open (extra ixBrowser-desktop load). The fill loop is for RETAILER
+        // discovery products only; harvested products become ready on their own via assetBufferStatus.
+        const batch = status.nextPendingUrls.filter((url) => !tried.has(url) && !String(url).startsWith("harvested:")).slice(0, batchSize);
         if (!batch.length) { summary.stoppedReason = "no_more_eligible_products"; break; }
         batch.forEach((url) => tried.add(url));
         // CPU governor: yield to live posting + the Pinterest agent before this heavy batch.
