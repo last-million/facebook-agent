@@ -11291,6 +11291,7 @@ async function runLiveFacebookPostScript(payload, options = {}) {
     stdout = err.stdout || "";
     stderr = err.stderr || "";
     const objects = parseJsonLogObjects(`${stdout}\n${stderr}`);
+    recordIxBrowserOpensFromObjects(objects); // ixBrowser open-budget: a failed connector run can still have opened a profile (counts against quota)
     const validation = livePostLogValidation(objects, payload);
     const candidatePostUrls = facebookPostCandidateUrlsFromLog(objects, payload.groupUrl || "");
     const liveLogFile = writeLiveFacebookPostLogFile({ payloadRelative, scriptPath, stdout, stderr, objects, validation, outcome: "error" });
@@ -11313,6 +11314,7 @@ async function runLiveFacebookPostScript(payload, options = {}) {
   }
   const payloadDeleted = cleanupPayload();
   const objects = parseJsonLogObjects(stdout);
+  recordIxBrowserOpensFromObjects(objects); // ixBrowser open-budget: count real opens (ix_open/ix_open_fallback; reuse not counted)
   const validation = livePostLogValidation(objects, payload);
   const liveLogFile = writeLiveFacebookPostLogFile({ payloadRelative, scriptPath, stdout, stderr, objects, validation, outcome: "ok" });
   return {
@@ -14646,7 +14648,9 @@ function anyCommenterFreeForPost(row, groupUrl, excludeProfileId, state = readSt
 const __keepOpenSession = new Map(); // profileId -> { endpoint, postsUsed, openedAt, release, inUse }
 const KEEP_OPEN_MAX_POSTS = 5;
 const KEEP_OPEN_MAX_MS = 40 * 60 * 1000;
-function keepOpenEnabled() { try { return readState().operator?.keepOpenSessionEnabled === true; } catch (_) { return false; } }
+// ON when the operator manually opts in (keepOpenSessionEnabled) OR automatically when we are near the self-learned
+// ixBrowser daily-open ceiling (ixOpenBudgetNearLimit) — auto-adapt stretches the remaining opens by reusing windows.
+function keepOpenEnabled() { try { return readState().operator?.keepOpenSessionEnabled === true || ixOpenBudgetNearLimit(); } catch (_) { return false; } }
 async function closeAllKeepOpenSessions(reason = "") {
   for (const [pid, sess] of [...__keepOpenSession.entries()]) {
     __keepOpenSession.delete(pid);
@@ -14670,6 +14674,90 @@ function closeStaleKeepOpenSessions() {
       try { sess.release && sess.release(); } catch (_) {}
     }
   }
+}
+
+// ============================================================================
+// ixBrowser DAILY OPEN-BUDGET — self-learning + auto-adapt (2026-06-16). The ixBrowser LOCAL API does not expose the
+// plan/quota (probed: every account/plan endpoint returns 1007 Not Found), and we hold no cloud credentials, so we LEARN
+// the daily profile-open ceiling from our OWN activity at ZERO added load: every real open the connector already logs as
+// step "ix_open"/"ix_open_fallback" is counted (a CDP-reuse logs "ix_reuse" and costs NO open, so it is NOT counted),
+// and the open-count at the instant error 1018 fires IS the plan's true daily limit (auto-updates if the plan changes —
+// no hard-coded number anywhere). Near the learned limit keepOpenEnabled() auto-flips ON to stretch the remaining opens;
+// at the limit the existing ixOpenCapHitUntil pause takes over. No polling, no extra browser activity; the only I/O is a
+// throttled (<=1/2min) state write so the count survives a restart. ENTIRELY PASSIVE until a 1018 has ever been seen
+// (learnedLimit=0 -> nearLimit=false -> no auto-adapt), so on the new ~1000/day plan it is pure visibility until/unless
+// the ceiling is actually approached.
+const IX_OPEN_BUDGET_NEAR_PCT = 0.85;
+let __ixOpensToday = 0;
+let __ixOpensTodayDate = "";       // YYYY-MM-DD the live count belongs to; "" = not yet initialized this process
+let __ixLearnedLimit = 0;          // cached learned daily-open ceiling (module var -> NO readState in the hot path)
+let __ixOpenBudgetPersistAt = 0;   // last throttled state-write (ms)
+function ixOpenBudgetDayKey(d = new Date()) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+function ixOpenBudgetEnsureToday() {
+  const today = ixOpenBudgetDayKey();
+  if (__ixOpensTodayDate === today) return;
+  // First touch this process OR a date rollover. On first touch, restore the persisted count if it is still today's
+  // (survives a mid-day restart); a new day always resets to 0 (ixBrowser quota resets daily).
+  let restored = 0;
+  if (__ixOpensTodayDate === "") {
+    // First touch this process: hydrate the count (if still today's) AND the learned ceiling from state ONCE, so the
+    // hot path (ixLearnedDailyOpenLimit / ixOpenBudgetNearLimit) never reads disk again. The learned limit is the plan
+    // ceiling (NOT daily) so it persists across date rollovers in memory.
+    try { const op = readState().operator || {}; if (op.ixOpensTodayDate === today) restored = Number(op.ixOpensToday) || 0; __ixLearnedLimit = Number(op.ixLearnedDailyOpenLimit) || 0; } catch (_) {}
+  }
+  __ixOpensToday = restored;
+  __ixOpensTodayDate = today;
+}
+function ixOpenBudgetPersist(force = false) {
+  const now = Date.now();
+  if (!force && now - __ixOpenBudgetPersistAt < 120000) return; // throttle: at most once / 2 min
+  __ixOpenBudgetPersistAt = now;
+  try {
+    const s = readState();
+    s.operator = s.operator || {};
+    s.operator.ixOpensToday = __ixOpensToday;
+    s.operator.ixOpensTodayDate = __ixOpensTodayDate;
+    writeState(s, { controlWrite: true });
+  } catch (_) {}
+}
+function countIxOpenEventsInObjects(objects = []) {
+  let n = 0;
+  for (const o of objects || []) { const st = o && o.step; if (st === "ix_open" || st === "ix_open_fallback") n++; }
+  return n;
+}
+function recordIxBrowserOpensFromObjects(objects) {
+  try {
+    const n = countIxOpenEventsInObjects(objects);
+    if (n <= 0) return;
+    ixOpenBudgetEnsureToday();
+    __ixOpensToday += n;
+    ixOpenBudgetPersist(false);
+  } catch (_) {}
+}
+function ixLearnedDailyOpenLimit() { ixOpenBudgetEnsureToday(); return __ixLearnedLimit; } // module var -> no disk I/O in the hot path
+function ixOpenBudgetNearLimit() {
+  const limit = ixLearnedDailyOpenLimit();
+  if (limit <= 0) return false;
+  ixOpenBudgetEnsureToday();
+  return __ixOpensToday >= IX_OPEN_BUDGET_NEAR_PCT * limit;
+}
+function ixOpenBudgetSnapshot() {
+  ixOpenBudgetEnsureToday();
+  const limit = ixLearnedDailyOpenLimit();
+  const used = __ixOpensToday;
+  const pct = limit > 0 ? used / limit : 0;
+  return {
+    opensToday: used,
+    date: __ixOpensTodayDate,
+    learnedLimit: limit > 0 ? limit : null,
+    remaining: limit > 0 ? Math.max(0, limit - used) : null,
+    pct: limit > 0 ? Math.round(pct * 100) : null,
+    nearLimit: limit > 0 && pct >= IX_OPEN_BUDGET_NEAR_PCT,
+    autoKeepOpen: limit > 0 && pct >= IX_OPEN_BUDGET_NEAR_PCT,
+    manualKeepOpen: (() => { try { return readState().operator?.keepOpenSessionEnabled === true; } catch (_) { return false; } })(),
+  };
 }
 
 async function runLiveFacebookPostFromPlan(body = {}) {
@@ -16366,8 +16454,18 @@ let __ixOpenQuotaExhaustedUntil = 0;
 function markIxBrowserOpenQuotaExhausted(reason = "") {
   const until = Date.now() + 60 * 60 * 1000; // pause ~60 min then re-probe; cleared early by a successful open
   __ixOpenQuotaExhaustedUntil = until;
-  try { const s = readState(); s.operator = s.operator || {}; s.operator.ixOpenCapHitUntil = until; writeState(s, { controlWrite: true }); } catch (_) {}
-  if (!markIxBrowserOpenQuotaExhausted.__t || Date.now() - markIxBrowserOpenQuotaExhausted.__t > 120000) { try { logEvent("ixbrowser_daily_open_quota_exhausted", { reason: oneLineField(reason, 80), pauseMin: 60 }); } catch (_) {} markIxBrowserOpenQuotaExhausted.__t = Date.now(); }
+  // SELF-LEARN the plan's daily-open ceiling: the (limit+1)th open is what 1018'd, so the opens SUCCESSFULLY counted so
+  // far today == the real limit. Keep the MAX ever seen (a mid-day restart can under-count; max converges upward) so the
+  // auto-adapt knows the ceiling on future days without any hard-coded number.
+  let learned = 0;
+  try { ixOpenBudgetEnsureToday(); learned = __ixOpensToday; } catch (_) {}
+  try {
+    const s = readState(); s.operator = s.operator || {};
+    s.operator.ixOpenCapHitUntil = until;
+    if (learned > 0) { const next = Math.max(Number(s.operator.ixLearnedDailyOpenLimit) || 0, learned); s.operator.ixLearnedDailyOpenLimit = next; __ixLearnedLimit = next; }
+    writeState(s, { controlWrite: true });
+  } catch (_) {}
+  if (!markIxBrowserOpenQuotaExhausted.__t || Date.now() - markIxBrowserOpenQuotaExhausted.__t > 120000) { try { logEvent("ixbrowser_daily_open_quota_exhausted", { reason: oneLineField(reason, 80), pauseMin: 60, learnedLimit: learned || undefined }); } catch (_) {} markIxBrowserOpenQuotaExhausted.__t = Date.now(); }
 }
 function ixOpenQuotaLatchedUntil(state) { return Math.max(__ixOpenQuotaExhaustedUntil, Number((state || readState()).operator?.ixOpenCapHitUntil || 0)); }
 function clearIxOpenQuotaLatchOnSuccess() {
@@ -18976,7 +19074,9 @@ function buildRunReports(force = false) {
   } catch {}
   let problemProfiles = [];
   try { problemProfiles = buildProblemProfiles({ windowHours: 24 }); } catch {}
-  const body = { generatedAt: new Date().toISOString(), runCount: out.length, latest: out[0] || null, runs: out.slice(0, 30), reconcile, problemProfiles };
+  let openBudget = null;
+  try { openBudget = ixOpenBudgetSnapshot(); } catch {}
+  const body = { generatedAt: new Date().toISOString(), runCount: out.length, latest: out[0] || null, runs: out.slice(0, 30), reconcile, problemProfiles, openBudget };
   __runReportCache.at = Date.now();
   __runReportCache.body = body;
   return body;
