@@ -14426,10 +14426,19 @@ async function completeVerifiedFacebookPostWithComment({
     // closed"). The post URL is already captured and the first comment is made by a
     // DIFFERENT profile, so the publisher session is finished here. (The finally-close later
     // becomes a harmless no-op.)
-    await ixBrowserCloseAfterUse(ready.profileId, "publisher_close_before_different_profile_comment").catch(() => {});
-    if (releaseKeyPre && normalIxProfileUseLocks.has(releaseKeyPre)) {
-      normalIxProfileUseLocks.delete(releaseKeyPre);
-      logEvent("facebook_live_post_publisher_lock_released_for_different_profile_comment", { profileId: ready.profileId });
+    if (keepOpenEnabled() && ready.__keepPublisherWindowOpen) {
+      // KEEP-OPEN: leave this publisher window OPEN + its per-profile lock HELD for the next post on this profile
+      // (reconnect over CDP = 0 extra ix-open). The different-profile comment below opens its OWN profile; the publisher
+      // just stays idle holding one lock (within the 8-cap at concurrency<=3). The loop's finally / reaper / stop own
+      // teardown. Skipping this close is what makes the keep-open optimization actually save opens — closing here would
+      // turn the just-created keep-open session into a phantom (dead window) and force a fresh open on the next post.
+      logEvent("ix_keepopen_publisher_held_for_reuse", { profileId: ready.profileId });
+    } else {
+      await ixBrowserCloseAfterUse(ready.profileId, "publisher_close_before_different_profile_comment").catch(() => {});
+      if (releaseKeyPre && normalIxProfileUseLocks.has(releaseKeyPre)) {
+        normalIxProfileUseLocks.delete(releaseKeyPre);
+        logEvent("facebook_live_post_publisher_lock_released_for_different_profile_comment", { profileId: ready.profileId });
+      }
     }
     if (approvalResult?.ok) {
       // After a moderator approves, FB needs time to flip the post from PENDING to publicly LIVE before a
@@ -14623,9 +14632,20 @@ function anyCommenterFreeForPost(row, groupUrl, excludeProfileId, state = readSt
 // session HOLDS the acquireNormalIxProfileUse lock for its whole life (so GLOBAL_MAX_OPEN_PROFILES=8 still bounds
 // memory) and is reaped on stop/disarm or after KEEP_OPEN_MAX_MS by closeStaleKeepOpenSessions. GATED OFF by default
 // (operator.keepOpenSessionEnabled===true) so a deploy never changes posting until the operator opts in after a test.
-const __keepOpenSession = new Map(); // profileId -> { endpoint, postsUsed, openedAt, release }
+//
+// KEEP_OPEN_MAX_MS must EXCEED one least-used-fairness rotation period, or reuse never fires: the 5 posts of a session
+// span 5 SEPARATE autopilot ticks (runLiveFacebookPostFromPlan returns after ONE post), and the least-used picker
+// (orderReadyRowsLeastUsed) re-sorts every tick so a just-posted profile sorts to the bottom and is NOT re-picked until
+// every peer matches its today-count — a full rotation. With the 4-profile working pool a rotation routinely exceeds
+// 12min, so a 12min window aged out before the profile's next turn and post #2 did a FRESH open (the saving never
+// materialized). 40min keeps all active profiles' windows alive across their turns (fairness preserved — we do NOT jump
+// the queue), so each profile reuses its own window on its next turn. The alive-probe (isCachedCdpEndpointAlive) self-
+// heals a window that died during the hold (fresh-open fallback), and the +20min hard bound in closeStaleKeepOpenSessions
+// still force-reaps a stuck in-use session. SAFE for <=~5 active profiles at concurrency 3 (peak ~7 of 8 locks: held
+// publishers + active commenters); beyond that the commenter open can hit the 8-cap 503 and defer to the resweep.
+const __keepOpenSession = new Map(); // profileId -> { endpoint, postsUsed, openedAt, release, inUse }
 const KEEP_OPEN_MAX_POSTS = 5;
-const KEEP_OPEN_MAX_MS = 12 * 60 * 1000;
+const KEEP_OPEN_MAX_MS = 40 * 60 * 1000;
 function keepOpenEnabled() { try { return readState().operator?.keepOpenSessionEnabled === true; } catch (_) { return false; } }
 async function closeAllKeepOpenSessions(reason = "") {
   for (const [pid, sess] of [...__keepOpenSession.entries()]) {
@@ -14636,7 +14656,15 @@ async function closeAllKeepOpenSessions(reason = "") {
 }
 function closeStaleKeepOpenSessions() {
   for (const [pid, sess] of [...__keepOpenSession.entries()]) {
-    if (Date.now() - (sess.openedAt || 0) > KEEP_OPEN_MAX_MS || sess.postsUsed >= KEEP_OPEN_MAX_POSTS) {
+    const __age = Date.now() - (sess.openedAt || 0);
+    // IN-USE GUARD: never reap a session whose profile is mid-flight (alive-probe + post + different-profile comment
+    // are in progress). Without this the 1s reaper could (a) delete the map entry DURING the alive-probe await so the
+    // reuse post proceeds lock-less and re-tracks nothing (TOCTOU untracked-window leak), or (b) yank the window while
+    // runLiveFacebookPostScript is posting into it (a long approval flow can run 6-18min). The loop's finally ALWAYS
+    // clears inUse (or tears the session down), so this only ever delays reaping by one post. An absolute hard bound
+    // (12min cap + 20min worst-case post) force-reaps a session whose inUse somehow got stuck.
+    if (sess.inUse === true && __age < KEEP_OPEN_MAX_MS + 20 * 60 * 1000) continue;
+    if (__age > KEEP_OPEN_MAX_MS || sess.postsUsed >= KEEP_OPEN_MAX_POSTS) {
       __keepOpenSession.delete(pid);
       ixBrowserCloseAfterUse(Number(pid), "keepopen_stale").catch(() => {});
       try { sess.release && sess.release(); } catch (_) {}
@@ -14838,6 +14866,9 @@ async function runLiveFacebookPostFromPlan(body = {}) {
     // KEEP-OPEN: reuse this profile's already-open CDP session (0 extra ix opens) if alive + under the post/age caps.
     const __ko = keepOpenEnabled();
     let __sess = __ko ? __keepOpenSession.get(ready.profileId) : null;
+    // Mark the session in-use BEFORE the alive-probe await so the 1s closeStaleKeepOpenSessions reaper cannot delete it
+    // (and yank its window) out from under this post — the finally clears it. Closes the probe-yield TOCTOU.
+    if (__sess) __sess.inUse = true;
     let __reuse = false;
     if (__sess && __sess.endpoint && __sess.postsUsed < KEEP_OPEN_MAX_POSTS && (Date.now() - (__sess.openedAt || 0)) < KEEP_OPEN_MAX_MS) {
       __reuse = await isCachedCdpEndpointAlive(__sess.endpoint).catch(() => false);
@@ -14850,6 +14881,12 @@ async function runLiveFacebookPostFromPlan(body = {}) {
     }
     const __postsBefore = __reuse ? __sess.postsUsed : 0;
     const __wantKeepOpen = __ko && (__postsBefore + 1) < KEEP_OPEN_MAX_POSTS;
+    // CRITICAL for the optimization to actually save opens: tell completeVerifiedFacebookPostWithComment NOT to close
+    // this publisher window after the post when we intend to reuse it for the next post. Without this the post->comment
+    // helper unconditionally closes the publisher (to free it for the different-profile comment) and the just-created
+    // keep-open session becomes a phantom (dead window) -> the next post does a full fresh ix-open and the quota saving
+    // never materializes. The loop's finally (HOLD) / reaper / stop own teardown when we keep it open.
+    ready.__keepPublisherWindowOpen = __wantKeepOpen;
     if (__reuse) payload.reuseCdpEndpoint = __sess.endpoint;
     if (__wantKeepOpen) payload.keepBrowserOpen = true;
     // On REUSE the session already holds the per-profile lock; do NOT re-acquire (would 409 "profile busy").
@@ -14940,7 +14977,11 @@ async function runLiveFacebookPostFromPlan(body = {}) {
           const __ep = (scriptResult && scriptResult.cdpEndpoint) || (__reuse && __sess ? __sess.endpoint : "");
           if (__ep) {
             if (__reuse && __sess) { __sess.postsUsed = __postsBefore + 1; __sess.endpoint = __ep; }
-            else { __keepOpenSession.set(ready.profileId, { endpoint: __ep, postsUsed: 1, openedAt: Date.now(), release: releaseProfileUse }); }
+            // inUse:true so the 1s reaper cannot reap THIS fresh session during post #1's own different-profile comment +
+            // approval leg (which runs AFTER this in completeVerifiedFacebookPostWithComment and can take 6-18min for an
+            // approval flow). The finally HOLD branch clears inUse once the post fully completes. (Reuse posts already set
+            // inUse=true at the top of the loop before the alive-probe.)
+            else { __keepOpenSession.set(ready.profileId, { endpoint: __ep, postsUsed: 1, openedAt: Date.now(), release: releaseProfileUse, inUse: true }); }
             __keepProfileOpenAfter = true;
           }
         }
@@ -15613,6 +15654,9 @@ async function runLiveFacebookPostFromPlan(body = {}) {
       if (__keepProfileOpenAfter) {
         // KEEP-OPEN: the session owns the window + the per-profile lock — do NOT close or release here. It is reaped
         // after KEEP_OPEN_MAX_POSTS / KEEP_OPEN_MAX_MS (closeStaleKeepOpenSessions) or on stop (closeAllKeepOpenSessions).
+        // Clear inUse now that this post is done so the next reuse/reaper sees an idle (reapable) session.
+        const __heldSess = __keepOpenSession.get(ready.profileId);
+        if (__heldSess) __heldSess.inUse = false;
         try { logEvent("ix_keepopen_session_held", { profileId: ready.profileId, postsUsed: (__keepOpenSession.get(ready.profileId) || {}).postsUsed || 0, groupUrl }); } catch (_) {}
       } else {
         const closeResult = await ixBrowserCloseAfterUse(ready.profileId, "facebook_live_post_attempt_finished");
