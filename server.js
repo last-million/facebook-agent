@@ -14776,7 +14776,8 @@ function ixOpenBudgetNearLimit(op) {
 function keepOpenPlanAutoDecision(op) {
   const limit = ixEffectiveDailyOpenLimit(op);
   if (limit <= 0) return null;
-  const target = Number((op || {}).autopilotMaxPostsPerRun) || 100;
+  const __t = Number((op || {}).autopilotMaxPostsPerRun);
+  const target = __t > 0 ? __t : 100;                   // 0 / NaN / negative -> the documented default
   const demand = target * IX_OPENS_PER_POST_EST;       // opens this run would cost WITHOUT keep-open
   return demand > IX_PLAN_HEADROOM_PCT * limit;          // would blow >80% of the plan -> enable keep-open
 }

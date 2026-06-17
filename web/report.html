@@ -177,21 +177,30 @@ function render(){
   if (rc.pending || rc.needsReview) recoEl.innerHTML = '<div class="reco warn">⚠ Reprise après interruption (kill mid-post) : ' + bits.join(' · ') + '</div>';
   else if (rc.recovered || rc.released) recoEl.innerHTML = '<div class="reco ok">✓ Reprise auto après interruption : ' + bits.join(' · ') + ' — aucune perte silencieuse</div>';
   else recoEl.innerHTML = '';
-  // BUDGET D'OUVERTURES ixBrowser (auto-appris depuis l'activité — l'API locale n'expose pas le plan)
+  // BUDGET D'OUVERTURES ixBrowser + keep-open auto selon le PLAN (l'API locale n'expose pas le plan -> connu/appris)
   var ob = DATA.openBudget || null;
   var obEl = document.getElementById("openbudget");
-  if (ob && (ob.opensToday || ob.learnedLimit)) {
+  if (ob && (ob.opensToday || ob.effectiveLimit)) {
     var used = ob.opensToday || 0;
-    var lim = ob.learnedLimit;
-    var ko = ob.manualKeepOpen ? 'keep-open <b>manuel ON</b>' : (ob.autoKeepOpen ? 'keep-open <b>auto-activé</b> (proche limite)' : 'keep-open off');
+    var lim = ob.effectiveLimit;
+    var KOMODE = {
+      force_on: 'keep-open <b>forcé ON</b>',
+      force_off: 'keep-open <b>forcé OFF</b>',
+      auto_on_tight_plan: 'keep-open <b>auto ON</b> (plan serré)',
+      auto_on_near_limit: 'keep-open <b>auto ON</b> (proche limite)',
+      auto_off_roomy_plan: 'keep-open auto OFF (plan large)',
+      auto_off_plan_unknown: 'keep-open auto OFF (plan inconnu)'
+    };
+    var ko = KOMODE[ob.mode] || (ob.keepOpenOn ? 'keep-open ON' : 'keep-open off');
+    var planSrc = ob.planLimit ? 'plan connu' : (ob.learnedLimit ? 'auto-appris' : '');
     var head, cls;
     if (lim) {
-      var line = '<b>' + used + '</b> / ~' + lim + ' ouvertures aujourd\'hui (' + (ob.pct != null ? ob.pct + '%' : '?') + ', reste ~' + ob.remaining + ') — ' + ko;
+      var line = '<b>' + used + '</b> / ~' + lim + ' ouvertures aujourd\'hui (' + planSrc + (ob.pct != null ? ', ' + ob.pct + '%' : '') + ', reste ~' + ob.remaining + ') — ' + ko;
       cls = ob.nearLimit ? 'warn' : 'ok';
       head = (ob.nearLimit ? '⚠ Proche de la limite d\'ouvertures ixBrowser : ' : '✓ Budget d\'ouvertures ixBrowser : ') + line;
     } else {
       cls = 'ok';
-      head = '✓ Ouvertures ixBrowser aujourd\'hui : <b>' + used + '</b> — limite du plan pas encore atteinte (auto-apprise au 1er 1018) — ' + ko;
+      head = '✓ Ouvertures ixBrowser aujourd\'hui : <b>' + used + '</b> — plan inconnu (auto-appris au 1er 1018) — ' + ko;
     }
     obEl.innerHTML = '<div class="reco ' + cls + '">' + head + '</div>';
   } else { obEl.innerHTML = ''; }
