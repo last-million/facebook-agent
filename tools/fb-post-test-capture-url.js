@@ -3952,18 +3952,24 @@ async function harvestGroupFeed(page, count, opts = {}) {
   for (let s = 0; s < initialSkips; s++) { const nf = await advanceToNextPhoto(page); if (!nf) break; curFbid = nf; }
   let lastFbid = curFbid;
   const maxSteps = Math.max(60, count * pCount * 10 + 200); // walk deep past SEEN photos (skips are cheap); the budget is the real bound
+  const walkCap = Math.max(count, 60); // CONTINUOUS-HARVEST: dig deep for the TIME BUDGET, not just the tiny server `count` (was quitting after ~2 items)
   let steps = 0;
   const visited = new Set(); // LOOP GUARD: fbids already walked this session
   let revisits = 0;
-  while (out.length < count && steps < maxSteps && Date.now() < budgetEnd) {
+  let deepestSeen = Infinity; // smallest (oldest) fbid reached this walk -> OLDER progress resets the oscillation guard
+  while (out.length < walkCap && steps < maxSteps && Date.now() < budgetEnd) {
     steps++;
     curFbid = (await photoViewerFbid(page)) || curFbid;
     lastFbid = curFbid || lastFbid;
     // LOOP GUARD: the theater can oscillate between two photos (ArrowRight bouncing — usually a wrong/broken
     // set=g. context). Repeatedly landing on already-walked photos means we're stuck -> stop instead of burning
     // the whole 240s budget on the same 2 tiles. New (older) photos reset the counter.
+    // Only treat repeated tiles as "stuck" when there is NO net-OLDER progress — a few revisits during a SEEN-skip pass
+    // near the top must not abort a walk that is about to break into the old backlog. Older progress resets the counter.
+    const __num = Number(String(curFbid || '').replace(/\D+/g, '')) || 0;
+    if (__num && __num < deepestSeen) { deepestSeen = __num; revisits = 0; }
     const isRevisit = curFbid && visited.has(curFbid);
-    if (isRevisit) { if (++revisits >= 4) { console.log(JSON.stringify({ step: 'harvest_walk_end', reason: 'loop_detected', steps, collected: out.length, lastFbid })); break; } }
+    if (isRevisit) { if (++revisits >= 8) { console.log(JSON.stringify({ step: 'harvest_walk_end', reason: 'loop_detected', steps, collected: out.length, lastFbid })); break; } }
     else { revisits = 0; if (curFbid) visited.add(curFbid); }
     if (!isRevisit && curFbid && !seenIds.has(curFbid)) {
       try {
@@ -3972,7 +3978,7 @@ async function harvestGroupFeed(page, count, opts = {}) {
         else { console.log(JSON.stringify({ step: 'harvest_walk_skip', fbid: curFbid, reason: 'no_product_link_or_dup' })); }
       } catch (e) { console.log(JSON.stringify({ step: 'harvest_walk_item_error', fbid: curFbid, error: String((e && e.message) || e).slice(0, 140) })); }
     }
-    if (out.length >= count) break;
+    if (out.length >= walkCap) break;
     let moved = '';
     for (let k = 0; k < pCount; k++) { const nf = await advanceToNextPhoto(page); if (!nf) { moved = ''; break; } moved = nf; }
     if (!moved) { console.log(JSON.stringify({ step: 'harvest_walk_end', reason: 'no_more_photos', steps, collected: out.length })); break; }
@@ -3982,8 +3988,8 @@ async function harvestGroupFeed(page, count, opts = {}) {
   // DEPTH FALLBACK (operator: the source group has HUNDREDS of old deal posts): the photo-theater walk often goes
   // shallow / oscillates near the newest posts and can't reach deep history. When it collected fewer than asked,
   // deep-scroll the /media grid (newest -> OLDEST) and pull every old post that still has a first-comment link.
-  if (out.length < count && Date.now() < budgetEnd - 20000) {
-    console.log(JSON.stringify({ step: 'harvest_grid_fallback', walkGot: out.length, want: count }));
+  if (out.length < walkCap && Date.now() < budgetEnd - 20000) {
+    console.log(JSON.stringify({ step: 'harvest_grid_fallback', walkGot: out.length, want: walkCap }));
     try {
       const base = String(opts.groupUrl || '').replace(/\/+$/, '').replace(/\/media$/i, '');
       const mediaUrl = base ? base + '/media' : `https://www.facebook.com/groups/${groupId}/media`;

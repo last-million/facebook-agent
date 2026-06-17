@@ -8378,6 +8378,8 @@ let __harvestEmptyRounds = 0;
 let __harvestWorkingProfilesByGroup = new Map(); // groupUrl -> Set of PROVEN member profiles (learned automatically)
 let __harvestProfileAttemptByGroup = new Map(); // groupUrl -> rotating exploration index (discovers new members each round)
 let __harvestReservePaused = false; // hysteresis: pause harvesting at reserveTarget, resume at reserveRefillAt
+let __lastFullRescanAt = 0;          // CONTINUOUS-HARVEST: full top-rescan (deleted-media recovery) at most once/day; otherwise resume DEEPER
+let __harvestStaleRoundsByGroup = new Map(); // groupUrl -> consecutive rounds with no OLDER progress (unsticks a monotonic cursor)
 // AUTO reserve sizing from the box's REAL daily posting capacity (assigned profiles x posts/profile/day,
 // already computed into productDiscovery.dailyPostTarget). overnight = tomorrow's posts + 50% safety buffer;
 // daytime = a small working buffer (safety net while the overnight stock drains). Scales as profiles/posts change.
@@ -8406,11 +8408,15 @@ async function harvestContentSourcesAsync(options = {}) {
     const a = auto ? harvestAutoReserves(state) : null;
     const reserveTarget = auto ? a.target : clampNumber(cs.reserveTarget, 1, 5000, 20);
     const reserveRefillAt = auto ? a.refillAt : clampNumber(cs.reserveRefillAt, 0, Math.max(0, reserveTarget - 1), 10);
-    const reserve = readHarvestedProducts(state).filter((r) => r && r.productKey && productHasReadyAssets({ key: r.productKey }, state)).length; // FRESH + re-eligible (single source of truth)
-    if (reserve >= reserveTarget) __harvestReservePaused = true;
-    if (reserve <= reserveRefillAt) __harvestReservePaused = false;
-    if (__harvestReservePaused) { __harvestNextAt = Date.now() + 900000; logEvent("harvest_reserve_satisfied", { reserve, target: reserveTarget }); return { reserveSatisfied: reserve }; } // reserve full -> re-check the groups for NEW listings in 15 min
-    const effectiveTarget = reserveTarget;
+    const reserve = readHarvestedProducts(state).filter((r) => r && r.productKey && productHasReadyAssets({ key: r.productKey }, state)).length; // FRESH + re-eligible (telemetry + cadence signal)
+    // CONTINUOUS HARVEST (operator 2026-06-16): build a LARGE pool ALL DAY, DECOUPLED from the tiny posting reserve.
+    // The old reserve gate paused harvesting at a ~15-60 working buffer (harvestAutoReserves) — the #1 reason the pool
+    // sat at 136 and never grew. Now we keep grabbing NEW + digging OLDER every round and pause ONLY when the WHOLE pool
+    // reaches a high poolTarget (default 2000). reserveTarget/refillAt stay only as telemetry + cadence hints.
+    const poolSize = readHarvestedProducts(state).length;
+    const poolTarget = clampNumber(cs.poolTarget, 50, 100000, 2000);
+    if (poolSize >= poolTarget) { __harvestNextAt = Date.now() + 900000; logEvent("harvest_pool_full", { poolSize, poolTarget, reserve }); return { poolFull: poolSize }; }
+    const effectiveTarget = poolTarget;
     const lines = recordLines(state.posting?.contentSources?.groupsText);
     const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
     // OPERATOR RULE: NEVER harvest with a PARKED profile (disconnected/errored/suspended) until the admin releases
@@ -8468,15 +8474,22 @@ async function harvestContentSourcesAsync(options = {}) {
     // the media FROM THE NEWEST (reset resume) so deleted/uncollected media products are re-collected. Still-tracked
     // products are skipped fast by postId (no re-download). Self-limits: once the reserve recovers above refillAt,
     // the normal resume-deeper walk returns. This is what keeps the reserve fed from ONE group's media indefinitely.
-    const rescanMedia = reserve <= reserveRefillAt;
-    if (rescanMedia) logEvent("harvest_rescan_media", { reserve, refillAt: reserveRefillAt });
+    // CONTINUOUS HARVEST: do the full top-RESET only RARELY (once/day, for deleted-media recovery). Doing it every
+    // low-reserve round (the old `reserve <= reserveRefillAt`) blanked the resume cursor every round on a small pool, so
+    // the connector re-scanned the newest, found all-seen (got:0), and NEVER walked the old backlog. Now nearly every
+    // round passes the REAL deep cursor -> the connector grabs NEW at the top when present, else digs OLDER.
+    const rescanMedia = (Date.now() - __lastFullRescanAt) > 86400000;
+    if (rescanMedia) { __lastFullRescanAt = Date.now(); logEvent("harvest_rescan_media", { reserve, refillAt: reserveRefillAt, dailyFullRescan: true }); }
     // RESUME POSITION: the deepest photo fbid reached per source group last round — the photo-viewer walk
     // jumps straight there and keeps going OLDER, so we never re-scroll from the top (unless rescanMedia).
     let resumeMap = {};
     try { resumeMap = JSON.parse(String(cs.harvestResume || "{}")) || {}; } catch (_) { resumeMap = {}; }
     const resumeUpdates = {};
     let harvestedNew = 0, skippedSeen = 0, reusedOld = 0;
-    const harvestCount = clampNumber(options.harvestCount || (effectiveTarget - reserve), 1, 20, 4); // grab the GAP toward the (day or night) target in one harvest (capped at 20/session)
+    // Per-round dig size: ask the connector for the MAX (20, its payload clamp) whenever the pool is below target, so each
+    // round digs the backlog as deep as the 240s connector budget allows (decoupled from the tiny reserve gap that made it
+    // collect ~2 then stop). 0 when the pool is full (the gate above already returned, so this stays 20 in practice).
+    const harvestCount = clampNumber(options.harvestCount || (poolSize < poolTarget ? 20 : 1), 1, 20, 4);
     // SHARED CLAIMS DIR (the pilot's tracker): all profiles harvesting in PARALLEL this round point at the
     // SAME dir; the atomic per-product claim file guarantees no two profiles ever take the same product.
     const harvestRunId = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
@@ -8554,12 +8567,28 @@ async function harvestContentSourcesAsync(options = {}) {
     try { fs.rmSync(claimsDir, { recursive: true, force: true }); } catch (_) {} // round done -> drop the claims tracker
     // PERSIST resume positions (deepest photo reached) AND the learned member set (which profiles proved
     // they can read each group) so harvest is warm immediately after a restart and never picks blind.
+    let cursorAdvanced = false; // did ANY group's cursor move deeper/older this round (backlog still draining)?
     try {
       const st2 = readState();
       st2.posting = st2.posting || {}; st2.posting.contentSources = st2.posting.contentSources || {};
       if (Object.keys(resumeUpdates).length) {
         let prev = {}; try { prev = JSON.parse(String(st2.posting.contentSources.harvestResume || "{}")) || {}; } catch (_) { prev = {}; }
-        st2.posting.contentSources.harvestResume = JSON.stringify(Object.assign(prev, resumeUpdates));
+        // MONOTONIC cursor: FB photo fbids are time-ordered DESCENDING (older = numerically smaller). Keep the SMALLER
+        // (deeper) fbid per group so a shallow lastFbid (e.g. from the daily top-rescan) can NEVER rewind the deep cursor.
+        const merged = { ...prev };
+        for (const [g, fb] of Object.entries(resumeUpdates)) {
+          const aNum = Number(String(prev[g] || "").replace(/\D+/g, "")) || 0;
+          const bNum = Number(String(fb || "").replace(/\D+/g, "")) || 0;
+          const advanced = bNum > 0 && (aNum === 0 || bNum < aNum);
+          if (advanced) { merged[g] = String(fb); cursorAdvanced = true; __harvestStaleRoundsByGroup.set(g, 0); }
+          else {
+            // No older progress -> keep the deep cursor, but after 4 stuck rounds CLEAR it so a non-monotonic group can
+            // re-find its deepest from the top next round instead of sticking forever.
+            const stale = (__harvestStaleRoundsByGroup.get(g) || 0) + 1;
+            if (stale >= 4) { delete merged[g]; __harvestStaleRoundsByGroup.set(g, 0); } else { __harvestStaleRoundsByGroup.set(g, stale); }
+          }
+        }
+        st2.posting.contentSources.harvestResume = JSON.stringify(merged);
       }
       const membersOut = {};
       for (const [gu, set] of __harvestWorkingProfilesByGroup.entries()) membersOut[gu] = [...set].slice(0, 50);
@@ -8567,8 +8596,8 @@ async function harvestContentSourcesAsync(options = {}) {
       writeState(st2);
     } catch (_) {}
     // RE-SCAN cadence: drain fast when producing; re-scan ~every minute when idle; back off when long-exhausted.
-    if ((harvestedNew + reusedOld) > 0) { __harvestEmptyRounds = 0; __harvestNextAt = Date.now(); } // got new -> immediately keep draining the remaining UNSEEN tiles
-    else { __harvestEmptyRounds += 1; __harvestNextAt = Date.now() + 900000; } // nothing new (all seen) -> re-check the groups for NEW listings in 15 min
+    if ((harvestedNew + reusedOld) > 0 || cursorAdvanced) { __harvestEmptyRounds = 0; __harvestNextAt = Date.now(); } // got new OR dug deeper -> immediately keep draining the backlog
+    else { __harvestEmptyRounds += 1; __harvestNextAt = Date.now() + 900000; } // nothing new AND no deeper progress (genuinely exhausted/throttled) -> re-check for NEW in 15 min
     logEvent("harvest_round", { groups: pairs.length, harvestedNew, reusedOld, skippedSeen, emptyRounds: __harvestEmptyRounds, nextInSec: Math.round((__harvestNextAt - Date.now()) / 1000) });
     return { groups: pairs.length, harvestedNew, reusedOld, skippedSeen };
   })().catch((e) => { logEvent("harvest_sources_error", { error: oneLineField((e && e.message) || String(e), 200) }); __harvestNextAt = Date.now() + 120000; return { error: true }; })
@@ -9048,10 +9077,11 @@ async function autopilotTickAsync(options = {}) {
     if (!dryRun && !__closeFinishedSweepInFlight && (Date.now() - __lastCloseFinishedSweepAt) > 120000) {
       closeFinishedIxProfilesSweep({ max: 12 }).catch(() => {});
     }
-    // CONTENT-SOURCE HARVEST (default OFF): fire-and-forget, single-flight, armed-gated, ~1-min re-scan
-    // cadence (__harvestNextAt). Harvests source groups' posts (text + image + first-comment link) into
-    // the buffer in parallel 4-by-4. When contentSourcesEnabled is off this never fires.
-    if (!dryRun && state.operator?.contentSourcesEnabled === true && state.operator?.armedForExternalActions
+    // CONTENT-SOURCE HARVEST (operator 2026-06-16: harvest CONTINUOUSLY ALL DAY within the start/end WINDOW, decoupled
+    // from posting — build a large pool no matter the posts/day). Gated on the posting WINDOW (autopilotPostingWindowOpen),
+    // NOT armed, so it digs the backlog even when no posting run is active. Single-flight, fire-and-forget, cadence via
+    // __harvestNextAt. When contentSourcesEnabled is off, or outside the window, this never fires.
+    if (!dryRun && state.operator?.contentSourcesEnabled === true && autopilotPostingWindowOpen(state)
         && !__harvestSourcesInFlight && Date.now() >= __harvestNextAt) {
       harvestContentSourcesAsync({}).catch(() => {});
     }
