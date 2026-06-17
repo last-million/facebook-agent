@@ -994,6 +994,18 @@ function writeState(state, opts = {}) {
       if (Object.prototype.hasOwnProperty.call(exOp, f)) clean.operator[f] = exOp[f];
     }
   }
+  // OPERATOR-CONFIG CLOBBER GUARD (2026-06-17 bug: "added a group, it saved, then vanished after a restart"). deepMerge
+  // REPLACES arrays, and controlWrite (used by the autopilot tick / harvest / open-budget background writes) bypasses the
+  // flag guard above — so a background full-state write holding a STALE snapshot silently DROPPED a posting group the
+  // operator had just added via the dashboard. posting.groups is ONLY ever changed by the operator's explicit state-PUT,
+  // so preserve the freshest ON-DISK value (existing is re-read above) on EVERY other write; only opts.allowOperatorConfig
+  // (set by PUT /api/state) may change it. This makes operator group edits durable against any background clobber.
+  if (!opts.allowOperatorConfig && existing.posting) {
+    clean.posting = clean.posting || {};
+    for (const f of ["groups", "groupUrls"]) {
+      if (existing.posting[f] !== undefined) clean.posting[f] = existing.posting[f];
+    }
+  }
   clean.ixbrowser.failedProfiles = mergeProtectedRecordLines(
     clean.ixbrowser?.failedProfiles,
     existing.ixbrowser?.failedProfiles,
@@ -19456,7 +19468,9 @@ const server = http.createServer(async (req, res) => {
       }
     } catch (_e) {}
     // controlWrite:true => the operator's explicit values for the protected control flags win.
-    const state = writeState(incoming, { controlWrite: true });
+    // allowOperatorConfig:true => this is the ONLY path allowed to change posting.groups (the dashboard save); every
+    // background writeState preserves the on-disk groups, so a stale snapshot can never drop a group the operator added.
+    const state = writeState(incoming, { controlWrite: true, allowOperatorConfig: true });
     logEvent("workflow_state_saved");
     // #1b SELF-DRIVE: on a fresh arm (false->true), kick an immediate single-flight tick so the first batch
     // launches NOW instead of waiting up to the full scheduler interval (~120s). autopilotTickAsync is
