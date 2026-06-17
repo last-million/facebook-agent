@@ -14648,9 +14648,25 @@ function anyCommenterFreeForPost(row, groupUrl, excludeProfileId, state = readSt
 const __keepOpenSession = new Map(); // profileId -> { endpoint, postsUsed, openedAt, release, inUse }
 const KEEP_OPEN_MAX_POSTS = 5;
 const KEEP_OPEN_MAX_MS = 40 * 60 * 1000;
-// ON when the operator manually opts in (keepOpenSessionEnabled) OR automatically when we are near the self-learned
-// ixBrowser daily-open ceiling (ixOpenBudgetNearLimit) — auto-adapt stretches the remaining opens by reusing windows.
-function keepOpenEnabled() { try { return readState().operator?.keepOpenSessionEnabled === true || ixOpenBudgetNearLimit(); } catch (_) { return false; } }
+// KEEP-OPEN DECISION — auto by ixBrowser PLAN, with a manual override. Tri-state operator.keepOpenSessionEnabled:
+//   === true  -> FORCE ON  (operator override, e.g. for a test)
+//   === false -> FORCE OFF (operator override)
+//   anything else (unset/'') -> AUTO: enable keep-open ONLY when the plan's daily-open budget is too tight to cover the
+//     run at the normal ~2 opens/post (publisher+commenter) — i.e. a SMALL plan auto-enables it (conserve opens), a ROOMY
+//     plan auto-disables it (no need, keep it simple). The self-learned-near-limit reactive net is OR'd in as a backstop.
+// The plan limit comes from operator.ixDailyOpenPlanLimit (the operator's known plan) if set, else the value self-learned
+// from the first error 1018. Unknown plan (neither) -> AUTO can't decide -> falls back to the reactive net (OFF until a
+// learned ceiling is approached). Reads operator ONCE (op) and passes it down -> NO extra disk I/O in the hot path.
+function keepOpenEnabled() {
+  try {
+    const op = readState().operator || {};
+    if (op.keepOpenSessionEnabled === true) return true;
+    if (op.keepOpenSessionEnabled === false) return false;
+    const auto = keepOpenPlanAutoDecision(op);   // true=tight plan / false=roomy / null=unknown
+    const near = ixOpenBudgetNearLimit(op);      // reactive backstop on the effective limit
+    return auto === null ? near : (auto || near);
+  } catch (_) { return false; }
+}
 async function closeAllKeepOpenSessions(reason = "") {
   for (const [pid, sess] of [...__keepOpenSession.entries()]) {
     __keepOpenSession.delete(pid);
@@ -14688,6 +14704,8 @@ function closeStaleKeepOpenSessions() {
 // (learnedLimit=0 -> nearLimit=false -> no auto-adapt), so on the new ~1000/day plan it is pure visibility until/unless
 // the ceiling is actually approached.
 const IX_OPEN_BUDGET_NEAR_PCT = 0.85;
+const IX_OPENS_PER_POST_EST = 2;     // ~ix-opens per post WITHOUT keep-open (publisher + different-profile commenter)
+const IX_PLAN_HEADROOM_PCT = 0.8;    // auto-enable keep-open when a run's open-demand would exceed this fraction of the plan
 let __ixOpensToday = 0;
 let __ixOpensTodayDate = "";       // YYYY-MM-DD the live count belongs to; "" = not yet initialized this process
 let __ixLearnedLimit = 0;          // cached learned daily-open ceiling (module var -> NO readState in the hot path)
@@ -14737,26 +14755,60 @@ function recordIxBrowserOpensFromObjects(objects) {
   } catch (_) {}
 }
 function ixLearnedDailyOpenLimit() { ixOpenBudgetEnsureToday(); return __ixLearnedLimit; } // module var -> no disk I/O in the hot path
-function ixOpenBudgetNearLimit() {
-  const limit = ixLearnedDailyOpenLimit();
+// The plan's daily-open ceiling used for ALL auto-decisions: the operator's KNOWN plan (operator.ixDailyOpenPlanLimit, set
+// when they tell us / change plans) takes precedence; else the value self-LEARNED from the first 1018; else 0 (unknown).
+// `op` is passed by the hot path (already-read operator) so this adds NO disk read there.
+function ixEffectiveDailyOpenLimit(op) {
+  let configured = 0;
+  try { configured = Number((op || readState().operator || {}).ixDailyOpenPlanLimit) || 0; } catch (_) {}
+  if (configured > 0) return configured;
+  ixOpenBudgetEnsureToday();
+  return __ixLearnedLimit;
+}
+function ixOpenBudgetNearLimit(op) {
+  const limit = ixEffectiveDailyOpenLimit(op);
   if (limit <= 0) return false;
   ixOpenBudgetEnsureToday();
   return __ixOpensToday >= IX_OPEN_BUDGET_NEAR_PCT * limit;
 }
+// AUTO keep-open decision by PLAN SIZE vs this run's open-demand. Returns true (tight plan -> enable to conserve opens),
+// false (roomy plan -> keep it simple), or null (plan unknown -> caller falls back to the reactive near-limit net).
+function keepOpenPlanAutoDecision(op) {
+  const limit = ixEffectiveDailyOpenLimit(op);
+  if (limit <= 0) return null;
+  const target = Number((op || {}).autopilotMaxPostsPerRun) || 100;
+  const demand = target * IX_OPENS_PER_POST_EST;       // opens this run would cost WITHOUT keep-open
+  return demand > IX_PLAN_HEADROOM_PCT * limit;          // would blow >80% of the plan -> enable keep-open
+}
 function ixOpenBudgetSnapshot() {
   ixOpenBudgetEnsureToday();
-  const limit = ixLearnedDailyOpenLimit();
+  let op = {}; try { op = readState().operator || {}; } catch (_) {}
+  const learned = __ixLearnedLimit;
+  const configured = Number(op.ixDailyOpenPlanLimit) || 0;
+  const limit = configured > 0 ? configured : learned;  // effective
   const used = __ixOpensToday;
   const pct = limit > 0 ? used / limit : 0;
+  const manual = op.keepOpenSessionEnabled;
+  const auto = keepOpenPlanAutoDecision(op);
+  const near = limit > 0 && pct >= IX_OPEN_BUDGET_NEAR_PCT;
+  let mode;
+  if (manual === true) mode = "force_on";
+  else if (manual === false) mode = "force_off";
+  else if (auto === true) mode = "auto_on_tight_plan";
+  else if (near) mode = "auto_on_near_limit";
+  else if (auto === false) mode = "auto_off_roomy_plan";
+  else mode = "auto_off_plan_unknown";
   return {
     opensToday: used,
     date: __ixOpensTodayDate,
-    learnedLimit: limit > 0 ? limit : null,
+    planLimit: configured > 0 ? configured : null,      // operator's KNOWN plan (if set)
+    learnedLimit: learned > 0 ? learned : null,          // self-learned from 1018 (if seen)
+    effectiveLimit: limit > 0 ? limit : null,
     remaining: limit > 0 ? Math.max(0, limit - used) : null,
     pct: limit > 0 ? Math.round(pct * 100) : null,
-    nearLimit: limit > 0 && pct >= IX_OPEN_BUDGET_NEAR_PCT,
-    autoKeepOpen: limit > 0 && pct >= IX_OPEN_BUDGET_NEAR_PCT,
-    manualKeepOpen: (() => { try { return readState().operator?.keepOpenSessionEnabled === true; } catch (_) { return false; } })(),
+    nearLimit: near,
+    keepOpenOn: (manual === true) || (manual !== false && (auto === true || near)),
+    mode,
   };
 }
 
