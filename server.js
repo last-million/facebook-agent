@@ -75,9 +75,12 @@ const MAX_CONCURRENT_NORMAL_IX_PROFILES = Math.max(3, Math.min(6, Math.floor(((o
 // HARD CEILING on TOTAL concurrent open ixBrowser profiles across ALL paths (posting + comment-recovery + harvest +
 // approval). acquireNormalIxProfileUse only locked PER-profile, never the TOTAL -> dozens piled up = the overnight
 // memory crash (201 chrome procs @ freeRam 1%). Now the (N+1)th open is refused so the caller defers/retries until a
-// slot frees (the operator's "don't open more than ~10, close+relaunch" rule). 8 leaves room for ~3 posters + their
-// comments + an approval, well under the ~30-50 profiles that crashed. (operator 2026-06-15)
-const GLOBAL_MAX_OPEN_PROFILES = 8;
+// slot frees (the operator's "don't open more than ~10, close+relaunch" rule). 14 leaves room for ~5-6 posters + their
+// comments + an approval, still well under the ~30-50 profiles that crashed (RAM) — and the live CPU/RAM/chrome governor
+// (waitForCpuHeadroom) + the per-profile 2-tab cap keep the real chrome footprint bounded far below that. Raised 8->14
+// 2026-06-16 alongside cap 3->5 (CORES_PER_PROFILE 1.5->1.0) so 5 concurrent posters don't starve their commenters on the
+// 8th lock. 9-core/32GB box: 14 profiles ~ <=112 chrome ~ <=18GB, leaving the OS + Pinterest ample headroom. (operator 2026-06-16)
+const GLOBAL_MAX_OPEN_PROFILES = 14;
 const MAX_COMMENT_FALLBACK_PROFILES = 8; // CEILING of profiles tried for the first comment. Was 40 -> on a STUCK post
 // (e.g. pending approval / not yet visible) it opened 40 browsers in a row, the #1 driver of the overnight memory crash
 // (201 chrome procs, freeRam 1%). A good post succeeds on the first profile, so 8 doesn't hurt normal posts; a post that
@@ -7163,6 +7166,11 @@ async function captureIxBrowserPage(profileId, options = {}) {
   let cdpEndpoint;
   let browser;
   let navigationError = "";
+  // CPU/RAM/chrome back-pressure BEFORE this heavy CDP render (profile-open + page.goto + lazy-load scroll). This is a
+  // SEPARATE spawn path from the connector funnel (reached by product discovery + title-backfill), so without this gate a
+  // capture could fire onto an already-pegged box with no throttle. Same governor as everywhere else; fail-open (proceeds
+  // after the bounded wait so it can never deadlock). Gate BEFORE acquiring the lock so it never holds a slot while waiting.
+  if (options.skipCpuGate !== true) { try { await waitForCpuHeadroom({ label: "browser_capture" }); } catch (_) {} }
   const releaseProfileUse = acquireNormalIxProfileUse(profileId, options.captureOnly ? "browser_capture_visible_page" : "browser_product_discovery");
   try {
     const openResult = await ixBrowserOpenForCdp(profileId, {
@@ -8042,7 +8050,7 @@ async function waitForCpuHeadroom(options = {}) {
   if (st.operator?.cpuGovernorEnabled === false) return { load: 0, waitedMs: 0, proceeded: true, disabled: true };
   const maxPercent = clampNumber(options.maxPercent != null ? options.maxPercent : st.operator?.cpuGovernorMaxPercent, 50, 99, 85);
   const minFreeRam = clampNumber(options.minFreeRamPercent != null ? options.minFreeRamPercent : st.operator?.resourceGuardMinFreeRamPercent, 5, 50, 15);
-  const maxChrome = clampNumber(options.maxChromeProcs != null ? options.maxChromeProcs : st.operator?.resourceGuardMaxChromeProcesses, 40, 600, 220);
+  const maxChrome = clampNumber(options.maxChromeProcs != null ? options.maxChromeProcs : st.operator?.resourceGuardMaxChromeProcesses, 40, 600, 150);
   const maxWaitMs = clampNumber(options.maxWaitMs != null ? options.maxWaitMs : (st.operator?.cpuGovernorMaxWaitSeconds || 0) * 1000, 0, 600000, 120000);
   const startedAt = Date.now();
   let load = await currentCpuLoadPercent();
@@ -8085,11 +8093,16 @@ function computeMachineParallelCap() {
   const RESERVED_CORES = 2;             // OS + Pinterest floor
   const RESERVED_GB = 4;                // keep this much RAM free for OS + Pinterest
   const PINTEREST_HEADROOM_FRAC = 0.25; // hand ~25% of usable cores to the other agent
-  const CORES_PER_PROFILE = 1.5;        // operator 2026-06-15: 1.0 (=cap 5) was too optimistic — a real run (posting +
-                                        // commenting + harvest all spawning chrome) pegged CPU to 99-100% and the server
-                                        // went UNRESPONSIVE (watchdog killed it 4x). chrome is multi-process; each active
-                                        // profile averages ~1.5 cores under load. 1.5 -> cap 3 = STABLE on this shared box
-                                        // (this is ALSO the sticky ceiling the dashboard's maxConcurrentProfiles clamps to).
+  const CORES_PER_PROFILE = 1.0;        // 2026-06-16: back to 1.0 (=cap 5 on this 9-core box) — SAFE NOW because the live
+                                        // breaker that did NOT exist/bite during the 2026-06-15 cap-5 overload is in place:
+                                        // waitForCpuHeadroom gates EVERY connector spawn (post/comment/approval/harvest) and
+                                        // BLOCKS a new heavy render whenever CPU>=85% / free-RAM<=15% / chrome>=cap, and the
+                                        // watchdog now TOLERATES a busy box (only kills a FROZEN low-CPU one). Measured at cap
+                                        // 3 on the real run: CPU ~14-24%, chrome peak ~30, 25GB free => each profile costs
+                                        // ~0.7 cores (the old 1.5 model was 2x pessimistic). cap 5 projects ~40% CPU / ~50
+                                        // chrome — huge margin; the gate throttles back the instant a spike approaches 85%, so
+                                        // it self-limits to whatever CPU allows and CANNOT peg the box into the old unresponsive
+                                        // crash. byRam (=18 here) + GLOBAL_MAX_OPEN_PROFILES(14) + the 2-tab/profile cap bound RAM.
   const GB_PER_PROFILE = 1.5;           // ~1.5 GiB resident per active ixBrowser profile
   const HARD_CEILING = 8;               // never auto-scale past this without operator review
   const usableCores = Math.max(1, (cores - RESERVED_CORES) * (1 - PINTEREST_HEADROOM_FRAC));
@@ -14631,7 +14644,7 @@ function anyCommenterFreeForPost(row, groupUrl, excludeProfileId, state = readSt
 // ixBrowser 100-opens/day quota (only profile-open does) — then close once. Cuts ~5 opens/post -> ~1-2 => ~3-4x more
 // posts/day on the same plan. The connector already honours payload.keepBrowserOpen (skip browser.close) +
 // payload.reuseCdpEndpoint (skip profile-open); the HARD CAP of 2 tabs/profile is enforced in the connector. A
-// session HOLDS the acquireNormalIxProfileUse lock for its whole life (so GLOBAL_MAX_OPEN_PROFILES=8 still bounds
+// session HOLDS the acquireNormalIxProfileUse lock for its whole life (so GLOBAL_MAX_OPEN_PROFILES=14 still bounds
 // memory) and is reaped on stop/disarm or after KEEP_OPEN_MAX_MS by closeStaleKeepOpenSessions. GATED OFF by default
 // (operator.keepOpenSessionEnabled===true) so a deploy never changes posting until the operator opts in after a test.
 //
