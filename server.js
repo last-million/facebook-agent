@@ -20191,6 +20191,37 @@ const server = http.createServer(async (req, res) => {
     logEvent("saved_product_deleted", { source: "copied", key: key || fcu, removed: all.length - kept.length });
     return json(res, 200, { ok: true, removed: all.length - kept.length, remaining: kept.length });
   }
+  if (req.method === "POST" && url.pathname === "/api/content-sources/saved-product/reset-used") {
+    // OPERATOR "mark available": clear the used/posted markers on harvested products so they RE-ENTER the postable pool
+    // WITHOUT deleting them. body.all===true -> EVERY product (+ empty the web used-register + per-run claims); else ONE
+    // product by productKey/firstCommentUrl. Append-only via updateHarvestedProductRecord -> safe while harvest runs.
+    const body = await readJson(req);
+    const st = readState();
+    const recs = readHarvestedProducts(st);
+    const clearPatch = () => ({ lastPostedAt: "", posted: "", postedCount: 0, reusedAt: new Date().toISOString() });
+    if (body.all === true) {
+      let cleared = 0;
+      for (const r of recs) {
+        if (r && (r.posted || r.lastPostedAt || r.postedCount)) {
+          const k = r.productKey || harvestSyntheticKey(r.firstCommentUrl);
+          if (updateHarvestedProductRecord(k, clearPatch(), st)) cleared++;
+        }
+      }
+      try { const uf = safeProjectPath(st.files?.usedProducts || "data/used-products.txt"); if (fs.existsSync(uf)) { fs.writeFileSync(uf + ".bak-" + Date.now(), fs.readFileSync(uf)); fs.writeFileSync(uf, ""); } } catch (_) {}
+      try { const cr = path.join(DATA_DIR, "post-claims"); for (const d of (fs.existsSync(cr) ? fs.readdirSync(cr) : [])) { try { fs.rmSync(path.join(cr, d), { recursive: true, force: true }); } catch (_) {} } } catch (_) {}
+      logEvent("saved_products_marked_available_all", { cleared, total: recs.length });
+      return json(res, 200, { ok: true, cleared, total: recs.length });
+    }
+    const key = String(body.productKey || body.key || "").trim();
+    const fcu = String(body.firstCommentUrl || "").trim();
+    if (!key && !fcu) return json(res, 400, { error: "productKey, firstCommentUrl, or all:true required" });
+    const rec = recs.find((r) => { const k = r.productKey || harvestSyntheticKey(r.firstCommentUrl); return (key && k === key) || (fcu && String(r.firstCommentUrl || "") === fcu); });
+    if (!rec) return json(res, 404, { error: "product not found" });
+    const k = rec.productKey || harvestSyntheticKey(rec.firstCommentUrl);
+    const ok = updateHarvestedProductRecord(k, clearPatch(), st);
+    logEvent("saved_product_marked_available", { key: k });
+    return json(res, 200, { ok: Boolean(ok), key: k });
+  }
   if (req.method === "POST" && url.pathname === "/api/posting/record-post-url") {
     const body = await readJson(req);
     const result = recordPublishedFacebookPostUrl(body);

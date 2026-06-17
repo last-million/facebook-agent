@@ -5722,9 +5722,13 @@ function uxAttachScrapedProducts() {
       const srcBadge = '<span class="sp-card-src ' + it.source + '">' + (it.source === "copied" ? "copied" : "web") + '</span>';
       const statusCls = (it.status === "posted" || it.status === "used") ? "posted" : "pending";
       const statusBadge = '<span class="sp-badge ' + statusCls + '">' + it.status + '</span>';
-      card.innerHTML = '<button class="sp-del" type="button" title="Remove from dashboard" aria-label="Remove">&times;</button><div class="sp-text"></div><div class="sp-meta">' + srcBadge + statusBadge + '</div>';
+      // "Mark available" (re-postable) — only for copied/harvested products currently marked posted/used.
+      const availBtn = (it.source === "copied" && (it.status === "posted" || it.posted)) ? '<button class="sp-avail" type="button" title="Mark available (re-postable)" aria-label="Mark available">&#8635;</button>' : '';
+      card.innerHTML = '<button class="sp-del" type="button" title="Remove from dashboard" aria-label="Remove">&times;</button>' + availBtn + '<div class="sp-text"></div><div class="sp-meta">' + srcBadge + statusBadge + '</div>';
       card.querySelector(".sp-text").textContent = (it.title || "(no text)").slice(0, 160);
       card.querySelector(".sp-del").addEventListener("click", (e) => { e.stopPropagation(); deleteItem(it); });
+      const avEl = card.querySelector(".sp-avail");
+      if (avEl) avEl.addEventListener("click", (e) => { e.stopPropagation(); resetItem(it); });
       card.addEventListener("click", () => openModal(it));
       list.appendChild(card);
     }
@@ -5737,6 +5741,24 @@ function uxAttachScrapedProducts() {
       close();
       await load();
     } catch (e) { alert("Could not remove: " + ((e && e.message) || e)); }
+  }
+  async function resetItem(it) {
+    // clear THIS product's used/posted markers so it re-enters the postable pool (keeps the product + image)
+    try {
+      await api("/api/content-sources/saved-product/reset-used", { method: "POST", body: JSON.stringify({ productKey: it.productKey, firstCommentUrl: it.url }) });
+      close();
+      await load();
+    } catch (e) { alert("Could not mark available: " + ((e && e.message) || e)); }
+  }
+  async function markAllAvailable() {
+    if (!confirm("Mark ALL saved products available (re-postable)?\nThis clears their 'used/posted' markers but KEEPS every product + image.")) return;
+    const btn = $("markAllAvailableBtn"); if (btn) btn.disabled = true;
+    try {
+      const r = await api("/api/content-sources/saved-product/reset-used", { method: "POST", body: JSON.stringify({ all: true }) });
+      await load();
+      alert("Done — " + ((r && r.cleared) || 0) + " of " + ((r && r.total) || 0) + " products marked available.");
+    } catch (e) { alert("Could not mark all available: " + ((e && e.message) || e)); }
+    finally { if (btn) btn.disabled = false; }
   }
   async function openModal(it) {
     const modal = $("scrapedModal"); if (!modal) return;
@@ -5764,6 +5786,7 @@ function uxAttachScrapedProducts() {
     st.textContent = status.join("  •  ");
     if (it.postUrl) { const a = document.createElement("a"); a.href = it.postUrl; a.target = "_blank"; a.rel = "noopener"; a.style.color = "#f0a93b"; a.style.display = "block"; a.style.marginTop = "6px"; a.textContent = "View live post ↗"; st.appendChild(a); }
     const delBtn = $("scrapedModalDelete"); if (delBtn) delBtn.onclick = () => deleteItem(it);
+    const avBtn = $("scrapedModalAvail"); if (avBtn) { avBtn.style.display = (it.source === "copied" && (it.status === "posted" || it.posted)) ? "" : "none"; avBtn.onclick = () => resetItem(it); }
     modal.style.display = "flex";
   }
   function close() { const m = $("scrapedModal"); if (m) m.style.display = "none"; }
@@ -5775,6 +5798,7 @@ function uxAttachScrapedProducts() {
     });
   }
   $("refreshScrapedBtn")?.addEventListener("click", () => load());
+  $("markAllAvailableBtn")?.addEventListener("click", markAllAvailable);
   $("scrapedModalClose")?.addEventListener("click", close);
   $("scrapedModal")?.addEventListener("click", (e) => { if (e.target === $("scrapedModal")) close(); });
   load();
