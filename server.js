@@ -8946,7 +8946,7 @@ async function sweepHarvestedImagesAsync() {
   __harvestedImageSweepInFlight = true;
   try {
     const state = readState();
-    const retentionDays = clampNumber(state.posting?.contentSources?.imageRetentionDays, 1, 90, 7);
+    const retentionDays = clampNumber(state.posting?.contentSources?.imageRetentionDays, 1, 90, 2);
     const cutoffMs = retentionDays * 86400 * 1000;
     const now = Date.now();
     let deleted = 0, errors = 0;
@@ -9118,7 +9118,8 @@ async function autopilotTickAsync(options = {}) {
     // IMAGE RETENTION sweep: once/hour, single-flight, fire-and-forget — frees disk of harvested images older
     // than imageRetentionDays. Never overlaps posting (the tick is single-flight).
     if (!dryRun && state.operator?.contentSourcesEnabled === true && state.operator?.armedForExternalActions
-        && !__harvestedImageSweepInFlight && (Date.now() - __lastHarvestedImageSweepAt) >= 3600000) {
+        && !isLivePostingInFlight() && !__harvestedImageSweepInFlight && (Date.now() - __lastHarvestedImageSweepAt) >= 3600000) {
+      // !isLivePostingInFlight: never unlink an image while a live post might be reading it (retention is now 2 days, so a soon-to-post product can fall due mid-run)
       sweepHarvestedImagesAsync().catch((err) => logEvent("autopilot_harvested_image_sweep_error", { error: oneLineField(err.message || String(err), 160) }));
     }
     // OPEN-GRAPH enrichment: pull the real product name/description from each harvested link's og:
@@ -19505,6 +19506,7 @@ const server = http.createServer(async (req, res) => {
     // single-flight (__autopilotTickInFlight) and early-returns when not armed, so it can never double-run
     // with the scheduled tick. Gate on the POST-write `state` (wasEnabled is const-scoped inside the try above).
     if (__armTransition && state.operator?.autopilotEnabled === true && state.operator?.armedForExternalActions === true) {
+      __harvestNextAt = 0; // R2 (operator 2026-06-17): fire the first harvest immediately on arm, not after a stale cadence carried over from the previous run
       setTimeout(() => { autopilotTickAsync().catch(() => {}); }, 0);
     }
     // REAL STOP: if this PUT turned a run OFF, kill in-flight connectors + recovery + close profiles now
@@ -20202,6 +20204,9 @@ const server = http.createServer(async (req, res) => {
     // manual harvest trigger (operator/live-test): fire-and-forget — progress lands in the audit
     // log (harvest_round / harvest_og_fetched / harvest_item) and data/harvested-products.jsonl.
     requireExternalArmed();
+    // R1 (operator 2026-06-17): manual harvest, like the automatic drivers, runs ONLY during an active posting
+    // run (content sources enabled + armed + inside the posting window) — never off-window at rest.
+    if (!harvestShouldRunNow(readState())) return json(res, 409, { error: "harvest_only_during_active_run", detail: "Harvesting runs only while a posting run is active (content sources enabled, armed, and inside the posting window)." });
     const body = await readJson(req);
     const count = clampNumber(body.count, 1, 20, 3);
     harvestContentSourcesAsync({ harvestCount: count }).catch((err) => logEvent("manual_harvest_error", { error: oneLineField(err.message || String(err), 160) }));
