@@ -47,6 +47,28 @@ image is deleted about when it becomes reuse-eligible, so each product effective
 harvest cap). Sweep keys on harvestedAt (not lastPostedAt) — a never-posted product harvested >2d ago is evicted
 (matches "remove after 2 days").
 
+**2026-06-18 UPDATE — operator chose STRICT 2 days (NOT 5), accepts low volume.** Operator: "don't harvest posts
+>2 days; if no fresh, wait 1h and re-check for new fresh listings." So harvestMaxAgeDays=2, imageRetentionDays=2,
+newCheckMinutes=60. The run IDLING when the source has no ≤2-day posts is EXPECTED/desired, not broken.
+HARD REALITY recorded: the source group's products mostly run 3-4 days old (~136 unique = supply ceiling), so
+strict-2-day yields little — the run posts only genuinely-fresh deals + idles otherwise. DON'T re-suggest loosening
+unless the operator asks. **HEAL fix shipped (uncommitted→auto-synced): in the harvest dedup branch (~8558) a
+re-found product (connector only returns ≤maxAgeDays posts, so a re-find = a FRESH re-listing) whose image is GONE
+gets its just-downloaded image RE-LINKED + harvestedAt refreshed (does NOT touch lastPostedAt → reuse window still
+governs). Without this, fresh re-listings were skipped as URL-dupes and never posted — the bug that made the
+fresh-only model unable to post.** My 2-day retention sweep had deleted ALL 136 images at once (they were 3-4d old);
+under the strict-2-day rule those were too old to post anyway, so that was actually correct — the heal lets the ones
+the source RE-LISTS fresh come back.
+
+**INCIDENT — groups reverted on restart (2026-06-18).** After a restart, posting.groups loaded as the STALE
+`1567661940074941 + o1498765421290862` (disk/committed all-day value) instead of the live `4854972804605257 +
+1322293839675416` — the operator's groups were in server MEMORY but had NEVER reached disk (root cause not fully
+explained; the b7541a5 preserve-fix protects groups going forward FROM disk, but can't recover a memory-only edit).
+Recovery: DISARMED the run for safety, asked the operator, PUT groups=[4854972804605257, 1322293839675416] (full
+URLs, groups+groupUrls) via allowOperatorConfig, and VERIFIED on the RAW DISK FILE (not just API/memory). LESSON:
+after ANY restart or group edit, verify posting.groups against the RAW data/workflow-state.json on disk, not the
+API. autopilotAutoResumeEnabled is ON (a crash/restart auto-resumes the run toward its remaining count).
+
 **Adversarial review** (5-angle Workflow, 7 confirmed / 3 plausible / 8 refuted) caught + FIXED: manual endpoint
 window bypass, __harvestNextAt-not-reset-on-arm, sweep-deletes-in-use-image, sweep fallback mismatch. Plausible-
 but-left (fail-open, near-unreachable): comment-article empty-aria-label bypass + incomplete comment-word locale

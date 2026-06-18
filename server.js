@@ -8556,15 +8556,18 @@ async function harvestContentSourcesAsync(options = {}) {
             if (it.imageLocalPath) { try { rel = path.relative(ROOT, it.imageLocalPath).replace(/\\/g, "/"); } catch (_) { rel = ""; } }
             const existing = existingByUrl.get(url);
             if (existing) {
-              // Already tracked = duplicate. DEDUP — EXCEPT: if it was POSTED >= 10 days ago AND is re-found
-              // in the source group now, RE-ENABLE it for ONE more post (the connector already re-downloaded
-              // its image). Re-posting will set posted again, restarting the 10-day clock.
-              const lastT = existing.lastPostedAt || existing.posted || "";
-              if (!lastT) { skippedSeen++; continue; } // unposted: already pending, skip
-              const ageMs = Date.now() - Date.parse(lastT);
-              if (!(Number.isFinite(ageMs) && ageMs >= 10 * 86400000)) { skippedSeen++; continue; } // posted < 10 days: skip
-              updateHarvestedProductRecord(existing.productKey, { lastPostedAt: "", posted: "", postedCount: 0, imageDeleted: false, imageLocalPath: rel, text: it.text, harvestedAt: new Date().toISOString(), reusedAt: new Date().toISOString() }, readState());
-              existing.lastPostedAt = ""; existing.posted = ""; reusedOld++;
+              // The connector returns ONLY posts within harvestMaxAgeDays, so a re-found product is a FRESH
+              // re-listing (operator 2026-06-18: fresh re-listings must be postable, not skipped as dupes). If its
+              // image is gone (e.g. the 2-day retention sweep deleted it), HEAL it: re-link the just-downloaded
+              // image + refresh harvestedAt so it is postable again and stays inside the retention window. We do
+              // NOT touch lastPostedAt — the reuseHours window still governs reposting, so this never forces a
+              // too-soon repost; a product with an intact image is already pending/postable so we leave it.
+              let imgGone = existing.imageDeleted === true || !existing.imageLocalPath;
+              if (!imgGone) { try { imgGone = !fs.existsSync(safeProjectPath(existing.imageLocalPath)); } catch (_) { imgGone = true; } }
+              if (imgGone && rel) {
+                updateHarvestedProductRecord(existing.productKey, { imageDeleted: false, imageLocalPath: rel, text: it.text, harvestedAt: new Date().toISOString(), reusedAt: new Date().toISOString() }, readState());
+                reusedOld++;
+              } else { skippedSeen++; }
               continue;
             }
             const persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, firstCommentText: it.commentLead, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId, ogTitle: it.ogTitle, ogDescription: it.ogDescription }, readState());
