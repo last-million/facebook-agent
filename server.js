@@ -1587,7 +1587,11 @@ function normalizeWorkflowState(state) {
   // production never stalls when no fresh products); its image is kept for re-posting, then deleted after
   // imageRetentionDays to free disk (the text+url record stays for dedup).
   state.posting.contentSources.reuseHours = clampNumber(state.posting.contentSources.reuseHours, 1, 720, 26);
-  state.posting.contentSources.imageRetentionDays = clampNumber(state.posting.contentSources.imageRetentionDays, 1, 90, 7);
+  state.posting.contentSources.imageRetentionDays = clampNumber(state.posting.contentSources.imageRetentionDays, 1, 90, 2); // operator 2026-06-17: remove saved products after 2 days (was 15)
+  // NEW-PRODUCT CHECK CADENCE + FRESHNESS CAP (operator 2026-06-17): harvest checks for new products every
+  // newCheckMinutes (default 60min) and never harvests a listing older than harvestMaxAgeDays (default 2 days).
+  state.posting.contentSources.newCheckMinutes = clampNumber(state.posting.contentSources.newCheckMinutes, 5, 720, 60);
+  state.posting.contentSources.harvestMaxAgeDays = clampNumber(state.posting.contentSources.harvestMaxAgeDays, 1, 30, 2);
   state.posting.contentSources.harvestResume = String(state.posting.contentSources.harvestResume || "").slice(0, 20000); // per-group photo-viewer resume positions {groupUrl: lastFbid}
   state.posting.contentSources.harvestMembers = String(state.posting.contentSources.harvestMembers || "").slice(0, 40000); // per-group proven-member profile ids {groupUrl:[ids]} — survives restarts
   // DISCONNECTED profiles (not logged into Facebook) — auto-parked here + SKIPPED by posting/harvest until
@@ -8180,7 +8184,7 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
   const payloadDir = path.join(DATA_DIR, "harvest-requests");
   fs.mkdirSync(payloadDir, { recursive: true });
   const payloadPath = path.join(payloadDir, `harvest-${Date.now()}-${crypto.randomBytes(5).toString("hex")}.json`);
-  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4), harvestSeenIds: (opts.seenIds || []).slice(0, 2000), harvestProfileIndex: Number(opts.profileIndex || 0), harvestProfileCount: Number(opts.profileCount || 1), harvestResumeFbid: String(opts.resumeFromFbid || ""), harvestClaimsDir: String(opts.claimsDir || "") }));
+  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4), harvestSeenIds: (opts.seenIds || []).slice(0, 2000), harvestProfileIndex: Number(opts.profileIndex || 0), harvestProfileCount: Number(opts.profileCount || 1), harvestResumeFbid: String(opts.resumeFromFbid || ""), harvestMaxAgeDays: clampNumber(opts.maxAgeDays, 1, 30, 2), harvestClaimsDir: String(opts.claimsDir || "") }));
   try {
     const { stdout } = await execFileAsync("node", [scriptPath, payloadPath], { cwd: ROOT, windowsHide: true, timeout: 6 * 60 * 1000, maxBuffer: 24 * 1024 * 1024 });
     const objs = parseJsonLogObjects(stdout);
@@ -8416,6 +8420,15 @@ async function harvestContentSourcesAsync(options = {}) {
     // they appear; pauses at target, resumes at refillAt. No big overnight batch (source groups don't post
     // at night), so on first start it just prepares a small buffer and begins, then feeds itself in parallel.
     const cs = state.posting?.contentSources || {};
+    // NEW-PRODUCT CHECK CADENCE (operator 2026-06-17: "check new products after each hour"): one harvest round
+    // per newCheckMinutes (default 60). Every round grabs NEW posts at the top and, when none, digs OLDER ones
+    // up to the harvestMaxAgeDays cap (2 days) — then sleeps an hour before re-checking. No more drain-immediately.
+    const newCheckMs = clampNumber(cs.newCheckMinutes, 5, 720, 60) * 60000;
+    // FRESHNESS CAP (operator 2026-06-17: "go to oldest ones but no more than 1 or 2 days, NOT 15 days"): the
+    // connector reads each post's visible age and STOPS the walk once it crosses harvestMaxAgeDays (default 2),
+    // so harvest never digs into stale backlog. Belt-and-suspenders below: we always start each walk from the
+    // NEWEST post (resumeFromFbid:"") instead of marching a saved cursor ever-deeper into old history.
+    const maxAgeDays = clampNumber(cs.harvestMaxAgeDays, 1, 30, 2);
     const auto = cs.reserveAuto !== false; // DEFAULT ON: size the buffer from the REAL daily posting capacity
     const a = auto ? harvestAutoReserves(state) : null;
     const reserveTarget = auto ? a.target : clampNumber(cs.reserveTarget, 1, 5000, 20);
@@ -8427,7 +8440,7 @@ async function harvestContentSourcesAsync(options = {}) {
     // reaches a high poolTarget (default 2000). reserveTarget/refillAt stay only as telemetry + cadence hints.
     const poolSize = readHarvestedProducts(state).length;
     const poolTarget = clampNumber(cs.poolTarget, 50, 100000, 2000);
-    if (poolSize >= poolTarget) { __harvestNextAt = Date.now() + 900000; logEvent("harvest_pool_full", { poolSize, poolTarget, reserve }); return { poolFull: poolSize }; }
+    if (poolSize >= poolTarget) { __harvestNextAt = Date.now() + newCheckMs; logEvent("harvest_pool_full", { poolSize, poolTarget, reserve }); return { poolFull: poolSize }; }
     const effectiveTarget = poolTarget;
     const lines = recordLines(state.posting?.contentSources?.groupsText);
     const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
@@ -8477,7 +8490,7 @@ async function harvestContentSourcesAsync(options = {}) {
       __harvestProfileAttemptByGroup.set(groupUrl, attempt);
       chosen.forEach((pid, idx) => pairs.push({ groupUrl, profileId: pid, autoPicked: !memberSet.has(pid), profileIndex: idx, profileCount: chosen.length }));
     }
-    if (!pairs.length) { __harvestNextAt = Date.now() + 300000; return { groups: 0 }; }
+    if (!pairs.length) { __harvestNextAt = Date.now() + newCheckMs; return { groups: 0 }; }
     const allRecs = readHarvestedProducts(state);
     const existingByUrl = new Map(allRecs.map((r) => [String(r.firstCommentUrl || ""), r]));
     const seenPostIds = allRecs.map((r) => String(r.postId || "")).filter(Boolean); // tiles already scraped -> skip + continue from last
@@ -8529,9 +8542,12 @@ async function harvestContentSourcesAsync(options = {}) {
         try { release = acquireNormalIxProfileUse(pair.profileId, "facebook_harvest"); }
         catch (e) { logEvent("harvest_profile_busy_skipped", { profileId: pair.profileId }); return; } // posting/discovery owns it -> skip
         try {
-          const harvestRes = await runHarvestConnector(pair.groupUrl, pair.profileId, harvestCount, { seenIds: seenPostIds, profileIndex: pair.profileIndex || 0, profileCount: pair.profileCount || 1, resumeFromFbid: rescanMedia ? "" : String(resumeMap[pair.groupUrl] || ""), claimsDir });
+          // ALWAYS START FROM THE NEWEST (operator 2026-06-17): resumeFromFbid:"" so the walk re-checks the top for
+          // NEW posts every round and only digs older within the connector's own maxAgeDays cap — it never marches a
+          // persisted cursor into 15-day-old history. The seenIds list skips already-harvested posts fast.
+          const harvestRes = await runHarvestConnector(pair.groupUrl, pair.profileId, harvestCount, { seenIds: seenPostIds, profileIndex: pair.profileIndex || 0, profileCount: pair.profileCount || 1, resumeFromFbid: "", maxAgeDays, claimsDir });
           const items = harvestRes.items || [];
-          if (harvestRes.lastFbid) resumeUpdates[pair.groupUrl] = harvestRes.lastFbid; // remember the deepest photo reached -> next round resumes older
+          // (deep-resume cursor intentionally NOT recorded anymore — freshness cap replaces backlog-marching)
           if (items.length) logEvent("harvest_profile_took", { profileId: pair.profileId, groupUrl: pair.groupUrl, count: items.length, products: items.map((it) => oneLineField(String(it.link || ""), 80)).slice(0, 8) }); // TRACKING: which profile claimed which products (parallel dedup proof)
           for (const it of items) {
             const url = String(it.link || "").trim();
@@ -8607,9 +8623,11 @@ async function harvestContentSourcesAsync(options = {}) {
       if (Object.keys(membersOut).length) st2.posting.contentSources.harvestMembers = JSON.stringify(membersOut);
       writeState(st2);
     } catch (_) {}
-    // RE-SCAN cadence: drain fast when producing; re-scan ~every minute when idle; back off when long-exhausted.
-    if ((harvestedNew + reusedOld) > 0 || cursorAdvanced) { __harvestEmptyRounds = 0; __harvestNextAt = Date.now(); } // got new OR dug deeper -> immediately keep draining the backlog
-    else { __harvestEmptyRounds += 1; __harvestNextAt = Date.now() + 900000; } // nothing new AND no deeper progress (genuinely exhausted/throttled) -> re-check for NEW in 15 min
+    // RE-CHECK cadence (operator 2026-06-17: "check new products after each hour"): every round — whether it
+    // grabbed new products or found none — sleeps newCheckMinutes (default 60) before the next check. No more
+    // immediate backlog-draining; the run posts from the steady fresh pool and harvest tops it up hourly.
+    if ((harvestedNew + reusedOld) > 0) __harvestEmptyRounds = 0; else __harvestEmptyRounds += 1;
+    __harvestNextAt = Date.now() + newCheckMs;
     logEvent("harvest_round", { groups: pairs.length, harvestedNew, reusedOld, skippedSeen, emptyRounds: __harvestEmptyRounds, nextInSec: Math.round((__harvestNextAt - Date.now()) / 1000) });
     return { groups: pairs.length, harvestedNew, reusedOld, skippedSeen };
   })().catch((e) => { logEvent("harvest_sources_error", { error: oneLineField((e && e.message) || String(e), 200) }); __harvestNextAt = Date.now() + 120000; return { error: true }; })
@@ -9089,11 +9107,11 @@ async function autopilotTickAsync(options = {}) {
     if (!dryRun && !__closeFinishedSweepInFlight && (Date.now() - __lastCloseFinishedSweepAt) > 120000) {
       closeFinishedIxProfilesSweep({ max: 12 }).catch(() => {});
     }
-    // CONTENT-SOURCE HARVEST (operator 2026-06-16: harvest CONTINUOUSLY ALL DAY within the start/end WINDOW, decoupled
-    // from posting — build a large pool no matter the posts/day). Gated on the posting WINDOW (autopilotPostingWindowOpen),
-    // NOT armed, so it digs the backlog even when no posting run is active. Single-flight, fire-and-forget, cadence via
-    // __harvestNextAt. When contentSourcesEnabled is off, or outside the window, this never fires.
-    if (!dryRun && state.operator?.contentSourcesEnabled === true && autopilotPostingWindowOpen(state)
+    // CONTENT-SOURCE HARVEST (operator 2026-06-17: harvest at the SAME TIME as prod, NOT all day). Gated by
+    // harvestShouldRunNow (enabled + ARMED + inside the posting window) so it only digs while a run is active.
+    // Single-flight, fire-and-forget, hourly cadence via __harvestNextAt. (The heartbeat carries the same gate;
+    // this in-tick call just lets harvest kick in immediately on the same tick a run is posting.)
+    if (!dryRun && harvestShouldRunNow(state)
         && !__harvestSourcesInFlight && Date.now() >= __harvestNextAt) {
       harvestContentSourcesAsync({}).catch(() => {});
     }
@@ -18892,6 +18910,18 @@ function autopilotPostingWindowOpen(state = readState()) {
   return true;
 }
 
+// HARVEST COUPLING (operator 2026-06-17: "disable harvesting all day — harvest at the SAME TIME as prod"):
+// harvesting runs ONLY while a posting run is actively running, NOT 24/7. "Actively running" = the harvest
+// feature is enabled AND the autopilot is ARMED AND we are inside the posting window. This covers BOTH run
+// modes the operator uses ("stop after N posts" and the start/end time schedule) because autopilotPostingWindowOpen
+// returns the schedule state for schedule-mode and `true` for plain count-mode. When prod stops (disarms) or the
+// window closes, harvest stops with it — no overnight/all-day digging, no CPU drain at rest.
+function harvestShouldRunNow(state) {
+  return state.operator?.contentSourcesEnabled === true
+    && state.operator?.armedForExternalActions === true
+    && autopilotPostingWindowOpen(state);
+}
+
 function zonedNowParts(timezone) {
   try {
     const parts = new Intl.DateTimeFormat("en-US", {
@@ -18989,14 +19019,12 @@ setInterval(() => {
   // KEEP-OPEN reaper: close + release any kept-open session past its post/age cap so a held window can't linger.
   if (__keepOpenSession.size > 0) { try { closeStaleKeepOpenSessions(); } catch (_) {} }
   const state = readState();
-  // CONTINUOUS HARVEST (operator 2026-06-16: "keep arming himself to maximum even AFTER the posting stop time; if prod
-  // runs low, get more to continue"): run the source-group harvest on the ALWAYS-ON heartbeat, DECOUPLED from posting AND
-  // from the posting window — it must KEEP digging the backlog overnight / after the posting stop time to STOCKPILE the
-  // pool to its max (poolTarget, default 2000), so the next posting session always has a full reserve. The pool gate
-  // inside harvestContentSourcesAsync pauses it (opens ZERO browsers) once the pool is full, and resumes when posting +
-  // 15-day image-retention drain it below target — so it self-maintains at max and prod never starves. Opt-in via
-  // contentSourcesEnabled (default OFF -> a server with harvest off opens nothing). Single-flight + cadence (__harvestNextAt).
-  if (state.operator?.contentSourcesEnabled === true
+  // HARVEST WHILE PROD RUNS (operator 2026-06-17: "disable harvesting all day — harvest at the SAME TIME as prod").
+  // The harvest driver lives on the always-on 1s heartbeat but is now gated by harvestShouldRunNow (enabled + ARMED +
+  // inside the posting window) so it fires ONLY during an active posting run, for BOTH the count and schedule modes.
+  // When prod stops or the window closes, harvest stops too (no overnight stockpiling, zero browsers at rest).
+  // Single-flight + hourly cadence (__harvestNextAt). The pool gate inside still pauses it once poolTarget is reached.
+  if (harvestShouldRunNow(state)
       && !__harvestSourcesInFlight && Date.now() >= __harvestNextAt) {
     harvestContentSourcesAsync({}).catch(() => {});
   }

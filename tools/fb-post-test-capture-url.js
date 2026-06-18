@@ -3882,8 +3882,60 @@ async function advanceToNextPhoto(page) {
 // press the Right arrow to step NEWEST -> OLDER through every group photo one-by-one, reading each post's
 // text + image + first-comment link. Tracks the last fbid so the NEXT run RESUMES from there and keeps
 // going DEEPER into history — no fragile grid-scroll, works for ANY group. Returns {items, lastFbid}.
+// FRESHNESS CAP (operator 2026-06-17: "no older than 1 or 2 days, not 15 days"). Parse a Facebook timestamp
+// STRING into an APPROXIMATE age in days. Coarse on purpose — we only need "older than N days?". Reads the
+// VISIBLE relative time ("2h" / "3d" / "1w" / "June 15"), multilingual (en/es/fr/ar). Returns { days, confident };
+// confident:false => unknown => caller FAILS OPEN (harvests as before) so a parse miss never falsely stops harvest.
+function fbTimestampToAgeDays(raw) {
+  const s = String(raw || '').toLowerCase().trim();
+  if (!s) return { days: null, confident: false };
+  // very recent (no "X ago" digits): just now / a moment ago / now
+  if (/(just now|a few seconds|moment ago|^now$|^just\b|ahora|hace un momento|à l'instant|a l'instant|à linstant|الآن|للتو)/i.test(s)) return { days: 0, confident: true };
+  // relative "<number> <unit-word>" — capture the number and the unit word, then classify the unit.
+  const m = s.match(/(\d+)\s*([a-zàâäéèêëîïôöùûüçñ؀-ۿ]+)/i);
+  if (m) {
+    const n = Number(m[1]); const u = m[2];
+    if (/^(s|sec|secs|second|seconds|min|mins|minute|minutes|mn|m|h|hr|hrs|hour|hours|heure|heures|hora|horas|دقيقة|دقائق|ساعة|ساعات)$/.test(u)) return { days: 0, confident: true };
+    if (/^(d|day|days|j|jour|jours|d[ií]a|d[ií]as|dia|dias|يوم|أيام|ايام)$/.test(u)) return { days: n, confident: true };
+    if (/^(w|wk|wks|week|weeks|sem|semaine|semaines|semana|semanas|أسبوع|اسبوع|أسابيع|اسابيع)$/.test(u)) return { days: n * 7, confident: true };
+    if (/^(mo|mos|month|months|mois|mes|meses|شهر|أشهر|شهور)$/.test(u)) return { days: n * 30, confident: true };
+    if (/^(y|yr|yrs|year|years|an|ans|ann[ée]e|ann[ée]es|a[ñn]o|a[ñn]os|سنة|سنوات|عام|أعوام)$/.test(u)) return { days: n * 365, confident: true };
+  }
+  // absolute date in the VISIBLE label => FB switched off relative time => post is older than the ~week relative
+  // window => definitely older than 2 days. A 4-digit year means >1 year; a bare month name means weeks+.
+  if (/\b(19|20)\d{2}\b/.test(s)) return { days: 400, confident: true };
+  // absolute month+day date ("June 15" / "15 Mar" / "15 juin") => FB switched off relative time => weeks+ old.
+  // Requires an adjacent day-number so stray words (e.g. "Marshalls", "May Co") can't false-trigger a stop.
+  const MONTH = '(jan(uary)?|feb(ruary)?|mar(ch)?|apr(il)?|may|jun(e)?|jul(y)?|aug(ust)?|sept?(ember)?|oct(ober)?|nov(ember)?|dec(ember)?|ene(ro)?|abr(il)?|ago(sto)?|dic(iembre)?|janv(ier)?|f[ée]vr(ier)?|mars|avr(il)?|mai|juin|juil(let)?|ao[ûu]t|d[ée]c(embre)?)';
+  if (new RegExp('(\\b\\d{1,2}\\s*' + MONTH + '\\b|\\b' + MONTH + '\\s+\\d{1,2}\\b)', 'i').test(s)) return { days: 30, confident: true };
+  return { days: null, confident: false };
+}
+// Read the CURRENT photo-theater post's age in days from its VISIBLE timestamp text. Reads innerText of anchor/
+// abbr/time elements only (NEVER tooltip/title/aria-label — those carry the absolute full date that is present on
+// EVERY post, recent ones included, and would mis-flag fresh posts as old). Skips timestamps inside comment
+// articles. Returns the FIRST confident parse in DOM order (the post header precedes comments). Fail-open on error.
+async function photoViewerPostAgeDays(page) {
+  try {
+    const cands = await page.evaluate(() => {
+      const out = [];
+      const root = document.querySelector('[role="dialog"]') || document;
+      const els = root.querySelectorAll('a[role="link"], a[href*="/posts/"], a[href*="/permalink/"], a[href*="/photo"], abbr, time');
+      for (const el of els) {
+        const art = el.closest && el.closest('[role="article"]');
+        if (art) { const al = (art.getAttribute('aria-label') || '').toLowerCase(); if (/comment|comentario|commentaire|coment|kommentar|تعليق/.test(al)) continue; }
+        const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (t && t.length <= 24) out.push(t);
+        if (out.length >= 40) break;
+      }
+      return out;
+    }).catch(() => []);
+    for (const t of cands) { const a = fbTimestampToAgeDays(t); if (a.confident) return { days: a.days, confident: true, raw: t }; }
+    return { days: null, confident: false, raw: (cands[0] || '') };
+  } catch (_) { return { days: null, confident: false, raw: '' }; }
+}
 async function harvestGroupFeed(page, count, opts = {}) {
   const out = [];
+  const maxAgeDays = Number(opts.maxAgeDays) || 0; // 0 => cap disabled (server always passes >=1, default 2)
   const seenLinks = new Set();
   const ogState = { n: 0 };
   const seenIds = new Set((opts.seenIds || []).map(String));
@@ -3957,6 +4009,7 @@ async function harvestGroupFeed(page, count, opts = {}) {
   const visited = new Set(); // LOOP GUARD: fbids already walked this session
   let revisits = 0;
   let deepestSeen = Infinity; // smallest (oldest) fbid reached this walk -> OLDER progress resets the oscillation guard
+  let tooOldStreak = 0; // consecutive UNSEEN posts confidently older than maxAgeDays -> 2 in a row = crossed the freshness boundary -> stop
   while (out.length < walkCap && steps < maxSteps && Date.now() < budgetEnd) {
     steps++;
     curFbid = (await photoViewerFbid(page)) || curFbid;
@@ -3972,11 +4025,21 @@ async function harvestGroupFeed(page, count, opts = {}) {
     if (isRevisit) { if (++revisits >= 8) { console.log(JSON.stringify({ step: 'harvest_walk_end', reason: 'loop_detected', steps, collected: out.length, lastFbid })); break; } }
     else { revisits = 0; if (curFbid) visited.add(curFbid); }
     if (!isRevisit && curFbid && !seenIds.has(curFbid)) {
-      try {
-        const rec = await harvestExtractPhoto(page, { href: `https://www.facebook.com/photo/?fbid=${curFbid}&set=g.${groupId}`, postId: curFbid, seenLinks, ogState, claimsDir: opts.claimsDir, profileId: opts.profileId, budgetEnd });
-        if (rec) { out.push(rec); console.log(JSON.stringify({ step: 'harvest_item', n: out.length, fbid: curFbid, textLen: (rec.text || '').length, textPreview: (rec.text || '').slice(0, 90), imageSaved: !!rec.imageLocalPath, link: rec.link })); }
-        else { console.log(JSON.stringify({ step: 'harvest_walk_skip', fbid: curFbid, reason: 'no_product_link_or_dup' })); }
-      } catch (e) { console.log(JSON.stringify({ step: 'harvest_walk_item_error', fbid: curFbid, error: String((e && e.message) || e).slice(0, 140) })); }
+      // FRESHNESS CAP: photo theater is newest -> older, so once we reach posts older than maxAgeDays everything
+      // beyond is older too. Confirm with 2 consecutive confident-too-old reads (so one stray timestamp misread
+      // can't abort a good walk), then STOP. Unknown age => fail open (harvest as before).
+      const age = (maxAgeDays > 0) ? await photoViewerPostAgeDays(page) : { confident: false };
+      if (age.confident && age.days > maxAgeDays) {
+        if (++tooOldStreak >= 2) { console.log(JSON.stringify({ step: 'harvest_walk_end', reason: 'age_cap', maxAgeDays, ageDays: age.days, raw: age.raw, collected: out.length, lastFbid })); break; }
+        console.log(JSON.stringify({ step: 'harvest_walk_skip_old', fbid: curFbid, ageDays: age.days, raw: age.raw }));
+      } else {
+        tooOldStreak = 0;
+        try {
+          const rec = await harvestExtractPhoto(page, { href: `https://www.facebook.com/photo/?fbid=${curFbid}&set=g.${groupId}`, postId: curFbid, seenLinks, ogState, claimsDir: opts.claimsDir, profileId: opts.profileId, budgetEnd });
+          if (rec) { out.push(rec); console.log(JSON.stringify({ step: 'harvest_item', n: out.length, fbid: curFbid, textLen: (rec.text || '').length, textPreview: (rec.text || '').slice(0, 90), imageSaved: !!rec.imageLocalPath, link: rec.link })); }
+          else { console.log(JSON.stringify({ step: 'harvest_walk_skip', fbid: curFbid, reason: 'no_product_link_or_dup' })); }
+        } catch (e) { console.log(JSON.stringify({ step: 'harvest_walk_item_error', fbid: curFbid, error: String((e && e.message) || e).slice(0, 140) })); }
+      }
     }
     if (out.length >= walkCap) break;
     let moved = '';
@@ -3988,7 +4051,10 @@ async function harvestGroupFeed(page, count, opts = {}) {
   // DEPTH FALLBACK (operator: the source group has HUNDREDS of old deal posts): the photo-theater walk often goes
   // shallow / oscillates near the newest posts and can't reach deep history. When it collected fewer than asked,
   // deep-scroll the /media grid (newest -> OLDEST) and pull every old post that still has a first-comment link.
-  if (out.length < walkCap && Date.now() < budgetEnd - 20000) {
+  // GRID FALLBACK digs the /media grid newest -> OLDEST with no per-post age check, so it would pull stale
+  // backlog. With the freshness cap active (operator 2026-06-17), skip it — the capped theater walk above is
+  // the only harvest path, keeping everything within maxAgeDays. (A flaky round just retries next hour.)
+  if (!maxAgeDays && out.length < walkCap && Date.now() < budgetEnd - 20000) {
     console.log(JSON.stringify({ step: 'harvest_grid_fallback', walkGot: out.length, want: walkCap }));
     try {
       const base = String(opts.groupUrl || '').replace(/\/+$/, '').replace(/\/media$/i, '');
@@ -4270,7 +4336,7 @@ async function main() {
     }
     let harvested = [], harvestLastFbid = '';
     try {
-      const r = await harvestGroupFeed(page, harvestCount, { seenIds: payload.harvestSeenIds || [], profileIndex: payload.harvestProfileIndex || 0, profileCount: payload.harvestProfileCount || 1, resumeFromFbid: payload.harvestResumeFbid || '', claimsDir: payload.harvestClaimsDir || '', profileId: payload.profileId, groupUrl: payload.groupUrl });
+      const r = await harvestGroupFeed(page, harvestCount, { seenIds: payload.harvestSeenIds || [], profileIndex: payload.harvestProfileIndex || 0, profileCount: payload.harvestProfileCount || 1, resumeFromFbid: payload.harvestResumeFbid || '', maxAgeDays: Number(payload.harvestMaxAgeDays) || 2, claimsDir: payload.harvestClaimsDir || '', profileId: payload.profileId, groupUrl: payload.groupUrl });
       if (Array.isArray(r)) { harvested = r; } else { harvested = (r && r.items) || []; harvestLastFbid = (r && r.lastFbid) || ''; }
     }
     catch (e) { console.log(JSON.stringify({ step: 'harvest_error', error: String((e && e.message) || e).slice(0, 300) })); }
