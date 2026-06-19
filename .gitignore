@@ -14,13 +14,20 @@ tmp-*.ps1
 ghtoken.txt
 
 # ── data/: contains LIVE SECRETS, login sessions, and runtime artifacts. ──
-# Exclude EVERYTHING under data/, then re-include only the safe, needed files.
-# NOTE: data/secrets.local.json (API keys, proxy creds) and data/.dashboard-token
-# are intentionally NOT re-included — re-enter them on the new machine via the dashboard.
+# Exclude EVERYTHING under data/, then re-include only the safe, needed scripts.
+# NOTE (operator 2026-06-18): the repo is CODE + DEPLOYMENT ONLY for cloning to other
+# machines. workflow-state.json (dashboard token + posting groups + profile config) is
+# now EXCLUDED — it stays LOCAL on each machine and is re-configured fresh after a clone.
+# Local settings/data survive machine restarts (the files are never deleted, only untracked).
 data/*
-!data/workflow-state.json
 !data/fb-server-watchdog.ps1
 !data/prod-autostop.js
+
+# ── Operator config + agent memory: machine-specific, contains group IDs + tokens. ──
+# LOCAL only (the repo is code + deployment only). Settings persist across restarts.
+claude-memory/
+hermes-config/
+.hermes/
 
 # local git config (created when HOME pointed at repo during setup)
 .gitconfig
