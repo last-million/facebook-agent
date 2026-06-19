@@ -10508,6 +10508,23 @@ function latestDifferentProfileVerifiedCommentForPost(postUrl = "", publishingPr
   return null;
 }
 
+function latestPublishedFacebookPostAtMs() {
+  // Newest published-post timestamp (ms) from the live-post ledger — the persistent first-comment drain's outer
+  // gate, so the drain opens ZERO browsers at rest (no post in the recent window => no drain). Cheap newest-first scan.
+  try {
+    const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 2000 });
+    for (let i = rows.length - 1; i >= 0; i -= 1) {
+      const r = rows[i];
+      if (!r || !r.postUrl) continue;
+      const isPublished = /^published/.test(String(r.event || "")) || ["published", "published_with_warning", "published_after_admin_approval"].includes(String(r.status || ""));
+      if (!isPublished) continue;
+      const at = Date.parse(r.at || "") || 0;
+      if (at) return at;
+    }
+  } catch (_) {}
+  return 0;
+}
+
 function postingPlanRowForRecord(body = {}) {
   const rows = latestPostingPlanRows();
   const planId = oneLineField(body.planId || body.plan_id || "", 140);
@@ -14351,6 +14368,13 @@ let __lastCommentResweepAt = 0;
 // churn (a stuck post burning profiles repeatedly). Skip it for ~20min, then retry (in case it went live/approved).
 const __commentRecoveryBackoff = new Map(); // postUrl -> last-attempt ms
 const COMMENT_RECOVERY_BACKOFF_MS = 22 * 60 * 1000; // operator 2026-06-16: re-check a pending post after ~22 min (FB approval window) instead of re-cycling it sooner — gives the moderator-approval time, then it gets approved + commented on the later pass
+// PERSISTENT FIRST-COMMENT DRAIN (operator 2026-06-19): the armed-gated resweep + the run-end final passes all stop
+// within ~5 min of disarm, but FB's moderation queue makes a pending post public 10-30 min LATER — so a late-approved
+// post never got its money-comment (the 8.5% miss). This always-on, armed-INDEPENDENT drain keeps re-commenting any
+// RECENTLY-published-but-uncommented post for up to PERSISTENT_DRAIN_WINDOW_MS after the last published post.
+let __lastPersistentDrainAt = 0;
+const PERSISTENT_DRAIN_INTERVAL_MS = 3 * 60 * 1000;   // drain at most every 3 min while disarmed
+const PERSISTENT_DRAIN_WINDOW_MS = 60 * 60 * 1000;    // keep draining up to 60 min after the last published post (outlasts the 30-min FB queue)
 async function resweepUncommentedFacebookPostsAsync(options = {}) {
   if (__commentResweepInFlight) return __commentResweepInFlight;
   __commentResweepInFlight = (async () => {
@@ -14361,10 +14385,10 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       // ignoreArmedGate = the operator FINISH/STOP comment-drain: run despite a fresh disarm, but WITHOUT force's
       // reach-back — it keeps the run-cutoff clamp below, so it only finishes the CURRENT run's comments and never
       // chases OLD posts from earlier runs (operator 2026-06-14: "don't go back for previous posts at launch").
-      if (!options.force && !options.ignoreArmedGate && !(state.operator?.autopilotEnabled && state.operator?.armedForExternalActions)) {
+      if (!options.force && !options.ignoreArmedGate && !options.drain && !(state.operator?.autopilotEnabled && state.operator?.armedForExternalActions)) {
         return summary;
       }
-      if (options.force || options.ignoreArmedGate) __forcedCommentResweepActive = true; // a forced post-publish resweep OR the finish/stop comment-drain may comment despite the run-limit/disarm
+      if (options.force || options.ignoreArmedGate || options.drain) __forcedCommentResweepActive = true; // a forced post-publish resweep, the finish/stop comment-drain, OR the persistent post-run drain may comment despite the run-limit/disarm
       const resweepStartedAt = Date.now(); // if the operator hits STOP after this, abort the loop (real stop)
       const windowMs = clampNumber(options.windowHours, 1, 168, 24) * 3600 * 1000;
       let cutoff = Date.now() - windowMs;
@@ -14379,7 +14403,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       // were never recovered (the stale-pending hole). NORMAL tick-driven sweeps keep the run-only focus (operator:
       // don't chase history every 90s during a run). Forced reach-back stays bounded by windowMs + maxToFix + the
       // attribution / comment-lock / never-twice guards below — it can never loop on un-commentable old posts.
-      if (__runStart > 0 && !options.force) cutoff = Math.max(cutoff, __runStart);
+      if (__runStart > 0 && !options.force && !options.drain) cutoff = Math.max(cutoff, __runStart); // drain uses its own recency window (windowHours) so it reaches THIS run's just-published tail after disarm, bounded so it never chases old runs
       const maxToFix = clampNumber(options.max, 1, 50, 10);
       const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 8000 });
       const publishedByPlan = new Map();
@@ -14406,7 +14430,8 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         const commentText = String(row?.commentTextPreview || row?.link || "").trim();
         if (!row || !commentText) { summary.stillMissing += 1; continue; } // cannot reconstruct the comment
         const __boAt = __commentRecoveryBackoff.get(postUrl) || 0;
-        if (Date.now() - __boAt < COMMENT_RECOVERY_BACKOFF_MS) { summary.stillMissing += 1; continue; } // tried recently + still uncommented -> defer (don't re-cycle profiles on a stuck/pending post)
+        const __backoffMs = options.drain ? (8 * 60 * 1000) : COMMENT_RECOVERY_BACKOFF_MS; // drain re-checks a pending post every ~8 min so the comment lands soon after FB approves it (vs the 22-min run cadence)
+        if (Date.now() - __boAt < __backoffMs) { summary.stillMissing += 1; continue; } // tried recently + still uncommented -> defer (don't re-cycle profiles on a stuck/pending post)
         await waitForPostingIdle({ label: "comment_resweep" });
         if (latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) continue; // a concurrent post may have just commented it
         __commentRecoveryBackoff.set(postUrl, Date.now()); // record this attempt (set BEFORE attempting so a timeout/crash still backs off)
@@ -19094,6 +19119,23 @@ setInterval(() => {
   if (harvestShouldRunNow(state)
       && !__harvestSourcesInFlight && Date.now() >= __harvestNextAt) {
     harvestContentSourcesAsync({}).catch(() => {});
+  }
+  // PERSISTENT FIRST-COMMENT DRAIN (operator 2026-06-19, the 10-30min-approval hole): FB makes a pending post public
+  // 10-30 min AFTER we record it published, but the armed-gated resweep + the run-end final passes all stop within
+  // ~5 min of disarm — so a late-approved post never got its money-comment (the 8.5% miss). This ALWAYS-ON drain
+  // re-comments any RECENTLY-published post still missing its different-profile first comment, for up to
+  // PERSISTENT_DRAIN_WINDOW_MS after the last published post. Bounded window => never chases old history. Single-
+  // flight, never reposts, never double-comments (the latestDifferentProfileVerifiedCommentForPost guard inside),
+  // yields to active posting. ZERO browsers at rest: the latestPublishedFacebookPostAtMs gate is a no-op once no
+  // post was published in the last 60 min.
+  if (!__commentResweepInFlight
+      && state.operator?.autopilotDryRun !== true
+      && Date.now() - __lastPersistentDrainAt > PERSISTENT_DRAIN_INTERVAL_MS) {
+    const __lastPub = latestPublishedFacebookPostAtMs();
+    if (__lastPub > 0 && (Date.now() - __lastPub) < PERSISTENT_DRAIN_WINDOW_MS) {
+      __lastPersistentDrainAt = Date.now();
+      resweepUncommentedFacebookPostsAsync({ drain: true, max: 25, windowHours: 1 }).catch(() => {});
+    }
   }
   const intervalMs = clampNumber(state.triggers?.heartbeatSeconds, 3, 120, 3) * 1000;
   if (Date.now() - lastHeartbeatTick < intervalMs) return;
