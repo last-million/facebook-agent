@@ -19624,6 +19624,11 @@ const server = http.createServer(async (req, res) => {
   }
   // Explicit STOP-ALL endpoint (dashboard Stop buttons can call this directly for an instant hard stop).
   if (req.method === "POST" && url.pathname === "/api/operator/stop-all") {
+    // SOURCE DIAGNOSTIC (operator 2026-06-19: "I launched but it stopped — WTF"): the server never auto-stops a run
+    // (only the run-limit/crash does, with different reasons), so an operator_stop_all is ALWAYS an external POST to
+    // this endpoint. Log WHO called it (UA distinguishes a real browser Stop-click from a script/cron/stale-tab) so a
+    // recurring mystery stop is traceable. IP is localhost for all dashboard calls; UA/referer are the useful signal.
+    try { logEvent("operator_stop_all_requested", { ua: oneLineField(req.headers["user-agent"] || "", 140), referer: oneLineField(req.headers["referer"] || req.headers["referrer"] || "", 160), remote: String(req.socket?.remoteAddress || "") }); } catch (_) {}
     const r = await stopAllExternalWork("operator_stop_all").catch((e) => ({ stopped: false, error: String((e && e.message) || e) }));
     return json(res, 200, r);
   }
