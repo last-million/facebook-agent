@@ -4025,12 +4025,16 @@ async function harvestGroupFeed(page, count, opts = {}) {
     if (isRevisit) { if (++revisits >= 8) { console.log(JSON.stringify({ step: 'harvest_walk_end', reason: 'loop_detected', steps, collected: out.length, lastFbid })); break; } }
     else { revisits = 0; if (curFbid) visited.add(curFbid); }
     if (!isRevisit && curFbid && !seenIds.has(curFbid)) {
-      // FRESHNESS CAP: photo theater is newest -> older, so once we reach posts older than maxAgeDays everything
-      // beyond is older too. Confirm with 2 consecutive confident-too-old reads (so one stray timestamp misread
-      // can't abort a good walk), then STOP. Unknown age => fail open (harvest as before).
+      // FRESHNESS CAP (operator 2026-06-18, yield fix): SKIP posts older than maxAgeDays, but DON'T stop the walk
+      // on just a couple of them. Facebook's media grid is NOT strictly newest-first, so an older photo can appear
+      // early — the old "stop after 2 in a row" crushed yield (got 17 -> 2). Keep walking the recent zone (bounded
+      // by walkCap + budget), skipping old posts and harvesting every fresh one; only stop after a LONG run of
+      // consecutive old posts (clearly past the fresh zone). Unknown age => fail open (harvest). DEBUG: every age
+      // read is appended to data/harvest-age-debug.log so we can see the REAL post ages this group is showing.
       const age = (maxAgeDays > 0) ? await photoViewerPostAgeDays(page) : { confident: false };
+      try { fs.appendFileSync(path.join(__dirname, '..', 'data', 'harvest-age-debug.log'), JSON.stringify({ fbid: curFbid, raw: age.raw, days: age.days, conf: age.confident, decision: (age.confident && age.days > maxAgeDays) ? 'skip_old' : 'harvest' }) + '\n'); } catch (_) {}
       if (age.confident && age.days > maxAgeDays) {
-        if (++tooOldStreak >= 2) { console.log(JSON.stringify({ step: 'harvest_walk_end', reason: 'age_cap', maxAgeDays, ageDays: age.days, raw: age.raw, collected: out.length, lastFbid })); break; }
+        if (++tooOldStreak >= 25) { console.log(JSON.stringify({ step: 'harvest_walk_end', reason: 'age_cap', maxAgeDays, ageDays: age.days, raw: age.raw, collected: out.length, lastFbid })); break; }
         console.log(JSON.stringify({ step: 'harvest_walk_skip_old', fbid: curFbid, ageDays: age.days, raw: age.raw }));
       } else {
         tooOldStreak = 0;
