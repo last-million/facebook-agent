@@ -1006,6 +1006,12 @@ function writeState(state, opts = {}) {
       if (existing.posting[f] !== undefined) clean.posting[f] = existing.posting[f];
     }
   }
+  // operator.postToAllGroups is OPERATOR-CONFIG (changed only via the dashboard PUT) — preserve the on-disk value
+  // on every background write so the duplicate-to-all-groups switch can't be silently flipped by a stale snapshot.
+  if (!opts.allowOperatorConfig && existing.operator && existing.operator.postToAllGroups !== undefined) {
+    clean.operator = clean.operator || {};
+    clean.operator.postToAllGroups = existing.operator.postToAllGroups;
+  }
   clean.ixbrowser.failedProfiles = mergeProtectedRecordLines(
     clean.ixbrowser?.failedProfiles,
     existing.ixbrowser?.failedProfiles,
@@ -9795,7 +9801,27 @@ function preparePostingPlan(options = {}) {
     // every row past the pool size — starving all but the first ~9 profiles of ready rows so fresh
     // profiles were never selected. The comment text above already tolerates an empty lead-in.
     const readyForLiveConnector = missingAssets.length === 0;
-    rows.push({
+    // FAN-OUT TO ALL GROUPS (operator 2026-06-18, flag operator.postToAllGroups). When ON, the SAME product is
+    // emitted as one row PER GROUP so it posts into EVERY group (each its own primary, no cross-group fallback),
+    // honoring 1x/group/24h via the per-group reuse stamp. When OFF, behavior is EXACTLY as before (one row,
+    // primary group + fallbacks). The run's post-counter still bounds total posts.
+    const __postToAll = state.operator?.postToAllGroups === true;
+    let __targetGroups = [slot.groupUrl];
+    if (__postToAll) {
+      const __reuseMs = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 24) * 3600 * 1000;
+      const __byGroup = (harvestedRec && harvestedRec.lastPostedAtByGroup && typeof harvestedRec.lastPostedAtByGroup === "object") ? harvestedRec.lastPostedAtByGroup : {};
+      const __seen = new Set();
+      __targetGroups = [];
+      for (const __g of [slot.groupUrl, ...fallbackGroupUrlsForSlot(slot, state)]) {
+        const __k = normalizedFacebookGroupKey(__g);
+        if (!__g || !__k || __seen.has(__k)) continue;
+        __seen.add(__k);
+        if (harvestedRec) { const __t = Date.parse(__byGroup[__k] || ""); if (Number.isFinite(__t) && (Date.now() - __t) < __reuseMs) continue; } // 1x per group per 24h
+        __targetGroups.push(__g);
+      }
+      if (!__targetGroups.length) continue; // this product already hit every group within its 24h window -> skip
+    }
+    const __row = {
       at,
       planId,
       sequence: index + 1,
@@ -9839,7 +9865,17 @@ function preparePostingPlan(options = {}) {
       linkPlacement: state.rules.linkPlacement,
       pinFirstComment: Boolean(state.rules.pinFirstComment),
       externalActionPolicy: "approval_required_no_browser_limit_bypass",
-    });
+    };
+    // EMIT: flag OFF -> the single row exactly as before; flag ON -> one row per target group (same product body,
+    // each with its own primary group, no cross-group fallback, and a distinct running sequence so each group post
+    // has its own ledger identity).
+    if (!__postToAll) {
+      rows.push(__row);
+    } else {
+      for (const __g of __targetGroups) {
+        rows.push({ ...__row, sequence: rows.length + 1, groupUrl: __g, fallbackGroupUrls: [] });
+      }
+    }
   }
   const postingPlanContent = writeJsonlFile(state.files.postingPlan || "data/posting-plan.jsonl", rows);
   registers.postingPlan = postingPlanContent;
@@ -10317,6 +10353,10 @@ function livePostLedgerKey(row = {}, profileId = "") {
     oneLineField(row.planId || row.plan_id || "", 120),
     Number(row.sequence || row.seq || 0),
     Number(profileId || row.profileId || profileIdFromLabel(row.profile) || 0),
+    // GROUP-SCOPED (operator 2026-06-18 post-to-all-groups): include the target group so the SAME product posted
+    // to a DIFFERENT group is a DISTINCT ledger identity and is NOT rejected by the duplicate-publish short-circuit.
+    // Safe for single-group mode: every row for a (plan,seq,profile) carries the same groupUrl -> identical key.
+    normalizedFacebookGroupKey(row.groupUrl || row.actualGroupUrl || ""),
   ].join(":");
 }
 
@@ -10521,7 +10561,13 @@ function recordPublishedFacebookPostUrl(body) {
   if (row && String(row.productKey || "").startsWith("harvested:")) {
     try {
       const __prevRec = harvestedRecordForKey(row.productKey, state) || {};
-      updateHarvestedProductRecord(row.productKey, { lastPostedAt: new Date().toISOString(), postedCount: (Number(__prevRec.postedCount) || 0) + 1, postUrl: String(postUrl || ""), posted: "" });
+      // PER-GROUP reuse stamp (operator 2026-06-18 post-to-all-groups): also remember the last-posted time PER
+      // GROUP so plan-build can let the same product post into a different group while still honoring 1x/group/24h.
+      const __nowISO = new Date().toISOString();
+      const __grpKey = normalizedFacebookGroupKey(row.groupUrl || "");
+      const __byGroup = Object.assign({}, (__prevRec.lastPostedAtByGroup && typeof __prevRec.lastPostedAtByGroup === "object") ? __prevRec.lastPostedAtByGroup : {});
+      if (__grpKey) __byGroup[__grpKey] = __nowISO;
+      updateHarvestedProductRecord(row.productKey, { lastPostedAt: __nowISO, lastPostedAtByGroup: __byGroup, postedCount: (Number(__prevRec.postedCount) || 0) + 1, postUrl: String(postUrl || ""), posted: "" });
       logEvent("harvested_post_recorded_reuse_eligible", { productKey: row.productKey, postedCount: (Number(__prevRec.postedCount) || 0) + 1 });
     } catch (_) {}
   }
@@ -11872,7 +11918,7 @@ function isNonFallbackFacebookPublishFailure(message = "") {
 function markLivePostedRegisters(row, postUrl) {
   const registers = readRegisters();
   const at = new Date().toISOString();
-  if (row.productUrl) registers.usedProducts = appendUniqueRecordLine(registers.usedProducts || "", `${at} | product_key=${row.productKey || ""} | product_url=${row.productUrl} | plan_id=${row.planId || ""} | post_url=${postUrl || ""}`);
+  if (row.productUrl) registers.usedProducts = appendUniqueRecordLine(registers.usedProducts || "", `${at} | product_key=${row.productKey || ""} | product_url=${row.productUrl} | plan_id=${row.planId || ""} | group_url=${row.groupUrl || ""} | post_url=${postUrl || ""}`);
   if (row.postText) registers.usedPostTexts = appendUniqueRecordLine(registers.usedPostTexts || "", `${at} | plan_id=${row.planId || ""} | ${oneLineField(row.postText, 500)}`);
   if (row.commentLeadIn) registers.usedCommentLeadIns = appendUniqueRecordLine(registers.usedCommentLeadIns || "", `${at} | plan_id=${row.planId || ""} | ${oneLineField(row.commentLeadIn, 300)}`);
   writeRegisters(registers);
@@ -11908,6 +11954,23 @@ function assertProductNotUsedToday(row, state = readState()) {
   if (!key) return;
   const timezone = state.operator?.scheduleTimezone || state.rules?.peakHoursTimezone || "America/New_York";
   const dayKey = dateKeyForTimezone(new Date(), timezone);
+  // PER-GROUP (operator 2026-06-18 post-to-all-groups): when posting each product into EVERY group, "used today"
+  // must be scoped to the GROUP — otherwise posting to group A blocks the SAME product from posting to group B.
+  // Block only a same-product + same-group repeat in the same day; different group => allowed.
+  if (state.operator?.postToAllGroups === true) {
+    const rowGroupKey = normalizedFacebookGroupKey(row.groupUrl || "");
+    for (const line of recordLines(readRegisters().usedProducts)) {
+      const firstField = String(line).split("|")[0].trim();
+      const m = firstField.match(/^(\d{4}-\d{2}-\d{2})/);
+      if (!m || m[1] !== dayKey) continue;
+      if (!productKeysFromText(line, state).has(key)) continue;
+      const lineGroupKey = normalizedFacebookGroupKey((String(line).match(/group_url=([^|]+)/i) || [])[1] || "");
+      if (lineGroupKey !== rowGroupKey) continue; // same product, DIFFERENT group -> not a conflict
+      const e = new Error(`Product already used today in this group (${dayKey} ${timezone}): ${row.productUrl || row.productKey}.`);
+      e.statusCode = 409; throw e;
+    }
+    return;
+  }
   const usedToday = productKeysUsedOnDate(readRegisters().usedProducts, state, dayKey);
   if (!usedToday.has(key)) return;
   const err = new Error(`Product already used today (${dayKey} ${timezone}): ${row.productUrl || row.productKey}. Refresh product discovery and rebuild the production plan.`);
