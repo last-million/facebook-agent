@@ -8672,6 +8672,12 @@ async function harvestContentSourcesAsync(options = {}) {
 }
 
 async function fillAssetBufferAsync(options = {}) {
+  // EXCLUSIVE harvested-only mode: this fill prepares WEB products (SYL link + scrape the retailer page, e.g. Walmart).
+  // Harvested products are already ready from the harvest and are EXCLUDED from this loop, so when contentSourcesExclusive
+  // is ON the fill has nothing to prepare yet would still OPEN the old web candidates' pages (Walmart) to scrape — the
+  // wasted opens the operator saw. Skip it entirely so harvested-only NEVER touches the web. (operator 2026-06-20: "he
+  // should NOT look for other Walmart products, just use harvested ones".) Mirrors the discovery gate at ~9018.
+  if (readState().operator?.contentSourcesExclusive === true) return { prepared: 0, attempted: 0, linkOk: 0, imageOk: 0, errors: [], stoppedReason: "content_sources_exclusive" };
   if (__assetBufferFillInFlight) return __assetBufferFillInFlight;
   __assetBufferFillInFlight = (async () => {
     const summary = { prepared: 0, attempted: 0, linkOk: 0, imageOk: 0, errors: [], stoppedReason: "" };
