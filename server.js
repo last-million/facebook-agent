@@ -1008,9 +1008,11 @@ function writeState(state, opts = {}) {
   }
   // operator.postToAllGroups is OPERATOR-CONFIG (changed only via the dashboard PUT) — preserve the on-disk value
   // on every background write so the duplicate-to-all-groups switch can't be silently flipped by a stale snapshot.
-  if (!opts.allowOperatorConfig && existing.operator && existing.operator.postToAllGroups !== undefined) {
+  if (!opts.allowOperatorConfig && existing.operator) {
     clean.operator = clean.operator || {};
-    clean.operator.postToAllGroups = existing.operator.postToAllGroups;
+    for (const f of ["postToAllGroups", "keepOpenSessionEnabled"]) {
+      if (existing.operator[f] !== undefined) clean.operator[f] = existing.operator[f];
+    }
   }
   // contentSources reuse/retention/harvest knobs are OPERATOR-CONFIG (changed only via the dashboard PUT) — preserve the
   // on-disk values on every background write so a stale-snapshot controlWrite can't silently revert them (the reuseHours
@@ -14847,7 +14849,7 @@ function anyCommenterFreeForPost(row, groupUrl, excludeProfileId, state = readSt
 // still force-reaps a stuck in-use session. SAFE for <=~5 active profiles at concurrency 3 (peak ~7 of 8 locks: held
 // publishers + active commenters); beyond that the commenter open can hit the 8-cap 503 and defer to the resweep.
 const __keepOpenSession = new Map(); // profileId -> { endpoint, postsUsed, openedAt, release, inUse }
-const KEEP_OPEN_MAX_POSTS = 5;
+const KEEP_OPEN_MAX_POSTS = 2; // operator 2026-06-19: reuse a session for 2 posts THEN rotate — fairness stays even (the least-used picker still chooses each session's profile, keep-open just does 2 posts on it), while cutting ~half the ixBrowser opens (fewer 1008 'server busy' + less CPU).
 const KEEP_OPEN_MAX_MS = 40 * 60 * 1000;
 // KEEP-OPEN DECISION — auto by ixBrowser PLAN, with a manual override. Tri-state operator.keepOpenSessionEnabled:
 //   === true  -> FORCE ON  (operator override, e.g. for a test)
