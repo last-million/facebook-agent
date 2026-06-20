@@ -14446,7 +14446,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         publishedByPlan.set(planKey, r); // keep the latest ledger row per plan
       }
       for (const ev of publishedByPlan.values()) {
-        if (__externalStopRequested > resweepStartedAt) { logEvent("comment_resweep_aborted_by_stop", { checked: summary.checked }); break; } // operator hit STOP -> halt now
+        if (!options.ignoreArmedGate && __externalStopRequested > resweepStartedAt) { logEvent("comment_resweep_aborted_by_stop", { checked: summary.checked }); break; } // operator hit STOP -> halt now. EXCEPTION (operator 2026-06-20): the ignoreArmedGate FINISH-drains (stop-drain 8270 / run-end 9075) run to COMPLETION — a 2nd/stale/double STOP must NOT bump __externalStopRequested past this drain's resweepStartedAt and abandon the comments the run already owes (that left 20 uncommented forever). Posting+harvest are already hard-killed before the finish-drain starts, so this only lets the cheap comment-finish complete.
         const postUrl = ev.postUrl;
         // Bound by ATTEMPTS, not just successes: a post that can never be commented (no eligible
         // commenter) must not make every 90s sweep do full-cost recovery work against it.
@@ -14459,7 +14459,12 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         const __boAt = __commentRecoveryBackoff.get(postUrl) || 0;
         const __backoffMs = options.drain ? (8 * 60 * 1000) : COMMENT_RECOVERY_BACKOFF_MS; // drain re-checks a pending post every ~8 min so the comment lands soon after FB approves it (vs the 22-min run cadence)
         if (Date.now() - __boAt < __backoffMs) { summary.stillMissing += 1; continue; } // tried recently + still uncommented -> defer (don't re-cycle profiles on a stuck/pending post)
-        await waitForPostingIdle({ label: "comment_resweep" });
+        // STARVATION FIX (operator 2026-06-20): the RECOVERY drains (persistent drain / stop-finish / run-end / forced)
+        // must NOT yield-forever to an always-posting run — that left the drain checking only 1 post/cycle while 20 stayed
+        // uncommented (audit: waitedMs 76544 -> checked 1). Bound their courtesy yield to 15s so ONE cycle clears the whole
+        // owed backlog; the cheap normal armed heartbeat sweep keeps the full polite yield (no added load at rest).
+        if (!options.drain && !options.ignoreArmedGate && !options.force) await waitForPostingIdle({ label: "comment_resweep" });
+        else await waitForPostingIdle({ label: "comment_resweep", maxWaitMs: 15000 });
         if (latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) continue; // a concurrent post may have just commented it
         __commentRecoveryBackoff.set(postUrl, Date.now()); // record this attempt (set BEFORE attempting so a timeout/crash still backs off)
         if (__commentRecoveryBackoff.size > 3000) { const cut = Date.now() - 2 * COMMENT_RECOVERY_BACKOFF_MS; for (const [k, v] of __commentRecoveryBackoff) if (v < cut) __commentRecoveryBackoff.delete(k); } // bound memory
@@ -19161,7 +19166,7 @@ setInterval(() => {
     const __lastPub = latestPublishedFacebookPostAtMs();
     if (__lastPub > 0 && (Date.now() - __lastPub) < PERSISTENT_DRAIN_WINDOW_MS) {
       __lastPersistentDrainAt = Date.now();
-      resweepUncommentedFacebookPostsAsync({ drain: true, max: 25, windowHours: 1 }).catch(() => {});
+      resweepUncommentedFacebookPostsAsync({ drain: true, max: 50, windowHours: 6 }).catch(() => {}); // operator 2026-06-20: windowHours 1->6 so the drain can SEE a long run's first-half posts (1h silently excluded posts published >60min ago -> never recovered); max 25->50 to clear a whole run's tail in one cycle (aligns with the stop/run-end drains' windowHours:24/max:50).
     }
   }
   const intervalMs = clampNumber(state.triggers?.heartbeatSeconds, 3, 120, 3) * 1000;
