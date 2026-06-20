@@ -8175,6 +8175,32 @@ function machineParallelCap(state) {
   return (Number.isFinite(v) && v >= 1) ? v : MAX_CONCURRENT_NORMAL_IX_PROFILES;
 }
 
+// ADAPTIVE CONCURRENCY (operator 2026-06-20: "be fast, never reach 100% CPU, never freeze, auto-calculated on ANY box").
+// Returns how many posting workers to run CONCURRENTLY this tick by sampling LIVE CPU% + free RAM + chrome count and
+// ramping within [1, hardCap]: full speed when the box is idle, collapsing to 1 (sequential) the instant load climbs.
+// This both self-fits any hardware AND breaks a runaway — when CPU rises (e.g. hung renders piling up) it STOPS adding
+// new windows, so the stuck ones drain and CPU recovers instead of spiraling to 100% (the fixed-5-concurrent crash on
+// 2026-06-20). The existing waitForCpuHeadroom still gates each individual open as a second backstop. Worst case any
+// probe fails -> the catch leaves cpu=100/freeRam=0/chrome=999 -> returns 1 (safest). Opt out: operator.adaptiveConcurrency===false.
+async function adaptiveMaxWorkers(state, hardCap) {
+  const userMax = clampNumber(state?.ixbrowser?.maxConcurrentProfiles, 1, hardCap, hardCap);
+  if (userMax <= 1) return 1;
+  let cpu = 100, freeRam = 0, chrome = 999;
+  try { cpu = await currentCpuLoadPercent(); } catch (_) {}
+  try { freeRam = currentFreeRamPercent(); } catch (_) {}
+  try { chrome = await currentChromeProcessCount(); } catch (_) {}
+  let n;
+  if (freeRam < 18 || chrome > 90) n = 1;   // hard back-pressure: low RAM / window pileup -> sequential, let it drain
+  else if (cpu >= 78) n = 1;                 // saturating -> sequential (breaks the spiral before 100%)
+  else if (cpu >= 68) n = 2;
+  else if (cpu >= 55) n = 3;
+  else if (cpu >= 42) n = 4;
+  else n = userMax;                          // idle box -> full speed
+  const out = Math.max(1, Math.min(n, userMax));
+  try { logEvent("adaptive_concurrency", { cpu, freeRam, chrome, workers: out, cap: userMax }); } catch (_) {}
+  return out;
+}
+
 // PREP yields to posting at SAFE boundaries (between fill batches — never mid-post, never with an
 // iX/HD browser half-open). Bounded (default 180s) then PROCEEDS, symmetric to waitForCpuHeadroom,
 // so prep can NEVER be permanently starved. Posting-idle is checked FIRST, then CPU headroom.
@@ -9203,7 +9229,9 @@ async function autopilotTickAsync(options = {}) {
       ? randomInt(Math.min(__secMin, __secMax), Math.max(__secMin, __secMax)) * 1000
       : 0;
     const __postCap = machineParallelCap(state); // auto machine ceiling (cpu+ram, reserves OS+Pinterest); operator may run FEWER, never more
-    const maxWorkers = clampNumber(state.ixbrowser?.maxConcurrentProfiles, 1, __postCap, __postCap);
+    const maxWorkers = (state.operator?.adaptiveConcurrency !== false)
+      ? await adaptiveMaxWorkers(state, __postCap)   // live CPU/RAM-scaled (fast when idle, 1 when loaded; never freezes)
+      : clampNumber(state.ixbrowser?.maxConcurrentProfiles, 1, __postCap, __postCap);
     decision.maxWorkers = maxWorkers;
     const withCapacity = capacity.profiles.filter((p) => p.remaining > 0);
     const eligibleProfiles = withCapacity.filter((p) => (now - (p.lastPostAt || 0)) >= minGapMs);
@@ -9451,7 +9479,7 @@ async function autopilotTickAsync(options = {}) {
     // try/finally guarantees the signal clears even if a worker throws (no starvation leak).
     beginLivePostingBatch();
     try {
-    if (state.operator?.autopilotConcurrentPosting && picked.length > 1) {
+    if (picked.length > 1 && (state.operator?.adaptiveConcurrency !== false || state.operator?.autopilotConcurrentPosting)) {
       const openStaggerMs = clampNumber(state.operator?.parallelOpenStaggerSeconds, 0, 30, 8) * 1000;
       logEvent("autopilot_posting_concurrent", { workers: picked.length, openStaggerMs, profileIds: picked.map((r) => Number(r.profileId || 0)) });
       // Stagger the worker STARTS so the iX profile-open requests don't collide (4 simultaneous
