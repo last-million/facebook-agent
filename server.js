@@ -1012,6 +1012,16 @@ function writeState(state, opts = {}) {
     clean.operator = clean.operator || {};
     clean.operator.postToAllGroups = existing.operator.postToAllGroups;
   }
+  // contentSources reuse/retention/harvest knobs are OPERATOR-CONFIG (changed only via the dashboard PUT) — preserve the
+  // on-disk values on every background write so a stale-snapshot controlWrite can't silently revert them (the reuseHours
+  // 24->48 revert the operator kept hitting). Dashboard PUTs (allowOperatorConfig) still change them normally.
+  if (!opts.allowOperatorConfig && existing.posting && existing.posting.contentSources) {
+    clean.posting = clean.posting || {};
+    clean.posting.contentSources = clean.posting.contentSources || {};
+    for (const f of ["reuseHours", "imageRetentionDays", "harvestMaxAgeDays", "newCheckMinutes"]) {
+      if (existing.posting.contentSources[f] !== undefined) clean.posting.contentSources[f] = existing.posting.contentSources[f];
+    }
+  }
   clean.ixbrowser.failedProfiles = mergeProtectedRecordLines(
     clean.ixbrowser?.failedProfiles,
     existing.ixbrowser?.failedProfiles,
@@ -1592,7 +1602,7 @@ function normalizeWorkflowState(state) {
   // RE-USE ROTATION knobs (dynamic): a posted harvested product becomes eligible again after reuseHours (so
   // production never stalls when no fresh products); its image is kept for re-posting, then deleted after
   // imageRetentionDays to free disk (the text+url record stays for dedup).
-  state.posting.contentSources.reuseHours = clampNumber(state.posting.contentSources.reuseHours, 1, 720, 26);
+  state.posting.contentSources.reuseHours = clampNumber(state.posting.contentSources.reuseHours, 1, 720, 24); // operator 2026-06-19: reuse every 24h (was 26/48). With retention 2d a product recycles ~1x before its image is deleted.
   state.posting.contentSources.imageRetentionDays = clampNumber(state.posting.contentSources.imageRetentionDays, 1, 90, 2); // operator 2026-06-17: remove saved products after 2 days (was 15)
   // NEW-PRODUCT CHECK CADENCE + FRESHNESS CAP (operator 2026-06-17): harvest checks for new products every
   // newCheckMinutes (default 60min) and never harvests a listing older than harvestMaxAgeDays (default 2 days).
@@ -3022,7 +3032,7 @@ function collectProductUrlsForPosting(state, options = {}) {
   let harvestedKeys = [];
   if (state.operator?.contentSourcesEnabled === true) {
     const recs = readHarvestedProducts(state);
-    const rh = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 26);
+    const rh = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 24);
     const onDisk = (r) => r && r.firstCommentUrl && r.imageLocalPath && !r.imageDeleted && imageFileLooksValid(safeProjectPath(r.imageLocalPath));
     const lastMs = (r) => { const s = r.lastPostedAt || r.posted || ""; const t = s ? Date.parse(s) : 0; return Number.isFinite(t) ? t : 0; };
     const fresh = recs.filter((r) => onDisk(r) && !(r.lastPostedAt || r.posted)).map((r) => r.productKey);
@@ -7964,7 +7974,7 @@ function productHasReadyAssets(product, state = readState(), reviewImages = null
     if (isProductClaimedForRun(state, product.key)) return false;
     // RE-USE WINDOW: ready if image-on-disk AND (never posted OR last post older than reuseHours). Lets a posted
     // product rotate back in after reuseHours so production never stalls. (lastPostedAt||posted for back-compat.)
-    const reuseHours = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 26);
+    const reuseHours = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 24);
     const lastTimeStr = rec.lastPostedAt || rec.posted || "";
     const lastMs = lastTimeStr ? Date.parse(lastTimeStr) : 0;
     if (lastMs && Number.isFinite(lastMs) && (Date.now() - lastMs) < reuseHours * 3600 * 1000) return false;
@@ -8003,7 +8013,7 @@ function assetBufferStatus(state = readState(), registers = readRegisters()) {
   for (const product of collectProductUrlsForPosting(state)) {
     const key = String(product.key || "").toLowerCase();
     // HARVESTED products are gated by their OWN reuse window — productHasReadyAssets checks the harvested record's
-    // lastPostedAt vs contentSources.reuseHours (default 48h) + per-run claim + on-disk image. They must NOT be subject
+    // lastPostedAt vs contentSources.reuseHours (default 24h) + per-run claim + on-disk image. They must NOT be subject
     // to the web-discovery used-products register (usedProductReuseWindowDays default 7d) or the no-review-photo register
     // (those track RETAILER products). Checking usedKeys/noPhotoKeys first wrongly held harvested products out for 7 days
     // even though their 48h reuse re-included them -> the ready pool starved (~44 of ~189) and posting stalled in idle
@@ -8295,7 +8305,22 @@ function isProductClaimedForRun(state, productKey) {
   try {
     if (!productKey) return false;
     const f = path.join(postClaimDirForRun(state), crypto.createHash("sha1").update(String(productKey).toLowerCase()).digest("hex") + ".claim");
-    return fs.existsSync(f);
+    let st; try { st = fs.statSync(f); } catch (_) { return false; } // no claim file -> not claimed
+    // CLAIM TTL = reuseHours (operator 2026-06-19): a SUCCESSFUL post never releases its claim (release runs ONLY on
+    // fail/throw at ~9400/9409). Without a TTL, every product the run touched stays "claimed" for the whole run, and
+    // productHasReadyAssets (~7964) drops it from the buffer BEFORE it even checks the reuse window -> the ready pool
+    // collapses to 0 -> the run idles 'pool_exhausted' though products ARE reuse-eligible. Expiring the claim at
+    // reuseHours lets the 24h reuse actually fire (and self-heals claims an auto-resume carried forward on the same
+    // runId). SAFE vs never-double-post: an in-flight post finishes in seconds-minutes (<< reuseHours) so a live post is
+    // never seen as expired, and within reuseHours BOTH this claim AND rec.lastPostedAt block a repost; only AFTER
+    // reuseHours (an intended re-use) is the product freed.
+    const reuseHours = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 24);
+    // Defense-in-depth: NEVER expire a claim while a live post batch is in flight. An in-flight key's claim mtime is
+    // frozen at post-START (not success) and rec.lastPostedAt isn't written until success, so expiring mid-flight is the
+    // one path no second guard backstops. Claims expire only in the idle gaps BETWEEN batches — which is exactly when
+    // readyCount is recomputed — so 24h recycling still fires while a hung/slow in-flight post can never be double-picked.
+    if (Date.now() - st.mtimeMs >= reuseHours * 3600 * 1000 && !isLivePostingInFlight()) { try { fs.rmSync(f, { force: true }); } catch (_) {} return false; }
+    return true;
   } catch (_) { return false; }
 }
 
@@ -19476,7 +19501,7 @@ const server = http.createServer(async (req, res) => {
     const autoR = csCfg.reserveAuto !== false;
     const ar = autoR ? harvestAutoReserves(st) : null;
     const target = autoR ? ar.target : clampNumber(csCfg.reserveTarget, 1, 5000, 20);
-    const reuseH = clampNumber(csCfg.reuseHours, 1, 720, 26);
+    const reuseH = clampNumber(csCfg.reuseHours, 1, 720, 24);
     const readyCount = rows.filter((r) => r.hasImage && (!r.posted || (() => { const t = Date.parse(r.posted); return Number.isFinite(t) && (Date.now() - t) >= reuseH * 3600000; })())).length; // FRESH + re-eligible
     const pct = target > 0 ? Math.min(100, Math.round((readyCount / target) * 100)) : 0;
     return json(res, 200, { harvested: rows, total: rows.length, reserve: { ready: readyCount, target, pct, full: readyCount >= target } });
