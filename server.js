@@ -8061,12 +8061,24 @@ function __cpuTimesSnapshot() {
 // to the controller — so right after a burst hits high CPU it backs the next ticks down to 1-2 workers until the peak
 // decays, self-tuning to the box's TRUE safe ceiling. Decay ~1.5%/sec (a 100 fades in ~60s, then it ramps back up).
 let __recentPeakCpu = 0, __recentPeakCpuAt = 0;
+let __learnedMaxWorkers = 2, __learnedMaxAt = 0;   // AIMD safe-concurrency ceiling: start conservative, LEARN the box's true limit
 function recentPeakCpu() {
-  return Math.max(0, __recentPeakCpu - Math.max(0, (Date.now() - __recentPeakCpuAt) / 1000) * 1.5);
+  return Math.max(0, __recentPeakCpu - Math.max(0, (Date.now() - __recentPeakCpuAt) / 1000) * 0.5);
 }
 function notePeakCpu(load) {
-  __recentPeakCpu = Math.max(recentPeakCpu(), Number(load) || 0);
+  load = Math.max(0, Math.min(100, Number(load) || 0));
+  __recentPeakCpu = Math.max(recentPeakCpu(), load);
   __recentPeakCpuAt = Date.now();
+  const now = Date.now();
+  // AIMD self-learning (operator 2026-06-20): a single idle CPU read can't predict a burst's load, so LEARN it instead.
+  // Any sample at/over the operator's 95% ceiling -> drop the safe worker count by 1 (>=20s between drops, so one burst
+  // only costs 1). A stretch of genuine headroom (<70% for 80s) -> cautiously raise it by 1. Converges to the largest
+  // worker count that keeps the box under ~90-95% on ANY hardware, and never sustains 100% / freezes.
+  if (load >= 92) {                                          // operator ceiling ~90-95% -> back off at 92 for margin before 100
+    if (now - __learnedMaxAt > 20000) { __learnedMaxWorkers = Math.max(1, __learnedMaxWorkers - 1); __learnedMaxAt = now; try { logEvent("adaptive_ceiling_down", { cpu: load, ceiling: __learnedMaxWorkers }); } catch (_) {} }
+  } else if (load < 62 && now - __learnedMaxAt > 150000) {   // 2.5 min of REAL headroom -> cautiously +1 (slow, so reductions stick + it rides ~85-90%)
+    __learnedMaxWorkers = Math.min(8, __learnedMaxWorkers + 1); __learnedMaxAt = now;
+  }
 }
 async function currentCpuLoadPercent(sampleMs = 240) {
   const a = __cpuTimesSnapshot();
@@ -8217,8 +8229,8 @@ async function adaptiveMaxWorkers(state, hardCap) {
   else if (cpu >= 72) n = 3;
   else if (cpu >= 58) n = 4;
   else n = userMax;                          // headroom -> full speed
-  const out = Math.max(1, Math.min(n, userMax));
-  try { logEvent("adaptive_concurrency", { cpu, freeRam, chrome, workers: out, cap: userMax }); } catch (_) {}
+  const out = Math.max(1, Math.min(n, userMax, __learnedMaxWorkers));   // never exceed the LEARNED safe ceiling
+  try { logEvent("adaptive_concurrency", { cpu, freeRam, chrome, workers: out, cap: userMax, learned: __learnedMaxWorkers }); } catch (_) {}
   return out;
 }
 
