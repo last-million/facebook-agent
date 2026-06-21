@@ -8062,7 +8062,7 @@ function productHasReadyAssets(product, state = readState(), reviewImages = null
     // skipped_already_used. Excluding it here drops it from the buffer reserve, the plan rebuild AND the picker in
     // ONE place, so the rebuild brings only fresh/unclaimed products and the run advances through the whole buffer.
     // (A FAILED post releases its claim -> the product is ready again to retry. A new run = new runId, no claims.)
-    if (isProductClaimedForRun(state, product.key)) return false;
+    if (productFullyClaimedForRun(state, product.key)) return false; // SWARM FIX #4: with postToAllGroups, "done" only when ALL target groups are claimed (else keep ready for the remaining groups)
     // RE-USE WINDOW: ready if image-on-disk AND (never posted OR last post older than reuseHours). Lets a posted
     // product rotate back in after reuseHours so production never stalls. (lastPostedAt||posted for back-compat.)
     const reuseHours = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 24);
@@ -8440,26 +8440,50 @@ function postClaimDirForRun(state) {
   const runId = String(state.operator?.autopilotRunId || "default").replace(/[^a-z0-9_-]/gi, "");
   return path.join(DATA_DIR, "post-claims", runId || "default");
 }
-function claimPostProductForRun(state, productKey) {
+// GROUP-AWARE CLAIM KEY (swarm fix #4). With operator.postToAllGroups, the SAME product is posted once PER target
+// group, so the per-run claim must be keyed by (product, group) — otherwise posting to the FIRST group claims the
+// product and permanently blocks its remaining groups for the rest of the run (fan-out silently collapses to one
+// group/run). When postToAllGroups is OFF, the key stays product-ONLY so a single-group run keeps the strict
+// never-double-post guarantee. groupUrl is ignored unless postToAllGroups is on.
+function postClaimBaseHash(state, productKey, groupUrl) {
+  let base = String(productKey || "").toLowerCase();
+  if (state.operator?.postToAllGroups === true && groupUrl) {
+    const g = normalizedFacebookGroupKey(groupUrl);
+    if (g) base = base + "|" + g;
+  }
+  return crypto.createHash("sha1").update(base).digest("hex");
+}
+function postClaimHashKey(state, productKey, groupUrl) { return postClaimBaseHash(state, productKey, groupUrl) + ".claim"; }
+// Is this product done for the run at the PRODUCT level (for the buffer + plan gates, which have no single group)?
+// postToAllGroups: "done" ONLY when claimed for EVERY target group — if any group is still unclaimed the product
+// must stay ready/pickable so its remaining groups get posted. OFF: the product-level claim is authoritative.
+function productFullyClaimedForRun(state, productKey) {
+  if (state.operator?.postToAllGroups === true) {
+    const groups = recordLines(state.posting?.groups).filter(Boolean);
+    if (groups.length) return groups.every((g) => isProductClaimedForRun(state, productKey, g));
+  }
+  return isProductClaimedForRun(state, productKey);
+}
+function claimPostProductForRun(state, productKey, groupUrl = "") {
   try {
     if (!productKey) return true;
     const dir = postClaimDirForRun(state);
     fs.mkdirSync(dir, { recursive: true });
-    const f = path.join(dir, crypto.createHash("sha1").update(String(productKey).toLowerCase()).digest("hex") + ".claim");
+    const f = path.join(dir, postClaimHashKey(state, productKey, groupUrl));
     try { fs.openSync(f, "wx"); return true; } catch (e) { if (e && e.code === "EEXIST") return false; return true; }
   } catch (_) { return true; } // fail-open: never block posting on a claim-fs error
 }
-function releasePostProductForRun(state, productKey) {
-  try { if (!productKey) return; const f = path.join(postClaimDirForRun(state), crypto.createHash("sha1").update(String(productKey).toLowerCase()).digest("hex") + ".claim"); fs.rmSync(f, { force: true }); } catch (_) {}
+function releasePostProductForRun(state, productKey, groupUrl = "") {
+  try { if (!productKey) return; const f = path.join(postClaimDirForRun(state), postClaimHashKey(state, productKey, groupUrl)); fs.rmSync(f, { force: true }); } catch (_) {}
 }
 // Is this product ALREADY claimed (posted or in-flight) THIS run? The picker uses this to SKIP it at pick time
 // instead of picking it and letting claimPostProductForRun reject it later — otherwise the batch fills with
 // sure-skips (the same already-posted products that rank "fresh" because they aren't marked used in the rebuilt
 // plan), and the run stalls without ever reaching the unclaimed rows. (Released claims = retryable, stay pickable.)
-function isProductClaimedForRun(state, productKey) {
+function isProductClaimedForRun(state, productKey, groupUrl = "") {
   try {
     if (!productKey) return false;
-    const f = path.join(postClaimDirForRun(state), crypto.createHash("sha1").update(String(productKey).toLowerCase()).digest("hex") + ".claim");
+    const f = path.join(postClaimDirForRun(state), postClaimHashKey(state, productKey, groupUrl));
     let st; try { st = fs.statSync(f); } catch (_) { return false; } // no claim file -> not claimed
     // CLAIM TTL = reuseHours (operator 2026-06-19): a SUCCESSFUL post never releases its claim (release runs ONLY on
     // fail/throw at ~9400/9409). Without a TTL, every product the run touched stays "claimed" for the whole run, and
@@ -9567,7 +9591,7 @@ async function autopilotTickAsync(options = {}) {
         if (enforceGroupCap && (__pickedByGroup.get(gKey) || 0) >= __perGroupCap) continue; // hold this group at its fair share on the first pass
         const prodKey = String(row.productKey || row.productUrl || row.link || "").toLowerCase();
         if (prodKey && usedProductKeys.has(prodKey)) continue; // each post must use a UNIQUE product
-        if (prodKey && isProductClaimedForRun(state, prodKey)) continue; // ALREADY claimed/posted this run -> skip at PICK time (don't fill the batch with sure-skips; advance to a fresh row)
+        if (prodKey && isProductClaimedForRun(state, prodKey, row.groupUrl)) continue; // ALREADY claimed/posted this run (for THIS group when postToAllGroups) -> skip at PICK time; advance to a fresh row
         // CONCURRENCY SAFETY: two products whose markers are the same OR variant SIBLINGS (shared long title
         // prefix, e.g. RC Lambo "...- Red" vs "...- White") must NOT be in the same parallel batch — their
         // near-identical captions make feed-capture ambiguous. Skip siblings.
@@ -9634,7 +9658,7 @@ async function autopilotTickAsync(options = {}) {
       // PER-RUN PRODUCT CLAIM: reserve this product for the whole run BEFORE posting so no later tick or
       // concurrent worker can post the same product twice (the parallel double-post fix). Skip if taken.
       const __prodKey = String(r.productKey || r.productUrl || r.link || "").toLowerCase();
-      if (!claimPostProductForRun(state, __prodKey)) {
+      if (!claimPostProductForRun(state, __prodKey, r.groupUrl)) {
         logEvent("autopilot_worker_skipped_product_already_used_this_run", { profileId: Number(r.profileId || 0), productKey: __prodKey.slice(0, 80) });
         return { profileId: Number(r.profileId || 0), ok: false, postUrl: "", error: "product_already_used_this_run" };
       }
@@ -9645,7 +9669,7 @@ async function autopilotTickAsync(options = {}) {
       // PublishIntentsAsync then marker-scans FB to RECOVER the landed post (record+count -> resweep comments it)
       // or RELEASE the claim to retry. A kill can no longer silently lose a live post. These are append-only
       // ledger rows (appendFacebookLivePostLedger is fail-safe) so they CANNOT affect the post itself.
-      const __claimHash = crypto.createHash("sha1").update(__prodKey).digest("hex");
+      const __claimHash = postClaimBaseHash(state, __prodKey, r.groupUrl); // SWARM FIX #4: group-aware so the kill-mid-post reconciler (releaseClaim) frees the SAME (product,group) claim that was set
       const __intentId = crypto.randomBytes(8).toString("hex");
       const __intentRunId = String(state.operator?.autopilotRunId || "");
       appendFacebookLivePostLedger({ event: "publish_intent", key: __intentId, planId: r.planId, sequence: r.sequence, profileId: Number(r.profileId || 0), profile: r.profile || "", groupUrl: r.groupUrl || "", status: "in_flight", message: `${__intentRunId}|${__claimHash}` });
@@ -9658,7 +9682,7 @@ async function autopilotTickAsync(options = {}) {
       };
       try {
         const v = await runLiveFacebookPostFromPlan({ fullRun: true, autopilot: true, planId: r.planId, sequence: r.sequence, countTowardRun: true });
-        if (!(v && v.ok)) releasePostProductForRun(state, __prodKey); // post did not land -> free the product for retry
+        if (!(v && v.ok)) releasePostProductForRun(state, __prodKey, r.groupUrl); // post did not land -> free the product (for THIS group when postToAllGroups) for retry
         autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", errorText: (v && (v.error || v.reason)) || "", validation: v && v.validation, source: "autopilot" });
         __intentOutcome = (v && v.ok) ? "completed_published" : "completed_not_landed"; __intentUrl = (v && v.postUrl) || "";
         // The per-run counter is now bumped at the RECORD moment inside completeVerifiedFacebookPostWithComment
@@ -9667,7 +9691,7 @@ async function autopilotTickAsync(options = {}) {
         // "stop at N" could overshoot by 1 (e.g. p48: posted, but its worker threw right after landing).
         return { profileId: Number(r.profileId || 0), ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", error: "" };
       } catch (err) {
-        releasePostProductForRun(state, __prodKey); // post threw -> free the product so the run can retry it
+        releasePostProductForRun(state, __prodKey, r.groupUrl); // post threw -> free the product (for THIS group when postToAllGroups) so the run can retry it
         autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: false, postUrl: "", errorText: oneLineField((err && (err.profileFailureReason || err.message)) || String(err), 240), profileRetryable: !!(err && err.profileRetryable), validation: err && err.livePostValidation, source: "autopilot" });
         __intentOutcome = "completed_error";
         return { profileId: Number(r.profileId || 0), ok: false, postUrl: "", error: oneLineField((err && err.message) || String(err), 200) };
@@ -9993,7 +10017,7 @@ function preparePostingPlan(options = {}) {
   // ready products exist further down the list. The BUFFER (productHasReadyAssets ~8036) already excludes claimed; the plan must
   // match it so its window advances to the unclaimed products. testPost uses `products` (not usableProducts) so a test is unaffected.
   const usableProducts = products.filter((product) => !usedKeys.has(product.key.toLowerCase()) && !noPhotoKeys.has(product.key.toLowerCase())
-    && (options.testPost || !isProductClaimedForRun(state, product.key)));
+    && (options.testPost || !productFullyClaimedForRun(state, product.key))); // SWARM FIX #4: product stays in the plan until claimed for EVERY target group (postToAllGroups)
   if (!options.testPost && !usableProducts.length) {
     const err = new Error("All available products are already marked used.");
     err.statusCode = 409;
