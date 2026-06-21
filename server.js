@@ -19629,10 +19629,10 @@ function buildRunReports(force = false) {
   let __dismissed = [];
   try { __dismissed = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "report-dismissed-runs.json"), "utf8")); } catch (_) {}
   const __dismissSet = new Set((Array.isArray(__dismissed) ? __dismissed : []).map(String));
-  const outVisible = out.filter((r, i) => {
-    if (i === 0) return true; // always show the newest run, even if it was dismissed
-    return !(__dismissSet.has(String(r.endedAt)) || __dismissSet.has(String(r.startedAt)));
-  });
+  // The operator may remove ANY run (incl. the latest) — non-destructive, restore/clear bring it back. The endedAt key
+  // keeps removals stable across restarts, so the old "never hide the newest" guard (which blocked removing the last run)
+  // is gone; the only poison risk was startedAt churn, now fixed.
+  const outVisible = out.filter((r) => !(__dismissSet.has(String(r.endedAt)) || __dismissSet.has(String(r.startedAt))));
   // LIVE RUN: surface the in-progress job (armed) + its progress so the report shows the CURRENT job, not only finished
   // ones. Mark the most-recent visible run as live when armed and its last post is recent (same 2h clustering window).
   let live = { armed: false, postedThisRun: 0, target: null };
@@ -19732,16 +19732,7 @@ const server = http.createServer(async (req, res) => {
       const key = String(body.endedAt || body.key || body.startedAt || "").trim();
       if (!key) return json(res, 400, { error: "endedAt required (or clear:true)" });
       if (body.restore === true) arr = arr.filter((x) => String(x) !== key);
-      else {
-        // GUARD (operator 2026-06-21): NEVER dismiss the single newest run cluster — the report must always surface the
-        // latest run. Reject a dismiss matching the current latest run's endedAt OR startedAt. (Older runs still dismissable.)
-        let __latest = null; try { __latest = buildRunReports(true).latest || {}; } catch (_) {}
-        const __nEnd = String(__latest && __latest.endedAt || ""), __nStart = String(__latest && __latest.startedAt || "");
-        if ((__nEnd && key === __nEnd) || (__nStart && key === __nStart)) {
-          return json(res, 400, { error: "cannot dismiss the latest run", key });
-        }
-        if (!arr.map(String).includes(key)) arr.push(key);
-      }
+      else if (!arr.map(String).includes(key)) arr.push(key); // operator may dismiss ANY run incl. the latest (restore/clear undo it)
     }
     try { fs.writeFileSync(f, JSON.stringify(arr.slice(-500))); } catch (_) {}
     __runReportCache.at = 0; // bust the 60s cache so the change shows on the next load immediately
