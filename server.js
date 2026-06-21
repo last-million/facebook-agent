@@ -9253,6 +9253,19 @@ function autopilotAutoDisarm(reason, detail) {
   // different-profile comment — without ever chasing OLD posts from earlier runs (operator 2026-06-14).
   if (reason === "run_limit_reached") {
     (async () => {
+      // RACE FIX (operator 2026-06-21): the Nth post's counter is bumped at the PUBLISH/record moment, so this
+      // disarm fires while that SAME post's different-profile inline comment is still in flight (publish+comment is
+      // bracketed by begin/endLivePostingBatch, and the inline comment also holds __postCompletionExternalActionInFlight).
+      // If the resweep ran NOW it would (a) race the in-flight comment and (b) pre-poison its backoff on a lock
+      // collision, then go quiet — leaving the tail post permanently uncommented (#20 of a 20-run). So FIRST wait until
+      // that post's own comment attempt has fully concluded (posting batch drained AND no post-completion external
+      // action in flight), THEN clear this window's backoff so the tail post is comment-eligible and un-poisoned when
+      // the passes check it. Bounded wait (max ~3 min) so a genuinely stuck post can never hang the disarm.
+      const __waitStartedAt = Date.now();
+      while ((isLivePostingInFlight() || __postCompletionExternalActionInFlight > 0) && (Date.now() - __waitStartedAt) < 180000) {
+        await sleep(2000);
+      }
+      try { __commentRecoveryBackoff.clear(); } catch {} // un-poison: the just-published tail must not be skipped by a pre-attempt backoff set during the race
       for (let pass = 0; pass < 5; pass += 1) {
         try {
           const r = await resweepUncommentedFacebookPostsAsync({ ignoreArmedGate: true, max: 50, windowHours: 24 });
@@ -9260,7 +9273,7 @@ function autopilotAutoDisarm(reason, detail) {
         } catch {}
         await sleep(5000);
       }
-      logEvent("autopilot_final_comment_resweep_done", { reason });
+      logEvent("autopilot_final_comment_resweep_done", { reason, waitedForInflightMs: Date.now() - __waitStartedAt });
     })().catch(() => {});
   }
 }
@@ -14669,7 +14682,14 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         if (!options.drain && !options.ignoreArmedGate && !options.force) await waitForPostingIdle({ label: "comment_resweep" });
         else await waitForPostingIdle({ label: "comment_resweep", maxWaitMs: 15000 });
         if (latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) continue; // a concurrent post may have just commented it
-        __commentRecoveryBackoff.set(postUrl, Date.now()); // record this attempt (set BEFORE attempting so a timeout/crash still backs off)
+        // BACKOFF POISONING FIX (operator 2026-06-21): for the FORCED recovery sweeps (run-end final / stop-finish /
+        // persistent drain / manual force) DON'T stamp the backoff before the attempt. Those sweeps run right after a
+        // post lands and can collide with that post's still-in-flight inline comment lock; a pre-attempt stamp would
+        // back the post off 8-22 min and make every later pass SKIP it — so the tail post never got re-tried. We stamp
+        // these only AFTER a failed attempt (below). The NORMAL armed heartbeat sweep keeps the conservative
+        // set-before-attempt (it polite-yields forever so it never collides, and a timeout/crash must still back it off).
+        const __forcedSweep = !!(options.drain || options.ignoreArmedGate || options.force);
+        if (!__forcedSweep) __commentRecoveryBackoff.set(postUrl, Date.now()); // record this attempt (set BEFORE attempting so a timeout/crash still backs off)
         if (__commentRecoveryBackoff.size > 3000) { const cut = Date.now() - 2 * COMMENT_RECOVERY_BACKOFF_MS; for (const [k, v] of __commentRecoveryBackoff) if (v < cut) __commentRecoveryBackoff.delete(k); } // bound memory
         summary.checked += 1;
         const groupUrl = facebookGroupUrlFromPostUrl(postUrl) || ev.actualGroupUrl || ev.groupUrl || row.groupUrl;
@@ -14687,8 +14707,9 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
             closeResults,
           });
           if (res?.ok || latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) summary.recommented += 1;
-          else summary.stillMissing += 1;
+          else { summary.stillMissing += 1; if (__forcedSweep) __commentRecoveryBackoff.set(postUrl, Date.now()); } // forced sweep: stamp backoff only AFTER a real failure, so a clean attempt isn't poisoned by a race
         } catch (err) {
+          if (__forcedSweep) __commentRecoveryBackoff.set(postUrl, Date.now()); // forced sweep: a thrown attempt also backs off (parity with the set-before path)
           summary.errors.push(oneLineField(err.message || String(err), 160));
         }
       }
@@ -19603,7 +19624,29 @@ function buildRunReports(force = false) {
   let __dismissed = [];
   try { __dismissed = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "report-dismissed-runs.json"), "utf8")); } catch (_) {}
   const __dismissSet = new Set((Array.isArray(__dismissed) ? __dismissed : []).map(String));
-  const outVisible = out.filter((r) => !__dismissSet.has(String(r.startedAt)));
+  // STALE-DISMISS SELF-HEAL (operator 2026-06-21): re-clustering (a new post extends/merges a run, the 20000-line
+  // window slides, a 2h-gap shifts) can change a run's startedAt so a previously-dismissed timestamp no longer matches
+  // any current run — yet still sat in the file. A bulk/loop dismiss-all had also stamped EVERY run incl. today's, so
+  // the report collapsed to one stale old run. Two guards make the dismiss filter robust: (1) IGNORE dismiss entries
+  // that match no current cluster startedAt (they can only ever hide nothing useful, and keeping them risks future
+  // false hides); (2) NEVER let the dismiss set hide the single NEWEST run cluster (out[0]) — the report must always
+  // surface the latest run. These are view-only and reversible (restore/clear still work); the ledger is untouched.
+  const __currentStartedAts = new Set(out.map((r) => String(r.startedAt)));
+  const __newestStartedAt = out.length ? String(out[0].startedAt) : "";
+  const outVisible = out.filter((r) => {
+    const sa = String(r.startedAt);
+    if (sa === __newestStartedAt) return true;        // always show the newest run, even if it was dismissed
+    return !__dismissSet.has(sa);
+  });
+  // Prune dismiss entries that no longer match any current cluster OR that target the newest run, so the file can't
+  // keep accumulating stale/over-reaching timestamps. Best-effort, only rewrites when something actually changed.
+  try {
+    const __pruned = [...__dismissSet].filter((sa) => sa !== __newestStartedAt && __currentStartedAts.has(sa));
+    if (__pruned.length !== __dismissSet.size) {
+      fs.writeFileSync(path.join(DATA_DIR, "report-dismissed-runs.json"), JSON.stringify(__pruned));
+      logEvent("report_dismiss_set_pruned", { before: __dismissSet.size, after: __pruned.length });
+    }
+  } catch (_) {}
   // LIVE RUN: surface the in-progress job (armed) + its progress so the report shows the CURRENT job, not only finished
   // ones. Mark the most-recent visible run as live when armed and its last post is recent (same 2h clustering window).
   let live = { armed: false, postedThisRun: 0, target: null };
@@ -19701,7 +19744,18 @@ const server = http.createServer(async (req, res) => {
       const startedAt = String(body.startedAt || "").trim();
       if (!startedAt) return json(res, 400, { error: "startedAt required (or clear:true)" });
       if (body.restore === true) arr = arr.filter((x) => String(x) !== startedAt);
-      else if (!arr.map(String).includes(startedAt)) arr.push(startedAt);
+      else {
+        // GUARD (operator 2026-06-21): NEVER dismiss the single newest run cluster. A dismiss-all / per-row UI loop that
+        // walked the visible list previously stamped EVERY run incl. today's, collapsing /report to one stale old run.
+        // The report must always surface the latest run, so reject a dismiss of the current latest startedAt. (Older
+        // runs can still be dismissed; clear/restore unchanged.)
+        let __latestStartedAt = "";
+        try { __latestStartedAt = String((buildRunReports(true).latest || {}).startedAt || ""); } catch (_) {}
+        if (__latestStartedAt && startedAt === __latestStartedAt) {
+          return json(res, 400, { error: "cannot dismiss the latest run", startedAt });
+        }
+        if (!arr.map(String).includes(startedAt)) arr.push(startedAt);
+      }
     }
     try { fs.writeFileSync(f, JSON.stringify(arr.slice(-500))); } catch (_) {}
     __runReportCache.at = 0; // bust the 60s cache so the change shows on the next load immediately
