@@ -8054,6 +8054,20 @@ function __cpuTimesSnapshot() {
   }
   return { idle, total };
 }
+// SELF-LEARNING CPU PEAK (operator 2026-06-20: "never reach 100%"). The adaptive controller samples CPU at tick START,
+// but BETWEEN posting bursts the box is idle (~15%) — so a single idle read would ALWAYS allow full speed and the burst
+// itself then spikes to 100% (observed in the first live test). Fix: track a DECAYING peak of EVERY CPU sample (the
+// per-open governor samples DURING the batch, capturing the burst's real load), and feed the higher of {instant, peak}
+// to the controller — so right after a burst hits high CPU it backs the next ticks down to 1-2 workers until the peak
+// decays, self-tuning to the box's TRUE safe ceiling. Decay ~1.5%/sec (a 100 fades in ~60s, then it ramps back up).
+let __recentPeakCpu = 0, __recentPeakCpuAt = 0;
+function recentPeakCpu() {
+  return Math.max(0, __recentPeakCpu - Math.max(0, (Date.now() - __recentPeakCpuAt) / 1000) * 1.5);
+}
+function notePeakCpu(load) {
+  __recentPeakCpu = Math.max(recentPeakCpu(), Number(load) || 0);
+  __recentPeakCpuAt = Date.now();
+}
 async function currentCpuLoadPercent(sampleMs = 240) {
   const a = __cpuTimesSnapshot();
   await sleep(sampleMs);
@@ -8061,7 +8075,9 @@ async function currentCpuLoadPercent(sampleMs = 240) {
   const idleDelta = b.idle - a.idle;
   const totalDelta = b.total - a.total;
   if (totalDelta <= 0) return 0;
-  return Math.max(0, Math.min(100, Math.round((1 - idleDelta / totalDelta) * 100)));
+  const __load = Math.max(0, Math.min(100, Math.round((1 - idleDelta / totalDelta) * 100)));
+  notePeakCpu(__load);
+  return __load;
 }
 // Free RAM % (sync, free) — RAM/handle exhaustion (NOT cpu) is what crashed Chrome ("application error")
 // when too many ixBrowser profiles opened at once. This is the real constraint to back-pressure on.
@@ -8186,16 +8202,21 @@ async function adaptiveMaxWorkers(state, hardCap) {
   const userMax = clampNumber(state?.ixbrowser?.maxConcurrentProfiles, 1, hardCap, hardCap);
   if (userMax <= 1) return 1;
   let cpu = 100, freeRam = 0, chrome = 999;
-  try { cpu = await currentCpuLoadPercent(); } catch (_) {}
+  // Use the HIGHER of the instant read and the recent DECAYING peak — so a burst that just spiked CPU to 100% holds the
+  // worker count down for ~60s (until the peak decays) instead of the idle inter-burst read re-allowing full speed.
+  try { cpu = Math.max(await currentCpuLoadPercent(), recentPeakCpu()); } catch (_) {}
   try { freeRam = currentFreeRamPercent(); } catch (_) {}
   try { chrome = await currentChromeProcessCount(); } catch (_) {}
   let n;
-  if (freeRam < 18 || chrome > 90) n = 1;   // hard back-pressure: low RAM / window pileup -> sequential, let it drain
-  else if (cpu >= 78) n = 1;                 // saturating -> sequential (breaks the spiral before 100%)
-  else if (cpu >= 68) n = 2;
-  else if (cpu >= 55) n = 3;
-  else if (cpu >= 42) n = 4;
-  else n = userMax;                          // idle box -> full speed
+  // operator 2026-06-20: "it can hit 90 or 95% maximum" -> drive the box UP toward ~90%, collapse to 1 only just ABOVE 92%
+  // (or the RAM/window backstop). Combined with the decaying-peak feedback (recentPeakCpu), a burst that touches ~95% holds
+  // the next ticks down so it rides ~85-92% and never sticks at 100% / freezes.
+  if (freeRam < 15 || chrome > 100) n = 1;   // hard back-pressure: low RAM / window pileup -> sequential, let it drain
+  else if (cpu >= 92) n = 1;                 // just over the operator's 90-95% ceiling -> back off hard (never 100%/freeze)
+  else if (cpu >= 85) n = 2;
+  else if (cpu >= 72) n = 3;
+  else if (cpu >= 58) n = 4;
+  else n = userMax;                          // headroom -> full speed
   const out = Math.max(1, Math.min(n, userMax));
   try { logEvent("adaptive_concurrency", { cpu, freeRam, chrome, workers: out, cap: userMax }); } catch (_) {}
   return out;
