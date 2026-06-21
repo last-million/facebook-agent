@@ -10763,7 +10763,11 @@ function latestDifferentProfileVerifiedCommentForPost(postUrl = "", publishingPr
     return null;
   }
   const publisherId = Number(publishingProfileId || 0);
-  const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 });
+  // SWARM FIX #2: read enough ledger history to cover the resweep's selection window (8000) + margin, so the
+  // dedup horizon can NEVER be smaller than the selection horizon (the old 5000 = ~1.1 days < the 8000-line /
+  // up-to-168h resweep selection, so a post whose comment-proof had scrolled past line 5000 was re-commented =
+  // a duplicate money-comment). Cheap now that readJsonlAbsoluteFile caches the append-only ledger.
+  const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 12000 });
   for (let index = rows.length - 1; index >= 0; index -= 1) {
     const item = rows[index];
     if (!item || item.postUrl !== cleanPostUrl) continue;
@@ -12404,7 +12408,11 @@ function commentCooldownBenchedSet(groupUrl, state = readState()) {
   const windowMs = clampNumber(state.operator?.commentCooldownHours, 1, 720, 48) * 60 * 60 * 1000;
   const cutoff = Date.now() - windowMs;
   const latestByPid = new Map();
-  for (const item of readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 })) {
+  // SWARM FIX #5: cover the FULL 48h bench window. The old 5000-line read spanned only ~1.1 days of the 34k-line
+  // ledger, so a comment FAILURE 30h ago (still inside the 48h bench) had scrolled past line 5000 -> latestByPid
+  // never saw it -> a known-bad commenter was un-benched early. Built ONCE per pool-build, and cheap now that
+  // readJsonlAbsoluteFile caches, so widen to 20000 (well above a day's volume).
+  for (const item of readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 20000 })) {
     if (!item || item.event !== "comment_recovery_finished") continue;
     const pid = Number(item.profileId || 0);
     if (!pid) continue;
@@ -14697,6 +14705,27 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         const planKey = r.planId ? String(r.planId) + "|" + String(r.sequence != null ? r.sequence : "") : "url:" + r.postUrl;
         publishedByPlan.set(planKey, r); // keep the latest ledger row per plan
       }
+      // SWARM FIX #2: build the "already has a different-profile verified comment" index ONCE from the SAME
+      // `rows` window the resweep selects from — so the dedup horizon equals the selection horizon (no duplicate
+      // money-comments) AND we avoid a per-post full ledger re-scan (this check runs for EVERY in-window post,
+      // potentially hundreds, before maxToFix attempts are made). Mirrors latestDifferentProfileVerifiedCommentForPost:
+      // event=comment_recovery_finished, status published/published_with_warning, commentVerified !== false.
+      const __verifiedCommentPidsByUrl = new Map(); // raw ledger postUrl -> Set(commenter profileId)
+      for (const r of rows) {
+        if (!r || r.event !== "comment_recovery_finished") continue;
+        if (!["published", "published_with_warning"].includes(String(r.status || ""))) continue;
+        if (r.validation && r.validation.commentVerified === false) continue;
+        const u = String(r.postUrl || ""); if (!u) continue; // key by RAW postUrl (mirrors item.postUrl === cleanPostUrl)
+        let set = __verifiedCommentPidsByUrl.get(u); if (!set) { set = new Set(); __verifiedCommentPidsByUrl.set(u, set); }
+        set.add(Number(r.profileId || 0));
+      }
+      const __hasDifferentProfileComment = (pUrl, pubId) => {
+        let u = ""; try { u = sanitizeFacebookPostUrl(pUrl || ""); } catch { return false; }
+        const set = __verifiedCommentPidsByUrl.get(u); if (!set) return false;
+        const pid = Number(pubId || 0);
+        for (const cpid of set) { if (!pid || cpid !== pid) return true; } // a DIFFERENT-profile (or any, if publisher unknown) verified comment exists
+        return false;
+      };
       for (const ev of publishedByPlan.values()) {
         if (!options.ignoreArmedGate && __externalStopRequested > resweepStartedAt) { logEvent("comment_resweep_aborted_by_stop", { checked: summary.checked }); break; } // operator hit STOP -> halt now. EXCEPTION (operator 2026-06-20): the ignoreArmedGate FINISH-drains (stop-drain 8270 / run-end 9075) run to COMPLETION — a 2nd/stale/double STOP must NOT bump __externalStopRequested past this drain's resweepStartedAt and abandon the comments the run already owes (that left 20 uncommented forever). Posting+harvest are already hard-killed before the finish-drain starts, so this only lets the cheap comment-finish complete.
         const postUrl = ev.postUrl;
@@ -14704,7 +14733,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         // commenter) must not make every 90s sweep do full-cost recovery work against it.
         if (summary.recommented >= maxToFix || summary.checked >= maxToFix) break;
         const publisherId = Number(ev.profileId || 0);
-        if (latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) continue; // already has a different-profile comment
+        if (__hasDifferentProfileComment(postUrl, publisherId)) continue; // already has a different-profile comment (SWARM FIX #2: build-once index over the full 8000 selection window, not a smaller 5000 re-read)
         const row = postingPlanRowForRecord({ planId: ev.planId, sequence: ev.sequence });
         const commentText = String(row?.commentTextPreview || row?.link || "").trim();
         if (!row || !commentText) { summary.stillMissing += 1; continue; } // cannot reconstruct the comment
@@ -15078,7 +15107,22 @@ const POST_PACING_GRACE_MS = 120000;
 function anyCommenterFreeForPost(row, groupUrl, excludeProfileId, state = readState()) {
   let candidates = [];
   try { candidates = commentRecoveryFallbackProfilesForGroup(row, groupUrl, state, { excludeProfileId }) || []; } catch (_) { candidates = []; }
-  if (!candidates.length) return { free: true, candidates: 0, soonestFreeSec: 0 }; // no known pool -> don't block (the live step's broader probe still tries)
+  if (!candidates.length) {
+    // SWARM FIX #3: an empty candidate pool has TWO causes that must be handled differently.
+    //  (a) NO commenter set is attributed/configured for this group -> legitimately fail-OPEN (a group without a
+    //      configured commenter pool must still post; the live step's broader probe still tries).
+    //  (b) A pool IS attributed but every profile is EXCLUDED right now (benched 48h / blocked / quarantined /
+    //      cooling / is the publisher) -> must HOLD. Failing open here publishes the post with a bare affiliate
+    //      link and NO first comment (the comment step re-hits the same empty pool). The caller holds + retries
+    //      next tick (logs post_held_no_free_commenter), so the post lands once a commenter frees.
+    let attributed = new Set();
+    try { attributed = attributedCommentProfileIdsForGroup(groupUrl, state) || new Set(); } catch (_) { attributed = new Set(); }
+    if (attributed.size > 0) {
+      const holdSec = clampNumber(state.rules?.commentCooldownMinutes, 1, 1440, 5) * 60; // re-check after ~the cooldown window (a cooling profile frees by then; a full 48h bench shows as a persistent, visible hold)
+      return { free: false, candidates: 0, soonestFreeSec: holdSec, poolFullyExcluded: true };
+    }
+    return { free: true, candidates: 0, soonestFreeSec: 0 }; // no attribution configured -> don't block
+  }
   const cooldownMs = clampNumber(state.rules?.commentCooldownMinutes, 1, 1440, 5) * 60 * 1000;
   const lastByPid = profileLastCommentTimeByProfileId(state);
   const limited = commentLimitedProfileIdSet(state);
@@ -17360,7 +17404,7 @@ function currentlyBlockedProfilesSummary(state = readState()) {
 function commentCooldownProfilesSummary(state = readState()) {
   const windowMs = clampNumber(state.operator?.commentCooldownHours, 1, 720, 48) * 60 * 60 * 1000;
   const cutoff = Date.now() - windowMs;
-  const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 });
+  const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 20000 }); // SWARM FIX #5: cover the full 48h cooldown window (cheap with the ledger cache); 5000 lines spanned only ~1.1 days
   const latestByPid = new Map();
   for (const item of rows) {
     if (!item || item.event !== "comment_recovery_finished") continue;
