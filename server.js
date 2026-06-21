@@ -8243,13 +8243,19 @@ function computeMachineParallelCap() {
 // Recompute + persist into state.operator (called on boot + every 24h). Fully wrapped / fail-open.
 function refreshMachineParallelCap(reason) {
   try {
-    const { cap, cores, totalGB, byCpu, byRam } = computeMachineParallelCap();
+    const { cap: computedCap, cores, totalGB, byCpu, byRam } = computeMachineParallelCap();
+    // OPERATOR OVERRIDE (2026-06-21: "he can do 6 parallel if the machine supports it"): when operator.parallelCapOverride
+    // is set (1-8), it becomes the CEILING instead of the auto-computed value — and SURVIVES this boot/24h recompute (the
+    // old code overwrote any manual cap every refresh). It is only a CEILING: adaptiveMaxWorkers + waitForCpuHeadroom still
+    // throttle the LIVE worker count down whenever CPU/RAM can't sustain it, so a 6 the box can't hold self-limits to 4-5.
+    const __ovr = Number(readState()?.operator?.parallelCapOverride);
+    const cap = (Number.isFinite(__ovr) && __ovr >= 1 && __ovr <= 8) ? __ovr : computedCap;
     const prev = Number(readState()?.operator?.machineParallelCap) || 0;
     // CRITICAL: write a PARTIAL (only the cap fields), NEVER a full read-modify-write of the whole state.
     // writeState merges this over the freshest on-disk state, so every other setting is preserved — even if
     // a boot-time read were momentarily bad, this can no longer wipe the operator's saved configuration.
-    writeState({ operator: { machineParallelCap: cap, machineParallelCapComputedAt: new Date().toISOString(), machineParallelCapMeta: { cores, totalGB, byCpu, byRam } } });
-    if (cap !== prev) logEvent("machine_parallel_cap_synced", { reason: reason || "manual", cap, prev, cores, totalGB, byCpu, byRam });
+    writeState({ operator: { machineParallelCap: cap, machineParallelCapComputedAt: new Date().toISOString(), machineParallelCapMeta: { cores, totalGB, byCpu, byRam, computedCap, override: (cap !== computedCap ? cap : null) } } });
+    if (cap !== prev) logEvent("machine_parallel_cap_synced", { reason: reason || "manual", cap, prev, computedCap, override: cap !== computedCap, cores, totalGB, byCpu, byRam });
     return cap;
   } catch (e) {
     try { logEvent("machine_parallel_cap_sync_error", { error: oneLineField((e && e.message) || String(e), 160) }); } catch (_) {}
@@ -18473,6 +18479,26 @@ async function ixBrowserRequest(endpoint, payload = {}) {
           }
         }
         throw retryErr;
+      }
+    }
+    // QUICK-RETRY a TRANSIENT local-API network blip BEFORE the heavy desktop restart (operator 2026-06-21: "he should
+    // not pause"). A single dropped 127.0.0.1 connection used to jump STRAIGHT to openIxBrowserDesktop + a ~5s recovery
+    // wait — but most of those blips are just the local ixBrowser API momentarily busy under parallel load and clear in
+    // <1s. So re-issue the SAME call a few times with a short backoff first; return the instant one succeeds. Only if it
+    // is STILL unreachable after the quick retries do we fall through to the (slow) desktop restart, which is correct
+    // when ixBrowser is genuinely down. NOT applied to ixbrowser_login_required (retrying can't fix a logged-out desktop).
+    if (isIxBrowserLocalConnectionError(err)) {
+      const __backoffs = [400, 900, 1600];
+      for (let __qr = 0; __qr < __backoffs.length; __qr += 1) {
+        await sleep(__backoffs[__qr]);
+        try {
+          const __quick = await ixBrowserRequestOnce(endpoint, payload);
+          logEvent("ixbrowser_local_blip_quick_recovered", { endpoint, attempt: __qr + 1 });
+          return __quick;
+        } catch (__qerr) {
+          err = __qerr; // carry the freshest error forward
+          if (!isIxBrowserLocalConnectionError(__qerr)) break; // a DIFFERENT failure -> stop quick-retrying, handle it normally below
+        }
       }
     }
     const canTryDesktopOpen = isRecoverableIxBrowserDesktopError(err);
