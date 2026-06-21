@@ -9279,7 +9279,7 @@ async function autopilotTickAsync(options = {}) {
     // imageRetentionDays so the saved store stays fresh and never accumulates ghosts. Same gate as the image sweep
     // (armed + not posting), single-flight, hourly; __lastHarvestedPruneAt starts at 0 so it runs in the first idle gap.
     if (!dryRun && state.operator?.contentSourcesEnabled === true && state.operator?.armedForExternalActions
-        && !isLivePostingInFlight() && !__harvestSourcesInFlight && !__harvestedPruneInFlight && (Date.now() - __lastHarvestedPruneAt) >= 3600000) {
+        && !isLivePostingInFlight() && !__harvestSourcesInFlight && !__harvestedImageSweepInFlight && !__harvestedPruneInFlight && (Date.now() - __lastHarvestedPruneAt) >= 3600000) {
       sweepHarvestedProductsByAgeAsync().catch((err) => logEvent("autopilot_harvested_prune_error", { error: oneLineField(err.message || String(err), 160) }));
     }
     // OPEN-GRAPH enrichment: pull the real product name/description from each harvested link's og:
