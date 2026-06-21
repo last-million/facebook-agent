@@ -2092,12 +2092,53 @@ function harvestedRecordForKey(key, state = readState()) {
 function appendHarvestedProductLine(file, record) {
   try { const fp = safeProjectPath(file); fs.mkdirSync(path.dirname(fp), { recursive: true }); fs.appendFileSync(fp, JSON.stringify(record) + "\n"); return true; } catch (_) { return false; }
 }
+// PERMANENT harvested-URL ledger (operator 2026-06-21): remember EVERY harvested product's unique first-comment URL
+// FOREVER (by its synthetic key) so the SAME product is never harvested/saved/re-posted twice — even after the 2-day
+// retention prune dropped its record from harvested-products.jsonl. Without this, a source group that re-posts the same
+// affiliate deal would re-harvest it as "new" once the original aged out. Append-only, tiny (one 12-char key/line),
+// NEVER pruned. Cached in-memory; seeded ONCE from the current store so products harvested before this ledger existed
+// are remembered too.
+const HARVEST_SEEN_KEYS_FILE = "data/harvested-seen-keys.txt";
+let __harvestSeenKeySet = null;
+function harvestedSeenKeySet(state = readState()) {
+  if (__harvestSeenKeySet) return __harvestSeenKeySet;
+  const set = new Set();
+  try {
+    const fp = safeProjectPath(HARVEST_SEEN_KEYS_FILE);
+    if (fs.existsSync(fp)) for (const line of fs.readFileSync(fp, "utf8").split(/\r?\n/)) { const t = line.trim(); if (t) set.add(t); }
+  } catch (_) {}
+  if (set.size === 0) { // first run: seed from the active store so pre-existing products are remembered too
+    try {
+      for (const r of readHarvestedProducts(state)) { const k = r.productKey || harvestSyntheticKey(r.firstCommentUrl); if (k) set.add(k); }
+      const fp = safeProjectPath(HARVEST_SEEN_KEYS_FILE);
+      fs.mkdirSync(path.dirname(fp), { recursive: true });
+      fs.writeFileSync(fp, set.size ? [...set].join("\n") + "\n" : "");
+    } catch (_) {}
+  }
+  __harvestSeenKeySet = set;
+  return set;
+}
+function harvestKeyAlreadySeen(url, state = readState()) {
+  if (!url) return false;
+  return harvestedSeenKeySet(state).has(harvestSyntheticKey(url));
+}
+function markHarvestKeySeen(url, state = readState()) {
+  try {
+    const k = harvestSyntheticKey(url);
+    const set = harvestedSeenKeySet(state);
+    if (set.has(k)) return;
+    set.add(k);
+    fs.appendFileSync(safeProjectPath(HARVEST_SEEN_KEYS_FILE), k + "\n");
+  } catch (_) {}
+}
 function appendHarvestedProduct(record, state = readState()) {
   const file = state.files?.harvestedProducts || "data/harvested-products.jsonl";
   const url = String(record?.firstCommentUrl || "").trim();
   if (!url) return false;
-  if (readHarvestedProducts(state).some((r) => String(r.firstCommentUrl || "") === url)) return false; // dedup by url
-  return appendHarvestedProductLine(file, {
+  // PERMANENT dedup: never re-harvest a URL we've EVER harvested (survives the 2-day prune that drops the active record)
+  if (harvestKeyAlreadySeen(url, state)) return false;
+  if (readHarvestedProducts(state).some((r) => String(r.firstCommentUrl || "") === url)) { markHarvestKeySeen(url, state); return false; } // already active -> ensure it's in the ledger, skip
+  const ok = appendHarvestedProductLine(file, {
     firstCommentUrl: url,
     productKey: record.productKey || harvestSyntheticKey(url),
     text: String(record.text || "").slice(0, 60000), // exact caption, effectively uncapped (operator: no character limit)
@@ -2113,6 +2154,8 @@ function appendHarvestedProduct(record, state = readState()) {
     posted: "",
     imageDeleted: false,
   });
+  if (ok) markHarvestKeySeen(url, state); // remember this URL forever so it's never harvested again, even post-prune
+  return ok;
 }
 function updateHarvestedProductRecord(key, patch, state = readState()) {
   const file = state.files?.harvestedProducts || "data/harvested-products.jsonl";
