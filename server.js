@@ -2131,6 +2131,23 @@ function markHarvestKeySeen(url, state = readState()) {
     fs.appendFileSync(safeProjectPath(HARVEST_SEEN_KEYS_FILE), k + "\n");
   } catch (_) {}
 }
+// OPERATOR OVERRIDE (2026-06-21): a manual delete / mark-available must let a product be HARVESTED AGAIN — so forget its
+// URL from the permanent ledger. forgetHarvestKey drops one; clearHarvestLedger wipes all (the "mark ALL available" reset).
+// Active products are still protected from duplicate harvest by appendHarvestedProduct's active-store check (it re-adds
+// them), so forgetting only actually re-opens products that are no longer in the store.
+function forgetHarvestKey(url, state = readState()) {
+  try {
+    const k = harvestSyntheticKey(url);
+    const set = harvestedSeenKeySet(state);
+    if (!set.has(k)) return false;
+    set.delete(k);
+    fs.writeFileSync(safeProjectPath(HARVEST_SEEN_KEYS_FILE), set.size ? [...set].join("\n") + "\n" : "");
+    return true;
+  } catch (_) { return false; }
+}
+function clearHarvestLedger() {
+  try { __harvestSeenKeySet = new Set(); fs.writeFileSync(safeProjectPath(HARVEST_SEEN_KEYS_FILE), ""); return true; } catch (_) { return false; }
+}
 function appendHarvestedProduct(record, state = readState()) {
   const file = state.files?.harvestedProducts || "data/harvested-products.jsonl";
   const url = String(record?.firstCommentUrl || "").trim();
@@ -20554,10 +20571,11 @@ const server = http.createServer(async (req, res) => {
     const all = readJsonlAbsoluteFile(safeProjectPath(file));
     const match = (r) => { const k = r.productKey || harvestSyntheticKey(r.firstCommentUrl); return (key && k === key) || (fcu && String(r.firstCommentUrl || "") === fcu); };
     const kept = all.filter((r) => !match(r));
-    for (const r of all) { if (match(r) && r.imageLocalPath) { try { fs.unlinkSync(safeProjectPath(r.imageLocalPath)); } catch (_) {} } } // free the image file too
+    let forgotten = 0;
+    for (const r of all) { if (match(r)) { if (r.imageLocalPath) { try { fs.unlinkSync(safeProjectPath(r.imageLocalPath)); } catch (_) {} } if (forgetHarvestKey(r.firstCommentUrl, st)) forgotten++; } } // free image + FORGET the URL so a manual delete makes it harvestable again
     writeJsonlFile(file, kept);
-    logEvent("saved_product_deleted", { source: "copied", key: key || fcu, removed: all.length - kept.length });
-    return json(res, 200, { ok: true, removed: all.length - kept.length, remaining: kept.length });
+    logEvent("saved_product_deleted", { source: "copied", key: key || fcu, removed: all.length - kept.length, forgotten });
+    return json(res, 200, { ok: true, removed: all.length - kept.length, remaining: kept.length, forgotten });
   }
   if (req.method === "POST" && url.pathname === "/api/content-sources/saved-product/reset-used") {
     // OPERATOR "mark available": clear the used/posted markers on harvested products so they RE-ENTER the postable pool
@@ -20577,8 +20595,9 @@ const server = http.createServer(async (req, res) => {
       }
       try { const uf = safeProjectPath(st.files?.usedProducts || "data/used-products.txt"); if (fs.existsSync(uf)) { fs.writeFileSync(uf + ".bak-" + Date.now(), fs.readFileSync(uf)); fs.writeFileSync(uf, ""); } } catch (_) {}
       try { const cr = path.join(DATA_DIR, "post-claims"); for (const d of (fs.existsSync(cr) ? fs.readdirSync(cr) : [])) { try { fs.rmSync(path.join(cr, d), { recursive: true, force: true }); } catch (_) {} } } catch (_) {}
-      logEvent("saved_products_marked_available_all", { cleared, total: recs.length });
-      return json(res, 200, { ok: true, cleared, total: recs.length });
+      const ledgerCleared = clearHarvestLedger(); // operator "make ALL available" -> also forget all harvested URLs so anything no longer in the store can be re-harvested (active products stay protected by the active-store check)
+      logEvent("saved_products_marked_available_all", { cleared, total: recs.length, ledgerCleared });
+      return json(res, 200, { ok: true, cleared, total: recs.length, ledgerCleared });
     }
     const key = String(body.productKey || body.key || "").trim();
     const fcu = String(body.firstCommentUrl || "").trim();
@@ -20587,8 +20606,9 @@ const server = http.createServer(async (req, res) => {
     if (!rec) return json(res, 404, { error: "product not found" });
     const k = rec.productKey || harvestSyntheticKey(rec.firstCommentUrl);
     const ok = updateHarvestedProductRecord(k, clearPatch(), st);
-    logEvent("saved_product_marked_available", { key: k });
-    return json(res, 200, { ok: Boolean(ok), key: k });
+    const forgotten = forgetHarvestKey(rec.firstCommentUrl, st); // also forget its URL so a manual "make available" lets it be re-harvested too
+    logEvent("saved_product_marked_available", { key: k, forgotten });
+    return json(res, 200, { ok: Boolean(ok), key: k, forgotten });
   }
   if (req.method === "POST" && url.pathname === "/api/posting/record-post-url") {
     const body = await readJson(req);
