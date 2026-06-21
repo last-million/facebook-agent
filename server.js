@@ -14291,6 +14291,16 @@ function recentGroupPosterCommentCandidates(groupUrl, state = readState(), optio
   const nowMs = Date.now();
   const seen = new Set();
   const out = [];
+  // STRICT PER-GROUP ATTRIBUTION (the same gate every OTHER candidate tier already applies):
+  // this prepend tier matched commenters purely by "this profile appears as a poster for this group
+  // in the ledger" — but a product posted to BOTH groups, plus historical cross-group posting, means
+  // FOREIGN-group profiles show up as posters here. They were prepended ahead of the filtered tiers,
+  // handed to the connector, and refused by the last-line guard ("not attributed to this group") — 382
+  // dead-end refusals that burned the no-access budget (25) before any RIGHT-group profile was reached,
+  // so 7 posts stayed uncommented. Gate this tier on attributedCommentProfileIdsForGroup (vanity<->numeric
+  // and trailing-slash aware via groupsMatchByAlias/normalizedFacebookGroupKey) exactly like the others.
+  // Fail-OPEN only when the group has NO attribution configured (size 0), matching every other tier.
+  const __attrIds = attributedCommentProfileIdsForGroup(groupUrl, state);
   try {
     const lines = fs.readFileSync(FB_LIVE_POST_LEDGER_FILE, "utf8").split(/\r?\n/);
     for (let i = lines.length - 1; i >= 0 && out.length < 12; i -= 1) {
@@ -14303,6 +14313,7 @@ function recentGroupPosterCommentCandidates(groupUrl, state = readState(), optio
       if (Number.isFinite(ts) && nowMs - ts > maxAgeMs) continue;
       const pid = Number(r.profileId || 0);
       if (!pid || pid === excludeId || seen.has(pid)) continue;
+      if (__attrIds.size && !__attrIds.has(pid)) continue; // STRICT: only THIS group's attributed profiles comment here
       const label = String(r.profile || pid);
       if (isDedicatedShopYourLikesProfileLabel(label, state)) continue;
       if (isBlockedIxBrowserProfileLabel(label, state)) continue;
