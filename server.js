@@ -19572,7 +19572,24 @@ function buildRunReports(force = false) {
   try { problemProfiles = buildProblemProfiles({ windowHours: 24 }); } catch {}
   let openBudget = null;
   try { openBudget = ixOpenBudgetSnapshot(); } catch {}
-  const body = { generatedAt: new Date().toISOString(), runCount: out.length, latest: out[0] || null, runs: out.slice(0, 30), reconcile, problemProfiles, openBudget };
+  // OPERATOR DISMISS (non-destructive): hide runs the operator removed from the report. The ledger is NEVER touched —
+  // only this small startedAt list filters the view; clearing the list (or restore) brings a run back.
+  let __dismissed = [];
+  try { __dismissed = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "report-dismissed-runs.json"), "utf8")); } catch (_) {}
+  const __dismissSet = new Set((Array.isArray(__dismissed) ? __dismissed : []).map(String));
+  const outVisible = out.filter((r) => !__dismissSet.has(String(r.startedAt)));
+  // LIVE RUN: surface the in-progress job (armed) + its progress so the report shows the CURRENT job, not only finished
+  // ones. Mark the most-recent visible run as live when armed and its last post is recent (same 2h clustering window).
+  let live = { armed: false, postedThisRun: 0, target: null };
+  try {
+    const __op = readState().operator || {};
+    live = { armed: !!__op.armedForExternalActions, postedThisRun: Number(__op.autopilotPostsThisRun || 0), target: (Number(__op.autopilotMaxPostsPerRun || 0) || null) };
+    if (live.armed && outVisible[0]) {
+      const __lastT = Date.parse(outVisible[0].endedAt || 0);
+      if (Number.isFinite(__lastT) && Date.now() - __lastT < RUN_SPLIT_GAP_MS) outVisible[0].live = true;
+    }
+  } catch (_) {}
+  const body = { generatedAt: new Date().toISOString(), runCount: outVisible.length, latest: outVisible[0] || null, runs: outVisible.slice(0, 30), live, reconcile, problemProfiles, openBudget };
   __runReportCache.at = Date.now();
   __runReportCache.body = body;
   return body;
@@ -19645,6 +19662,25 @@ const server = http.createServer(async (req, res) => {
     } catch (e) {
       return json(res, 500, { ok: false, error: oneLineField((e && e.message) || String(e), 200) });
     }
+  }
+  if (req.method === "POST" && url.pathname === "/api/reports/runs/dismiss") {
+    // OPERATOR: remove (hide) a run from the report by its startedAt — NON-destructive (the post ledger is untouched;
+    // only data/report-dismissed-runs.json filters the view). body.restore:true un-hides it; body.clear:true clears all.
+    const body = await readJson(req);
+    const f = path.join(DATA_DIR, "report-dismissed-runs.json");
+    let arr = []; try { arr = JSON.parse(fs.readFileSync(f, "utf8")); } catch (_) {}
+    if (!Array.isArray(arr)) arr = [];
+    if (body.clear === true) { arr = []; }
+    else {
+      const startedAt = String(body.startedAt || "").trim();
+      if (!startedAt) return json(res, 400, { error: "startedAt required (or clear:true)" });
+      if (body.restore === true) arr = arr.filter((x) => String(x) !== startedAt);
+      else if (!arr.map(String).includes(startedAt)) arr.push(startedAt);
+    }
+    try { fs.writeFileSync(f, JSON.stringify(arr.slice(-500))); } catch (_) {}
+    __runReportCache.at = 0; // bust the 60s cache so the change shows on the next load immediately
+    logEvent("report_run_dismissed", { startedAt: body.startedAt || "", restore: !!body.restore, clear: !!body.clear, total: arr.length });
+    return json(res, 200, { ok: true, dismissed: arr.length });
   }
 
   if (req.method === "GET" && url.pathname === "/api/status") {

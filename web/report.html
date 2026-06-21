@@ -20,7 +20,6 @@
     -webkit-font-smoothing:antialiased; padding:max(14px,env(safe-area-inset-top)) 14px 60px;
   }
   .wrap{max-width:1080px;margin:0 auto}
-  /* top bar */
   .top{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:18px}
   .top h1{font-size:1.22rem;margin:0;font-weight:700;letter-spacing:.2px;display:flex;align-items:center;gap:9px}
   .top h1 .dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px rgba(63,185,80,.16)}
@@ -33,47 +32,58 @@
   .toggle{display:flex;align-items:center;gap:7px;color:var(--mut);font-size:.82rem;user-select:none;cursor:pointer}
   .toggle input{accent-color:var(--blue);width:16px;height:16px}
   .upd{color:var(--dim);font-size:.76rem;white-space:nowrap}
-  /* run chips */
-  .chips{display:flex;gap:9px;overflow-x:auto;padding:4px 2px 12px;-webkit-overflow-scrolling:touch;scrollbar-width:thin}
-  .chip{flex:0 0 auto;border:1px solid var(--line);background:var(--card);border-radius:11px;padding:9px 13px;cursor:pointer;
-    min-width:118px;transition:.15s}
-  .chip:hover{border-color:#3a4b5e}
-  .chip.on{border-color:var(--blue);background:linear-gradient(180deg,#1d2937,#172029);box-shadow:0 0 0 1px var(--blue) inset}
-  .chip .cd{font-size:.74rem;color:var(--mut)}
-  .chip .cp{font-size:1.02rem;font-weight:700;margin-top:2px}
-  .chip .cc{font-size:.74rem;margin-top:2px}
-  .badge{display:inline-block;font-size:.64rem;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
-    color:#06210f;background:var(--green);border-radius:5px;padding:1px 6px;margin-bottom:5px}
+  /* LIVE banner */
+  .livecard{background:linear-gradient(180deg,#142433,#111a22);border:1px solid #2a4258;border-radius:14px;padding:14px 16px;margin:4px 0 16px;box-shadow:var(--sh)}
+  .livecard .lh{display:flex;align-items:center;gap:9px;font-weight:700;font-size:.98rem;color:#bfe0ff}
+  .livecard .lblink{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px rgba(63,185,80,.18);animation:pulse 1.4s infinite}
+  @keyframes pulse{50%{box-shadow:0 0 0 8px rgba(63,185,80,0)}}
+  .livecard .lp{color:var(--mut);font-size:.86rem;margin:7px 0 2px}
+  .livecard .lp b{color:var(--tx);font-variant-numeric:tabular-nums}
+  /* run accordion */
+  .runcard{background:var(--card);border:1px solid var(--line);border-radius:var(--r);margin-bottom:10px;box-shadow:var(--sh);overflow:hidden}
+  .runcard[open]{border-color:#33485c}
+  .runcard > summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:11px;padding:14px 15px;user-select:none}
+  .runcard > summary::-webkit-details-marker{display:none}
+  .runcard > summary:hover{background:var(--card2)}
+  .rchev{color:var(--mut);font-size:.85rem;transition:transform .15s;flex:0 0 auto;width:12px}
+  .runcard[open] .rchev{transform:rotate(90deg)}
+  .rmain{display:flex;align-items:center;gap:8px;min-width:0}
+  .rdate{font-weight:700;font-size:.92rem;white-space:nowrap}
+  .rlive{font-size:.62rem;font-weight:800;letter-spacing:.5px;color:#06210f;background:var(--green);border-radius:5px;padding:2px 7px;animation:pulse 1.4s infinite}
+  .rposts{color:var(--mut);font-size:.84rem;white-space:nowrap}
+  .rrate{font-weight:700;font-size:.98rem;white-space:nowrap;margin-left:auto}
+  .rrate small{font-size:.72rem;color:var(--mut);font-weight:600}
+  .runc{font-size:.72rem;color:var(--red);white-space:nowrap;font-weight:600}
+  .rdel{flex:0 0 auto;appearance:none;border:1px solid var(--line);background:transparent;color:var(--mut);width:30px;height:30px;border-radius:8px;cursor:pointer;font-size:.85rem;line-height:1;transition:.15s}
+  .rdel:hover{background:rgba(240,98,90,.14);border-color:rgba(240,98,90,.5);color:#ff8a83}
+  .rbody{padding:6px 15px 16px;border-top:1px solid var(--line)}
   /* stat grid */
-  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(146px,1fr));gap:12px;margin:6px 0 18px}
-  .stat{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:15px 16px;box-shadow:var(--sh);position:relative;overflow:hidden}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(146px,1fr));gap:12px;margin:12px 0 6px}
+  .stat{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);padding:14px 15px;position:relative;overflow:hidden}
   .stat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--blue);opacity:.85}
   .stat.g::before{background:var(--green)} .stat.a::before{background:var(--amber)}
   .stat.r::before{background:var(--red)} .stat.v::before{background:var(--violet)}
-  .stat .k{color:var(--mut);font-size:.76rem;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
-  .stat .v{font-size:1.75rem;font-weight:760;margin-top:5px;line-height:1.05;font-variant-numeric:tabular-nums}
-  .stat .v small{font-size:.95rem;color:var(--mut);font-weight:600}
-  .stat .x{color:var(--dim);font-size:.74rem;margin-top:3px}
-  /* section */
-  h2{font-size:.95rem;color:var(--tx);margin:22px 0 11px;font-weight:700;display:flex;align-items:center;gap:8px}
+  .stat .k{color:var(--mut);font-size:.74rem;font-weight:600;text-transform:uppercase;letter-spacing:.4px}
+  .stat .v{font-size:1.6rem;font-weight:760;margin-top:5px;line-height:1.05;font-variant-numeric:tabular-nums}
+  .stat .v small{font-size:.92rem;color:var(--mut);font-weight:600}
+  .stat .x{color:var(--dim);font-size:.73rem;margin-top:3px}
+  h2{font-size:.9rem;color:var(--tx);margin:18px 0 10px;font-weight:700;display:flex;align-items:center;gap:8px}
   h2 .ln{flex:1;height:1px;background:var(--line)}
-  .cards2{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}
-  .grp{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:15px 16px;box-shadow:var(--sh)}
-  .grp .gh{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
-  .grp .gn{font-weight:700;font-size:.95rem}
-  .grp .tag{font-size:.68rem;color:var(--mut);border:1px solid var(--line);border-radius:6px;padding:2px 7px}
+  .cards2{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}
+  .grp{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);padding:14px 15px}
+  .grp .gh{display:flex;justify-content:space-between;align-items:center;margin-bottom:9px}
   .grp .row{display:flex;justify-content:space-between;font-size:.84rem;padding:4px 0;color:var(--mut)}
   .grp .row b{color:var(--tx);font-variant-numeric:tabular-nums}
+  .tag{font-size:.68rem;color:var(--mut);border:1px solid var(--line);border-radius:6px;padding:2px 7px}
   .bar{height:7px;border-radius:5px;background:#0c1116;overflow:hidden;margin-top:9px}
-  .bar > i{display:block;height:100%;background:linear-gradient(90deg,var(--green),#57d06a);border-radius:5px}
+  .bar > i{display:block;height:100%;background:linear-gradient(90deg,var(--green),#57d06a);border-radius:5px;transition:width .4s}
   .bar.warn > i{background:linear-gradient(90deg,var(--amber),#e6bf52)}
   .bar.bad  > i{background:linear-gradient(90deg,var(--red),#f6837c)}
-  /* table */
-  .tablecard{background:var(--card);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;box-shadow:var(--sh)}
+  .tablecard{background:var(--bg2);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
   table{width:100%;border-collapse:collapse;font-size:.85rem}
   thead th{text-align:left;color:var(--mut);font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.4px;
-    padding:11px 13px;background:var(--bg2);border-bottom:1px solid var(--line);position:sticky;top:0}
-  tbody td{padding:10px 13px;border-bottom:1px solid #1d262f;font-variant-numeric:tabular-nums;vertical-align:middle}
+    padding:10px 12px;background:#10161d;border-bottom:1px solid var(--line)}
+  tbody td{padding:9px 12px;border-bottom:1px solid #1d262f;font-variant-numeric:tabular-nums;vertical-align:middle}
   tbody tr:last-child td{border-bottom:0}
   tbody tr:hover{background:#192129}
   .pill{display:inline-block;font-size:.7rem;font-weight:700;border-radius:6px;padding:2px 8px}
@@ -81,7 +91,6 @@
   .pill.f{color:#5fb6ff;background:rgba(78,161,255,.13)}
   .pill.x{color:var(--mut);background:rgba(139,152,168,.12)}
   .ok{color:var(--green)} .no{color:var(--red);font-weight:600} .slow{color:var(--amber)}
-  .hist td{cursor:pointer}
   .empty{padding:46px 20px;text-align:center;color:var(--mut)}
   .err{background:rgba(240,98,90,.1);border:1px solid rgba(240,98,90,.35);color:#ffb4ae;border-radius:12px;padding:14px 16px;margin:14px 0;font-size:.86rem}
   .reco{border-radius:11px;padding:11px 15px;margin:2px 0 14px;font-size:.86rem;font-weight:500}
@@ -89,17 +98,18 @@
   .reco.ok{background:rgba(63,185,80,.1);border:1px solid rgba(63,185,80,.32);color:#7ee08a}
   .reco b{font-weight:800}
   .foot{color:var(--dim);font-size:.74rem;text-align:center;margin-top:26px}
+  .foot a{color:var(--dim)}
   .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--line);border-top-color:var(--blue);border-radius:50%;animation:s .7s linear infinite;vertical-align:-2px}
   @keyframes s{to{transform:rotate(360deg)}}
-  /* responsive: detail table -> stacked cards on phones */
   @media(max-width:640px){
     body{padding:12px 10px 50px}
     .top h1{font-size:1.08rem}
-    .stat .v{font-size:1.5rem}
+    .rposts{display:none}
+    .stat .v{font-size:1.4rem}
     table.detail thead{display:none}
     table.detail,table.detail tbody,table.detail tr,table.detail td{display:block;width:100%}
     table.detail tr{border-bottom:1px solid var(--line);padding:8px 4px}
-    table.detail td{border:0;padding:4px 13px;display:flex;justify-content:space-between;gap:12px}
+    table.detail td{border:0;padding:4px 12px;display:flex;justify-content:space-between;gap:12px}
     table.detail td::before{content:attr(data-l);color:var(--mut);font-size:.74rem;font-weight:600;text-transform:uppercase;letter-spacing:.3px}
   }
 </style>
@@ -109,21 +119,21 @@
   <div class="top">
     <div>
       <h1><span class="dot"></span> Rapport des runs</h1>
-      <div class="sub">Facebook autopilot — généré automatiquement depuis les logs (sans IA)</div>
+      <div class="sub">Facebook autopilot — généré depuis les logs (sans IA). Clique une carte pour la dérouler.</div>
     </div>
     <div class="controls">
-      <label class="toggle"><input type="checkbox" id="auto" checked> Auto 60s</label>
+      <label class="toggle"><input type="checkbox" id="auto" checked> Auto 30s</label>
       <span class="upd" id="upd"></span>
       <button class="btn" id="refresh">↻ Rafraîchir</button>
     </div>
   </div>
 
   <div id="err"></div>
-  <div class="chips" id="chips"></div>
   <div id="reco"></div>
   <div id="openbudget"></div>
+  <div id="live"></div>
+  <div id="runs"><div class="empty"><span class="spin"></span> Chargement du rapport…</div></div>
   <div id="probprof"></div>
-  <div id="body"><div class="empty"><span class="spin"></span> Chargement du rapport…</div></div>
 
   <div class="foot" id="foot"></div>
 </div>
@@ -131,115 +141,90 @@
 <script>
 "use strict";
 var TOKEN = "__DASHBOARD_TOKEN__";
-var DATA = null, SEL = 0, timer = null;
+var DATA = null, timer = null;
+var OPEN = new Set(); // startedAt of cards the operator expanded — preserved across auto-refresh
 
 function fmtTime(iso){ if(!iso) return "—"; try{ var d=new Date(iso); return d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"}); }catch(e){ return "—"; } }
-function fmtDate(iso){ if(!iso) return "—"; try{ var d=new Date(iso); return d.toLocaleDateString([], {day:"2-digit",month:"short"})+" "+d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}); }catch(e){ return "—"; } }
+function fmtDate(iso){ if(!iso) return "—"; try{ var d=new Date(iso); return d.toLocaleDateString([], {weekday:"short",day:"2-digit",month:"short"})+" "+d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}); }catch(e){ return "—"; } }
 function fmtGap(s){ if(s==null) return "—"; if(s<90) return s+"s"; return (s/60).toFixed(1)+"m"; }
 function gapClass(s){ if(s==null) return "no"; if(s>180) return "slow"; return "ok"; }
 function esc(x){ return String(x==null?"":x).replace(/[&<>"]/g,function(c){return({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c];}); }
 function grpPill(g){ var c = g==="o-group"?"o":(g==="4854"?"f":"x"); return '<span class="pill '+c+'">'+esc(g)+'</span>'; }
 function rateBar(p){ var cls = p>=90?"":(p>=70?"warn":"bad"); return '<div class="bar '+cls+'"><i style="width:'+Math.max(2,Math.min(100,p))+'%"></i></div>'; }
+function statCard(k,v,x,cls){ return '<div class="stat '+(cls||"")+'"><div class="k">'+esc(k)+'</div><div class="v">'+v+'</div><div class="x">'+esc(x)+'</div></div>'; }
 
 function load(force){
   var u = "/api/reports/runs" + (force?"?force=1":"");
   document.getElementById("refresh").innerHTML = '<span class="spin"></span> …';
   fetch(u, { headers: { "x-dashboard-token": TOKEN }, cache:"no-store" })
     .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
-    .then(function(j){ DATA=j; document.getElementById("err").innerHTML=""; if(SEL>=(j.runs||[]).length) SEL=0; render(); })
+    .then(function(j){ DATA=j; document.getElementById("err").innerHTML=""; render(); })
     .catch(function(e){ document.getElementById("err").innerHTML='<div class="err">⚠ Impossible de charger le rapport : '+esc(e.message)+' — ouvre cette page via <b>/report</b> (le serveur injecte le token).</div>'; })
     .finally(function(){ document.getElementById("refresh").innerHTML="↻ Rafraîchir"; });
 }
 
 function render(){
-  if(!DATA){ return; }
+  if(!DATA) return;
   document.getElementById("upd").textContent = "MAJ " + fmtTime(DATA.generatedAt);
-  document.getElementById("foot").textContent = (DATA.runCount||0)+" run(s) détectée(s) — source : facebook-live-posts.jsonl + events.log + watchdog";
-  var runs = DATA.runs || [];
-  // chips
-  var ch = runs.map(function(r,i){
-    var rate=r.commentRate;
-    return '<div class="chip '+(i===SEL?"on":"")+'" onclick="pick('+i+')">'
-      + (i===0?'<div class="badge">Dernière</div>':'')
-      + '<div class="cd">'+esc(fmtDate(r.startedAt))+'</div>'
-      + '<div class="cp">'+r.posts+' posts</div>'
-      + '<div class="cc '+(rate>=90?"ok":rate>=70?"slow":"no")+'">'+rate+'% commentés</div></div>';
-  }).join("");
-  document.getElementById("chips").innerHTML = ch || "";
-  // kill-mid-post reconcile banner (silent-loss guard visibility)
-  var rc = DATA.reconcile || {};
-  var recoEl = document.getElementById("reco");
-  var bits = [];
-  if (rc.pending) bits.push('<b>'+rc.pending+'</b> interrompu(s), reprise en cours');
-  if (rc.needsReview) bits.push('<b>'+rc.needsReview+'</b> à vérifier manuellement');
-  if (rc.recovered) bits.push('<b>'+rc.recovered+'</b> récupéré(s)');
-  if (rc.released) bits.push('<b>'+rc.released+'</b> relancé(s)');
-  if (rc.pending || rc.needsReview) recoEl.innerHTML = '<div class="reco warn">⚠ Reprise après interruption (kill mid-post) : ' + bits.join(' · ') + '</div>';
-  else if (rc.recovered || rc.released) recoEl.innerHTML = '<div class="reco ok">✓ Reprise auto après interruption : ' + bits.join(' · ') + ' — aucune perte silencieuse</div>';
-  else recoEl.innerHTML = '';
-  // BUDGET D'OUVERTURES ixBrowser + keep-open auto selon le PLAN (l'API locale n'expose pas le plan -> connu/appris)
-  var ob = DATA.openBudget || null;
-  var obEl = document.getElementById("openbudget");
-  if (ob && (ob.opensToday || ob.effectiveLimit)) {
-    var used = ob.opensToday || 0;
-    var lim = ob.effectiveLimit;
-    var KOMODE = {
-      force_on: 'keep-open <b>forcé ON</b>',
-      force_off: 'keep-open <b>forcé OFF</b>',
-      auto_on_tight_plan: 'keep-open <b>auto ON</b> (plan serré)',
-      auto_on_near_limit: 'keep-open <b>auto ON</b> (proche limite)',
-      auto_off_roomy_plan: 'keep-open auto OFF (plan large)',
-      auto_off_plan_unknown: 'keep-open auto OFF (plan inconnu)'
-    };
-    var ko = KOMODE[ob.mode] || (ob.keepOpenOn ? 'keep-open ON' : 'keep-open off');
-    var planSrc = ob.planLimit ? 'plan connu' : (ob.learnedLimit ? 'auto-appris' : '');
-    var head, cls;
-    if (lim) {
-      var line = '<b>' + used + '</b> / ~' + lim + ' ouvertures aujourd\'hui (' + planSrc + (ob.pct != null ? ', ' + ob.pct + '%' : '') + ', reste ~' + ob.remaining + ') — ' + ko;
-      cls = ob.nearLimit ? 'warn' : 'ok';
-      head = (ob.nearLimit ? '⚠ Proche de la limite d\'ouvertures ixBrowser : ' : '✓ Budget d\'ouvertures ixBrowser : ') + line;
-    } else {
-      cls = 'ok';
-      head = '✓ Ouvertures ixBrowser aujourd\'hui : <b>' + used + '</b> — plan inconnu (auto-appris au 1er 1018) — ' + ko;
-    }
-    obEl.innerHTML = '<div class="reco ' + cls + '">' + head + '</div>';
-  } else { obEl.innerHTML = ''; }
-  // COMPTES À PROBLÈME (vrais échecs, hors victimes du quota ixBrowser 1018/1004)
-  var pp = DATA.problemProfiles || [];
-  var ppEl = document.getElementById("probprof");
-  if (pp.length) {
-    var ppRows = pp.map(function (p) {
-      return '<tr><td><b>p' + p.profileId + '</b></td><td class="no">' + p.realFails + '</td><td class="' + (p.unblocks ? 'slow' : '') + '">' + (p.unblocks || 0) + '</td><td>' + esc(p.lastReal || '—') + '</td></tr>';
-    }).join("");
-    ppEl.innerHTML = '<h2>⚠ Comptes à problème (font perdre du temps) <span class="ln"></span></h2>'
-      + '<div class="reco warn" style="margin:0 0 8px">Vrais échecs (accès groupe / blocage compte) sur 24h — <b>PAS</b> les victimes du quota ixBrowser (1018/1004). À vérifier ou libérer depuis le dashboard.</div>'
-      + '<div class="tablecard"><table><thead><tr><th>Profil</th><th>Échecs réels</th><th>Déblocages</th><th>Dernière raison</th></tr></thead><tbody>' + ppRows + '</tbody></table></div>';
-  } else {
-    ppEl.innerHTML = '';
-  }
-  var r = runs[SEL];
-  var b = document.getElementById("body");
-  if(!r){ b.innerHTML='<div class="tablecard"><div class="empty">Aucune run enregistrée pour le moment.<br>Le rapport se remplira dès le premier post.</div></div>'; return; }
+  document.getElementById("foot").textContent = (DATA.runCount||0)+" run(s) — source : facebook-live-posts.jsonl + events.log + watchdog";
 
-  // stat cards
+  // global banners (reconcile / open-budget / problem accounts)
+  renderGlobals();
+
+  // LIVE run banner
+  var lv = DATA.live || {};
+  var liveEl = document.getElementById("live");
+  if (lv.armed) {
+    var tgt = lv.target || null;
+    var done = lv.postedThisRun || 0;
+    var pct = tgt ? Math.min(100, Math.round(done/tgt*100)) : null;
+    liveEl.innerHTML = '<div class="livecard">'
+      + '<div class="lh"><span class="lblink"></span> Run en cours</div>'
+      + '<div class="lp"><b>'+done+'</b>'+(tgt? ' / <b>'+tgt+'</b>' : '')+' posts publiés'+(pct!=null? ' &middot; '+pct+'%':'')+'</div>'
+      + (pct!=null? rateBar(pct) : '') + '</div>';
+  } else liveEl.innerHTML = '';
+
+  // RUNS accordion (collapsed by default)
+  var runs = DATA.runs || [];
+  var runsEl = document.getElementById("runs");
+  if(!runs.length){ runsEl.innerHTML = '<div class="tablecard"><div class="empty">Aucune run enregistrée pour le moment.<br>Le rapport se remplira dès le premier post.</div></div>'; return; }
+  runsEl.innerHTML = runs.map(function(r,i){ return runCard(r,i); }).join("");
+}
+
+function runCard(r,i){
+  var rate=r.commentRate;
+  var sa = esc(r.startedAt);
+  var open = OPEN.has(r.startedAt) ? ' open' : '';
+  return '<details class="runcard" data-sa="'+sa+'" ontoggle="onToggle(this)"'+open+'>'
+    + '<summary>'
+      + '<span class="rchev">▸</span>'
+      + '<span class="rmain"><span class="rdate">'+esc(fmtDate(r.startedAt))+'</span>'
+      + (r.live?'<span class="rlive">● EN COURS</span>':(i===0?'<span class="pill x">dernière</span>':''))+'</span>'
+      + '<span class="rposts">'+r.posts+' posts &middot; '+r.durationMin+'m</span>'
+      + '<span class="rrate '+(rate>=90?"ok":rate>=70?"slow":"no")+'">'+rate+'%<small> comm.</small></span>'
+      + (r.uncommented? '<span class="runc">'+r.uncommented+' sans</span>':'')
+      + '<button class="rdel" title="Supprimer cette run du rapport" onclick="dismiss(event,\''+sa+'\')">✕</button>'
+    + '</summary>'
+    + '<div class="rbody">'+runBody(r)+'</div>'
+    + '</details>';
+}
+
+function runBody(r){
   var ramTxt = r.minRamPct==null ? "—" : (r.minRamPct+"%");
   var chrTxt = r.chromePeak==null ? "—" : r.chromePeak;
-  var html = ''
-    + '<div class="stats">'
+  var html = '<div class="stats">'
     + statCard("Posts publiés", r.posts, "sur "+r.durationMin+" min", "")
     + statCard("Commentés", r.commentRate+'<small>%</small>', r.commented+"/"+r.posts+" • "+r.uncommented+" sans", r.commentRate>=90?"g":(r.commentRate>=70?"a":"r"))
     + statCard("Délai médian", fmtGap(r.gap.medianSec), "max "+fmtGap(r.gap.maxSec), "v")
     + statCard("Pic Chrome", chrTxt, "RAM libre min "+ramTxt, (r.chromePeak&&r.chromePeak>120)?"r":"g")
     + statCard("Redémarrages", r.restarts, r.restarts? "serveur relancé":"aucun — stable", r.restarts?"a":"g")
     + '</div>';
-
-  // per-group
   var gks = Object.keys(r.byGroup||{});
   if(gks.length){
     html += '<h2>Par groupe <span class="ln"></span></h2><div class="cards2">';
     html += gks.map(function(g){
       var v=r.byGroup[g];
-      return '<div class="grp"><div class="gh"><span class="gn">'+grpPill(g)+'</span><span class="tag">'+v.posts+' posts</span></div>'
+      return '<div class="grp"><div class="gh"><span>'+grpPill(g)+'</span><span class="tag">'+v.posts+' posts</span></div>'
         + '<div class="row"><span>Commentés</span><b>'+v.commented+'/'+v.posts+'</b></div>'
         + '<div class="row"><span>Taux</span><b class="'+(v.commentRate>=90?"ok":v.commentRate>=70?"slow":"no")+'">'+v.commentRate+'%</b></div>'
         + '<div class="row"><span>Délai médian</span><b>'+fmtGap(v.gapMedianSec)+'</b></div>'
@@ -247,8 +232,6 @@ function render(){
     }).join("");
     html += '</div>';
   }
-
-  // detail table
   html += '<h2>Détail des posts <span class="ln"></span></h2><div class="tablecard"><table class="detail"><thead><tr>'
     + '<th>#</th><th>Groupe</th><th>Publié</th><th>Commenté</th><th>Délai</th><th>Profils</th></tr></thead><tbody>';
   html += (r.detail||[]).map(function(d,i){
@@ -262,29 +245,59 @@ function render(){
       + '<td data-l="Profils">'+esc(prof)+'</td></tr>';
   }).join("");
   html += '</tbody></table></div>';
-
-  // history
-  if(runs.length>1){
-    html += '<h2>Historique des runs <span class="ln"></span></h2><div class="tablecard"><table class="hist"><thead><tr>'
-      + '<th>Run</th><th>Posts</th><th>Commentés</th><th>Délai méd.</th><th>Chrome</th><th>Restart</th><th>Durée</th></tr></thead><tbody>';
-    html += runs.map(function(rr,i){
-      return '<tr onclick="pick('+i+')"'+(i===SEL?' style="background:#192633"':'')+'>'
-        + '<td>'+esc(fmtDate(rr.startedAt))+(i===0?' <span class="pill x">dernière</span>':'')+'</td>'
-        + '<td>'+rr.posts+'</td>'
-        + '<td class="'+(rr.commentRate>=90?"ok":rr.commentRate>=70?"slow":"no")+'">'+rr.commentRate+'%</td>'
-        + '<td>'+fmtGap(rr.gap.medianSec)+'</td>'
-        + '<td>'+(rr.chromePeak==null?"—":rr.chromePeak)+'</td>'
-        + '<td class="'+(rr.restarts?"slow":"ok")+'">'+rr.restarts+'</td>'
-        + '<td>'+rr.durationMin+'m</td></tr>';
-    }).join("");
-    html += '</tbody></table></div>';
-  }
-  b.innerHTML = html;
+  return html;
 }
-function statCard(k,v,x,cls){ return '<div class="stat '+(cls||"")+'"><div class="k">'+esc(k)+'</div><div class="v">'+v+'</div><div class="x">'+esc(x)+'</div></div>'; }
-function pick(i){ SEL=i; render(); window.scrollTo({top:0,behavior:"smooth"}); }
 
-function arm(){ if(timer) clearInterval(timer); if(document.getElementById("auto").checked){ timer=setInterval(function(){ load(false); }, 60000); } }
+function renderGlobals(){
+  var rc = DATA.reconcile || {};
+  var recoEl = document.getElementById("reco");
+  var bits = [];
+  if (rc.pending) bits.push('<b>'+rc.pending+'</b> interrompu(s), reprise en cours');
+  if (rc.needsReview) bits.push('<b>'+rc.needsReview+'</b> à vérifier manuellement');
+  if (rc.recovered) bits.push('<b>'+rc.recovered+'</b> récupéré(s)');
+  if (rc.released) bits.push('<b>'+rc.released+'</b> relancé(s)');
+  if (rc.pending || rc.needsReview) recoEl.innerHTML = '<div class="reco warn">⚠ Reprise après interruption (kill mid-post) : ' + bits.join(' · ') + '</div>';
+  else if (rc.recovered || rc.released) recoEl.innerHTML = '<div class="reco ok">✓ Reprise auto après interruption : ' + bits.join(' · ') + ' — aucune perte silencieuse</div>';
+  else recoEl.innerHTML = '';
+
+  var ob = DATA.openBudget || null;
+  var obEl = document.getElementById("openbudget");
+  if (ob && (ob.opensToday || ob.effectiveLimit)) {
+    var used = ob.opensToday || 0, lim = ob.effectiveLimit;
+    var KOMODE = { force_on:'keep-open <b>forcé ON</b>', force_off:'keep-open <b>forcé OFF</b>', auto_on_tight_plan:'keep-open <b>auto ON</b> (plan serré)', auto_on_near_limit:'keep-open <b>auto ON</b> (proche limite)', auto_off_roomy_plan:'keep-open auto OFF (plan large)', auto_off_plan_unknown:'keep-open auto OFF (plan inconnu)' };
+    var ko = KOMODE[ob.mode] || (ob.keepOpenOn ? 'keep-open ON' : 'keep-open off');
+    var planSrc = ob.planLimit ? 'plan connu' : (ob.learnedLimit ? 'auto-appris' : '');
+    var head, cls;
+    if (lim) {
+      var line = '<b>' + used + '</b> / ~' + lim + ' ouvertures aujourd\'hui (' + planSrc + (ob.pct != null ? ', ' + ob.pct + '%' : '') + ', reste ~' + ob.remaining + ') — ' + ko;
+      cls = ob.nearLimit ? 'warn' : 'ok';
+      head = (ob.nearLimit ? '⚠ Proche de la limite d\'ouvertures ixBrowser : ' : '✓ Budget d\'ouvertures ixBrowser : ') + line;
+    } else { cls = 'ok'; head = '✓ Ouvertures ixBrowser aujourd\'hui : <b>' + used + '</b> — plan inconnu (auto-appris au 1er 1018) — ' + ko; }
+    obEl.innerHTML = '<div class="reco ' + cls + '">' + head + '</div>';
+  } else { obEl.innerHTML = ''; }
+
+  var pp = DATA.problemProfiles || [];
+  var ppEl = document.getElementById("probprof");
+  if (pp.length) {
+    var ppRows = pp.map(function (p) { return '<tr><td><b>p' + p.profileId + '</b></td><td class="no">' + p.realFails + '</td><td class="' + (p.unblocks ? 'slow' : '') + '">' + (p.unblocks || 0) + '</td><td>' + esc(p.lastReal || '—') + '</td></tr>'; }).join("");
+    ppEl.innerHTML = '<h2>⚠ Comptes à problème (font perdre du temps) <span class="ln"></span></h2>'
+      + '<div class="reco warn" style="margin:0 0 8px">Vrais échecs (accès groupe / blocage compte) sur 24h — <b>PAS</b> les victimes du quota ixBrowser (1018/1004).</div>'
+      + '<div class="tablecard"><table><thead><tr><th>Profil</th><th>Échecs réels</th><th>Déblocages</th><th>Dernière raison</th></tr></thead><tbody>' + ppRows + '</tbody></table></div>';
+  } else { ppEl.innerHTML = ''; }
+}
+
+function onToggle(el){ var sa=el.getAttribute("data-sa"); if(el.open) OPEN.add(sa); else OPEN.delete(sa); }
+
+function dismiss(ev, sa){
+  ev.stopPropagation(); ev.preventDefault();
+  if(!confirm("Supprimer cette run du rapport ? (les posts ne sont pas supprimés de Facebook — c'est juste masqué ici)")) return;
+  fetch("/api/reports/runs/dismiss", { method:"POST", headers:{ "x-dashboard-token":TOKEN, "Content-Type":"application/json" }, body:JSON.stringify({ startedAt: sa }) })
+    .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
+    .then(function(){ OPEN.delete(sa); load(true); })
+    .catch(function(e){ alert("Erreur suppression : "+e.message); });
+}
+
+function arm(){ if(timer) clearInterval(timer); if(document.getElementById("auto").checked){ timer=setInterval(function(){ load(false); }, 30000); } }
 document.getElementById("refresh").addEventListener("click", function(){ load(true); });
 document.getElementById("auto").addEventListener("change", arm);
 load(false); arm();
