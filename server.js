@@ -9957,7 +9957,14 @@ function preparePostingPlan(options = {}) {
   }
   const usedKeys = recentlyUsedProductKeys(registers.usedProducts, state);
   const noPhotoKeys = recentlyNoPhotoProductKeys(registers.noReviewPhotoProducts, state);
-  const usableProducts = products.filter((product) => !usedKeys.has(product.key.toLowerCase()) && !noPhotoKeys.has(product.key.toLowerCase()));
+  // EXCLUDE products ALREADY CLAIMED/posted THIS run (parallel-stall fix 2026-06-21). A successful post NEVER releases its
+  // claim (release runs only on fail/throw), and harvested products stay in `products` after posting (they're tracked by
+  // lastPostedAtByGroup, not the usedProducts register), so without this filter the plan rebuilds rows for the SAME already-
+  // posted front-of-list products every tick — all claimed -> every pick skipped -> 'no_ready_row' though dozens of UNCLAIMED
+  // ready products exist further down the list. The BUFFER (productHasReadyAssets ~8036) already excludes claimed; the plan must
+  // match it so its window advances to the unclaimed products. testPost uses `products` (not usableProducts) so a test is unaffected.
+  const usableProducts = products.filter((product) => !usedKeys.has(product.key.toLowerCase()) && !noPhotoKeys.has(product.key.toLowerCase())
+    && (options.testPost || !isProductClaimedForRun(state, product.key)));
   if (!options.testPost && !usableProducts.length) {
     const err = new Error("All available products are already marked used.");
     err.statusCode = 409;
