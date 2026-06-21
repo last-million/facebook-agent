@@ -9070,6 +9070,59 @@ async function sweepHarvestedImagesAsync() {
     __lastHarvestedImageSweepAt = Date.now();
   }
 }
+let __harvestedPruneInFlight = false;
+let __lastHarvestedPruneAt = 0;
+// SAVED-PRODUCT RETENTION prune (operator 2026-06-21: "keep 48h reuse, but automatically clean the products
+// more than 2 days old from saved products"). The old image sweep only BLANKED the image and KEPT the record
+// (line 1608's own comment said imageRetentionDays should "remove saved products after 2 days", but the record
+// lingered as a ghost — image gone, still read on every pass, inflating the saved count). This physically
+// REMOVES records (and any leftover image) whose harvestedAt is older than imageRetentionDays, and COMPACTS the
+// append-only log to one line per surviving product. Keys on harvestedAt (same clock the image sweep uses); a
+// record with no parseable harvestedAt is KEPT (never prune what we can't date). Single-flight + only runs when
+// NOT posting/harvesting, so the rewrite can never race a concurrent append.
+async function sweepHarvestedProductsByAgeAsync() {
+  if (__harvestedPruneInFlight) return { skipped: "in_flight" };
+  if (isLivePostingInFlight() || __harvestSourcesInFlight) return { skipped: "busy" };
+  __harvestedPruneInFlight = true;
+  try {
+    const state = readState();
+    const file = state.files?.harvestedProducts || "data/harvested-products.jsonl";
+    let raw = [];
+    try { raw = readJsonlFile(file); } catch { raw = []; }
+    if (!raw.length) return { ok: true, prunedCount: 0, keptCount: 0 };
+    // dedup by firstCommentUrl, last-wins (mirror readHarvestedProducts) so the rewrite keeps the freshest record
+    const byUrl = new Map();
+    for (const r of raw) { if (r && r.firstCommentUrl) byUrl.set(String(r.firstCommentUrl), r); }
+    const recs = [...byUrl.values()];
+    const retentionDays = clampNumber(state.posting?.contentSources?.imageRetentionDays, 1, 90, 2);
+    const cutoffMs = retentionDays * 86400 * 1000;
+    const now = Date.now();
+    const keep = [], prune = [];
+    for (const r of recs) {
+      const h = Date.parse(r.harvestedAt || "");
+      if (Number.isFinite(h) && (now - h) >= cutoffMs) prune.push(r); else keep.push(r);
+    }
+    if (!prune.length) {
+      // nothing aged out — still COMPACT if the append-only log has bloated well past the unique count
+      if (raw.length > recs.length * 2 + 20) { writeJsonlFile(file, keep); logEvent("harvested_products_compacted", { fileLinesBefore: raw.length, unique: recs.length }); }
+      return { ok: true, prunedCount: 0, keptCount: keep.length };
+    }
+    let imagesDeleted = 0;
+    for (const r of prune) {
+      if (!r.imageLocalPath || r.imageDeleted) continue;
+      try { const ip = safeProjectPath(r.imageLocalPath); if (fs.existsSync(ip)) { fs.unlinkSync(ip); imagesDeleted += 1; } } catch (_) {}
+    }
+    writeJsonlFile(file, keep);
+    logEvent("harvested_products_pruned", { prunedCount: prune.length, imagesDeleted, keptCount: keep.length, retentionDays, fileLinesBefore: raw.length });
+    return { ok: true, prunedCount: prune.length, imagesDeleted, keptCount: keep.length };
+  } catch (err) {
+    logEvent("harvested_products_prune_error", { error: oneLineField(err.message || String(err), 200) });
+    return { ok: false, error: String((err && err.message) || err) };
+  } finally {
+    __harvestedPruneInFlight = false;
+    __lastHarvestedPruneAt = Date.now();
+  }
+}
 // Keep production posting unblocked by the fresh-discovery / latest-run asserts:
 // refresh candidates with the fast HTTP discovery (no browser) when stale, and
 // re-stamp still-live existing candidates into the latest run. Throttled +
@@ -9221,6 +9274,13 @@ async function autopilotTickAsync(options = {}) {
         && !isLivePostingInFlight() && !__harvestedImageSweepInFlight && (Date.now() - __lastHarvestedImageSweepAt) >= 3600000) {
       // !isLivePostingInFlight: never unlink an image while a live post might be reading it (retention is now 2 days, so a soon-to-post product can fall due mid-run)
       sweepHarvestedImagesAsync().catch((err) => logEvent("autopilot_harvested_image_sweep_error", { error: oneLineField(err.message || String(err), 160) }));
+    }
+    // SAVED-PRODUCT prune (operator 2026-06-21): physically remove harvested RECORDS (+ leftover images) older than
+    // imageRetentionDays so the saved store stays fresh and never accumulates ghosts. Same gate as the image sweep
+    // (armed + not posting), single-flight, hourly; __lastHarvestedPruneAt starts at 0 so it runs in the first idle gap.
+    if (!dryRun && state.operator?.contentSourcesEnabled === true && state.operator?.armedForExternalActions
+        && !isLivePostingInFlight() && !__harvestSourcesInFlight && !__harvestedPruneInFlight && (Date.now() - __lastHarvestedPruneAt) >= 3600000) {
+      sweepHarvestedProductsByAgeAsync().catch((err) => logEvent("autopilot_harvested_prune_error", { error: oneLineField(err.message || String(err), 160) }));
     }
     // OPEN-GRAPH enrichment: pull the real product name/description from each harvested link's og:
     // tags (feeds the posting #tags). Fire-and-forget, single-flight, a few records per tick.
@@ -20409,6 +20469,13 @@ const server = http.createServer(async (req, res) => {
     // manual trigger for the harvested-link OpenGraph enrichment (normally runs per tick)
     const body = await readJson(req);
     const result = await backfillHarvestedOpenGraphAsync(clampNumber(body.max, 1, 25, 5));
+    return json(res, 200, { ok: !result.error, ...result });
+  }
+  if (req.method === "POST" && url.pathname === "/api/content-sources/prune-saved") {
+    // manual trigger for the saved-product RETENTION prune (normally runs hourly in the tick): physically
+    // removes harvested records (+ any leftover image) older than imageRetentionDays and compacts the log.
+    // Self-skips while posting/harvesting so it can never race a concurrent append.
+    const result = await sweepHarvestedProductsByAgeAsync();
     return json(res, 200, { ok: !result.error, ...result });
   }
   if (req.method === "POST" && url.pathname === "/api/content-sources/harvest-now") {
