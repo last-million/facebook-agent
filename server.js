@@ -20712,6 +20712,11 @@ server.listen(PORT, HOST, () => {
   // sees it. Re-synced every 24h by the heartbeat. (cpu+ram, reserves OS + the co-resident Pinterest agent.)
   __lastMachineCapSyncAt = Date.now();
   refreshMachineParallelCap("boot");
+  // PERMANENT harvested-URL ledger: seed it from the current store at boot so every product harvested so far is
+  // remembered BEFORE the 2-day prune can drop any record — otherwise a prune that fires before the first NEW harvest
+  // would "forget" those URLs and they'd be re-harvested if the source re-posts them. (Ongoing: appendHarvestedProduct
+  // adds each new URL; the prune never touches this ledger.)
+  try { const n = harvestedSeenKeySet().size; logEvent("harvested_seen_ledger_ready", { keys: n }); } catch (_) {}
   // Warm up the persistent image-selector service in WSL so the first asset
   // prep call doesn't pay the WSL cold-start.
   // [WEDGE-DEBUG] temporarily disabled to isolate the boot wedge (see _wedgewatch).
