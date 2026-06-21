@@ -2042,14 +2042,30 @@ function readJsonlFile(relativePath) {
     .filter(Boolean);
 }
 
+// EVENT-LOOP UNBLOCK (2026-06-21 swarm fix #1): the FB live-post ledger grew to ~23 MB / 34k lines and ~10
+// hot helpers (comment dedup, fairness, bench, reconciler) re-read + re-split the WHOLE file synchronously,
+// several times per post — during a 5-worker batch these stack and BLOCK libuv for seconds, so the watchdog
+// HTTP health probe times out at only 28-48% CPU and frozen-kills the server (a restart spiral, proven live).
+// FIX: the ledger is APPEND-ONLY, so cache the split LINES keyed on mtime+size; an append changes size -> the
+// cache refreshes ONCE, and every read in between skips the big readFileSync+split. We cache only the line
+// STRINGS (immutable -> safe to share) and JSON.parse ONLY the requested tail, so callers always get FRESH
+// row objects (no shared-mutation risk) and a limited read parses N lines instead of all 34k.
+const __jsonlLineCache = new Map(); // absolutePath -> { mtimeMs, size, lines: string[] }
 function readJsonlAbsoluteFile(filePath, options = {}) {
-  if (!fs.existsSync(filePath)) return [];
+  let st;
+  try { st = fs.statSync(filePath); } catch { return []; } // missing/unreadable -> empty (same as before)
   const limit = Number(options.limit || 0);
-  const lines = String(fs.readFileSync(filePath, "utf8") || "")
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter((line) => line && !line.startsWith("#"));
-  const rows = limit > 0 ? lines.slice(-limit) : lines;
+  let entry = __jsonlLineCache.get(filePath);
+  if (!entry || entry.mtimeMs !== st.mtimeMs || entry.size !== st.size) {
+    const lines = String(fs.readFileSync(filePath, "utf8") || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("#"));
+    entry = { mtimeMs: st.mtimeMs, size: st.size, lines };
+    __jsonlLineCache.set(filePath, entry);
+    if (__jsonlLineCache.size > 24) { const oldest = __jsonlLineCache.keys().next().value; if (oldest !== filePath) __jsonlLineCache.delete(oldest); } // bound: only a handful of hot files use this
+  }
+  const rows = limit > 0 ? entry.lines.slice(-limit) : entry.lines;
   return rows.map((line) => {
     try {
       return JSON.parse(line);
@@ -2416,7 +2432,20 @@ function isFacebookAccountError(message) {
 
 function appendJsonlAbsoluteFile(filePath, row) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.appendFileSync(filePath, `${JSON.stringify(row)}\n`);
+  const line = `${JSON.stringify(row)}\n`;
+  fs.appendFileSync(filePath, line);
+  // Keep the readJsonlAbsoluteFile cache HOT across appends (swarm fix #1): extend the cached line array in
+  // place and re-sync the mtime/size key, so an append does NOT force the next read to re-slurp the whole
+  // multi-MB file. One cheap statSync instead of a 23 MB readFileSync+split on every post-step.
+  try {
+    const entry = __jsonlLineCache.get(filePath);
+    if (entry) {
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith("#")) entry.lines.push(trimmed);
+      const st = fs.statSync(filePath);
+      entry.mtimeMs = st.mtimeMs; entry.size = st.size;
+    }
+  } catch (_) { __jsonlLineCache.delete(filePath); } // on any mismatch, drop the cache so the next read rebuilds it cleanly
 }
 
 function writeTextFile(relativePath, content) {
