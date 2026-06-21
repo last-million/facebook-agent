@@ -194,6 +194,7 @@ function render(){
 function runCard(r,i){
   var rate=r.commentRate;
   var sa = esc(r.startedAt);
+  var ea = esc(r.endedAt || r.startedAt); // dismiss key = endedAt (restart-stable)
   var open = OPEN.has(r.startedAt) ? ' open' : '';
   return '<details class="runcard" data-sa="'+sa+'" ontoggle="onToggle(this)"'+open+'>'
     + '<summary>'
@@ -203,7 +204,7 @@ function runCard(r,i){
       + '<span class="rposts">'+r.posts+' posts &middot; '+r.durationMin+'m</span>'
       + '<span class="rrate '+(rate>=90?"ok":rate>=70?"slow":"no")+'">'+rate+'%<small> comm.</small></span>'
       + (r.uncommented? '<span class="runc">'+r.uncommented+' sans</span>':'')
-      + '<button class="rdel" title="Supprimer cette run du rapport" onclick="dismiss(event,\''+sa+'\')">✕</button>'
+      + '<button class="rdel" title="Supprimer cette run du rapport" onclick="dismiss(event,\''+sa+'\',\''+ea+'\')">✕</button>'
     + '</summary>'
     + '<div class="rbody">'+runBody(r)+'</div>'
     + '</details>';
@@ -288,10 +289,10 @@ function renderGlobals(){
 
 function onToggle(el){ var sa=el.getAttribute("data-sa"); if(el.open) OPEN.add(sa); else OPEN.delete(sa); }
 
-function dismiss(ev, sa){
+function dismiss(ev, sa, ea){
   ev.stopPropagation(); ev.preventDefault();
   if(!confirm("Supprimer cette run du rapport ? (les posts ne sont pas supprimés de Facebook — c'est juste masqué ici)")) return;
-  fetch("/api/reports/runs/dismiss", { method:"POST", headers:{ "x-dashboard-token":TOKEN, "Content-Type":"application/json" }, body:JSON.stringify({ startedAt: sa }) })
+  fetch("/api/reports/runs/dismiss", { method:"POST", headers:{ "x-dashboard-token":TOKEN, "Content-Type":"application/json" }, body:JSON.stringify({ endedAt: ea || sa, startedAt: sa }) })
     .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
     .then(function(){ OPEN.delete(sa); load(true); })
     .catch(function(e){ alert("Erreur suppression : "+e.message); });

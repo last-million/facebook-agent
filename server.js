@@ -19619,34 +19619,20 @@ function buildRunReports(force = false) {
   try { problemProfiles = buildProblemProfiles({ windowHours: 24 }); } catch {}
   let openBudget = null;
   try { openBudget = ixOpenBudgetSnapshot(); } catch {}
-  // OPERATOR DISMISS (non-destructive): hide runs the operator removed from the report. The ledger is NEVER touched —
-  // only this small startedAt list filters the view; clearing the list (or restore) brings a run back.
+  // OPERATOR DISMISS (non-destructive, RESTART-STABLE): hide runs the operator removed. KEY = the run's ENDED-AT
+  // (last-post timestamp). Why endedAt and not startedAt: the report reads a SLIDING window (last 20000 ledger lines),
+  // so as the ledger grows a run's EARLY posts age out first and its startedAt shifts — a startedAt-keyed dismiss then
+  // stops matching and the "removed" run REAPPEARS after a restart (operator 2026-06-21: "old jobs come back even after
+  // i removed them"). The LAST post ages out LAST, so endedAt stays stable until the whole run leaves the window — so a
+  // dismiss keyed on it sticks until the run is gone anyway. We match endedAt OR startedAt (back-compat), NEVER hide the
+  // newest run, and DO NOT auto-prune (the old prune is exactly what re-surfaced dismissed runs). Clear/restore still work.
   let __dismissed = [];
   try { __dismissed = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "report-dismissed-runs.json"), "utf8")); } catch (_) {}
   const __dismissSet = new Set((Array.isArray(__dismissed) ? __dismissed : []).map(String));
-  // STALE-DISMISS SELF-HEAL (operator 2026-06-21): re-clustering (a new post extends/merges a run, the 20000-line
-  // window slides, a 2h-gap shifts) can change a run's startedAt so a previously-dismissed timestamp no longer matches
-  // any current run — yet still sat in the file. A bulk/loop dismiss-all had also stamped EVERY run incl. today's, so
-  // the report collapsed to one stale old run. Two guards make the dismiss filter robust: (1) IGNORE dismiss entries
-  // that match no current cluster startedAt (they can only ever hide nothing useful, and keeping them risks future
-  // false hides); (2) NEVER let the dismiss set hide the single NEWEST run cluster (out[0]) — the report must always
-  // surface the latest run. These are view-only and reversible (restore/clear still work); the ledger is untouched.
-  const __currentStartedAts = new Set(out.map((r) => String(r.startedAt)));
-  const __newestStartedAt = out.length ? String(out[0].startedAt) : "";
-  const outVisible = out.filter((r) => {
-    const sa = String(r.startedAt);
-    if (sa === __newestStartedAt) return true;        // always show the newest run, even if it was dismissed
-    return !__dismissSet.has(sa);
+  const outVisible = out.filter((r, i) => {
+    if (i === 0) return true; // always show the newest run, even if it was dismissed
+    return !(__dismissSet.has(String(r.endedAt)) || __dismissSet.has(String(r.startedAt)));
   });
-  // Prune dismiss entries that no longer match any current cluster OR that target the newest run, so the file can't
-  // keep accumulating stale/over-reaching timestamps. Best-effort, only rewrites when something actually changed.
-  try {
-    const __pruned = [...__dismissSet].filter((sa) => sa !== __newestStartedAt && __currentStartedAts.has(sa));
-    if (__pruned.length !== __dismissSet.size) {
-      fs.writeFileSync(path.join(DATA_DIR, "report-dismissed-runs.json"), JSON.stringify(__pruned));
-      logEvent("report_dismiss_set_pruned", { before: __dismissSet.size, after: __pruned.length });
-    }
-  } catch (_) {}
   // LIVE RUN: surface the in-progress job (armed) + its progress so the report shows the CURRENT job, not only finished
   // ones. Mark the most-recent visible run as live when armed and its last post is recent (same 2h clustering window).
   let live = { armed: false, postedThisRun: 0, target: null };
@@ -19741,25 +19727,25 @@ const server = http.createServer(async (req, res) => {
     if (!Array.isArray(arr)) arr = [];
     if (body.clear === true) { arr = []; }
     else {
-      const startedAt = String(body.startedAt || "").trim();
-      if (!startedAt) return json(res, 400, { error: "startedAt required (or clear:true)" });
-      if (body.restore === true) arr = arr.filter((x) => String(x) !== startedAt);
+      // KEY = the run's ENDED-AT (restart-stable; see buildRunReports). Accept endedAt; fall back to key/startedAt for
+      // older callers. Store whatever stable id the page sends; the filter matches endedAt OR startedAt.
+      const key = String(body.endedAt || body.key || body.startedAt || "").trim();
+      if (!key) return json(res, 400, { error: "endedAt required (or clear:true)" });
+      if (body.restore === true) arr = arr.filter((x) => String(x) !== key);
       else {
-        // GUARD (operator 2026-06-21): NEVER dismiss the single newest run cluster. A dismiss-all / per-row UI loop that
-        // walked the visible list previously stamped EVERY run incl. today's, collapsing /report to one stale old run.
-        // The report must always surface the latest run, so reject a dismiss of the current latest startedAt. (Older
-        // runs can still be dismissed; clear/restore unchanged.)
-        let __latestStartedAt = "";
-        try { __latestStartedAt = String((buildRunReports(true).latest || {}).startedAt || ""); } catch (_) {}
-        if (__latestStartedAt && startedAt === __latestStartedAt) {
-          return json(res, 400, { error: "cannot dismiss the latest run", startedAt });
+        // GUARD (operator 2026-06-21): NEVER dismiss the single newest run cluster — the report must always surface the
+        // latest run. Reject a dismiss matching the current latest run's endedAt OR startedAt. (Older runs still dismissable.)
+        let __latest = null; try { __latest = buildRunReports(true).latest || {}; } catch (_) {}
+        const __nEnd = String(__latest && __latest.endedAt || ""), __nStart = String(__latest && __latest.startedAt || "");
+        if ((__nEnd && key === __nEnd) || (__nStart && key === __nStart)) {
+          return json(res, 400, { error: "cannot dismiss the latest run", key });
         }
-        if (!arr.map(String).includes(startedAt)) arr.push(startedAt);
+        if (!arr.map(String).includes(key)) arr.push(key);
       }
     }
     try { fs.writeFileSync(f, JSON.stringify(arr.slice(-500))); } catch (_) {}
     __runReportCache.at = 0; // bust the 60s cache so the change shows on the next load immediately
-    logEvent("report_run_dismissed", { startedAt: body.startedAt || "", restore: !!body.restore, clear: !!body.clear, total: arr.length });
+    logEvent("report_run_dismissed", { key: body.endedAt || body.startedAt || "", restore: !!body.restore, clear: !!body.clear, total: arr.length });
     return json(res, 200, { ok: true, dismissed: arr.length });
   }
 
