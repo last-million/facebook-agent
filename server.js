@@ -2271,12 +2271,18 @@ async function backfillHarvestedOpenGraphAsync(maxPerRound = 5) {
     let enriched = 0;
     for (const rec of recs) {
       const og = await fetchOpenGraphForHarvestedLink(rec.firstCommentUrl);
+      const __ogOk = !!(og.ogTitle || og.ogDescription);
+      const __ogTries = (Number(rec.ogTries) || 0) + 1;
       updateHarvestedProductRecord(rec.productKey || harvestSyntheticKey(rec.firstCommentUrl), {
         ogTitle: og.ogTitle,
         ogDescription: og.ogDescription,
-        ogTriedAt: new Date().toISOString(),
+        ogTries: __ogTries,
+        // SWARM FIX #11: only PERMANENTLY mark tried on SUCCESS (or after 3 failed attempts) — a transient timeout /
+        // bot-wall returns empty og, and the old unconditional stamp excluded the record from ALL future backfill
+        // rounds forever, so it kept the weaker caption-derived #tags. Leaving ogTriedAt unset lets it retry.
+        ogTriedAt: (__ogOk || __ogTries >= 3) ? new Date().toISOString() : "",
       });
-      if (og.ogTitle || og.ogDescription) enriched += 1;
+      if (__ogOk) enriched += 1;
     }
     if (recs.length) logEvent("harvested_opengraph_backfill", { tried: recs.length, enriched });
     return { tried: recs.length, enriched };
@@ -8780,7 +8786,18 @@ async function harvestContentSourcesAsync(options = {}) {
               } else { skippedSeen++; }
               continue;
             }
-            const persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, firstCommentText: it.commentLead, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId, ogTitle: it.ogTitle, ogDescription: it.ogDescription }, readState());
+            let persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, firstCommentText: it.commentLead, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId, ogTitle: it.ogTitle, ogDescription: it.ogDescription }, readState());
+            if (!persisted) {
+              // SWARM FIX #7: the URL is NOT in the active store (existing was falsy) yet the append was rejected -> it
+              // is in the PERMANENT seen-ledger because the age-sweep already pruned its record. The connector only
+              // returns posts within harvestMaxAgeDays, so this is a FRESH in-window RE-LISTING that must be postable
+              // again (else it is un-harvestable forever + re-scraped every round for nothing). Re-admit it: forget the
+              // ledger key, append fresh. STILL-ACTIVE products are protected by the `existing` check above, so this
+              // only re-admits genuinely pruned-then-relisted URLs (which get a fresh harvestedAt, no immediate re-prune).
+              try { forgetHarvestKey(url, readState()); } catch (_) {}
+              persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, firstCommentText: it.commentLead, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId, ogTitle: it.ogTitle, ogDescription: it.ogDescription }, readState());
+              if (persisted) reusedOld++;
+            }
             if (persisted) { existingByUrl.set(url, { firstCommentUrl: url, posted: "" }); harvestedNew++; }
           }
           // AUTO-LEARN the member profile: a profile that READ the group (returned items) is a proven member
@@ -9582,21 +9599,26 @@ async function autopilotTickAsync(options = {}) {
     const __batchCap = Math.max(1, Math.min(maxWorkers, __runRemainingForBatch));
     const __perGroupCap = Math.max(1, Math.ceil(__batchCap / Math.max(1, __readyGroupKeys.length)));
     const __pickedByGroup = new Map();
+    // SWARM FIX #10: tally WHY ready rows were skipped so the no_ready_row detail names the real blocker (claimed /
+    // sibling / dup / group_cap / not_eligible) instead of always blaming "no eligible profile" — the misattribution
+    // that made the claim-leak stall hard to diagnose. Counters are approximate (both pick passes increment).
+    const __skip = { not_eligible: 0, used_pid: 0, group_cap: 0, dup_product: 0, claimed: 0, sibling: 0 };
     const __pickPass = (enforceGroupCap) => {
       for (const row of readyRows) {
         if (picked.length >= __batchCap) break;
         const pid = Number(row.profileId || profileIdFromLabel(row.profile) || 0);
-        if (!eligibleIds.has(pid) || usedIds.has(pid)) continue;
+        if (!eligibleIds.has(pid)) { __skip.not_eligible += 1; continue; }
+        if (usedIds.has(pid)) { __skip.used_pid += 1; continue; }
         const gKey = normalizedFacebookGroupKey(row.groupUrl);
-        if (enforceGroupCap && (__pickedByGroup.get(gKey) || 0) >= __perGroupCap) continue; // hold this group at its fair share on the first pass
+        if (enforceGroupCap && (__pickedByGroup.get(gKey) || 0) >= __perGroupCap) { __skip.group_cap += 1; continue; } // hold this group at its fair share on the first pass
         const prodKey = String(row.productKey || row.productUrl || row.link || "").toLowerCase();
-        if (prodKey && usedProductKeys.has(prodKey)) continue; // each post must use a UNIQUE product
-        if (prodKey && isProductClaimedForRun(state, prodKey, row.groupUrl)) continue; // ALREADY claimed/posted this run (for THIS group when postToAllGroups) -> skip at PICK time; advance to a fresh row
+        if (prodKey && usedProductKeys.has(prodKey)) { __skip.dup_product += 1; continue; } // each post must use a UNIQUE product
+        if (prodKey && isProductClaimedForRun(state, prodKey, row.groupUrl)) { __skip.claimed += 1; continue; } // ALREADY claimed/posted this run (for THIS group when postToAllGroups) -> skip at PICK time; advance to a fresh row
         // CONCURRENCY SAFETY: two products whose markers are the same OR variant SIBLINGS (shared long title
         // prefix, e.g. RC Lambo "...- Red" vs "...- White") must NOT be in the same parallel batch — their
         // near-identical captions make feed-capture ambiguous. Skip siblings.
         const markerKey = computePostMarkerPhrase(row).toLowerCase();
-        if (markerKey && [...usedMarkers].some((m) => markersAreSiblings(markerKey, m))) continue;
+        if (markerKey && [...usedMarkers].some((m) => markersAreSiblings(markerKey, m))) { __skip.sibling += 1; continue; }
         usedIds.add(pid);
         if (prodKey) usedProductKeys.add(prodKey);
         usedMarkers.add(markerKey);
@@ -9608,7 +9630,7 @@ async function autopilotTickAsync(options = {}) {
     if (picked.length < __batchCap) __pickPass(false); // fill the remainder if a group had too few ready rows
     if (!picked.length) {
       decision.action = "no_ready_row";
-      decision.detail = `plan ${plan.planId}: ${readyRows.length} ready row(s), none match the ${eligibleIds.size} eligible profile(s)`;
+      decision.detail = `plan ${plan.planId}: ${readyRows.length} ready, 0 picked — claimed=${__skip.claimed}, sibling=${__skip.sibling}, dup_product=${__skip.dup_product}, group_cap=${__skip.group_cap}, not_eligible=${__skip.not_eligible}, used_pid=${__skip.used_pid} (${eligibleIds.size} eligible profiles)`;
       __autopilotLastDecision = decision;
       logEvent("autopilot_no_ready_row", decision);
       return decision;
@@ -9823,13 +9845,22 @@ function detectIncompleteRunAtBoot() {
     const __priorNoProgress = __sameRun ? (Number(op.autopilotCrashResumeNoProgress) || 0) : 0;
     const __noProgressNow = __madeProgress ? 0 : (__priorNoProgress + 1);
     const __totalResumes = __sameRun ? (Number(op.autopilotCrashResumeAttempts) || 0) : 0;
+    // SWARM FIX #6: TIME-RATE crash-loop breaker. The progress-aware cap below never gives up while each segment
+    // posts >=1 — exactly what an event-loop FREEZE/restart spiral does (post a few, get frozen-killed, reboot,
+    // repeat). If the SAME run has crash-resumed >=3 times within 30 min, treat it as a systemic spiral, STOP
+    // auto-resuming, and surface the banner so the operator sees "posting paused, server kept restarting" instead of
+    // a silent thrash. firstAt is persisted in state, so the window survives the very restarts it is counting.
+    const __nowMs = Date.now();
+    const __streakStart = __sameRun ? (Number(op.autopilotCrashResumeFirstAt) || __nowMs) : __nowMs;
+    const __resumeSpiral = __sameRun && __totalResumes >= 3 && (__nowMs - __streakStart) < 30 * 60 * 1000;
     const __canAutoResume = op.autopilotAutoResumeEnabled === true && __reason === "run_active_at_restart"
-      && max > 0 && posted < max && __runRecent && __noProgressNow < 3 && __totalResumes < 40;
+      && max > 0 && posted < max && __runRecent && __noProgressNow < 3 && __totalResumes < 40 && !__resumeSpiral;
     if (__canAutoResume) {
       state.operator.lastIncompleteRun = { at: new Date().toISOString(), posted, max, reason: __reason, status: "auto_resumed", resolvedAt: new Date().toISOString() };
       state.operator.autopilotCrashResumeRunId = String(__runId);
       state.operator.autopilotCrashResumeAttempts = __totalResumes + 1;
       state.operator.autopilotCrashResumeNoProgress = __noProgressNow;
+      state.operator.autopilotCrashResumeFirstAt = __streakStart; // SWARM FIX #6: anchor the rate-window start (persists across the restarts it counts)
       state.operator.autopilotMaxPostsPerRun = Math.max(1, max - posted); // continue toward the same N total
       state.operator.autopilotPostsThisRun = 0;
       state.operator.autopilotEnabled = true;
@@ -9839,11 +9870,12 @@ function detectIncompleteRunAtBoot() {
       logEvent("autopilot_auto_resumed_after_crash", { posted, max, remaining: Math.max(1, max - posted), totalResumes: __totalResumes + 1, consecutiveNoProgress: __noProgressNow, madeProgress: __madeProgress, runId: String(__runId) });
       return;
     }
+    if (__resumeSpiral) logEvent("autopilot_auto_resume_halted_crash_spiral", { resumes: __totalResumes, windowMin: Math.round((__nowMs - __streakStart) / 60000), posted, max, runId: String(__runId) }); // SWARM FIX #6
     state.operator.lastIncompleteRun = {
       at: new Date().toISOString(),
       posted,
       max,
-      reason: __reason,
+      reason: __resumeSpiral ? "crash_resume_spiral_halted" : __reason,
       status: "pending",
     };
     state.operator.autopilotEnabled = false;
@@ -20429,6 +20461,15 @@ const server = http.createServer(async (req, res) => {
     state.operator.autopilotEnabled = true;
     state.operator.armedForExternalActions = true;
     state.operator.autopilotDryRun = false;
+    if (action === "relaunch") {
+      // SWARM FIX #9: a relaunch is a FRESH full-count run, so it needs a CLEAN claim namespace. Keeping the old
+      // runId reused the interrupted run's post-claims dir, so products still claimed there were excluded for up to
+      // reuseHours -> the relaunch produced FEWER than N posts (or stalled at no_ready_row). Regenerate the runId and
+      // clear the post-claims dirs, exactly as a fresh arm does. ('continue' deliberately KEEPS runId+claims so it
+      // never re-posts the segment it already completed.)
+      state.operator.autopilotRunId = String(Date.now());
+      try { fs.rmSync(path.join(DATA_DIR, "post-claims"), { recursive: true, force: true }); } catch (_) {}
+    }
     state.operator.lastIncompleteRun = { ...run, status: action === "continue" ? "continued" : "relaunched", resolvedAt: new Date().toISOString() };
     const next = writeState(state, { controlWrite: true });
     logEvent(`incomplete_run_${action === "continue" ? "continued" : "relaunched"}`, { posted: run.posted, max: run.max, newMax });
@@ -20792,7 +20833,12 @@ const server = http.createServer(async (req, res) => {
     const body = await readJson(req);
     const st = readState();
     const recs = readHarvestedProducts(st);
-    const clearPatch = () => ({ lastPostedAt: "", posted: "", postedCount: 0, reusedAt: new Date().toISOString() });
+    // SWARM FIX #8: also clear lastPostedAtByGroup (+ postUrl) so "mark available" / reset-used FULLY restores the
+    // product across ALL groups — the old patch left the per-group stamps, so the postToAllGroups fan-out still
+    // skipped every group the product had hit <24h ago (product looked available at top level but stayed blocked
+    // per-group). SWARM FIX #12: do NOT zero postedCount — keep it as a lifetime total (reports read it; nothing
+    // gates posting on it), reusedAt already records the reset moment.
+    const clearPatch = () => ({ lastPostedAt: "", posted: "", postUrl: "", lastPostedAtByGroup: {}, reusedAt: new Date().toISOString() });
     if (body.all === true) {
       let cleared = 0;
       for (const r of recs) {
