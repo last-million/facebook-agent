@@ -5615,5 +5615,12 @@ main().then(() => {
   // Normal runs (no keepBrowserOpen) already closed the browser at 5588, so the socket drains and node exits on its own.
   let __ko = false;
   try { const __p = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8')); __ko = !!(__p && __p.keepBrowserOpen); } catch (_) {}
-  if (__ko) process.exit(0);
+  if (__ko) {
+    // Exit cleanly, but ONLY after stdout has drained to the pipe: process.exit() can truncate a buffered pipe write,
+    // which would lose the result JSON the server parses (-> a landed post would look failed -> double-post on retry).
+    // Drain first; a 3s hard fallback guarantees exit even if 'drain' never fires.
+    const __exit = () => process.exit(0);
+    setTimeout(__exit, 3000).unref();
+    if (process.stdout.writableLength === 0) __exit(); else process.stdout.once('drain', __exit);
+  }
 }).catch(e => { console.error(JSON.stringify({ step: 'error', message: e.message, stack: e.stack })); process.exit(1); });
