@@ -10712,6 +10712,7 @@ function appendFacebookLivePostLedger(event = {}) {
     // MUST be declared here or the stamp is discarded. Length-capped so per-row bytes stay bounded. title/ogDescription/
     // productKey are persisted so a HARVESTED post's comment marker reproduces byte-identical on recovery.
     commentTextPreview: oneLineField(event.commentTextPreview || "", 2000),
+    commentPostText: oneLineField(event.commentPostText || "", 4000),
     commentLink: oneLineField(event.commentLink || "", 1000),
     pinFirstComment: event.pinFirstComment !== false,
     harvested: Boolean(event.harvested),
@@ -12145,7 +12146,11 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
             // POST LANDED -> record it as published so the resweep comments it (no silent loss).
             const actualGroupUrl = facebookGroupUrlFromPostUrl(rec.postUrl) || groupUrl;
             try { recordPublishedFacebookPostUrl({ postUrl: rec.postUrl, row, planId, sequence, profile: row.profile || profileId, groupUrl: actualGroupUrl }); } catch (_) {}
-            appendFacebookLivePostLedger({ event: "published", key: it.key, planId, sequence, profileId, profile: row.profile || "", groupUrl, actualGroupUrl, postUrl: rec.postUrl, status: "published", message: "recovered after kill-mid-post (publish_intent reconcile)", validation: rec.validation || null });
+            appendFacebookLivePostLedger({ event: "published", key: it.key, planId, sequence, profileId, profile: row.profile || "", groupUrl, actualGroupUrl, postUrl: rec.postUrl, status: "published", message: "recovered after kill-mid-post (publish_intent reconcile)", validation: rec.validation || null,
+              // DURABLE COMMENT-RECOVERY: stamp the payload here too — this kill-mid-post path lands a post WITHOUT going
+              // through completeVerifiedFacebookPostWithComment, so without this the recovered post has no payload and is
+              // permanently uncommentable once the plan is overwritten (the exact interrupted-run case the fix targets).
+              commentTextPreview: row.commentTextPreview || "", commentPostText: row.postText || "", commentLink: row.link || "", pinFirstComment: row.pinFirstComment !== false, harvested: Boolean(row.harvested), commentImagePath: row.image || row.imagePath || "", title: row.title || "", ogDescription: row.ogDescription || "", productKey: row.productKey || "" });
             // COUNT it toward the run if it belongs to the CURRENT run (parity with the live counter bump), so a
             // recovered landed post doesn't make a "stop at N" run over-publish by 1.
             try {
@@ -14826,6 +14831,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
               profile: __p.profile || ev.profile || "",
               groupUrl: __p.groupUrl || ev.groupUrl || ev.actualGroupUrl || "",
               commentTextPreview: __p.commentTextPreview || "",
+              postText: __p.commentPostText || "",
               link: __p.commentLink || "",
               pinFirstComment: __p.pinFirstComment !== false,
               harvested: Boolean(__p.harvested),
@@ -14944,6 +14950,7 @@ async function completeVerifiedFacebookPostWithComment({
     // append (fires once per landed post, BEFORE the comment attempt, so it exists even if the post ends up
     // uncommented). Lets the resweep rebuild + comment it later even after the per-tick plan is overwritten.
     commentTextPreview: row.commentTextPreview || "",
+    commentPostText: row.postText || "",
     commentLink: row.link || "",
     pinFirstComment: row.pinFirstComment !== false,
     harvested: Boolean(row.harvested),
