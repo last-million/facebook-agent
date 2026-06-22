@@ -4212,6 +4212,10 @@ async function main() {
     // Reuse endpoint died between the server's liveness check and this connect -> fall back to a FRESH
     // open so the (cross-)comment still completes. This is the load-bearing reuse safety net.
     console.log(JSON.stringify({ step: 'ix_reuse_connect_failed', endpoint, error: String((connErr && connErr.message) || connErr).slice(0, 200), fallback: 'fresh_open' }));
+    // KEEP-OPEN FIX: the reuse connect failed = Chrome is half-dead but ixBrowser still considers the profile OPEN.
+    // Re-issuing profile-open WITHOUT a close first returns 1008 / leaves an orphan window past the 2-tab cap. Force a
+    // clean close before the fresh open so the reopen lands ONE clean window (mirrors the 1004 recovery at L91-92).
+    try { await ixPost('profile-close', { profile_id: Number(payload.profileId) }, 20000); await new Promise((r) => setTimeout(r, 2500)); } catch (_) {}
     const freshOpen = await openIxProfile(payload, targetUrl);
     endpoint = freshOpen.data.ws || ('http://' + freshOpen.data.debugging_address);
     console.log(JSON.stringify({ step: 'ix_open_fallback', endpoint }));
@@ -5601,4 +5605,15 @@ try {
     if (__wd.unref) __wd.unref();
   }
 } catch (_) {}
-main().catch(e => { console.error(JSON.stringify({ step: 'error', message: e.message, stack: e.stack })); process.exit(1); });
+main().then(() => {
+  // KEEP-OPEN FIX (primary): on a keepBrowserOpen run the finally above deliberately SKIPS browser.close() (5588) to
+  // leave the REMOTE ixBrowser window open for the server's __keepOpenSession to reuse. But the still-attached CDP
+  // socket + the live page.on('response') listener keep THIS node child alive forever -> the server's execFileAsync
+  // SIGKILLs it at the 10-min timeout -> the result is never returned -> the post never "completes" (started but no
+  // url_recorded). Force a clean exit(0) AFTER all stdout (result JSON + ix_kept_open_for_batch) has flushed; this tears
+  // down ONLY this child + its socket, NOT the remote window (browser.close was skipped), which the server reuses.
+  // Normal runs (no keepBrowserOpen) already closed the browser at 5588, so the socket drains and node exits on its own.
+  let __ko = false;
+  try { const __p = JSON.parse(require('fs').readFileSync(process.argv[2], 'utf8')); __ko = !!(__p && __p.keepBrowserOpen); } catch (_) {}
+  if (__ko) process.exit(0);
+}).catch(e => { console.error(JSON.stringify({ step: 'error', message: e.message, stack: e.stack })); process.exit(1); });

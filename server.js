@@ -14249,7 +14249,7 @@ async function recoverPublishedPostCommentWithFallbackProfiles({ row, ready, gro
     validation,
   });
   if (!fallbackProfiles.length) return null;
-  await closeLiveProfileBeforeCommentFallback({ row, ready, groupUrl, postUrl, ledgerKey, closeResults });
+  if (!(keepOpenEnabled() && ready.__keepPublisherWindowOpen && __keepOpenSession.has(ready.profileId))) await closeLiveProfileBeforeCommentFallback({ row, ready, groupUrl, postUrl, ledgerKey, closeResults }); // KEEP-OPEN FIX: skip the pre-comment publisher close when this profile's window is intentionally HELD for reuse (else the just-registered keep-open session becomes a phantom -> 0 reuse). The different-profile comment opens its OWN profile. Flag-OFF: guard is false (keepOpenEnabled false, __keepPublisherWindowOpen false, session map empty) -> close runs exactly as before.
   const recovery = await recoverFacebookCommentWithProfiles({
     row,
     ready,
@@ -14531,7 +14531,7 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
       registers: readRegisters(),
     };
   }
-  await closeLiveProfileBeforeCommentFallback({ row, ready, groupUrl, postUrl, ledgerKey, closeResults });
+  if (!(keepOpenEnabled() && ready.__keepPublisherWindowOpen && __keepOpenSession.has(ready.profileId))) await closeLiveProfileBeforeCommentFallback({ row, ready, groupUrl, postUrl, ledgerKey, closeResults }); // KEEP-OPEN FIX: skip the pre-comment publisher close when this profile's window is intentionally HELD for reuse (else the just-registered keep-open session becomes a phantom -> 0 reuse). The different-profile comment opens its OWN profile. Flag-OFF: guard is false (keepOpenEnabled false, __keepPublisherWindowOpen false, session map empty) -> close runs exactly as before.
   const recovery = await recoverFacebookCommentWithProfiles({
     row,
     ready,
@@ -15248,19 +15248,23 @@ async function closeAllKeepOpenSessions(reason = "") {
     try { sess.release && sess.release(); } catch (_) {}
   }
 }
-function closeStaleKeepOpenSessions() {
+async function closeStaleKeepOpenSessions() {
   for (const [pid, sess] of [...__keepOpenSession.entries()]) {
     const __age = Date.now() - (sess.openedAt || 0);
-    // IN-USE GUARD: never reap a session whose profile is mid-flight (alive-probe + post + different-profile comment
-    // are in progress). Without this the 1s reaper could (a) delete the map entry DURING the alive-probe await so the
-    // reuse post proceeds lock-less and re-tracks nothing (TOCTOU untracked-window leak), or (b) yank the window while
-    // runLiveFacebookPostScript is posting into it (a long approval flow can run 6-18min). The loop's finally ALWAYS
-    // clears inUse (or tears the session down), so this only ever delays reaping by one post. An absolute hard bound
-    // (12min cap + 20min worst-case post) force-reaps a session whose inUse somehow got stuck.
-    if (sess.inUse === true && __age < KEEP_OPEN_MAX_MS + 20 * 60 * 1000) continue;
-    if (__age > KEEP_OPEN_MAX_MS || sess.postsUsed >= KEEP_OPEN_MAX_POSTS) {
+    // KEEP-OPEN FIX (idle dead-window reap): an IDLE (not-in-use) session whose window has DIED -> reap it NOW (within
+    // ~1s) + release its held lock, so a phantom lock can't starve GLOBAL_MAX_OPEN_PROFILES up to the age cap.
+    if (sess.inUse !== true) {
+      const __alive = await isCachedCdpEndpointAlive(sess.endpoint).catch(() => false);
+      if (!__alive) { __keepOpenSession.delete(pid); ixBrowserCloseAfterUse(Number(pid), "keepopen_dead_window").catch(() => {}); try { sess.release && sess.release(); } catch (_) {} continue; }
+    }
+    // IN-USE GUARD: never reap a session mid-flight (alive-probe + post + different-profile comment can run 6-18min for
+    // an approval). Force-reap a STUCK inUse session only after a SAFE 20min bound (above the ~18min approval max) so a
+    // legit long post is never yanked, but a wedged inUse session can't hold its lock forever.
+    const __stuckInUse = sess.inUse === true && __age >= 20 * 60 * 1000;
+    if (sess.inUse === true && !__stuckInUse) continue;
+    if (__stuckInUse || __age > KEEP_OPEN_MAX_MS || sess.postsUsed >= KEEP_OPEN_MAX_POSTS) {
       __keepOpenSession.delete(pid);
-      ixBrowserCloseAfterUse(Number(pid), "keepopen_stale").catch(() => {});
+      ixBrowserCloseAfterUse(Number(pid), __stuckInUse ? "keepopen_stuck_inuse" : "keepopen_stale").catch(() => {});
       try { sess.release && sess.release(); } catch (_) {}
     }
   }
@@ -15661,7 +15665,7 @@ async function runLiveFacebookPostFromPlan(body = {}) {
         const maxConnTries = clampNumber(readState().operator?.connectorOpenRetries, 0, 3, 1);
         for (;;) {
           try {
-            scriptResult = await runLiveFacebookPostScript(payload);
+            scriptResult = await runLiveFacebookPostScript(payload, payload.reuseCdpEndpoint ? { timeoutMs: 120000 } : undefined); // KEEP-OPEN FIX: fail a wedged reuse-attach fast (~2min) so the connector-retry below does a clean fresh open instead of a 10-min execFileAsync hang. Flag-OFF: reuseCdpEndpoint undefined -> default FACEBOOK_LIVE_POST_TIMEOUT_MS, unchanged.
             break;
           } catch (scriptErr) {
             const m = String((scriptErr && scriptErr.message) || scriptErr || "");
@@ -15993,6 +15997,11 @@ async function runLiveFacebookPostFromPlan(body = {}) {
       );
     } catch (err) {
       lastError = err;
+      // KEEP-OPEN FIX: on the throw/timeout path no session was registered (__keepProfileOpenAfter still false), but the
+      // connector skipped browser.close() (keepBrowserOpen was true) and the finally's ixBrowserCloseAfterUse can return
+      // close_failed under load -> a leaked window. Force-close it before the finally releases the lock. Flag-OFF: guard
+      // false (keepOpenEnabled false / __keepPublisherWindowOpen false) -> skipped, catch runs unchanged.
+      if (keepOpenEnabled() && ready.__keepPublisherWindowOpen && !__keepProfileOpenAfter) { try { await ixBrowserForceCloseForRecovery(ready.profileId, "keepopen_failed_window_leak"); } catch (_) {} }
       const errorMessage = oneLineField(err.message || String(err), 300);
       groupErrors.push({ groupUrl, error: errorMessage });
       if (err.uncertainAfterPostClick) {
@@ -19527,7 +19536,7 @@ setInterval(() => {
     closeFinishedIxProfilesSweep({ max: 12 }).catch(() => {});
   }
   // KEEP-OPEN reaper: close + release any kept-open session past its post/age cap so a held window can't linger.
-  if (__keepOpenSession.size > 0) { try { closeStaleKeepOpenSessions(); } catch (_) {} }
+  if (__keepOpenSession.size > 0) { closeStaleKeepOpenSessions().catch(() => {}); } // KEEP-OPEN FIX: now async (idle dead-window alive-probe) -> fire-and-forget
   const state = readState();
   // HARVEST WHILE PROD RUNS (operator 2026-06-17: "disable harvesting all day — harvest at the SAME TIME as prod").
   // The harvest driver lives on the always-on 1s heartbeat but is now gated by harvestShouldRunNow (enabled + ARMED +
