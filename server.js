@@ -10706,6 +10706,19 @@ function appendFacebookLivePostLedger(event = {}) {
     message: oneLineField(event.message || "", 700),
     liveLogFile: oneLineField(event.liveLogFile || "", 300),
     payloadFile: oneLineField(event.payloadFile || "", 300),
+    // DURABLE COMMENT-RECOVERY (2026-06-22): persist the composed comment payload on the published ledger row so an
+    // interrupted run's uncommented post stays re-commentable even after posting-plan.jsonl is overwritten. This
+    // serializer is a FIXED WHITELIST (it silently drops any field not listed here — e.g. approvalProfileId), so these
+    // MUST be declared here or the stamp is discarded. Length-capped so per-row bytes stay bounded. title/ogDescription/
+    // productKey are persisted so a HARVESTED post's comment marker reproduces byte-identical on recovery.
+    commentTextPreview: oneLineField(event.commentTextPreview || "", 2000),
+    commentLink: oneLineField(event.commentLink || "", 1000),
+    pinFirstComment: event.pinFirstComment !== false,
+    harvested: Boolean(event.harvested),
+    commentImagePath: oneLineField(event.commentImagePath || "", 300),
+    title: oneLineField(event.title || "", 200),
+    ogDescription: oneLineField(event.ogDescription || "", 500),
+    productKey: oneLineField(event.productKey || "", 200),
     validation: event.validation && typeof event.validation === "object" ? {
       ok: Boolean(event.validation.ok),
       errors: Array.isArray(event.validation.errors) ? event.validation.errors.map(String).slice(0, 20) : [],
@@ -14756,6 +14769,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       const maxToFix = clampNumber(options.max, 1, 50, 10);
       const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 8000 });
       const publishedByPlan = new Map();
+      const payloadByPlan = new Map(); // DURABLE COMMENT-RECOVERY: planId|sequence -> ledger row carrying the stored comment payload
       for (const r of rows) {
         if (!r || !r.postUrl) continue;
         const isPublished = /^published/.test(String(r.event || "")) || ["published", "published_with_warning", "published_after_admin_approval"].includes(String(r.status || ""));
@@ -14766,6 +14780,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         // that share a permalink (via the URL-capture race) collapse to one and the 2nd never gets commented (Fix B).
         const planKey = r.planId ? String(r.planId) + "|" + String(r.sequence != null ? r.sequence : "") : "url:" + r.postUrl;
         publishedByPlan.set(planKey, r); // keep the latest ledger row per plan
+        if (r.commentTextPreview || r.commentLink) payloadByPlan.set(planKey, r); // DURABLE COMMENT-RECOVERY: remember the comment payload by plan (survives the per-tick plan overwrite)
       }
       // SWARM FIX #2: build the "already has a different-profile verified comment" index ONCE from the SAME
       // `rows` window the resweep selects from — so the dedup horizon equals the selection horizon (no duplicate
@@ -14796,9 +14811,31 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         if (summary.recommented >= maxToFix || summary.checked >= maxToFix) break;
         const publisherId = Number(ev.profileId || 0);
         if (__hasDifferentProfileComment(postUrl, publisherId)) continue; // already has a different-profile comment (SWARM FIX #2: build-once index over the full 8000 selection window, not a smaller 5000 re-read)
-        const row = postingPlanRowForRecord({ planId: ev.planId, sequence: ev.sequence });
+        let row = postingPlanRowForRecord({ planId: ev.planId, sequence: ev.sequence });
+        if (!row || !String(row.commentTextPreview || row.link || "").trim()) {
+          // DURABLE COMMENT-RECOVERY: the per-tick posting-plan.jsonl was overwritten so the live row is gone -> rebuild
+          // it from the comment payload persisted on the durable published ledger row at publish time. Only fires when
+          // the live row is missing AND a stored payload exists (the previously-unrecoverable interrupted-run case);
+          // when the live row exists, behavior is byte-for-byte unchanged. Carries every field the comment path reads,
+          // incl. the harvested-marker inputs (title/ogDescription/productKey) so the marker reproduces exactly.
+          const __pk = ev.planId ? String(ev.planId) + "|" + String(ev.sequence != null ? ev.sequence : "") : "url:" + ev.postUrl;
+          const __p = payloadByPlan.get(__pk);
+          if (__p && (__p.commentTextPreview || __p.commentLink)) {
+            row = {
+              planId: ev.planId, sequence: ev.sequence,
+              profile: __p.profile || ev.profile || "",
+              groupUrl: __p.groupUrl || ev.groupUrl || ev.actualGroupUrl || "",
+              commentTextPreview: __p.commentTextPreview || "",
+              link: __p.commentLink || "",
+              pinFirstComment: __p.pinFirstComment !== false,
+              harvested: Boolean(__p.harvested),
+              title: __p.title || "", ogDescription: __p.ogDescription || "", productKey: __p.productKey || "",
+              imagePath: __p.commentImagePath || ev.imagePath || "",
+            };
+          }
+        }
         const commentText = String(row?.commentTextPreview || row?.link || "").trim();
-        if (!row || !commentText) { summary.stillMissing += 1; continue; } // cannot reconstruct the comment
+        if (!row || !commentText) { summary.stillMissing += 1; continue; } // cannot reconstruct the comment (no live plan row AND no durable payload)
         const __boAt = __commentRecoveryBackoff.get(postUrl) || 0;
         const __backoffMs = options.drain ? (8 * 60 * 1000) : COMMENT_RECOVERY_BACKOFF_MS; // drain re-checks a pending post every ~8 min so the comment lands soon after FB approves it (vs the 22-min run cadence)
         if (Date.now() - __boAt < __backoffMs) { summary.stillMissing += 1; continue; } // tried recently + still uncommented -> defer (don't re-cycle profiles on a stuck/pending post)
@@ -14903,6 +14940,17 @@ async function completeVerifiedFacebookPostWithComment({
     sequence: row.sequence,
     profileId: ready.profileId,
     profile: row.profile || "",
+    // DURABLE COMMENT-RECOVERY: stamp the composed comment payload from the in-scope plan row onto this published
+    // append (fires once per landed post, BEFORE the comment attempt, so it exists even if the post ends up
+    // uncommented). Lets the resweep rebuild + comment it later even after the per-tick plan is overwritten.
+    commentTextPreview: row.commentTextPreview || "",
+    commentLink: row.link || "",
+    pinFirstComment: row.pinFirstComment !== false,
+    harvested: Boolean(row.harvested),
+    commentImagePath: row.image || row.imagePath || "",
+    title: row.title || "",
+    ogDescription: row.ogDescription || "",
+    productKey: row.productKey || "",
     groupUrl,
     actualGroupUrl,
     postUrl,
