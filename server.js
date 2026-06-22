@@ -8300,7 +8300,13 @@ function refreshMachineParallelCap(reason) {
 // READ helper used by EVERY dispatch path so they share one ceiling. Falls back to the CPU-adaptive
 // legacy constant if the cap was never computed yet (first boot mid-tick).
 function machineParallelCap(state) {
-  const v = Number((state || readState())?.operator?.machineParallelCap);
+  const s = state || readState();
+  // LIVE OPERATOR OVERRIDE: honor operator.parallelCapOverride (1-8) IMMEDIATELY, without waiting for the boot/24h
+  // refreshMachineParallelCap recompute — so the operator can raise/lower parallelism on the fly. It is still only a
+  // CEILING: adaptiveMaxWorkers + waitForCpuHeadroom throttle the live worker count down whenever CPU/RAM can't hold it.
+  const ovr = Number(s?.operator?.parallelCapOverride);
+  if (Number.isFinite(ovr) && ovr >= 1 && ovr <= 8) return ovr;
+  const v = Number(s?.operator?.machineParallelCap);
   return (Number.isFinite(v) && v >= 1) ? v : MAX_CONCURRENT_NORMAL_IX_PROFILES;
 }
 
