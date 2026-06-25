@@ -2428,11 +2428,11 @@ async function restoreIxProfileProxy(profileId) {
   const pid = String(profileId || "").replace(/\D+/g, ""); if (!pid) return false;
   const state = readState();
   const bak = (state.posting?.proxyBackups || {})[pid];
-  if (!bak || String(bak.proxy_type) === "direct") { if (bak) { delete state.posting.proxyBackups[pid]; writeState(state); } return false; }
+  if (!bak || String(bak.proxy_type) === "direct") { if (bak) { state.posting.proxyBackups[pid] = null; writeState(state); } return false; } // null (not delete): writeState deep-merges, so delete would be re-added from base; null overwrites + readers skip it
   try {
     await ixBrowserRequest("profile-update", { profile_id: Number(pid), proxy_config: { proxy_mode: Number(bak.proxy_mode) || 2, proxy_type: bak.proxy_type, proxy_id: bak.proxy_id, proxy_ip: bak.proxy_ip, proxy_port: bak.proxy_port } });
   } catch (e) { try { logEvent("ix_profile_proxy_restore_failed", { profileId: pid, error: oneLineField(e.message || String(e), 140) }); } catch (_) {} return false; }
-  const s2 = readState(); if (s2.posting?.proxyBackups) { delete s2.posting.proxyBackups[pid]; writeState(s2); }
+  const s2 = readState(); if (s2.posting?.proxyBackups) { s2.posting.proxyBackups[pid] = null; writeState(s2); } // null overwrites (delete wouldn't survive writeState's deep-merge)
   try { logEvent("ix_profile_proxy_restored", { profileId: pid }); } catch (_) {}
   return true;
 }
@@ -20264,18 +20264,20 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/profiles/on-direct") {
     // profiles the agent switched to Direct (machine IP) because their proxy was dead — operator visibility (FB-safety)
     const bks = readState().posting?.proxyBackups || {};
-    const list = Object.keys(bks).map((pid) => ({ profileId: pid, since: bks[pid]?.at || "", originalProxy: bks[pid]?.proxy_ip ? `${bks[pid].proxy_type || "http"}://${bks[pid].proxy_ip}:${bks[pid].proxy_port || ""}` : "" }));
+    const list = Object.keys(bks).filter((pid) => bks[pid]).map((pid) => ({ profileId: pid, since: bks[pid]?.at || "", originalProxy: bks[pid]?.proxy_ip ? `${bks[pid].proxy_type || "http"}://${bks[pid].proxy_ip}:${bks[pid].proxy_port || ""}` : "" }));
     return json(res, 200, { onDirect: list });
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/restore-proxy") {
     const id = url.searchParams.get("profileId") || "";
     const ok = await restoreIxProfileProxy(id);
-    return json(res, 200, { ok, profileId: id, onDirect: Object.keys(readState().posting?.proxyBackups || {}) });
+    const bks2 = readState().posting?.proxyBackups || {};
+    return json(res, 200, { ok, profileId: id, onDirect: Object.keys(bks2).filter((p) => bks2[p]) });
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/restore-all-proxies") {
     const bks = readState().posting?.proxyBackups || {};
-    let restored = 0; for (const pid of Object.keys(bks)) { try { if (await restoreIxProfileProxy(pid)) restored += 1; } catch (_) {} }
-    return json(res, 200, { ok: true, restored, remaining: Object.keys(readState().posting?.proxyBackups || {}).length });
+    let restored = 0; for (const pid of Object.keys(bks)) { try { if (bks[pid] && await restoreIxProfileProxy(pid)) restored += 1; } catch (_) {} }
+    const bks2 = readState().posting?.proxyBackups || {};
+    return json(res, 200, { ok: true, restored, remaining: Object.keys(bks2).filter((p) => bks2[p]).length });
   }
   if (req.method === "GET" && url.pathname === "/api/profiles/comment-limited") {
     return json(res, 200, { commentLimited: (readState().posting?.commentLimitedProfiles || []) }); // post-only profiles; Release via /api/profiles/release
