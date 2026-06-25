@@ -66,6 +66,9 @@ const __verifiedCommentPidsByUrlMem = new Map();
 // ledger/map can't catch yet). This Set holds the sanitized postUrl currently being commented; a 2nd attempt for the
 // same post is skipped while one is in flight. Always released in a finally (process-local, so it can never stick).
 const __commentInFlightPostUrls = new Set();
+// AUTO machine-IP fallback: per-profile count of dead-proxy -> switch-to-Direct attempts (bounds the retry so a profile
+// whose ixBrowser update can't take eventually parks in "Profiles having issue" instead of looping forever).
+const __directSwitchTries = {};
 function __noteVerifiedCommentInMemory(rawPostUrl, commenterPid) {
   let u = ""; try { u = sanitizeFacebookPostUrl(rawPostUrl || ""); } catch { u = String(rawPostUrl || ""); }
   if (!u) return;
@@ -1649,6 +1652,9 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.harvestMembers = String(state.posting.contentSources.harvestMembers || "").slice(0, 40000); // per-group proven-member profile ids {groupUrl:[ids]} — survives restarts
   // DISCONNECTED profiles (not logged into Facebook) — auto-parked here + SKIPPED by posting/harvest until
   // the admin re-logs them in and releases them from the Prod-tab "Disconnected profiles" section.
+  // PROXY BACKUPS: { profileId: {proxy_mode,proxy_type,proxy_id,proxy_ip,proxy_port,at} } — the ORIGINAL proxy of any
+  // profile the agent auto-switched to Direct (machine IP) when its proxy was dead. Reversible via /api/profiles/restore-proxy.
+  if (!state.posting.proxyBackups || typeof state.posting.proxyBackups !== "object" || Array.isArray(state.posting.proxyBackups)) state.posting.proxyBackups = {};
   // PROFILES HAVING ISSUE: a profile the agent has auto-benched after it REPEATEDLY failed to work (proxy unreachable,
   // could-not-open-composer, etc.). NOT parked on a single/transient failure — only once it crosses the repeated-failure
   // threshold (operator: "even if they don't have proxy you can use them, they will work; only if one doesn't work, put
@@ -2389,6 +2395,46 @@ function markProfileIssue(profileId, label, reason) {
 // toward the repeated-failure threshold) — NOT an instant bench, because a flaky proxy may still work next attempt.
 function isProxyUnreachableError(message) {
   return /facebook_proxy_unreachable|ERR_TUNNEL_CONNECTION_FAILED|ERR_PROXY|ERR_SOCKS|ERR_NAME_NOT_RESOLVED|ERR_INTERNET_DISCONNECTED/i.test(String(message || ""));
+}
+// AUTO machine-IP fallback (operator 2026-06-25, "if there's no proxy let them work with our machine IP"): switch a
+// profile whose proxy is dead to Direct (proxy_type=direct, proxy_mode=custom) via the ixBrowser local API so it
+// connects through the machine's own IP. REVERSIBLE: the original proxy (id/type/ip/port/mode) is backed up to
+// state.posting.proxyBackups[pid] before the switch (also the marker that the profile is already on Direct, so we never
+// re-switch or retry-loop). PROVEN live 2026-06-25: profile 78 switched -> posted to the real group via the box IP.
+async function switchIxProfileToDirect(profileId) {
+  const pid = String(profileId || "").replace(/\D+/g, ""); if (!pid) return false;
+  try { if ((readState().posting?.proxyBackups || {})[pid]) return false; } catch (_) {} // already switched
+  let orig = null;
+  try {
+    const data = await ixBrowserRequest("profile-list", { page: 1, limit: 500 });
+    const list = (data && Array.isArray(data.data)) ? data.data : [];
+    const p = list.find((x) => String(x.profile_id) === pid);
+    if (p) orig = { proxy_mode: p.proxy_mode, proxy_type: p.proxy_type, proxy_id: p.proxy_id, proxy_ip: p.proxy_ip, proxy_port: p.proxy_port };
+  } catch (_) {}
+  if (orig && String(orig.proxy_type) === "direct") { // already Direct in ixBrowser -> just record so we don't loop
+    try { const s = readState(); s.posting.proxyBackups = s.posting.proxyBackups || {}; s.posting.proxyBackups[pid] = { ...orig, at: new Date().toISOString(), wasAlreadyDirect: true }; writeState(s); } catch (_) {}
+    return false;
+  }
+  try {
+    await ixBrowserRequest("profile-update", { profile_id: Number(pid), proxy_config: { proxy_mode: 2, proxy_type: "direct" } });
+  } catch (e) { try { logEvent("ix_profile_direct_switch_failed", { profileId: pid, error: oneLineField(e.message || String(e), 140) }); } catch (_) {} return false; }
+  try { const s = readState(); s.posting.proxyBackups = s.posting.proxyBackups || {}; s.posting.proxyBackups[pid] = { ...(orig || {}), at: new Date().toISOString() }; writeState(s); } catch (_) {}
+  try { logEvent("ix_profile_switched_to_direct", { profileId: pid, original: orig }); } catch (_) {}
+  return true;
+}
+// Restore a profile's ORIGINAL proxy from the backup (for when the operator fixes the proxy). Re-binds by proxy_id
+// (ixBrowser keeps the credentials by id). Best-effort — if it can't fully restore, the operator re-sets it in ixBrowser.
+async function restoreIxProfileProxy(profileId) {
+  const pid = String(profileId || "").replace(/\D+/g, ""); if (!pid) return false;
+  const state = readState();
+  const bak = (state.posting?.proxyBackups || {})[pid];
+  if (!bak || String(bak.proxy_type) === "direct") { if (bak) { delete state.posting.proxyBackups[pid]; writeState(state); } return false; }
+  try {
+    await ixBrowserRequest("profile-update", { profile_id: Number(pid), proxy_config: { proxy_mode: Number(bak.proxy_mode) || 2, proxy_type: bak.proxy_type, proxy_id: bak.proxy_id, proxy_ip: bak.proxy_ip, proxy_port: bak.proxy_port } });
+  } catch (e) { try { logEvent("ix_profile_proxy_restore_failed", { profileId: pid, error: oneLineField(e.message || String(e), 140) }); } catch (_) {} return false; }
+  const s2 = readState(); if (s2.posting?.proxyBackups) { delete s2.posting.proxyBackups[pid]; writeState(s2); }
+  try { logEvent("ix_profile_proxy_restored", { profileId: pid }); } catch (_) {}
+  return true;
 }
 // FB "not logged in" / login-wall / session-expired signal (distinct from a group/membership issue).
 function isFacebookNotLoggedInError(message) {
@@ -17314,7 +17360,7 @@ function autoBlacklistProfileIfNeeded(opts = {}) {
     const pid = Number(opts.profileId || profileIdFromLabel(profile) || 0);
     if (!pid) return;
     const ok = Boolean(opts.ok || opts.postUrl); // a captured permalink proves the profile CAN post
-    if (ok) { __profileBlockStreak[pid] = 0; clearIxOpenQuotaLatchOnSuccess(); return; }
+    if (ok) { __profileBlockStreak[pid] = 0; delete __directSwitchTries[pid]; clearIxOpenQuotaLatchOnSuccess(); return; }
     const errorText = String(opts.errorText || opts.error || "");
     // ixBrowser DAILY OPEN-QUOTA (1018): account-wide infra, NOT this profile's fault. NEVER bench/blacklist it
     // (cycling profiles can't help — the whole account is capped). Set the run-level pause latch (autopilotMayPostNow
@@ -17332,6 +17378,23 @@ function autoBlacklistProfileIfNeeded(opts = {}) {
     // Retry handles it; the blacklist streak ignores it entirely.
     const isOpenInfraFailure = !hard && /\b1004\b|profile[ _-]?open[ _-]?failed|could not open (?:the )?profile|配置文件打开失败|connectovercdp|connect over cdp|cdp (?:timeout|timed out|refused|closed|error)|websocket|target (?:page )?closed|browser has been closed|connection (?:closed|refused)|server busy|ECONNREFUSED|ECONNRESET|socket hang/i.test(errorText);
     if (isOpenInfraFailure) { try { logEvent("profile_open_infra_not_benched", { profileId: pid, error: oneLineField(errorText, 140) }); } catch (_) {} maybeParkPersistentOpen1004(pid, profile, errorText, opts); return; }
+    // AUTO machine-IP fallback (operator 2026-06-25): a DEAD/unreachable proxy (Facebook never loaded) -> switch this
+    // profile to Direct (the machine IP) and give it a FRESH chance instead of benching it. Only the FIRST time (the
+    // proxyBackups marker). If the SAME profile STILL fails proxy-unreachable AFTER it is already on Direct, fall through
+    // to the normal soft-count -> "Profiles having issue" park ("if they still don't work, put them in the section").
+    // Toggle off with operator.autoDirectOnDeadProxy=false (then a dead proxy just parks the profile as before).
+    if (isProxyUnreachableError(errorText) && readState().operator?.autoDirectOnDeadProxy !== false) {
+      const __onDirect = !!(readState().posting?.proxyBackups || {})[String(pid)]; // already switched to Direct
+      __directSwitchTries[pid] = (__directSwitchTries[pid] || 0) + 1;
+      // up to 3 switch attempts (covers a slow/failed ixBrowser update); after that, or once already on Direct and STILL
+      // failing, fall through to the normal soft-count -> "Profiles having issue" park (so it never infinite-loops).
+      if (!__onDirect && __directSwitchTries[pid] <= 3) {
+        __profileBlockStreak[pid] = 0; // fresh chance on Direct (machine IP)
+        switchIxProfileToDirect(pid).catch(() => {});
+        try { logEvent("ix_profile_dead_proxy_switching_to_direct", { profileId: pid, attempt: __directSwitchTries[pid], error: oneLineField(errorText, 120) }); } catch (_) {}
+        return; // retry on Direct on the next open
+      }
+    }
     // opts.profileRetryable is the connector's structured "profile open/login failed" signal —
     // robust even when the wrapper message hides/truncates the original reason. Treat it as soft.
     const soft = isTransientBlockingPostFailure(errorText) || isProxyUnreachableError(errorText) || opts.profileRetryable === true; // proxy-unreachable is SOFT: it counts toward the repeated-failure threshold but never instant-benches (a flaky proxy may work next time)
@@ -20197,6 +20260,22 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/api/profiles/issues") {
     return json(res, 200, { issues: (readState().posting?.issueProfiles || []) }); // profiles auto-benched after repeated failures; Release via /api/profiles/release-issue
+  }
+  if (req.method === "GET" && url.pathname === "/api/profiles/on-direct") {
+    // profiles the agent switched to Direct (machine IP) because their proxy was dead — operator visibility (FB-safety)
+    const bks = readState().posting?.proxyBackups || {};
+    const list = Object.keys(bks).map((pid) => ({ profileId: pid, since: bks[pid]?.at || "", originalProxy: bks[pid]?.proxy_ip ? `${bks[pid].proxy_type || "http"}://${bks[pid].proxy_ip}:${bks[pid].proxy_port || ""}` : "" }));
+    return json(res, 200, { onDirect: list });
+  }
+  if (req.method === "POST" && url.pathname === "/api/profiles/restore-proxy") {
+    const id = url.searchParams.get("profileId") || "";
+    const ok = await restoreIxProfileProxy(id);
+    return json(res, 200, { ok, profileId: id, onDirect: Object.keys(readState().posting?.proxyBackups || {}) });
+  }
+  if (req.method === "POST" && url.pathname === "/api/profiles/restore-all-proxies") {
+    const bks = readState().posting?.proxyBackups || {};
+    let restored = 0; for (const pid of Object.keys(bks)) { try { if (await restoreIxProfileProxy(pid)) restored += 1; } catch (_) {} }
+    return json(res, 200, { ok: true, restored, remaining: Object.keys(readState().posting?.proxyBackups || {}).length });
   }
   if (req.method === "GET" && url.pathname === "/api/profiles/comment-limited") {
     return json(res, 200, { commentLimited: (readState().posting?.commentLimitedProfiles || []) }); // post-only profiles; Release via /api/profiles/release
