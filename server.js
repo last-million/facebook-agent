@@ -14770,6 +14770,13 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       if (!options.force && !options.ignoreArmedGate && !options.drain && !(state.operator?.autopilotEnabled && state.operator?.armedForExternalActions)) {
         return summary;
       }
+      // OPERATOR "Pause drain" toggle (operator.commentDrainPaused): stop ALL browser-opening comment RECOVERY
+      // (persistent post-run drain / stop-finish / auto-disarm finish / manual force) so a STOPPED box goes fully
+      // silent. The normal in-RUN armed heartbeat sweep (no drain/force/ignoreArmedGate flag) is NOT gated here, so a
+      // live run still comments every post — only the recovery drains the operator explicitly paused are held.
+      if (state.operator?.commentDrainPaused === true && (options.drain || options.force || options.ignoreArmedGate)) {
+        return summary;
+      }
       if (options.force || options.ignoreArmedGate || options.drain) __forcedCommentResweepActive = true; // a forced post-publish resweep, the finish/stop comment-drain, OR the persistent post-run drain may comment despite the run-limit/disarm
       const resweepStartedAt = Date.now(); // if the operator hits STOP after this, abort the loop (real stop)
       const windowMs = clampNumber(options.windowHours, 1, 168, 24) * 3600 * 1000;

@@ -6036,6 +6036,7 @@ function uxAttachIncompleteRunBanner() {
       // double-launch (Start is gone while a run is active).
       const runActive = Boolean(op.armedForExternalActions) || Boolean(enabled);
       setProdCtlButtons(runActive, Boolean(op.paused));
+      document.querySelectorAll(".prodCtl-draintoggle").forEach(function (el) { el.textContent = op.commentDrainPaused ? "▶ Resume drain" : "❚❚ Pause drain"; });
       const buf = ap.buffer || {};
       const cap = ap.capacity || {};
       const hl = $("prodHeadline");
@@ -6249,6 +6250,18 @@ function uxAttachIncompleteRunBanner() {
       prodResult("▶ Resumed — posting continues.");
       renderProdTab();
     }
+    async function doProdDrainToggle() {
+      const r = await api("/api/state").catch(() => null);
+      const cur = r ? ((r.state || r).operator || {}) : {};
+      const pause = !(cur.commentDrainPaused === true); // toggle
+      prodResult(pause ? "Pausing comment-drain…" : "Resuming comment-drain…");
+      await prodPatchState({ operator: { commentDrainPaused: pause } });
+      document.querySelectorAll(".prodCtl-draintoggle").forEach(function (el) { el.textContent = pause ? "▶ Resume drain" : "❚❚ Pause drain"; });
+      prodResult(pause
+        ? "⏸ Comment-drain PAUSED — the box stays fully silent (no comment browser activity), even after a stop. Any in-flight post finishes, then it goes quiet. Resume to let it finish owed/pending comments."
+        : "▶ Comment-drain RESUMED — it will finish any pending/owed comments.");
+      renderProdTab();
+    }
     document.addEventListener("click", function (e) {
       const btn = e.target && e.target.closest ? e.target.closest(".prodCtl") : null;
       if (!btn) return;
@@ -6256,6 +6269,7 @@ function uxAttachIncompleteRunBanner() {
       else if (btn.classList.contains("prodCtl-stop")) doProdStop();
       else if (btn.classList.contains("prodCtl-pause")) doProdPause();
       else if (btn.classList.contains("prodCtl-resume")) doProdResume();
+      else if (btn.classList.contains("prodCtl-draintoggle")) doProdDrainToggle();
     });
     prodOn("prodLoadProfilesBtn", async function () { prodResult("Loading IXBrowser profiles…"); await loadIxProfilesQuiet(); renderProdRoleSelects(); const s = $("prodRolesStatus"); if (s) { s.className = "inlineNotice ok"; s.textContent = "Profiles loaded — choose roles (saves automatically)."; } });
     ["prodModeratorProfileSelect", "prodSylProfileSelect", "prodExcludedProfileSelect"].forEach(function (id) { const el = $(id); if (el) el.addEventListener("change", function () { if (typeof saveProdRoles === "function") saveProdRoles(); }); });
