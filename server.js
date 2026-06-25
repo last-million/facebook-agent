@@ -14977,7 +14977,8 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
             ledgerKey: livePostLedgerKey(row, publisherId),
             closeResults,
           });
-          if (res?.ok || latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) summary.recommented += 1;
+          if (res?.skipped) { summary.skippedInFlight = (summary.skippedInFlight || 0) + 1; } // DOUBLE-COMMENT GUARD: the per-post in-flight lock skipped this — ANOTHER attempt is actively committing the comment. NOT a failure: do not count it stillMissing and do NOT stamp the backoff (that 8-min poison would delay re-checking a post that ends up genuinely uncommented if the in-flight attempt fails). Left un-backed-off, the next sweep re-checks it immediately.
+          else if (res?.ok || latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) summary.recommented += 1;
           else { summary.stillMissing += 1; if (__forcedSweep) __commentRecoveryBackoff.set(postUrl, Date.now()); } // forced sweep: stamp backoff only AFTER a real failure, so a clean attempt isn't poisoned by a race
         } catch (err) {
           if (__forcedSweep) __commentRecoveryBackoff.set(postUrl, Date.now()); // forced sweep: a thrown attempt also backs off (parity with the set-before path)
