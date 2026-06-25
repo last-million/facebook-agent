@@ -927,39 +927,28 @@ async function waitForPublishedCommentText(page, commentText, timeoutMs = 22000)
   return { verified: false, needle: '', reason: 'required_comment_link_not_visible' };
 }
 
-async function loadCollapsedCommentsForDupCheck(page, marker) {
+async function loadCollapsedCommentsForDupCheck(page) {
   // DOUBLE-COMMENT GUARD (2026-06-25): FB shows only "Most relevant"/a few comments by default, so a PRIOR comment of
-  // ours can be hidden under "View more comments". Expand the TARGET post's comment list so the marker-scoped dup-check
-  // below can see it. CRITICAL: this is SCOPED to the [role="article"] that carries the marker — it must NEVER scroll
-  // the whole feed or expand a NEIGHBOR post (a neighbor post of the SAME product carries the SAME affiliate link in
-  // its comments; surfacing it would make the page-wide check false-match and skip a post we never commented = a
-  // PERMANENT miss, worse than a duplicate). Bounded (~3s) + multilingual + fail-open. No marker / no marker-article
-  // resolved -> expand NOTHING (the dup-check then fails open and we post). Clicks only top-level "view more comments"
-  // links INSIDE the target article (NOT "view replies").
-  if (!marker) return;
+  // ours can be hidden under "View more comments". Expand the comment list so the dup-check below can see it. This is
+  // ONLY called when we are confidently on the TARGET post's single PERMALINK (the caller gates on expectedPostParts),
+  // so a whole-page "view more comments" expansion is safe: there are NO same-product NEIGHBOR posts to surface (unlike
+  // the group feed), and FB renders each comment as its own sibling [role="article"] OUTSIDE the post article, so a
+  // post-article-only scope would never reach the comments. Bounded (~3s) + multilingual + fail-open (never throws).
+  // Clicks only top-level "view more comments" links (NOT "view replies").
   const deadline = Date.now() + 3000;
   for (let i = 0; i < 4 && Date.now() < deadline; i += 1) {
-    const clicked = await page.evaluate((marker) => {
+    const clicked = await page.evaluate(() => {
       const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
-      const onPerma = /\/groups\/[0-9]+\/(?:permalink|posts)\/[0-9]+/i.test(location.pathname || '');
-      const txt = (el) => (onPerma ? (el.textContent || '') : (el.innerText || ''));
-      const normalize = (input) => String(input || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-      const matches = (value) => { if (String(value || '').includes(marker)) return true; const cm = normalize(marker); return cm.length >= 12 && normalize(value).includes(cm); };
       const labelOf = (el) => (el.getAttribute('aria-label') || el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      const COMMENT_BTN = /leave a comment|write a comment|comment as|\bcomment\b|commenter|comenta|comentar|comentário|comentario|تعليق|اكتب تعليق|أضف تعليق|kommentar|kommentieren|commenta|scrivi un commento/i;
-      const articles = [...document.querySelectorAll('[role="article"]')].filter((el) => visible(el) && matches(txt(el)));
-      if (!articles.length) return false; // can't resolve the target post's article -> expand nothing (fail-open)
-      // expand ONLY the single comment-target article (same one the dup-check + findAndClickCommentBtn use) — never a neighbor
-      const target = articles.find((a) => [...a.querySelectorAll('[role="button"],button,a,[contenteditable="true"],[role="textbox"],textarea')].some((c) => visible(c) && COMMENT_BTN.test(labelOf(c)))) || articles[0];
       const isMore = (t) => /view more comments|view \d+ (more )?comment|previous comments|more comments|voir plus de commentaires|plus de commentaires|commentaires pr[eé]c[eé]dents|afficher.*commentaires|ver m[aá]s comentarios|m[aá]s comentarios|comentarios anteriores|ver mais coment[aá]rios|mais coment[aá]rios|coment[aá]rios anteriores|weitere kommentare|mehr kommentare anzeigen|عرض المزيد من التعليقات|تعليقات سابقة|مزيد من التعليقات/.test(t);
-      const cands = [...target.querySelectorAll('[role="button"], span, a, div')].filter(visible)
+      const cands = [...document.querySelectorAll('[role="button"], span, a, div')].filter(visible)
         .filter((el) => { const t = labelOf(el); return t.length >= 4 && t.length <= 60 && isMore(t) && !/repl|r[eé]pons|respuest|resposta|antworten|write a comment|comment as|\blike\b|\bshare\b/.test(t); });
       cands.sort((a, b) => labelOf(a).length - labelOf(b).length); // shortest matching label = the actual link, not a container
       if (cands[0]) { cands[0].scrollIntoView({ block: 'center' }); cands[0].click(); return true; }
       return false;
-    }, marker).catch(() => false);
+    }).catch(() => false);
     await sleep(clicked ? 600 : 250);
-    if (!clicked) break; // nothing left to expand inside the target article -> stop
+    if (!clicked) break; // nothing left to expand -> stop
   }
 }
 
@@ -1304,62 +1293,68 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
   };
   if (applyRestriction(await facebookRestrictionSnapshot(page, { includeBody: false }))) return result;
   if (!(await ensureExpectedPostLoaded('initial_page'))) return result;
-  // DOUBLE-COMMENT GUARD: expand the TARGET post's collapsed comments (marker-scoped) so the dup-check below sees a
-  // PRIOR comment of ours even when FB hid it under "View more comments" (the gap that produced the duplicate money-comments).
-  await loadCollapsedCommentsForDupCheck(page, marker).catch(() => {});
-  // Duplicate-comment guard (IDEMPOTENT): if the TARGET post ALREADY has a comment containing the required LINK, skip
-  // posting another. We match the LINK needle (the unique, stable part) — NOT the full text, which mismatches when
-  // emojis render as <img> or whitespace differs. CRITICAL (2026-06-25 review): this scan is SCOPED to the marker
-  // article only. A page-wide scan false-matches a NEIGHBOR post that carries the SAME affiliate link in its comments
-  // (the same product is reposted across groups within the reuse window), which on the in-place feed path
-  // (expectedPostUrl='') would skip-as-done a post we NEVER commented = a PERMANENT, unrecoverable miss. So we scope to
-  // the [role="article"] carrying the marker and FAIL OPEN: if we can't resolve that article, we do NOT skip (we post;
-  // a worst-case duplicate is caught by the server in-memory map / per-post in-flight lock — a false skip is not).
-  const dupNeedles = requiredCommentNeedles(commentText);
-  const existingDupCheck = await page.evaluate(({ needles, marker }) => {
-    try {
-      if (!needles || !needles.length) return { found: false };
-      if (!marker) return { found: false, unscoped: true }; // no marker to scope by -> fail open (post)
-      const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
-      const onPerma = /\/groups\/[0-9]+\/(?:permalink|posts)\/[0-9]+/i.test(location.pathname || '');
-      const txt = (el) => (onPerma ? (el.textContent || '') : (el.innerText || ''));
-      const normalize = (input) => String(input || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-      const matches = (value) => { if (String(value || '').includes(marker)) return true; const cm = normalize(marker); return cm.length >= 12 && normalize(value).includes(cm); };
-      // Scope to the SINGLE article the comment will actually be written to = the first visible [role="article"] that
-      // matches the marker AND has a comment control (mirrors findAndClickCommentBtn's target). The marker is
-      // PRODUCT-derived, NOT post-unique (the #fb per-post fingerprint was removed 2026-06-12), so a SAME-PRODUCT
-      // neighbor in the feed ALSO matches the marker; checking any article other than the exact comment-target would
-      // let a neighbor's identical affiliate-link comment skip a post we never commented = a PERMANENT miss. Checking
-      // ONLY the comment-target article means we skip IFF that article already carries the link (a real duplicate).
-      // FAIL-OPEN: if we can't resolve it, do NOT skip (post; a worst-case duplicate is caught by the server in-memory
-      // map / per-post in-flight lock — a false skip here is unrecoverable).
-      const COMMENT_BTN = /leave a comment|write a comment|comment as|\bcomment\b|commenter|comenta|comentar|comentário|comentario|تعليق|اكتب تعليق|أضف تعليق|kommentar|kommentieren|commenta|scrivi un commento/i;
-      const hasCommentControl = (a) => [...a.querySelectorAll('[role="button"],button,a,[contenteditable="true"],[role="textbox"],textarea')]
-        .some((c) => visible(c) && COMMENT_BTN.test((c.getAttribute('aria-label') || c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim()));
-      const articles = [...document.querySelectorAll('[role="article"]')].filter((el) => visible(el) && matches(txt(el)));
-      const target = articles.find(hasCommentControl) || articles[0];
-      if (!target) return { found: false, unscoped: true }; // can't resolve the comment-target article -> fail open (do NOT skip)
-      const editors = [...document.querySelectorAll('textarea, input, [contenteditable="true"], [role="textbox"]')].filter(visible);
-      const els = [target, ...target.querySelectorAll('div, span, a')].filter(visible)
-        .filter((el) => !editors.some((ed) => el === ed || el.contains(ed))); // ignore the comment box itself
-      for (const el of els) {
-        const t = (el.innerText || el.textContent || '').replace(/\s+/g, ' ');
-        const n = needles.find((v) => t.includes(v));
-        if (n) return { found: true, needle: n, scoped: true };
-      }
-      return { found: false, scoped: true };
-    } catch (e) { return { found: false, error: e?.message || String(e) }; }
-  }, { needles: dupNeedles, marker }).catch(() => ({ found: false }));
-  if (existingDupCheck.found) {
-    result.clicked = false;
-    result.typed = false;
-    result.submitted = true;
-    result.verified = true;
-    result.skipped = true;
-    result.skipReason = 'comment_link_already_exists_on_post_no_duplicate_needed';
-    result.verifiedNeedle = existingDupCheck.needle || commentText;
-    result.duplicateCheck = existingDupCheck;
-    return result;
+  // DOUBLE-COMMENT GUARD (2026-06-25, hardened after adversarial review): the idempotent dup-check runs ONLY when we are
+  // confidently on the TARGET post's single PERMALINK (expectedPostParts set AND ensureExpectedPostLoaded above confirmed
+  // the URL matches). WHY gated:
+  //  - On a PERMALINK the page shows exactly ONE post + its comment thread, so a whole-document link scan reliably
+  //    attributes a found comment to THIS post. FB renders each comment as its OWN sibling [role="article"] OUTSIDE the
+  //    post article, so we MUST scan document-wide (a post-article-only scope would never see the comments and we'd
+  //    re-post a duplicate). There are no same-product NEIGHBOR posts on a permalink, so no false-match.
+  //  - On the IN-PLACE FEED path (expectedPostUrl='') we SKIP this check entirely: the marker is PRODUCT-derived, not
+  //    post-unique (the #fb per-post fingerprint was removed 2026-06-12), so a same-product neighbor in the feed carries
+  //    the SAME affiliate link and a feed scan would skip-as-done a post we NEVER commented = a PERMANENT, unrecoverable
+  //    miss. The in-place post is FRESH (a concurrent different-profile double is blocked server-side by the per-post
+  //    in-flight lock); and if the in-place comment posts-but-fails-verify, the caller falls back to the PERMALINK where
+  //    this check DOES run and catches it. So skipping on the feed loses nothing and removes the permanent-miss risk.
+  if (expectedPostParts) {
+    await loadCollapsedCommentsForDupCheck(page).catch(() => {}); // expand the post's comments so a collapsed prior comment is visible
+    const dupNeedles = requiredCommentNeedles(commentText);
+    const existingDupCheck = await page.evaluate(({ needles, marker }) => {
+      try {
+        if (!needles || !needles.length) return { found: false };
+        const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+        const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+        const markerMatch = (value) => { if (marker && String(value || '').includes(marker)) return true; const cm = norm(marker); return cm.length >= 12 && norm(value).includes(cm); };
+        // FB renders each COMMENT as its own [role="article"] with a comment aria-label (multilingual), and renders
+        // RELATED/SUGGESTED posts (their own articles + comments) BELOW the target on a group permalink. The affiliate
+        // link is PRODUCT-stable (every repost reuses the byte-identical shortlink), so we must scan ONLY the target
+        // post's OWN comment thread — not the whole document (a same-product related post would false-match = a
+        // PERMANENT miss) and not the post body (a harvested bare-domain caption could false-match = a miss).
+        const COMMENT_LABEL = /comment|commentaire|comentario|comentário|comentar|تعليق|kommentar|commento/i;
+        const isComment = (a) => COMMENT_LABEL.test(a.getAttribute('aria-label') || '');
+        const articles = [...document.querySelectorAll('[role="article"]')].filter(visible);
+        // target POST article = the non-comment article carrying the marker; fall back to the first non-comment article
+        const postArticle = articles.find((a) => !isComment(a) && marker && markerMatch(a.textContent || a.innerText || '')) || articles.find((a) => !isComment(a));
+        if (!postArticle) return { found: false, unresolved: true }; // can't locate the target post -> fail open (post; never a false skip)
+        // collect ONLY the target's own comment-articles: those in DOM order AFTER the target post article, STOPPING at
+        // the first following NON-comment article (= a related/suggested post, which must NOT be scanned).
+        const commentArticles = [];
+        let started = false;
+        for (const a of articles) {
+          if (a === postArticle) { started = true; continue; }
+          if (!started) continue;
+          if (isComment(a)) commentArticles.push(a);
+          else break;
+        }
+        for (const a of commentArticles) {
+          const t = (a.innerText || a.textContent || '').replace(/\s+/g, ' ');
+          const n = needles.find((v) => t.includes(v));
+          if (n) return { found: true, needle: n };
+        }
+        return { found: false };
+      } catch (e) { return { found: false, error: e?.message || String(e) }; }
+    }, { needles: dupNeedles, marker }).catch(() => ({ found: false }));
+    if (existingDupCheck.found) {
+      result.clicked = false;
+      result.typed = false;
+      result.submitted = true;
+      result.verified = true;
+      result.skipped = true;
+      result.skipReason = 'comment_link_already_exists_on_post_no_duplicate_needed';
+      result.verifiedNeedle = existingDupCheck.needle || commentText;
+      result.duplicateCheck = existingDupCheck;
+      return result;
+    }
   }
   const initialCommentPath = await page.evaluate(() => location.pathname).catch(() => '');
   const captureTargetState = async () => page.evaluate((marker) => {
