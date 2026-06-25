@@ -52,6 +52,41 @@ let __forcedCommentResweepActive = false;
 // __externalStopRequested) still hard-blocks them. A counter, not a boolean, so overlapping inline comments
 // across concurrent posts don't clear the exemption early.
 let __postCompletionExternalActionInFlight = 0;
+// IN-MEMORY authoritative verified-comment index (DOUBLE-COMMENT GUARD, 2026-06-25): the single ledger append can be
+// EBUSY-dropped under parallel posting (forensic: a dropped comment_recovery_finished proof makes a COMMENTED post
+// LOOK uncommented -> the drain re-opens + re-comments it = a duplicate money-comment; the operator confirmed 25). This
+// map is stamped the INSTANT a comment verifies (inside appendFacebookLivePostLedger, BEFORE the file write) so a
+// dropped write can NEVER lose the proof within a process lifetime. Keyed sanitized postUrl -> Set(commenter profileId).
+// It mirrors EXACTLY what the dedup counts as a proof and is consulted (unioned with the ledger) by both
+// latestDifferentProfileVerifiedCommentForPost and the resweep dedup. On restart it's empty and rebuilds lazily from
+// the ledger; the connector's live dup-check (loads collapsed comments) is the cross-restart ground-truth backstop.
+const __verifiedCommentPidsByUrlMem = new Map();
+// Per-post IN-FLIGHT comment lock: the inline first-comment (at publish) and a concurrent resweep/drain can BOTH open a
+// browser to comment the SAME post in the small window before either's proof lands (the true-simultaneous race the
+// ledger/map can't catch yet). This Set holds the sanitized postUrl currently being commented; a 2nd attempt for the
+// same post is skipped while one is in flight. Always released in a finally (process-local, so it can never stick).
+const __commentInFlightPostUrls = new Set();
+function __noteVerifiedCommentInMemory(rawPostUrl, commenterPid) {
+  let u = ""; try { u = sanitizeFacebookPostUrl(rawPostUrl || ""); } catch { u = String(rawPostUrl || ""); }
+  if (!u) return;
+  let set = __verifiedCommentPidsByUrlMem.get(u);
+  if (!set) { set = new Set(); __verifiedCommentPidsByUrlMem.set(u, set); }
+  set.add(Number(commenterPid || 0));
+  if (__verifiedCommentPidsByUrlMem.size > 20000) { // bound memory (drop the oldest-inserted url)
+    const firstKey = __verifiedCommentPidsByUrlMem.keys().next().value;
+    if (firstKey !== undefined) __verifiedCommentPidsByUrlMem.delete(firstKey);
+  }
+}
+function __memDifferentProfileCommenter(sanitizedUrl, publisherId) { // -> a commenter pid DIFFERENT from publisher (or any if publisher unknown), else null
+  const set = __verifiedCommentPidsByUrlMem.get(String(sanitizedUrl || ""));
+  if (!set) return null;
+  const pid = Number(publisherId || 0);
+  for (const cpid of set) { if (!pid || cpid !== pid) return cpid; }
+  return null;
+}
+function __memHasDifferentProfileComment(sanitizedUrl, publisherId) {
+  return __memDifferentProfileCommenter(sanitizedUrl, publisherId) !== null;
+}
 const PER_POST_LOG_SWEEP_INTERVAL_MS = 6 * 3600 * 1000;
 const STATE_FILE = path.join(DATA_DIR, "workflow-state.json");
 const LOCAL_DB_DIR = path.join(DATA_DIR, "local-db");
@@ -10757,6 +10792,16 @@ function appendFacebookLivePostLedger(event = {}) {
       message: oneLineField(event.closeResult.message || "", 240),
     } : null,
   };
+  // DOUBLE-COMMENT GUARD (2026-06-25): stamp the in-memory verified-comment index the INSTANT a verified comment proof
+  // is built — BEFORE the EBUSY-droppable file append — so a dropped write can never make a commented post look
+  // uncommented within this process (which let the drain re-open + re-comment it). Mirrors EXACTLY what the dedup
+  // counts as a proof: event=comment_recovery_finished, status published/published_with_warning, commentVerified!==false.
+  if (row.event === "comment_recovery_finished"
+      && ["published", "published_with_warning"].includes(String(row.status || ""))
+      && !(row.validation && row.validation.commentVerified === false)
+      && row.postUrl) {
+    try { __noteVerifiedCommentInMemory(row.postUrl, row.profileId); } catch {}
+  }
   try {
     appendJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, row);
   } catch (err) {
@@ -10854,6 +10899,13 @@ function latestDifferentProfileVerifiedCommentForPost(postUrl = "", publishingPr
     return null;
   }
   const publisherId = Number(publishingProfileId || 0);
+  // DOUBLE-COMMENT GUARD: an in-memory verified-comment proof (stamped at comment time, immune to EBUSY ledger drops)
+  // counts even if its ledger row was dropped. Return a synthetic proof so the truthiness-based callers treat the post
+  // as already-commented and skip re-commenting it (this is what stops the drain re-opening an already-commented post).
+  const __memPid = __memDifferentProfileCommenter(cleanPostUrl, publisherId);
+  if (__memPid !== null) {
+    return { event: "comment_recovery_finished", postUrl: cleanPostUrl, profileId: __memPid, status: "published", inMemory: true, validation: { ok: true, commentVerified: true } };
+  }
   // SWARM FIX #2: read enough ledger history to cover the resweep's selection window (8000) + margin, so the
   // dedup horizon can NEVER be smaller than the selection horizon (the old 5000 = ~1.1 days < the 8000-line /
   // up-to-168h resweep selection, so a post whose comment-proof had scrolled past line 5000 was re-commented =
@@ -14490,8 +14542,34 @@ async function addRequiredFirstCommentWithDifferentProfile(args) {
   // Wrap the whole comment-completion body so a run-limit auto-disarm doesn't lock out the REQUIRED first
   // comment of an already-published post (see __postCompletionExternalActionInFlight). A real STOP still blocks.
   __postCompletionExternalActionInFlight += 1;
+  // DOUBLE-COMMENT GUARD (per-post in-flight lock): if another attempt is ALREADY commenting this exact post (the
+  // inline first-comment racing a concurrent resweep/drain, before either's verified proof lands), do NOT open a 2nd
+  // browser to comment it — that produced duplicate money-comments. Skip; the in-flight attempt finishes and stamps
+  // the in-memory map + ledger so a later sweep sees it as done. Released in finally below -> the lock can never stick.
+  let __urlLock = "";
+  try { __urlLock = sanitizeFacebookPostUrl((args && args.postUrl) || ""); } catch { __urlLock = String((args && args.postUrl) || ""); }
+  if (__urlLock && __commentInFlightPostUrls.has(__urlLock)) {
+    __postCompletionExternalActionInFlight = Math.max(0, __postCompletionExternalActionInFlight - 1);
+    return {
+      ok: false,
+      skipped: true,
+      posted: true,
+      postUrl: (args && args.postUrl) || "",
+      planId: args && args.row && args.row.planId,
+      sequence: args && args.row && args.row.sequence,
+      profileId: args && args.ready && args.ready.profileId,
+      attemptedGroups: [],
+      attemptedCommentProfiles: [],
+      closeResults: (args && args.closeResults) || [],
+      message: "comment_already_in_flight_for_post",
+    };
+  }
+  if (__urlLock) __commentInFlightPostUrls.add(__urlLock);
   try { return await addRequiredFirstCommentWithDifferentProfileImpl(args); }
-  finally { __postCompletionExternalActionInFlight = Math.max(0, __postCompletionExternalActionInFlight - 1); }
+  finally {
+    __postCompletionExternalActionInFlight = Math.max(0, __postCompletionExternalActionInFlight - 1);
+    if (__urlLock) __commentInFlightPostUrls.delete(__urlLock);
+  }
 }
 async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, groupUrl, postUrl, imagePath, postValidation, ledgerKey, closeResults }) {
   const state = readState();
@@ -14825,9 +14903,10 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       }
       const __hasDifferentProfileComment = (pUrl, pubId) => {
         let u = ""; try { u = sanitizeFacebookPostUrl(pUrl || ""); } catch { return false; }
-        const set = __verifiedCommentPidsByUrl.get(u); if (!set) return false;
         const pid = Number(pubId || 0);
-        for (const cpid of set) { if (!pid || cpid !== pid) return true; } // a DIFFERENT-profile (or any, if publisher unknown) verified comment exists
+        const set = __verifiedCommentPidsByUrl.get(u);
+        if (set) { for (const cpid of set) { if (!pid || cpid !== pid) return true; } } // a DIFFERENT-profile (or any, if publisher unknown) verified comment exists in the ledger window
+        if (__memHasDifferentProfileComment(u, pid)) return true; // DOUBLE-COMMENT GUARD: in-memory proof (EBUSY-immune) — catches a verified comment whose ledger row was dropped
         return false;
       };
       for (const ev of publishedByPlan.values()) {

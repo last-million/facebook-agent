@@ -927,6 +927,32 @@ async function waitForPublishedCommentText(page, commentText, timeoutMs = 22000)
   return { verified: false, needle: '', reason: 'required_comment_link_not_visible' };
 }
 
+async function loadCollapsedCommentsForDupCheck(page) {
+  // DOUBLE-COMMENT GUARD (2026-06-25): FB shows only "Most relevant"/a few comments by default, so a PRIOR comment of
+  // ours can be hidden under "View more comments". The link-needle duplicate-check below only scans rendered elements,
+  // so a collapsed prior comment is missed and a SECOND comment gets posted (the 25 duplicate money-comments the
+  // operator saw). Expand the comment list first — bounded (~4s) + multilingual + fail-open (any failure just proceeds
+  // with today's behavior, never throws). Scrolls to lazy-load and clicks top-level "view more comments" links only
+  // (NOT "view replies", which expands sub-threads we don't dedup on).
+  const deadline = Date.now() + 4000;
+  for (let i = 0; i < 6 && Date.now() < deadline; i += 1) {
+    const clicked = await page.evaluate(() => {
+      const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
+      const labelOf = (el) => (el.getAttribute('aria-label') || el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const isMore = (t) => /view more comments|view \d+ (more )?comment|previous comments|more comments|voir plus de commentaires|plus de commentaires|commentaires pr[eé]c[eé]dents|afficher.*commentaires|ver m[aá]s comentarios|m[aá]s comentarios|comentarios anteriores|ver mais coment[aá]rios|mais coment[aá]rios|coment[aá]rios anteriores|weitere kommentare|mehr kommentare anzeigen|عرض المزيد من التعليقات|تعليقات سابقة|مزيد من التعليقات/.test(t);
+      const cands = [...document.querySelectorAll('[role="button"], span, a, div')].filter(visible)
+        .filter((el) => { const t = labelOf(el); return t.length >= 4 && t.length <= 60 && isMore(t) && !/repl|r[eé]pons|respuest|resposta|antworten|write a comment|comment as|\blike\b|\bshare\b/.test(t); });
+      // prefer the SHORTEST matching label (the actual "View more comments" link, not a big container that contains it)
+      cands.sort((a, b) => labelOf(a).length - labelOf(b).length);
+      if (cands[0]) { cands[0].scrollIntoView({ block: 'center' }); cands[0].click(); return true; }
+      window.scrollBy(0, 1400);
+      return false;
+    }).catch(() => false);
+    await sleep(clicked ? 700 : 350);
+    if (!clicked && i >= 2) break; // nothing left to expand after a couple of scrolls -> stop early
+  }
+}
+
 async function clickCommentSubmitControl(page) {
   return await page.evaluate(() => {
     const visible = (el) => {
@@ -1268,6 +1294,9 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
   };
   if (applyRestriction(await facebookRestrictionSnapshot(page, { includeBody: false }))) return result;
   if (!(await ensureExpectedPostLoaded('initial_page'))) return result;
+  // DOUBLE-COMMENT GUARD: expand collapsed comments so the link-needle dup-check below sees a PRIOR comment of ours
+  // even when FB has hidden it under "View more comments" (the gap that produced the duplicate money-comments).
+  await loadCollapsedCommentsForDupCheck(page).catch(() => {});
   // Duplicate-comment guard (IDEMPOTENT): if the post ALREADY has a comment containing the required LINK, skip
   // posting another. We match the LINK needle (the unique, stable part) — NOT the full text, which mismatches
   // when emojis render as <img> or whitespace differs (that exact-text miss is what produced the double
