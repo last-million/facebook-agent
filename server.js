@@ -2439,7 +2439,16 @@ function isFacebookAccountError(message) {
 function appendJsonlAbsoluteFile(filePath, row) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const line = `${JSON.stringify(row)}\n`;
-  fs.appendFileSync(filePath, line);
+  // EBUSY RETRY (2026-06-25 forensics): under 5-way parallel posting + keep-open, concurrent appends to the single
+  // ledger file intermittently throw EBUSY/EPERM and SILENTLY drop the row — incl. comment_recovery_finished proofs,
+  // which makes commented posts look uncommented (inflates the miss count + risks a wasteful re-comment). Retry a few
+  // times with tiny backoffs so a write is never lost. EBUSY is rare, so the normal path takes the first try (no sleep).
+  let __wrote = false;
+  for (const __d of [0, 10, 25, 50, 100]) {
+    try { if (__d) sleepSync(__d); fs.appendFileSync(filePath, line); __wrote = true; break; }
+    catch (e) { if (!(e && ["EBUSY", "EPERM", "EACCES", "EMFILE", "ENFILE"].includes(e.code))) throw e; }
+  }
+  if (!__wrote) fs.appendFileSync(filePath, line); // exhausted retries -> one final attempt; a throw propagates to the caller's guard (as before)
   // Keep the readJsonlAbsoluteFile cache HOT across appends (swarm fix #1): extend the cached line array in
   // place and re-sync the mtime/size key, so an append does NOT force the next read to re-slurp the whole
   // multi-MB file. One cheap statSync instead of a 23 MB readFileSync+split on every post-step.
@@ -8430,6 +8439,12 @@ async function stopAllExternalWork(reason) {
   if (reason === "operator_stop_all" || reason === "dashboard_disarm") {
     setTimeout(() => {
       (async () => {
+        // DISARM-RACE FIX (2026-06-25 forensics): the connector-kill above FAILS any tail post whose first-comment was
+        // in flight at the STOP -> that failure stamped the per-post recovery backoff -> the drain passes below would
+        // then SKIP it as "tried recently" and it stays permanently uncommented (the 06-24 'External actions are locked'
+        // bursts = ~6 lost comments/multi-run night). Un-poison the backoff first (mirrors the auto-disarm fix at ~9344)
+        // so the drain RE-comments the killed-mid-flight tail posts instead of skipping them. Now durable-recoverable too.
+        try { __commentRecoveryBackoff.clear(); } catch {}
         for (let pass = 0; pass < 5; pass += 1) {
           try {
             const r = await resweepUncommentedFacebookPostsAsync({ ignoreArmedGate: true, max: 50, windowHours: 24 });
