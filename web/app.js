@@ -5831,6 +5831,31 @@ function uxAttachDisconnectedProfiles() {
   load();
 }
 
+function uxAttachIssueProfiles() {
+  const list = $("issueProfilesList");
+  if (!list) return;
+  async function load() {
+    try {
+      const data = await api("/api/profiles/issues");
+      const rows = (data && data.issues) || [];
+      const c = $("issueProfilesCount"); if (c) c.textContent = String(rows.length);
+      if (!rows.length) { list.innerHTML = '<div style="opacity:.6">No profiles with issues — all working. ✓</div>'; return; }
+      list.innerHTML = "";
+      for (const r of rows) {
+        const row = document.createElement("div"); row.className = "discRow";
+        const info = document.createElement("div"); info.className = "di-info";
+        info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "repeatedly failed to work") + (r.at ? ' · ' + r.at : '') + '</div>';
+        const btn = document.createElement("button"); btn.type = "button"; btn.textContent = "Release";
+        btn.title = "Fix the underlying issue first, then Release to put this profile back in posting rotation";
+        btn.addEventListener("click", async () => { btn.disabled = true; try { await api("/api/profiles/release-issue?profileId=" + encodeURIComponent(r.profileId) + (r.label ? "&label=" + encodeURIComponent(r.label) : ""), { method: "POST", body: "{}" }); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
+        row.appendChild(info); row.appendChild(btn); list.appendChild(row);
+      }
+    } catch (e) { list.innerHTML = '<div style="opacity:.6">Could not load profiles having issue.</div>'; }
+  }
+  $("refreshIssueProfilesBtn")?.addEventListener("click", () => load());
+  load();
+}
+
 function uxAttachErroredProfiles() {
   const list = $("erroredProfilesList");
   if (!list) return;
@@ -5988,6 +6013,7 @@ function uxAttachIncompleteRunBanner() {
     try { uxAttachConfirmGuards(); } catch (err) { console.warn("uxAttachConfirmGuards failed", err); }
     try { uxAttachScrapedProducts(); } catch (err) { console.warn("uxAttachScrapedProducts failed", err); }
     try { uxAttachDisconnectedProfiles(); } catch (err) { console.warn("uxAttachDisconnectedProfiles failed", err); }
+    try { uxAttachIssueProfiles(); } catch (err) { console.warn("uxAttachIssueProfiles failed", err); }
     try { uxAttachErroredProfiles(); } catch (err) { console.warn("uxAttachErroredProfiles failed", err); }
     try { uxAttachSuspendedProfiles(); } catch (err) { console.warn("uxAttachSuspendedProfiles failed", err); }
     try { uxAttachBlockedModerators(); } catch (err) { console.warn("uxAttachBlockedModerators failed", err); }

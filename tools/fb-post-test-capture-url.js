@@ -4749,6 +4749,15 @@ async function main() {
     // transient composer-open miss — otherwise the server collapses both to "cannot_post_in_group"
     // and wrongly benches profiles. A distinct error lets the server label it not_a_member_of_group.
     const d = composerOpen.diagnostic || {};
+    // PROXY/NETWORK UNREACHABLE: if Facebook never loaded (the page ended on a chrome-error page, or a net::ERR_TUNNEL /
+    // ERR_PROXY / timed-out), the profile's PROXY is unreachable — there is NO composer because FB itself never rendered.
+    // Throw a DISTINCT reason so the server counts it as a SOFT failure (toward the repeated-failure threshold) and the
+    // profile only lands in the Prod-tab "Profiles having issue" section after it REPEATEDLY fails — never on one blip.
+    const netProbe = `${d.url || ''} ${d.title || ''} ${d.dialogText || ''}`;
+    const netErr = (netProbe.match(/ERR_[A-Z_]+/) || [])[0] || '';
+    if (/^chrome-error:\/\//i.test(String(d.url || '')) || /ERR_TUNNEL_CONNECTION_FAILED|ERR_PROXY|ERR_SOCKS|ERR_TIMED_OUT|ERR_CONNECTION_(?:RESET|CLOSED|REFUSED|FAILED)|ERR_NAME_NOT_RESOLVED|ERR_INTERNET_DISCONNECTED|ERR_ADDRESS_UNREACHABLE|this site can.?t be reached|took too long to respond/i.test(netProbe)) {
+      throw new Error(`facebook_proxy_unreachable${netErr ? ': ' + netErr : ''}`);
+    }
     const btns = Array.isArray(d.buttons) ? d.buttons : [];
     const probe = `${d.title || ''} ${d.dialogText || ''} ${btns.map((b) => String(b && b.label || '').toLowerCase()).join(' | ')}`.toLowerCase();
     if (/join group|request to join|pending approval|cancel request|must be a member|you are not a member|only members can|members of this group|invitation only|invited to join|private group|answer.*question.*join|membership question/.test(probe)) {

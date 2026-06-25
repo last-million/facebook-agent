@@ -1649,6 +1649,15 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.harvestMembers = String(state.posting.contentSources.harvestMembers || "").slice(0, 40000); // per-group proven-member profile ids {groupUrl:[ids]} — survives restarts
   // DISCONNECTED profiles (not logged into Facebook) — auto-parked here + SKIPPED by posting/harvest until
   // the admin re-logs them in and releases them from the Prod-tab "Disconnected profiles" section.
+  // PROFILES HAVING ISSUE: a profile the agent has auto-benched after it REPEATEDLY failed to work (proxy unreachable,
+  // could-not-open-composer, etc.). NOT parked on a single/transient failure — only once it crosses the repeated-failure
+  // threshold (operator: "even if they don't have proxy you can use them, they will work; only if one doesn't work, put
+  // it in a section the admin can fix + release"). Surfaced in the Prod-tab "Profiles having issue" section; Release
+  // clears it (array + the text bench) and puts it back in rotation.
+  if (!Array.isArray(state.posting.issueProfiles)) state.posting.issueProfiles = [];
+  state.posting.issueProfiles = state.posting.issueProfiles
+    .filter((p) => p && (p.profileId || p.profile_id))
+    .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200) }));
   if (!Array.isArray(state.posting.disconnectedProfiles)) state.posting.disconnectedProfiles = [];
   state.posting.disconnectedProfiles = state.posting.disconnectedProfiles
     .filter((p) => p && (p.profileId || p.profile_id))
@@ -2355,6 +2364,32 @@ function releaseDisconnectedProfile(profileId) {
   if (state.posting.disconnectedProfiles.length !== before) { writeState(state); logEvent("profile_released_reconnected", { profileId: id }); return true; }
   return false;
 }
+// PROFILES HAVING ISSUE (auto-benched after REPEATED failures). markProfileIssue surfaces the profile in the Prod-tab
+// "Profiles having issue" section so the admin can fix the underlying problem and Release it. The actual posting/comment
+// exclusion is the existing text bench (facebookProfileStatus, written by autoBlacklistProfileIfNeeded at threshold);
+// this array is the releasable UI surface. Re-stamps an existing entry (freshest reason/time) instead of duplicating.
+function issueProfileIdSet(state = readState()) {
+  return new Set((state.posting?.issueProfiles || []).map((p) => String(p.profileId || "")));
+}
+function markProfileIssue(profileId, label, reason) {
+  const id = String(profileId || "").replace(/\D+/g, "");
+  if (!id) return false;
+  const state = readState();
+  const list = Array.isArray(state.posting.issueProfiles) ? state.posting.issueProfiles : [];
+  const existing = list.find((p) => String(p.profileId) === id);
+  if (existing) { existing.at = new Date().toISOString(); existing.reason = String(reason || existing.reason || "repeatedly failed to work").slice(0, 200); }
+  else { list.push({ profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "repeatedly failed to work").slice(0, 200) }); }
+  state.posting.issueProfiles = list;
+  writeState(state);
+  logEvent("profile_issue_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
+  return true;
+}
+// PROXY UNREACHABLE: Facebook never loaded through the profile's proxy (connector throws facebook_proxy_unreachable when
+// the page ends on a chrome-error / net::ERR_TUNNEL_CONNECTION_FAILED / ERR_PROXY*). Treated as a SOFT failure (counts
+// toward the repeated-failure threshold) — NOT an instant bench, because a flaky proxy may still work next attempt.
+function isProxyUnreachableError(message) {
+  return /facebook_proxy_unreachable|ERR_TUNNEL_CONNECTION_FAILED|ERR_PROXY|ERR_SOCKS|ERR_NAME_NOT_RESOLVED|ERR_INTERNET_DISCONNECTED/i.test(String(message || ""));
+}
 // FB "not logged in" / login-wall / session-expired signal (distinct from a group/membership issue).
 function isFacebookNotLoggedInError(message) {
   return /not logged in|logged out|log in to|login required|session expired|please log in|enter your password|manual login (timed out|required)|facebook login|login wall|logged_out|not_logged_in|needs_login|facebook_needs_login|facebook_login_required_for_profile/i.test(String(message || ""));
@@ -2432,13 +2467,14 @@ function releaseModeratorBlocked(profileId) {
 function releaseParkedProfile(profileId) {
   const id = String(profileId || "").replace(/\D+/g, "");
   const state = readState();
-  const before = (state.posting.disconnectedProfiles || []).length + (state.posting.erroredProfiles || []).length + (state.posting.suspendedProfiles || []).length + (state.posting.commentLimitedProfiles || []).length + (state.posting.blockedModerators || []).length;
+  const before = (state.posting.disconnectedProfiles || []).length + (state.posting.erroredProfiles || []).length + (state.posting.suspendedProfiles || []).length + (state.posting.commentLimitedProfiles || []).length + (state.posting.blockedModerators || []).length + (state.posting.issueProfiles || []).length;
   state.posting.disconnectedProfiles = (state.posting.disconnectedProfiles || []).filter((p) => String(p.profileId) !== id);
   state.posting.erroredProfiles = (state.posting.erroredProfiles || []).filter((p) => String(p.profileId) !== id);
   state.posting.suspendedProfiles = (state.posting.suspendedProfiles || []).filter((p) => String(p.profileId) !== id);
   state.posting.commentLimitedProfiles = (state.posting.commentLimitedProfiles || []).filter((p) => String(p.profileId) !== id);
   state.posting.blockedModerators = (state.posting.blockedModerators || []).filter((p) => String(p.profileId) !== id);
-  const after = state.posting.disconnectedProfiles.length + state.posting.erroredProfiles.length + state.posting.suspendedProfiles.length + state.posting.commentLimitedProfiles.length + state.posting.blockedModerators.length;
+  state.posting.issueProfiles = (state.posting.issueProfiles || []).filter((p) => String(p.profileId) !== id);
+  const after = state.posting.disconnectedProfiles.length + state.posting.erroredProfiles.length + state.posting.suspendedProfiles.length + state.posting.commentLimitedProfiles.length + state.posting.blockedModerators.length + state.posting.issueProfiles.length;
   if (after !== before) { writeState(state); logEvent("profile_released_reconnected", { profileId: id }); return true; }
   return false;
 }
@@ -17298,7 +17334,7 @@ function autoBlacklistProfileIfNeeded(opts = {}) {
     if (isOpenInfraFailure) { try { logEvent("profile_open_infra_not_benched", { profileId: pid, error: oneLineField(errorText, 140) }); } catch (_) {} maybeParkPersistentOpen1004(pid, profile, errorText, opts); return; }
     // opts.profileRetryable is the connector's structured "profile open/login failed" signal —
     // robust even when the wrapper message hides/truncates the original reason. Treat it as soft.
-    const soft = isTransientBlockingPostFailure(errorText) || opts.profileRetryable === true;
+    const soft = isTransientBlockingPostFailure(errorText) || isProxyUnreachableError(errorText) || opts.profileRetryable === true; // proxy-unreachable is SOFT: it counts toward the repeated-failure threshold but never instant-benches (a flaky proxy may work next time)
     if (!hard && !soft) return; // not a profile-health failure (e.g. product/image issue) — ignore
     __profileBlockStreak[pid] = (__profileBlockStreak[pid] || 0) + 1;
     const state = readState();
@@ -17325,6 +17361,9 @@ function autoBlacklistProfileIfNeeded(opts = {}) {
     state.posting.facebookProfileStatus = appendUniqueRecordLine(state.posting.facebookProfileStatus, line);
     writeState(state);
     logEvent("profile_auto_blacklisted", { profileId: pid, profile, hard, streak, persisted, total, source: opts.source || "", lastError: oneLineField(errorText, 160) });
+    // OPERATOR (2026-06-25): surface every auto-benched ("doesn't work after repeated tries") profile in the Prod-tab
+    // "Profiles having issue" section so the admin can fix the underlying problem (proxy, group access, …) and Release it.
+    try { markProfileIssue(pid, profile, oneLineField(errorText, 160)); } catch (_) {}
   } catch (_e) { /* never break a posting flow */ }
 }
 
@@ -20156,6 +20195,9 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/profiles/suspended") {
     return json(res, 200, { suspended: (readState().posting?.suspendedProfiles || []) });
   }
+  if (req.method === "GET" && url.pathname === "/api/profiles/issues") {
+    return json(res, 200, { issues: (readState().posting?.issueProfiles || []) }); // profiles auto-benched after repeated failures; Release via /api/profiles/release-issue
+  }
   if (req.method === "GET" && url.pathname === "/api/profiles/comment-limited") {
     return json(res, 200, { commentLimited: (readState().posting?.commentLimitedProfiles || []) }); // post-only profiles; Release via /api/profiles/release
   }
@@ -20186,9 +20228,19 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/release") {
     const id = url.searchParams.get("profileId") || "";
-    const ok = releaseParkedProfile(id); // clears ANY parked list (disconnected / account error / suspended / comment-limited)
+    const ok = releaseParkedProfile(id); // clears ANY parked list (disconnected / account error / suspended / comment-limited / issue)
     const stx = readState();
     return json(res, 200, { ok, profileId: id, disconnected: (stx.posting?.disconnectedProfiles || []), errored: (stx.posting?.erroredProfiles || []), suspended: (stx.posting?.suspendedProfiles || []), commentLimited: (stx.posting?.commentLimitedProfiles || []) });
+  }
+  if (req.method === "POST" && url.pathname === "/api/profiles/release-issue") {
+    // Release a "Profiles having issue" entry: clear BOTH the issueProfiles array AND the text bench
+    // (facebookProfileStatus) so the profile truly re-enters posting rotation, not just the UI list.
+    const id = url.searchParams.get("profileId") || "";
+    const label = url.searchParams.get("label") || "";
+    releaseParkedProfile(id);
+    let unblocked = false;
+    try { unblockPostingProfile({ profileId: id, profileLabel: label || String(id) }); unblocked = true; } catch (_) {}
+    return json(res, 200, { ok: true, profileId: id, unblocked, issues: (readState().posting?.issueProfiles || []) });
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/disconnect") {
     const id = url.searchParams.get("profileId") || "";
