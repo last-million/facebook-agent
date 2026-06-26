@@ -2473,6 +2473,33 @@ function markProfileCommentLimited(profileId, label, reason) {
   logEvent("profile_comment_limited_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
   return true;
 }
+// AUTO comment-limit a REPEATEDLY-failing commenter (operator 2026-06-26): a profile that keeps failing to comment with
+// a COMMENTER-SPECIFIC reason (can't open/submit the comment box) — NOT a post-pending/unavailable reason (the post's
+// fault, the drain re-tries it) — is a broken commenter dragging the comment rate (e.g. pid 84: 8x marker_scoped_comment_box
+// while others comment fine). After 3 such failures, mark it comment-limited (post-only -> excluded from the commenter
+// pool, surfaced in the Prod-tab "Comment-limited" section for the admin to fix + Release). A verified comment resets it.
+const __commentFailStreak = {}; // commenter pid -> consecutive commenter-specific comment failures
+const COMMENTER_AUTO_LIMIT_THRESHOLD = 3;
+function isCommenterSpecificCommentFailure(validation) {
+  const errs = (validation && Array.isArray(validation.errors) ? validation.errors : []).join(" ").toLowerCase();
+  if (!errs) return false;
+  if (/comment_target_unavailable_or_pending|post_pending|cannot_access|comments_disabled|content_unavailable|page_unavailable|external actions are locked|already in flight/.test(errs)) return false; // post-state / not the commenter's fault
+  return /marker_scoped_comment_box|marker_scoped_comment_button_not_found|comment_not_submitted|comment_not_verified|comment_box|could not open (?:the )?comment|comment_blocked/.test(errs); // the commenter itself can't comment here
+}
+function noteCommentAttemptOutcome(profileId, validation) {
+  try {
+    const pid = Number(profileId) || 0; if (!pid) return;
+    if (validation && validation.ok) { __commentFailStreak[pid] = 0; return; } // a verified comment clears the streak
+    if (!isCommenterSpecificCommentFailure(validation)) return; // post-pending etc. -> don't blame the commenter
+    __commentFailStreak[pid] = (__commentFailStreak[pid] || 0) + 1;
+    if (__commentFailStreak[pid] >= COMMENTER_AUTO_LIMIT_THRESHOLD) {
+      const errs = (validation.errors || []).join(", ");
+      markProfileCommentLimited(pid, "", `auto: ${__commentFailStreak[pid]} repeated comment failures (${oneLineField(errs, 120)})`);
+      __commentFailStreak[pid] = 0;
+      try { logEvent("profile_auto_comment_limited", { profileId: pid, streak: COMMENTER_AUTO_LIMIT_THRESHOLD, reason: oneLineField(errs, 140) }); } catch (_) {}
+    }
+  } catch (_) {}
+}
 // TEMPORARY BLOCKED MODERATOR (operator): a moderator FB walls on forced_account_switch (the Continue click can't
 // clear it) cannot approve right now — FB blocks the account for ~20min. Bench it for a 24-min cooldown, then it
 // AUTO-RETESTS on its next approval turn; a SUCCESSFUL approval auto-removes it (orchestrator). Admin can also
@@ -13645,6 +13672,7 @@ async function runFacebookCommentRecoveryAttempt({ row, profileId, profileLabel,
       liveLogFile: scriptResult.liveLogFile || "",
       payloadFile: scriptResult.payloadFile || "",
     });
+    noteCommentAttemptOutcome(numericProfileId, validation); // OPERATOR 2026-06-26: track repeated commenter-specific failures -> auto comment-limit a broken commenter (post-only)
     if (!validation.ok) {
       recordPublishedPostCommentIssue({
         row,
@@ -20260,6 +20288,13 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/api/profiles/issues") {
     return json(res, 200, { issues: (readState().posting?.issueProfiles || []) }); // profiles auto-benched after repeated failures; Release via /api/profiles/release-issue
+  }
+  if (req.method === "POST" && url.pathname === "/api/profiles/comment-limit") {
+    // manually sideline a broken COMMENTER (post-only) — excluded from the commenter pool, surfaced in the
+    // Comment-limited section; Release via /api/profiles/release. (Auto-fires too, after 3 commenter-specific failures.)
+    const id = url.searchParams.get("profileId") || "";
+    const ok = markProfileCommentLimited(id, url.searchParams.get("label") || "", url.searchParams.get("reason") || "manually comment-limited by admin (broken commenter)");
+    return json(res, 200, { ok, profileId: id, commentLimited: (readState().posting?.commentLimitedProfiles || []) });
   }
   if (req.method === "GET" && url.pathname === "/api/profiles/on-direct") {
     // profiles the agent switched to Direct (machine IP) because their proxy was dead — operator visibility (FB-safety)
