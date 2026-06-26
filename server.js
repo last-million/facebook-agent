@@ -21321,6 +21321,18 @@ function cleanOrphanIxBrowserChromeAtBoot() {
   } catch (e) { logEvent("boot_orphan_cleanup_error", { error: oneLineField(e.message || String(e), 140) }); }
 }
 
+// ROOT-CAUSE FIX (2026-06-26): if another server instance already owns the port (a racing restart / watchdog +
+// manual start), this instance must EXIT cleanly instead of lingering as an ORPHAN that keeps its own stale state
+// cache + scheduler and corrupts the shared workflow-state.json (that orphan race made the status API report
+// armed=true while the real state was disarmed -> the Stop button stuck). Exit on EADDRINUSE so there is only ever
+// ONE live server.
+server.on("error", (err) => {
+  if (err && err.code === "EADDRINUSE") {
+    try { console.error(`Port ${PORT} already in use — another server instance owns it. Exiting to avoid an orphan.`); } catch (_) {}
+    process.exit(1);
+  }
+  try { logEvent("dashboard_server_error", { code: err && err.code, error: oneLineField((err && (err.message || String(err))) || "", 200) }); } catch (_) {}
+});
 server.listen(PORT, HOST, () => {
   logEvent("dashboard_started", { url: `http://${HOST}:${PORT}` });
   console.log(`Facebook Agent dashboard: http://${HOST}:${PORT}`);
