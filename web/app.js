@@ -6060,7 +6060,10 @@ function uxAttachIncompleteRunBanner() {
       // RUN GUARD + smart states: drive every mirrored control bar from real server state (correct on reload
       // + across tabs). stopped -> Start only ; running -> Pause+Stop ; paused -> Resume+Stop. No way to
       // double-launch (Start is gone while a run is active).
-      const runActive = Boolean(op.armedForExternalActions) || Boolean(enabled);
+      // FRESH armed state from the status API — `op` is the CACHED workflowState, which is STALE right after a Stop
+      // (server disarmed but the client cache not yet refreshed) -> the Stop button wrongly stayed visible. ap.armed is live.
+      const armedNow = (ap.armed != null) ? ap.armed : op.armedForExternalActions;
+      const runActive = Boolean(armedNow) || Boolean(enabled);
       setProdCtlButtons(runActive, Boolean(op.paused));
       document.querySelectorAll(".prodCtl-draintoggle").forEach(function (el) { el.textContent = op.commentDrainPaused ? "▶ Resume drain" : "❚❚ Pause drain"; });
       const buf = ap.buffer || {};
