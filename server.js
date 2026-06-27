@@ -1049,7 +1049,7 @@ function writeState(state, opts = {}) {
   if (!opts.controlWrite) {
     const exOp = existing.operator || {};
     clean.operator = clean.operator || {};
-    for (const f of ["autopilotEnabled", "armedForExternalActions", "autopilotDryRun", "autopilotPostsThisRun"]) {
+    for (const f of ["autopilotEnabled", "armedForExternalActions", "autopilotDryRun", "autopilotPostsThisRun", "commentDrainPaused"]) {
       if (Object.prototype.hasOwnProperty.call(exOp, f)) clean.operator[f] = exOp[f];
     }
   }
@@ -8585,6 +8585,10 @@ async function stopAllExternalWork(reason) {
     const s = readState();
     s.operator.armedForExternalActions = false;
     s.operator.autopilotEnabled = false;
+    // OPERATOR STOP (2026-06-27): "when I click Stop it must STOP" — halt the persistent post-run comment drain too, so a
+    // stopped box goes quiet instead of re-opening posts for ~window minutes. The ONE-TIME stop-finish-drain below is
+    // EXEMPT (stopFinishDrain) so this run's owed comments still land; a fresh launch/resume clears the flag (drain back on).
+    if (reason === "operator_stop_all" || reason === "dashboard_disarm") s.operator.commentDrainPaused = true;
     writeState(s, { controlWrite: true });
   } catch (_) {}
   // Kill every connector child process (they run `node tools/fb-post-test-capture-url.js`). execFile with an
@@ -8612,7 +8616,7 @@ async function stopAllExternalWork(reason) {
         try { __commentRecoveryBackoff.clear(); } catch {}
         for (let pass = 0; pass < 5; pass += 1) {
           try {
-            const r = await resweepUncommentedFacebookPostsAsync({ ignoreArmedGate: true, max: 50, windowHours: 24 });
+            const r = await resweepUncommentedFacebookPostsAsync({ ignoreArmedGate: true, stopFinishDrain: true, max: 50, windowHours: 24 });
             if (!r || (r.checked === 0 && r.recommented === 0)) break;
           } catch {}
           await sleep(5000);
@@ -10063,6 +10067,7 @@ function detectIncompleteRunAtBoot() {
       state.operator.autopilotPostsThisRun = 0;
       state.operator.autopilotEnabled = true;
       state.operator.armedForExternalActions = true;
+      state.operator.commentDrainPaused = false; // a (re)armed run re-enables the comment drain a prior operator STOP had paused
       state.operator.autopilotDryRun = false;
       writeState(state, { controlWrite: true });
       logEvent("autopilot_auto_resumed_after_crash", { posted, max, remaining: Math.max(1, max - posted), totalResumes: __totalResumes + 1, consecutiveNoProgress: __noProgressNow, madeProgress: __madeProgress, runId: String(__runId) });
@@ -15039,8 +15044,8 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       // (persistent post-run drain / stop-finish / auto-disarm finish / manual force) so a STOPPED box goes fully
       // silent. The normal in-RUN armed heartbeat sweep (no drain/force/ignoreArmedGate flag) is NOT gated here, so a
       // live run still comments every post — only the recovery drains the operator explicitly paused are held.
-      if (state.operator?.commentDrainPaused === true && (options.drain || options.force || options.ignoreArmedGate)) {
-        return summary;
+      if (state.operator?.commentDrainPaused === true && !options.stopFinishDrain && (options.drain || options.force || options.ignoreArmedGate)) {
+        return summary; // operator paused the drain -> hold ALL recovery sweeps EXCEPT the one-time stop-finish-drain (it must still land THIS run's owed comments before the box goes silent)
       }
       if (options.force || options.ignoreArmedGate || options.drain) __forcedCommentResweepActive = true; // a forced post-publish resweep, the finish/stop comment-drain, OR the persistent post-run drain may comment despite the run-limit/disarm
       const resweepStartedAt = Date.now(); // if the operator hits STOP after this, abort the loop (real stop)
@@ -20469,6 +20474,7 @@ const server = http.createServer(async (req, res) => {
       if (!wasEnabled && nowEnabled) {
         __armTransition = true; // false->true arm: kick an immediate tick after writeState (below) so batch 1 doesn't wait ~120s
         incoming.operator.autopilotPostsThisRun = 0; // fresh arm => count THIS run only
+        incoming.operator.commentDrainPaused = false; // a fresh launch re-enables the comment drain a prior operator STOP had paused (else this run's tail/late comments stay blocked)
         incoming.operator.autopilotRunId = String(Date.now()); // fresh per-run product-claim namespace (no cross-run carryover)
         try { const cr = path.join(DATA_DIR, "post-claims"); for (const d of (fs.existsSync(cr) ? fs.readdirSync(cr) : [])) { try { fs.rmSync(path.join(cr, d), { recursive: true, force: true }); } catch (_) {} } } catch (_) {} // drop stale claim dirs
         logEvent("autopilot_run_armed_counter_reset", { maxPostsPerRun: incoming.operator.autopilotMaxPostsPerRun, runId: incoming.operator.autopilotRunId });
@@ -20879,6 +20885,7 @@ const server = http.createServer(async (req, res) => {
     state.operator.autopilotPostsThisRun = 0;
     state.operator.autopilotEnabled = true;
     state.operator.armedForExternalActions = true;
+    state.operator.commentDrainPaused = false; // launching/relaunching a run re-enables the comment drain a prior operator STOP had paused
     state.operator.autopilotDryRun = false;
     if (action === "relaunch") {
       // SWARM FIX #9: a relaunch is a FRESH full-count run, so it needs a CLEAN claim namespace. Keeping the old
