@@ -8625,12 +8625,24 @@ function postClaimBaseHash(state, productKey, groupUrl) {
   return crypto.createHash("sha1").update(base).digest("hex");
 }
 function postClaimHashKey(state, productKey, groupUrl) { return postClaimBaseHash(state, productKey, groupUrl) + ".claim"; }
+// The full set of posting groups for fan-out (operator.postToAllGroups): the UNION of the structured
+// groupAssignmentData[].url and the posting.groups text, deduped by normalizedFacebookGroupKey. SINGLE SOURCE OF
+// TRUTH so the fan-out builder (preparePostingPlan) and the "fully claimed" gate below always agree on the target
+// set — even if a future operator edit updates only ONE of the two config lists (divergence would otherwise let a
+// product be marked fully-claimed before every group was posted, silently dropping a secondary group).
+function allConfiguredPostingGroupUrls(state) {
+  const out = []; const seen = new Set();
+  const push = (u) => { const s = String(u || "").trim(); const k = normalizedFacebookGroupKey(s); if (!s || !k || seen.has(k)) return; seen.add(k); out.push(s); };
+  (Array.isArray(state?.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : []).forEach((g) => push(g && g.url));
+  recordLines(state?.posting?.groups).forEach(push);
+  return out;
+}
 // Is this product done for the run at the PRODUCT level (for the buffer + plan gates, which have no single group)?
 // postToAllGroups: "done" ONLY when claimed for EVERY target group — if any group is still unclaimed the product
 // must stay ready/pickable so its remaining groups get posted. OFF: the product-level claim is authoritative.
 function productFullyClaimedForRun(state, productKey) {
   if (state.operator?.postToAllGroups === true) {
-    const groups = recordLines(state.posting?.groups).filter(Boolean);
+    const groups = allConfiguredPostingGroupUrls(state);
     if (groups.length) return groups.every((g) => isProductClaimedForRun(state, productKey, g));
   }
   return isProductClaimedForRun(state, productKey);
@@ -10238,6 +10250,36 @@ function preparePostingPlan(options = {}) {
   const at = new Date().toISOString();
   let delayCursor = 0;
   const rows = [];
+  // FAN-OUT PER-GROUP PROFILES (operator 2026-06-27): with operator.postToAllGroups the SAME listing must reach
+  // EVERY group, but the primary slot's profile is (50/50 split) usually a member of only ONE group, so reusing it
+  // for the other groups FAILED (not a member) and most listings landed in just one group. Build, from the
+  // already-eligibility-filtered postingSlots, the pool of profiles assigned to EACH group + the full target-group
+  // list, so each fan-out copy is posted by a profile that BELONGS to that group. Slots are emitted least-used-first;
+  // a per-group rotating cursor spreads the extra fan-out posts fairly. (No effect when postToAllGroups is OFF.)
+  const __allPostingGroupUrls = allConfiguredPostingGroupUrls(state); // single source of truth (shared with productFullyClaimedForRun)
+  const __fanoutProfilesByGroupKey = new Map();
+  for (const __s of slots) {
+    const __gk = normalizedFacebookGroupKey(__s.groupUrl);
+    if (!__gk) continue;
+    let __arr = __fanoutProfilesByGroupKey.get(__gk);
+    if (!__arr) { __arr = []; __fanoutProfilesByGroupKey.set(__gk, __arr); }
+    if (!__arr.some((x) => x.profileKey === __s.profileKey)) __arr.push({ profile: __s.profile, profileId: __s.profileId, profileKey: __s.profileKey });
+  }
+  const __fanoutCursorByGroupKey = new Map();
+  const __pickFanoutProfileForGroup = (groupUrl, excludeProfileKey) => {
+    const gk = normalizedFacebookGroupKey(groupUrl);
+    const pool = __fanoutProfilesByGroupKey.get(gk) || [];
+    if (!pool.length) return null; // no eligible profile assigned to this group -> can't post the listing here (skip the group, never post with a non-member)
+    const start = __fanoutCursorByGroupKey.get(gk) || 0;
+    let fallback = null;
+    for (let n = 0; n < pool.length; n += 1) {
+      const cand = pool[(start + n) % pool.length];
+      if (excludeProfileKey && cand.profileKey === excludeProfileKey) { if (!fallback) fallback = cand; continue; } // prefer a DIFFERENT profile (spread load); keep the primary as fallback if it's the only member
+      __fanoutCursorByGroupKey.set(gk, (start + n + 1) % pool.length);
+      return cand;
+    }
+    return fallback; // the slot's own profile is the only one assigned to this group -> it IS a member, use it
+  };
   for (let index = 0; index < limit; index += 1) {
     const slot = slots[index];
     const concurrency = concurrencyBatchForSlot(slot, state);
@@ -10301,14 +10343,18 @@ function preparePostingPlan(options = {}) {
       const __byGroup = (harvestedRec && harvestedRec.lastPostedAtByGroup && typeof harvestedRec.lastPostedAtByGroup === "object") ? harvestedRec.lastPostedAtByGroup : {};
       const __seen = new Set();
       __targetGroups = [];
-      for (const __g of [slot.groupUrl, ...fallbackGroupUrlsForSlot(slot, state)]) {
+      // ALL posting groups (primary first) — NOT fallbackGroupUrlsForSlot(slot), which drops any group the PRIMARY
+      // profile can't post to and so collapsed the fan-out to one group. Group membership is now satisfied per-group
+      // at emit time by __pickFanoutProfileForGroup (a profile assigned to that group), not by the primary profile.
+      for (const __g of [slot.groupUrl, ...__allPostingGroupUrls]) {
         const __k = normalizedFacebookGroupKey(__g);
         if (!__g || !__k || __seen.has(__k)) continue;
         __seen.add(__k);
-        if (harvestedRec) { const __t = Date.parse(__byGroup[__k] || ""); if (Number.isFinite(__t) && (Date.now() - __t) < __reuseMs) continue; } // 1x per group per 24h
+        if (harvestedRec) { const __t = Date.parse(__byGroup[__k] || ""); if (Number.isFinite(__t) && (Date.now() - __t) < __reuseMs) continue; } // 1x per group per reuse window
+        if (normalizedFacebookGroupKey(__g) !== normalizedFacebookGroupKey(slot.groupUrl) && !__fanoutProfilesByGroupKey.has(__k)) continue; // no profile assigned to this group -> skip it (don't emit an unpostable row)
         __targetGroups.push(__g);
       }
-      if (!__targetGroups.length) continue; // this product already hit every group within its 24h window -> skip
+      if (!__targetGroups.length) continue; // this product already hit every group within its reuse window -> skip
     }
     const __row = {
       at,
@@ -10361,8 +10407,18 @@ function preparePostingPlan(options = {}) {
     if (!__postToAll) {
       rows.push(__row);
     } else {
+      const __primaryGroupKey = normalizedFacebookGroupKey(slot.groupUrl);
       for (const __g of __targetGroups) {
-        rows.push({ ...__row, sequence: rows.length + 1, groupUrl: __g, fallbackGroupUrls: [] });
+        // PRIMARY group keeps the paired slot profile (already a member). SECONDARY groups get a profile ASSIGNED to
+        // that group (rotating, least-used-first) so the listing is posted by a real member — never the primary
+        // profile that isn't in this group. If no member profile exists for a secondary group, skip it (no unpostable row).
+        let __rp = __row.profile, __rpid = __row.profileId;
+        if (normalizedFacebookGroupKey(__g) !== __primaryGroupKey) {
+          const __pick = __pickFanoutProfileForGroup(__g, slot.profileKey);
+          if (!__pick) continue;
+          __rp = __pick.profile; __rpid = __pick.profileId || profileIdFromLabel(__pick.profile) || "";
+        }
+        rows.push({ ...__row, sequence: rows.length + 1, groupUrl: __g, fallbackGroupUrls: [], profile: __rp, profileId: __rpid });
       }
     }
   }
