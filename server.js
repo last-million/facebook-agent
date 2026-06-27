@@ -1046,11 +1046,25 @@ function writeState(state, opts = {}) {
   // which is exactly how a "stop" got lost. UNLESS the caller is the operator's explicit control
   // path (opts.controlWrite === true), preserve the freshest ON-DISK values for these flags so a
   // stale snapshot can never override a fresh enable/disable/arm/disarm or the per-run counter.
-  if (!opts.controlWrite) {
+  {
     const exOp = existing.operator || {};
     clean.operator = clean.operator || {};
-    for (const f of ["autopilotEnabled", "armedForExternalActions", "autopilotDryRun", "autopilotPostsThisRun", "commentDrainPaused"]) {
-      if (Object.prototype.hasOwnProperty.call(exOp, f)) clean.operator[f] = exOp[f];
+    // OPERATOR-CONTROL flags (enable / arm / dryRun / drain-pause): may be changed ONLY by an explicit operator-control
+    // write (opts.operatorControl). A BACKGROUND controlWrite (the autopilot tick, a posting worker's post-completion
+    // counter write, harvest, the cpu governor) holding a STALE pre-STOP snapshot must NEVER resurrect armed/enabled —
+    // the 2026-06-27 bug where a worker's controlWrite re-armed a run ~20s after the operator's Stop. So these are
+    // preserved from the freshest ON-DISK value on EVERY non-operatorControl write (controlWrite or not). Only the few
+    // explicit arm/disarm sites (operator STOP, PUT /api/state, relaunch endpoint, auto-disarm, crash auto-resume,
+    // boot-disarm) pass operatorControl:true.
+    if (!opts.operatorControl) {
+      for (const f of ["autopilotEnabled", "armedForExternalActions", "autopilotDryRun", "commentDrainPaused"]) {
+        if (Object.prototype.hasOwnProperty.call(exOp, f)) clean.operator[f] = exOp[f];
+      }
+    }
+    // The per-run COUNTER is legitimately updated by the background tick (controlWrite); it only needs protection from a
+    // stale NON-controlWrite snapshot (the original guard), so it stays keyed on controlWrite.
+    if (!opts.controlWrite && Object.prototype.hasOwnProperty.call(exOp, "autopilotPostsThisRun")) {
+      clean.operator.autopilotPostsThisRun = exOp.autopilotPostsThisRun;
     }
   }
   // OPERATOR-CONFIG CLOBBER GUARD (2026-06-17 bug: "added a group, it saved, then vanished after a restart"). deepMerge
@@ -8589,7 +8603,7 @@ async function stopAllExternalWork(reason) {
     // stopped box goes quiet instead of re-opening posts for ~window minutes. The ONE-TIME stop-finish-drain below is
     // EXEMPT (stopFinishDrain) so this run's owed comments still land; a fresh launch/resume clears the flag (drain back on).
     if (reason === "operator_stop_all" || reason === "dashboard_disarm") s.operator.commentDrainPaused = true;
-    writeState(s, { controlWrite: true });
+    writeState(s, { controlWrite: true, operatorControl: true });
   } catch (_) {}
   // Kill every connector child process (they run `node tools/fb-post-test-capture-url.js`). execFile with an
   // args array avoids shell-quoting issues. Pinterest uses a different script + msedge, so it's untouched.
@@ -9514,7 +9528,7 @@ function autopilotAutoDisarm(reason, detail) {
   s.operator = s.operator || {};
   s.operator.autopilotEnabled = false;
   s.operator.armedForExternalActions = false;
-  writeState(s, { controlWrite: true });
+  writeState(s, { controlWrite: true, operatorControl: true }); // operatorControl: the run-complete disarm MUST stick (a stale tick controlWrite must not re-arm)
   logEvent("autopilot_auto_disarmed", { reason, detail });
   // KEEP-OPEN: the run ended -> close + release every kept-open posting session (no posting -> no reuse -> free them).
   closeAllKeepOpenSessions("auto_disarm").catch(() => {});
@@ -10069,7 +10083,7 @@ function detectIncompleteRunAtBoot() {
       state.operator.armedForExternalActions = true;
       state.operator.commentDrainPaused = false; // a (re)armed run re-enables the comment drain a prior operator STOP had paused
       state.operator.autopilotDryRun = false;
-      writeState(state, { controlWrite: true });
+      writeState(state, { controlWrite: true, operatorControl: true });
       logEvent("autopilot_auto_resumed_after_crash", { posted, max, remaining: Math.max(1, max - posted), totalResumes: __totalResumes + 1, consecutiveNoProgress: __noProgressNow, madeProgress: __madeProgress, runId: String(__runId) });
       return;
     }
@@ -10083,8 +10097,8 @@ function detectIncompleteRunAtBoot() {
     };
     state.operator.autopilotEnabled = false;
     state.operator.armedForExternalActions = false;
-    // controlWrite: the clobber guard would otherwise resurrect the pre-restart armed flags.
-    writeState(state, { controlWrite: true });
+    // operatorControl: this boot-disarm MUST stick — the preservation guard would otherwise resurrect the pre-restart armed flags.
+    writeState(state, { controlWrite: true, operatorControl: true });
     logEvent("incomplete_run_detected_at_boot", { posted, max, reason: __reason });
   } catch (err) {
     logEvent("incomplete_run_boot_check_error", { error: oneLineField(err.message || String(err), 200) });
@@ -20471,7 +20485,15 @@ const server = http.createServer(async (req, res) => {
       // a disarm = armed true->false OR autopilot true->false (the dashboard Stop sends both)
       if ((wasArmed && incoming.operator?.armedForExternalActions === false) || (wasEnabled && incoming.operator?.autopilotEnabled === false)) __disarmTransition = true;
       incoming.operator = incoming.operator || {};
-      if (!wasEnabled && nowEnabled) {
+      // STOP COOLDOWN (2026-06-27 defense-in-depth): refuse a false->true arm within ~6s of an operator STOP. That
+      // transition is almost always a STALE auto-save echo from a not-yet-refreshed dashboard re-sending its old armed
+      // toggle (the re-arm bug), NOT a deliberate relaunch (which the operator makes seconds later). Keeps a clicked
+      // Stop from un-stopping even on an un-refreshed browser; a real relaunch just needs one more click after 6s.
+      if (!wasEnabled && nowEnabled && __externalStopRequested && (Date.now() - __externalStopRequested) < 6000) {
+        incoming.operator.autopilotEnabled = false;
+        incoming.operator.armedForExternalActions = false;
+        logEvent("arm_blocked_stop_cooldown", { sinceStopMs: Date.now() - __externalStopRequested });
+      } else if (!wasEnabled && nowEnabled) {
         __armTransition = true; // false->true arm: kick an immediate tick after writeState (below) so batch 1 doesn't wait ~120s
         incoming.operator.autopilotPostsThisRun = 0; // fresh arm => count THIS run only
         incoming.operator.commentDrainPaused = false; // a fresh launch re-enables the comment drain a prior operator STOP had paused (else this run's tail/late comments stay blocked)
@@ -20490,7 +20512,7 @@ const server = http.createServer(async (req, res) => {
     // controlWrite:true => the operator's explicit values for the protected control flags win.
     // allowOperatorConfig:true => this is the ONLY path allowed to change posting.groups (the dashboard save); every
     // background writeState preserves the on-disk groups, so a stale snapshot can never drop a group the operator added.
-    const state = writeState(incoming, { controlWrite: true, allowOperatorConfig: true });
+    const state = writeState(incoming, { controlWrite: true, allowOperatorConfig: true, operatorControl: true }); // explicit operator state write (arm/disarm/config) — may change armed/enabled
     logEvent("workflow_state_saved");
     // #1b SELF-DRIVE: on a fresh arm (false->true), kick an immediate single-flight tick so the first batch
     // launches NOW instead of waiting up to the full scheduler interval (~120s). autopilotTickAsync is
@@ -20897,7 +20919,7 @@ const server = http.createServer(async (req, res) => {
       try { fs.rmSync(path.join(DATA_DIR, "post-claims"), { recursive: true, force: true }); } catch (_) {}
     }
     state.operator.lastIncompleteRun = { ...run, status: action === "continue" ? "continued" : "relaunched", resolvedAt: new Date().toISOString() };
-    const next = writeState(state, { controlWrite: true });
+    const next = writeState(state, { controlWrite: true, operatorControl: true }); // explicit relaunch/continue — may set armed/enabled true
     logEvent(`incomplete_run_${action === "continue" ? "continued" : "relaunched"}`, { posted: run.posted, max: run.max, newMax });
     return json(res, 200, { ok: true, action, newMax, state: next });
   }

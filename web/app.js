@@ -5105,7 +5105,20 @@ function bindAsync(id, handler) {
 }
 
 bindAsync("startBtn", () => control("start-next"));
-bindAsync("stopBtn", async () => { try { await api("/api/operator/stop-all", { method: "POST", body: JSON.stringify({}) }); } catch (_) {} return control("stop-active"); }); // STOP = kill in-flight posting/harvest/comment work too, not just the job
+bindAsync("stopBtn", async () => {
+  // STOP-RE-ARM FIX (2026-06-27): sync the DOM toggles + in-memory cache to DISARMED *before* anything can auto-save.
+  // Otherwise control()'s ensureSavedBeforeAction (or the debounced quiet auto-save) PUTs the still-true toggles and
+  // RE-ARMS the run we just stopped — the operator's "I clicked Stop but it didn't stop". Mirrors the Prod-tab stop.
+  try {
+    const a = document.getElementById("armedForExternalActionsRail"); if (a) a.checked = false;
+    const e = document.getElementById("autopilotEnabledRail"); if (e) e.checked = false;
+    if (typeof workflowState === "object" && workflowState) {
+      workflowState.operator = Object.assign({}, workflowState.operator || {}, { armedForExternalActions: false, autopilotEnabled: false, commentDrainPaused: true });
+    }
+  } catch (_) {}
+  try { await api("/api/operator/stop-all", { method: "POST", body: JSON.stringify({}) }); } catch (_) {}
+  return control("stop-active");
+}); // STOP = kill in-flight posting/harvest/comment work too, not just the job
 bindAsync("clearBtn", () => control("clear-done"));
 bindAsync("clearBtnMonitor", () => control("clear-done"));
 bindAsync("refreshMonitorBtn", () => refresh({ force: true }));
