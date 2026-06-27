@@ -90,6 +90,27 @@ function __memDifferentProfileCommenter(sanitizedUrl, publisherId) { // -> a com
 function __memHasDifferentProfileComment(sanitizedUrl, publisherId) {
   return __memDifferentProfileCommenter(sanitizedUrl, publisherId) !== null;
 }
+// DOUBLE-COMMENT GUARD — RESTART SURVIVABILITY (operator 2026-06-27, after 10 doubles that ALL straddled a server
+// restart): __verifiedCommentPidsByUrlMem above is process-local and EMPTY after a restart/crash, and the dedup's
+// ledger-scan fallback let the drain re-comment already-commented posts (= duplicate money-comments). The map's own
+// doc claims it "rebuilds lazily from the ledger" but NO such rebuild ever existed. Rebuild it here from the durable
+// ledger — the exact comment_recovery_finished proofs the live path stamps — so the reliable, consistently-sanitized
+// guard is restored the instant the process boots (called BEFORE the scheduler/drain can run). Bounded to the recent
+// window so the one-time boot scan stays cheap; the connector live dup-check stays the final cross-restart backstop.
+function rebuildVerifiedCommentMemFromLedger() {
+  try {
+    const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 20000 });
+    let proofs = 0;
+    for (const r of rows) {
+      if (!r || r.event !== "comment_recovery_finished" || !r.postUrl) continue;
+      if (!["published", "published_with_warning"].includes(String(r.status || ""))) continue;
+      if (r.validation && r.validation.commentVerified === false) continue;
+      __noteVerifiedCommentInMemory(r.postUrl, r.profileId);
+      proofs += 1;
+    }
+    logEvent("verified_comment_mem_rebuilt_from_ledger", { posts: __verifiedCommentPidsByUrlMem.size, proofs });
+  } catch (e) { try { logEvent("verified_comment_mem_rebuild_error", { error: oneLineField((e && e.message) || String(e), 160) }); } catch (_) {} }
+}
 const PER_POST_LOG_SWEEP_INTERVAL_MS = 6 * 3600 * 1000;
 const STATE_FILE = path.join(DATA_DIR, "workflow-state.json");
 const LOCAL_DB_DIR = path.join(DATA_DIR, "local-db");
@@ -15063,7 +15084,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         if (!r || r.event !== "comment_recovery_finished") continue;
         if (!["published", "published_with_warning"].includes(String(r.status || ""))) continue;
         if (r.validation && r.validation.commentVerified === false) continue;
-        const u = String(r.postUrl || ""); if (!u) continue; // key by RAW postUrl (mirrors item.postUrl === cleanPostUrl)
+        let u = ""; try { u = sanitizeFacebookPostUrl(String(r.postUrl || "")); } catch { u = String(r.postUrl || ""); } if (!u) continue; // key by SANITIZED postUrl so the (also-sanitized) lookup can never miss on a trailing-slash/format diff (2026-06-27)
         let set = __verifiedCommentPidsByUrl.get(u); if (!set) { set = new Set(); __verifiedCommentPidsByUrl.set(u, set); }
         set.add(Number(r.profileId || 0));
       }
@@ -21392,6 +21413,9 @@ server.on("error", (err) => {
 server.listen(PORT, HOST, () => {
   logEvent("dashboard_started", { url: `http://${HOST}:${PORT}` });
   console.log(`Facebook Agent dashboard: http://${HOST}:${PORT}`);
+  // DOUBLE-COMMENT GUARD: repopulate the in-memory verified-comment map from the durable ledger BEFORE the scheduler/
+  // drain can run, so a restart never makes an already-commented post look uncommented (2026-06-27 restart-doubles fix).
+  rebuildVerifiedCommentMemFromLedger();
   // AUTO-PARALLEL CAP: compute the machine-synced parallel ceiling FIRST so the very first tick already
   // sees it. Re-synced every 24h by the heartbeat. (cpu+ram, reserves OS + the co-resident Pinterest agent.)
   __lastMachineCapSyncAt = Date.now();
