@@ -1057,7 +1057,7 @@ function writeState(state, opts = {}) {
     // explicit arm/disarm sites (operator STOP, PUT /api/state, relaunch endpoint, auto-disarm, crash auto-resume,
     // boot-disarm) pass operatorControl:true.
     if (!opts.operatorControl) {
-      for (const f of ["autopilotEnabled", "armedForExternalActions", "autopilotDryRun", "commentDrainPaused"]) {
+      for (const f of ["autopilotEnabled", "armedForExternalActions", "autopilotDryRun", "commentDrainPaused", "commentDrainDisabled"]) {
         if (Object.prototype.hasOwnProperty.call(exOp, f)) clean.operator[f] = exOp[f];
       }
     }
@@ -15063,6 +15063,13 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
     const summary = { checked: 0, recommented: 0, stillMissing: 0, errors: [] };
     try {
       const state = readState();
+      // OPERATOR KILL-SWITCH (2026-06-27): comment RECOVERY fully DISABLED. The operator wants each post commented ONCE
+      // at publish and NEVER re-scanned/re-commented (the drain kept re-opening already-commented posts). When
+      // commentDrainDisabled is set, NO resweep runs AT ALL — not the persistent post-run drain, not the stop/finish
+      // drain, not the in-RUN armed sweep. Only the inline first-comment at publish (a separate path) remains. The
+      // trade-off (accepted): a post whose inline comment misses (e.g. pending-approval that goes public later) stays
+      // uncommented — there is no recovery. Toggle commentDrainDisabled=false to restore recovery.
+      if (state.operator?.commentDrainDisabled === true) return summary;
       // Re-commenting is an EXTERNAL action — gate on the universal kill switch unless forced.
       // ignoreArmedGate = the operator FINISH/STOP comment-drain: run despite a fresh disarm, but WITHOUT force's
       // reach-back — it keeps the run-cutoff clamp below, so it only finishes the CURRENT run's comments and never
