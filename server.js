@@ -8568,6 +8568,22 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
       throw e;
     }
     const result = objs.filter((o) => o && o.step === "harvest_result").pop();
+    // OBSERVABILITY (2026-06-27): surface WHY a group yields few/0 items. The connector logs harvest_theater_opened
+    // (navigable?), harvest_walk_end (reason: no_more_photos / age_cap / loop_detected) and harvest_walk_done — none of
+    // which reach events.log today, so a got=0 group (e.g. o1498765421290862's non-navigable photo theater) is
+    // undiagnosable in prod. Stamp the key diag per round so the real cause is auditable.
+    try {
+      const __opened = objs.filter((o) => o && o.step === "harvest_theater_opened").pop();
+      const __end = objs.filter((o) => o && (o.step === "harvest_walk_end" || o.step === "harvest_walk_done")).pop();
+      const __grid = objs.filter((o) => o && o.step === "harvest_grid_fallback").pop();
+      logEvent("harvest_walk_diag", {
+        groupUrl, profileId: Number(profileId),
+        got: (result && Array.isArray(result.items)) ? result.items.length : 0,
+        navigable: __opened ? __opened.navigable : null, set: __opened ? __opened.set : null,
+        endReason: __end ? (__end.reason || __end.step) : null, collected: __end ? __end.collected : null, steps: __end ? __end.steps : null,
+        gridFallback: !!__grid,
+      });
+    } catch (_) {}
     return { items: (result && Array.isArray(result.items)) ? result.items : [], lastFbid: String((result && result.lastFbid) || "") };
   } finally {
     try { fs.unlinkSync(payloadPath); } catch (_) {}
