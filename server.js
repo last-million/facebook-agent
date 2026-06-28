@@ -3305,6 +3305,28 @@ function attachStoredProductTitles(products, titleMap) {
   return products;
 }
 
+// GUARANTEE SAME PRODUCT IN ALL GROUPS (operator 2026-06-28): with postToAllGroups a harvested product must reach
+// EVERY configured group. The upstream pool filters (collectProductUrlsForPosting + productHasReadyAssets) used a
+// PRODUCT-level lastPostedAt, so a product dropped out of the pool 24h after its FIRST group post and never came back
+// for the remaining group(s) (and retention then pruned it -> PERMANENT miss; only ~45% reached both groups). This
+// helper makes those filters GROUP-aware: a product is still "owed" (stays eligible) while ANY configured group has
+// not received it within reuseMs. It NEVER re-opens a group that WAS posted inside reuseMs (the per-group 1x/window
+// rule is preserved). The plan builder is already group-aware (lastPostedAtByGroup at ~10402) — it just never saw the
+// product because the pool dropped it. Fail-open (keep eligible) on any error.
+function harvestedProductOwesAnyConfiguredGroup(rec, state, reuseMs) {
+  try {
+    const groups = allConfiguredPostingGroupUrls(state).map(normalizedFacebookGroupKey).filter(Boolean);
+    if (!groups.length) return false;
+    const byGroup = (rec && rec.lastPostedAtByGroup && typeof rec.lastPostedAtByGroup === "object") ? rec.lastPostedAtByGroup : {};
+    const now = Date.now();
+    for (const g of groups) {
+      const t = byGroup[g] ? Date.parse(byGroup[g]) : 0;
+      if (!t || !Number.isFinite(t) || (now - t) >= reuseMs) return true; // never posted there, OR its window elapsed -> still owed
+    }
+    return false; // posted to EVERY configured group within reuseMs -> not owed
+  } catch (_) { return true; }
+}
+
 function collectProductUrlsForPosting(state, options = {}) {
   const latestOnly = Boolean(options.latestDiscoveryOnly || options.latest_discovery_only);
   const candidateRows = latestOnly
@@ -3324,8 +3346,17 @@ function collectProductUrlsForPosting(state, options = {}) {
     const rh = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 24);
     const onDisk = (r) => r && r.firstCommentUrl && r.imageLocalPath && !r.imageDeleted && imageFileLooksValid(safeProjectPath(r.imageLocalPath));
     const lastMs = (r) => { const s = r.lastPostedAt || r.posted || ""; const t = s ? Date.parse(s) : 0; return Number.isFinite(t) ? t : 0; };
+    const __reuseMs = rh * 3600 * 1000;
+    const __fanout = state.operator?.postToAllGroups === true;
     const fresh = recs.filter((r) => onDisk(r) && !(r.lastPostedAt || r.posted)).map((r) => r.productKey);
-    const reeligible = recs.filter((r) => onDisk(r) && (r.lastPostedAt || r.posted) && lastMs(r) > 0 && (Date.now() - lastMs(r)) >= rh * 3600 * 1000).sort((a, b) => lastMs(a) - lastMs(b)).map((r) => r.productKey);
+    // RE-ELIGIBLE: product-level window when posting to a single group; GROUP-AWARE (still owes a configured group)
+    // when postToAllGroups, so a product posted to ONE group stays eligible for the remaining group(s) instead of
+    // being dropped from the pool for the whole window (the "same product not in all groups" bug).
+    const reeligible = recs.filter((r) => onDisk(r) && (r.lastPostedAt || r.posted) && (
+      __fanout
+        ? harvestedProductOwesAnyConfiguredGroup(r, state, __reuseMs)
+        : (lastMs(r) > 0 && (Date.now() - lastMs(r)) >= __reuseMs)
+    )).sort((a, b) => lastMs(a) - lastMs(b)).map((r) => r.productKey);
     harvestedKeys = [...fresh, ...reeligible];
   }
   // EXCLUSIVE mode: post ONLY copied products (skip web-discovery products entirely). When off, copied
@@ -8304,9 +8335,17 @@ function productHasReadyAssets(product, state = readState(), reviewImages = null
     // RE-USE WINDOW: ready if image-on-disk AND (never posted OR last post older than reuseHours). Lets a posted
     // product rotate back in after reuseHours so production never stalls. (lastPostedAt||posted for back-compat.)
     const reuseHours = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 24);
-    const lastTimeStr = rec.lastPostedAt || rec.posted || "";
-    const lastMs = lastTimeStr ? Date.parse(lastTimeStr) : 0;
-    if (lastMs && Number.isFinite(lastMs) && (Date.now() - lastMs) < reuseHours * 3600 * 1000) return false;
+    const __reuseMs = reuseHours * 3600 * 1000;
+    if (state.operator?.postToAllGroups === true) {
+      // GROUP-AWARE re-use (mirrors collectProductUrlsForPosting): a product stays READY while it still owes a
+      // configured group, so the remaining group(s) receive it instead of it being benched for the whole window
+      // after its FIRST group post. productFullyClaimedForRun above already handles the CURRENT run's claims.
+      if (!harvestedProductOwesAnyConfiguredGroup(rec, state, __reuseMs)) return false;
+    } else {
+      const lastTimeStr = rec.lastPostedAt || rec.posted || "";
+      const lastMs = lastTimeStr ? Date.parse(lastTimeStr) : 0;
+      if (lastMs && Number.isFinite(lastMs) && (Date.now() - lastMs) < __reuseMs) return false;
+    }
     // SKIP junk-text products: the extractor sometimes grabbed the comment-sort header ("Most relevant" /
     // "Plus pertinents") instead of the product caption -> don't post those.
     const title = cleanHarvestedPostText(rec.text || "");
@@ -10467,6 +10506,12 @@ function preparePostingPlan(options = {}) {
       const __byGroup = (harvestedRec && harvestedRec.lastPostedAtByGroup && typeof harvestedRec.lastPostedAtByGroup === "object") ? harvestedRec.lastPostedAtByGroup : {};
       const __seen = new Set();
       __targetGroups = [];
+      // COVERAGE-FIRST (operator 2026-06-28): while ANY configured group has NEVER received this harvested product,
+      // deliver to the never-served group(s) FIRST and do NOT re-post a group it already has — even if that group's
+      // reuse window has elapsed. This caps the "one group floods while another is still owed" failure (e.g. the owed
+      // group's pool is temporarily down) and enforces the operator intent: the SAME product reaches EVERY group once
+      // before any group gets it a 2nd time. Once every group has it, independent 1x/reuse windows resume.
+      const __coverageIncomplete = !!harvestedRec && [slot.groupUrl, ...__allPostingGroupUrls].some((g) => { const k = normalizedFacebookGroupKey(g); return k && !__byGroup[k]; });
       // ALL posting groups (primary first) — NOT fallbackGroupUrlsForSlot(slot), which drops any group the PRIMARY
       // profile can't post to and so collapsed the fan-out to one group. Group membership is now satisfied per-group
       // at emit time by __pickFanoutProfileForGroup (a profile assigned to that group), not by the primary profile.
@@ -10474,11 +10519,12 @@ function preparePostingPlan(options = {}) {
         const __k = normalizedFacebookGroupKey(__g);
         if (!__g || !__k || __seen.has(__k)) continue;
         __seen.add(__k);
+        if (__coverageIncomplete && __byGroup[__k]) continue; // coverage-first: don't re-post an already-served group until EVERY configured group has this product once
         if (harvestedRec) { const __t = Date.parse(__byGroup[__k] || ""); if (Number.isFinite(__t) && (Date.now() - __t) < __reuseMs) continue; } // 1x per group per reuse window
         if (normalizedFacebookGroupKey(__g) !== normalizedFacebookGroupKey(slot.groupUrl) && !__fanoutProfilesByGroupKey.has(__k)) continue; // no profile assigned to this group -> skip it (don't emit an unpostable row)
         __targetGroups.push(__g);
       }
-      if (!__targetGroups.length) continue; // this product already hit every group within its reuse window -> skip
+      if (!__targetGroups.length) continue; // already hit every group within its reuse window (or coverage pending on a temporarily-unservable group) -> skip
     }
     const __row = {
       at,
