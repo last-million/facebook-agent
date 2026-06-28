@@ -492,6 +492,8 @@ function defaultState() {
       autopilotPostsThisRun: 0, // counter of confirmed posts since the run was armed (reset on each fresh arm)
       autopilotWorkerStaggerSeconds: 25,
       adminApprovalSettleSeconds: 3,
+      blockedModeratorCooldownMinutes: 2, // DYNAMIC (operator 2026-06-28): minutes a moderator FB-walls on the account-switch is benched before retry. Was a hardcoded 24->2min const; now live-editable via PUT /api/state.
+      commentRecoveryBackoffMinutes: 4, // DYNAMIC (operator 2026-06-28): minutes before a still-uncommented post is re-tried by the drain/sweep -> each post commented within ~5-6 min of going public. Was a hardcoded 22/8->4min const; now live-editable.
       parallelOpenStaggerSeconds: 8,
       cpuGovernorEnabled: true,
       cpuGovernorMaxPercent: 85,
@@ -2546,7 +2548,7 @@ function blockedModeratorCooldownSet(state = readState()) {
   const ids = new Set();
   for (const p of (state.posting?.blockedModerators || [])) {
     const at = Date.parse(String(p.at || "")) || 0;
-    if (at && (now - at) < BLOCKED_MODERATOR_COOLDOWN_MS) ids.add(String(p.profileId || "")); // still cooling down -> skip in the rotation
+    if (at && (now - at) < (clampNumber(state.operator?.blockedModeratorCooldownMinutes, 1, 60, 2) * 60000)) ids.add(String(p.profileId || "")); // still cooling down -> skip in the rotation (DYNAMIC: operator.blockedModeratorCooldownMinutes)
   }
   return ids;
 }
@@ -15173,7 +15175,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         const commentText = String(row?.commentTextPreview || row?.link || "").trim();
         if (!row || !commentText) { summary.stillMissing += 1; continue; } // cannot reconstruct the comment (no live plan row AND no durable payload)
         const __boAt = __commentRecoveryBackoff.get(postUrl) || 0;
-        const __backoffMs = options.drain ? (4 * 60 * 1000) : COMMENT_RECOVERY_BACKOFF_MS; // operator 2026-06-28: drain re-checks every ~4 min (was 8) so a post is commented within ~5-6 min of going public
+        const __backoffMs = clampNumber(state.operator?.commentRecoveryBackoffMinutes, 1, 60, 4) * 60 * 1000; // DYNAMIC (operator 2026-06-28): re-check interval -> post commented within ~5-6 min of going public; live-editable via operator.commentRecoveryBackoffMinutes (default 4)
         if (Date.now() - __boAt < __backoffMs) { summary.stillMissing += 1; continue; } // tried recently + still uncommented -> defer (don't re-cycle profiles on a stuck/pending post)
         // STARVATION FIX (operator 2026-06-20): the RECOVERY drains (persistent drain / stop-finish / run-end / forced)
         // must NOT yield-forever to an always-posting run — that left the drain checking only 1 post/cycle while 20 stayed
