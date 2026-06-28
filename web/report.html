@@ -215,6 +215,7 @@ function runBody(r){
   var chrTxt = r.chromePeak==null ? "—" : r.chromePeak;
   var html = '<div class="stats">'
     + statCard("Posts publiés", r.posts, "sur "+r.durationMin+" min", "")
+    + statCard("Produits uniques", (r.uniqueProducts||0), (r.productsInBoth||0)+" dans les 2 groupes", (r.uniqueProducts? (r.productsInBoth>0?"g":"a") : ""))
     + statCard("Commentés", r.commentRate+'<small>%</small>', r.commented+"/"+r.posts+" • "+r.uncommented+" sans", r.commentRate>=90?"g":(r.commentRate>=70?"a":"r"))
     + statCard("Délai médian", fmtGap(r.gap.medianSec), "max "+fmtGap(r.gap.maxSec), "v")
     + statCard("Pic Chrome", chrTxt, "RAM libre min "+ramTxt, (r.chromePeak&&r.chromePeak>120)?"r":"g")
@@ -233,12 +234,34 @@ function runBody(r){
     }).join("");
     html += '</div>';
   }
+  // PAR PRODUIT — chaque produit harvested, son numéro, combien de fois posté, dans quels groupes, par quels profils
+  var prods = r.products || [];
+  if (prods.length) {
+    html += '<h2>Par produit <span class="ln"></span> <span class="tag">'+(r.productsInBoth||0)+'/'+(r.uniqueProducts||prods.length)+' dans les 2 groupes</span></h2>';
+    html += '<div class="tablecard"><table class="detail"><thead><tr>'
+      + '<th>Produit</th><th>Titre</th><th>Posté</th><th>Groupes</th><th>Profils</th></tr></thead><tbody>';
+    html += prods.map(function(p){
+      var gl = Object.keys(p.groups||{}).map(function(g){ return grpPill(g)+' ×'+p.groups[g]; }).join(' ');
+      var multi = (p.groupCount>=2) ? '<span class="ok">✓ '+p.groupCount+' groupes</span>' : '<span class="slow">⚠ 1 seul</span>';
+      var prof = (p.profiles||[]).join(', ');
+      var ttl = (p.title||p.shortKey||'').toString();
+      return '<tr>'
+        + '<td data-l="Produit"><b>P'+p.num+'</b></td>'
+        + '<td data-l="Titre" title="'+esc(p.key)+'">'+esc(ttl.length>46?ttl.slice(0,46)+'…':ttl)+'</td>'
+        + '<td data-l="Posté"><b>'+p.total+'×</b> '+multi+'</td>'
+        + '<td data-l="Groupes">'+gl+'</td>'
+        + '<td data-l="Profils">'+esc(prof)+'</td></tr>';
+    }).join("");
+    html += '</tbody></table></div>';
+  }
   html += '<h2>Détail des posts <span class="ln"></span></h2><div class="tablecard"><table class="detail"><thead><tr>'
-    + '<th>#</th><th>Groupe</th><th>Publié</th><th>Commenté</th><th>Délai</th><th>Profils</th></tr></thead><tbody>';
+    + '<th>#</th><th>Produit</th><th>Groupe</th><th>Publié</th><th>Commenté</th><th>Délai</th><th>Profils</th></tr></thead><tbody>';
   html += (r.detail||[]).map(function(d,i){
     var prof = d.profilePub ? (d.profilePub + (d.profileCom? " → "+d.profileCom : " → —")) : "—";
+    var pnum = d.productNum ? ('<span class="pill x" title="'+esc(d.productKey||"")+'">P'+d.productNum+'</span>') : '—';
     return '<tr>'
       + '<td data-l="#">'+(i+1)+'</td>'
+      + '<td data-l="Produit">'+pnum+'</td>'
       + '<td data-l="Groupe">'+grpPill(d.group)+'</td>'
       + '<td data-l="Publié">'+fmtTime(d.publishedAt)+'</td>'
       + '<td data-l="Commenté">'+(d.commentedAt?fmtTime(d.commentedAt):'<span class="no">non commenté</span>')+'</td>'

@@ -20204,6 +20204,11 @@ function buildRunReports(force = false) {
     const gaps = [];
     const detail = [];
     let commented = 0;
+    // PER-PRODUCT TRACKING (operator 2026-06-28): give each harvested product a stable per-run NUMBER so the report
+    // shows, per publication, WHICH product it is + a "Par produit" recap (how many times posted, in which groups, by
+    // which profiles) — so the operator can verify the same product is duplicated across BOTH groups vs only one.
+    const productMap = new Map(); // productKey -> { num, key, title, total, groups:{g:n}, profiles:Set }
+    const productOrder = [];
     for (const p of run.posts) {
       const g = __reportGroupName(p.groupUrl || p.actualGroupUrl || p.postUrl);
       const gg = groups[g] || (groups[g] = { posts: 0, commented: 0, gaps: [] });
@@ -20211,8 +20216,20 @@ function buildRunReports(force = false) {
       const c = commentByUrl.get(p.postUrl);
       let gapSec = null;
       if (c && c.t >= p._t) { gapSec = Math.round((c.t - p._t) / 1000); gaps.push(gapSec); gg.gaps.push(gapSec); gg.commented += 1; commented += 1; }
-      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profileCom: c ? c.profileId : null });
+      const pk = String(p.productKey || "");
+      let pnum = 0;
+      if (pk) {
+        let pm = productMap.get(pk);
+        if (!pm) { pm = { num: productOrder.length + 1, key: pk, title: String(p.title || p.ogTitle || ""), total: 0, groups: {}, profiles: new Set() }; productMap.set(pk, pm); productOrder.push(pm); }
+        pm.total += 1;
+        pm.groups[g] = (pm.groups[g] || 0) + 1;
+        if (p.profileId) pm.profiles.add(Number(p.profileId));
+        pnum = pm.num;
+      }
+      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profileCom: c ? c.profileId : null, productNum: pnum, productKey: pk, title: String(p.title || "") });
     }
+    const products = productOrder.map((pm) => ({ num: pm.num, key: pm.key, shortKey: pm.key.replace(/^harvested:/, ""), title: pm.title, total: pm.total, groups: pm.groups, groupCount: Object.keys(pm.groups).length, profiles: Array.from(pm.profiles) }));
+    const productsInBoth = products.filter((p) => p.groupCount >= 2).length;
     const byGroup = {};
     for (const [g, v] of Object.entries(groups)) byGroup[g] = { posts: v.posts, commented: v.commented, commentRate: __reportPct(v.commented, v.posts), gapMedianSec: __reportMedian(v.gaps) };
     const winGov = gov.filter((e) => { const t = Date.parse(e.at || 0); return Number.isFinite(t) && t >= run.startT - 60000 && t <= run.lastT + 600000; });
@@ -20238,6 +20255,9 @@ function buildRunReports(force = false) {
       minRamPct: minRam,
       restarts,
       detail,
+      products,
+      uniqueProducts: products.length,
+      productsInBoth,
     };
   }).reverse(); // most recent run first
   // KILL-MID-POST RECONCILE STATUS (silent-loss guard visibility): an intent with no resolution older than
