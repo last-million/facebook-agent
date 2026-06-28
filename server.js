@@ -7863,8 +7863,6 @@ function isTransientPostingProfileFailureLine(line = "") {
 const PROFILE_FAILURE_STICKY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const PROFILE_TRANSIENT_FAILURE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const PROFILE_COMMENT_FAILURE_MAX_AGE_MS = 45 * 60 * 1000;
-const PROFILE_AUTO_BLACKLIST_REPEATED_MAX_AGE_MS = 60 * 60 * 1000; // default (operator.autoBlacklistRetryMinutes) — see isRepeatedTransientBlacklistLine
-
 // Is this the auto-blacklist line for REPEATED TRANSIENT/infra posting failures (could not open composer / dead
 // proxy / profile-open) — i.e. a bench that SHOULD self-heal after a short retry cooldown, NOT a genuine FB account
 // block? The auto-blacklist reason is the synthetic "auto_blacklist_repeated_blocking_failures_N" (the underlying
@@ -7876,6 +7874,22 @@ function isRepeatedTransientBlacklistLine(line = "") {
   if (!/auto_blacklist_repeated_blocking_failures/i.test(text)) return false;
   if (/auto_blacklist_account_blocked|account_hard_blocked|issue=account_unusable|status=facebook_account_|account[_ ](?:suspended|disabled|locked|review)|checkpoint|cannot_use_facebook/i.test(text)) return false;
   return true;
+}
+
+// STATE-BLOAT GUARD (2026-06-28): with the ~60min self-heal (autoBlacklistRetryMinutes) a persistently-dead profile
+// re-benches roughly hourly; without this, each re-bench APPENDS a fresh repeated-transient auto-blacklist line and
+// grows the two synchronously-serialised state strings (facebookProfileStatus / failedProfiles) ~24x/day — the exact
+// bloat the project memory blames for the watchdog-killed load spiral. So on re-bench REPLACE-not-grow: strip THIS
+// pid's PRIOR repeated-transient auto-blacklist line(s) before appending the fresh one. Untouched: genuine account
+// blocks (isRepeatedTransientBlacklistLine excludes them), resolved/unblock lines, soft-strike crumbs, other pids.
+function stripPriorRepeatedBlacklistLines(value, profileId) {
+  const pid = Number(profileId);
+  if (!pid) return String(value || "");
+  const pidRe = new RegExp(`profile_id=${pid}(?!\\d)`); // anchored: profile_id=8 must NOT match profile_id=80/87
+  return String(value || "")
+    .split(/\r?\n/)
+    .filter((line) => !(pidRe.test(line) && isRepeatedTransientBlacklistLine(line)))
+    .join("\n");
 }
 
 // In-memory throttle for the "configured group has 0 eligible profiles" fan-out alert (preparePostingPlan): the
@@ -7912,7 +7926,7 @@ function postingFailureLineExceededAgeBudget(line, state) {
   // configured group for 24h. A genuine FB account block is excluded by isRepeatedTransientBlacklistLine and keeps
   // the full sticky budget below. (state optional: a missing state safely falls to the 60min default.)
   if (isRepeatedTransientBlacklistLine(line)) {
-    const mins = clampNumber((state && state.operator) ? state.operator.autoBlacklistRetryMinutes : undefined, 5, 1440, 60);
+    const mins = clampNumber((state && state.operator) ? state.operator.autoBlacklistRetryMinutes : undefined, 30, 1440, 60); // floor 30min: never tight enough to recreate the documented blacklist<->unblock churn
     return ageMs > mins * 60 * 1000;
   }
   if (isTransientPostingProfileFailureLine(line)) return ageMs > PROFILE_TRANSIENT_FAILURE_MAX_AGE_MS;
@@ -10358,18 +10372,20 @@ function preparePostingPlan(options = {}) {
   // throttle, never per-tick spam). Detects the no-eligible-PROFILE case only — NOT the legitimate per-product
   // 1x/group/24h reuse skip (which is handled per-product later, not pool-wide).
   try {
-    if (__allPostingGroupUrls.length > 1 && state.operator?.postToAllGroups === true) {
+    // !options.testPost: a TEST prepare must have NO live/state side effects (and must not pre-set the throttle and
+    // swallow the next REAL alert) — see MEMORY fb-no-live-post-without-ok.
+    if (!options.testPost && __allPostingGroupUrls.length > 1 && state.operator?.postToAllGroups === true) {
       const __missingGroupKeys = __allPostingGroupUrls
         .map((g) => normalizedFacebookGroupKey(g))
         .filter((k) => k && !__fanoutProfilesByGroupKey.has(k));
       const __nowKeys = __missingGroupKeys.slice().sort().join(",");
       if (__nowKeys !== __noEligibleGroupAlertKeys) {
-        __noEligibleGroupAlertKeys = __nowKeys;
         state.operator = state.operator || {};
         state.operator.groupsWithoutEligibleProfiles = __missingGroupKeys.map((k) => ({ group: k, at }));
         writeState(state, { controlWrite: true });
         if (__missingGroupKeys.length) logEvent("posting_group_no_eligible_profiles", { planId, groups: __missingGroupKeys.join(","), note: "whole assigned pool benched/logged-out -> fan-out skipping this configured group; release/fix its profiles" });
         else logEvent("posting_group_no_eligible_profiles_cleared", { planId });
+        __noEligibleGroupAlertKeys = __nowKeys; // advance ONLY after the write+event land, so a thrown write never drops this transition's alert
       }
     }
   } catch (_) { /* observability only — never break plan building */ }
@@ -17631,6 +17647,12 @@ function autoBlacklistProfileIfNeeded(opts = {}) {
       ? { component: "facebook_review", issue: "account_hard_blocked", status: "cannot_post_in_any_group", action: "quarantined", reason: "auto_blacklist_account_blocked_or_restricted", source: opts.source || "auto_blacklist", auto_blocked: "1" }
       : { component: "facebook_review", issue: "posting_group_issue", status: "cannot_post_in_any_group", action: "skip_profile", reason: `auto_blacklist_repeated_blocking_failures_${total}`, source: opts.source || "auto_blacklist", auto_blocked: "1" };
     const line = buildProfileRecordLine(record, fields);
+    if (!hard && isRepeatedTransientBlacklistLine(line)) {
+      // REPLACE-not-grow: the self-healing repeated-transient bench must not accumulate a fresh line on every ~hourly
+      // re-bench of a stranded pool (see stripPriorRepeatedBlacklistLines — state-bloat / load-spiral guard).
+      state.ixbrowser.failedProfiles = stripPriorRepeatedBlacklistLines(state.ixbrowser.failedProfiles, pid);
+      state.posting.facebookProfileStatus = stripPriorRepeatedBlacklistLines(state.posting.facebookProfileStatus, pid);
+    }
     state.ixbrowser.failedProfiles = appendUniqueRecordLine(state.ixbrowser.failedProfiles, line);
     state.posting.facebookProfileStatus = appendUniqueRecordLine(state.posting.facebookProfileStatus, line);
     writeState(state);
