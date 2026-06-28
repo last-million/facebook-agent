@@ -494,6 +494,7 @@ function defaultState() {
       adminApprovalSettleSeconds: 3,
       blockedModeratorCooldownMinutes: 2, // DYNAMIC (operator 2026-06-28): minutes a moderator FB-walls on the account-switch is benched before retry. Was a hardcoded 24->2min const; now live-editable via PUT /api/state.
       commentRecoveryBackoffMinutes: 4, // DYNAMIC (operator 2026-06-28): minutes before a still-uncommented post is re-tried by the drain/sweep -> each post commented within ~5-6 min of going public. Was a hardcoded 22/8->4min const; now live-editable.
+      commentMaxAgeMinutes: 6, // DYNAMIC (operator 2026-06-28): HARD cutoff -> ABANDON a post if uncommented this many minutes after it went PUBLIC (no late comment). For an approval-required group the clock starts at APPROVAL (status published_after_admin_approval), not submission; a still-pending post is exempt until approved.
       parallelOpenStaggerSeconds: 8,
       cpuGovernorEnabled: true,
       cpuGovernorMaxPercent: 85,
@@ -15148,6 +15149,18 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         if (summary.recommented >= maxToFix || summary.checked >= maxToFix) break;
         const publisherId = Number(ev.profileId || 0);
         if (__hasDifferentProfileComment(postUrl, publisherId)) continue; // already has a different-profile comment (SWARM FIX #2: build-once index over the full 8000 selection window, not a smaller 5000 re-read)
+        // COMMENT MAX-AGE CUTOFF (operator 2026-06-28): only comment within ~N min of a post going PUBLIC; abandon later
+        // (no late comment). The clock starts at PUBLIC time = ev.at of the LATEST published-status row: for an approved
+        // post that row is published_after_admin_approval (approval time), for a direct post it's the publish time. A
+        // STILL-PENDING post in an approval-required group (status not yet *_after_admin_approval) is EXEMPT so the
+        // approval flow can run + the comment lands within N min of the LATER approval. Dynamic: operator.commentMaxAgeMinutes.
+        {
+          const __maxAgeMs = clampNumber(state.operator?.commentMaxAgeMinutes, 1, 240, 6) * 60 * 1000;
+          const __evAt = Date.parse(ev.at || "") || 0;
+          const __approved = String(ev.status || "") === "published_after_admin_approval";
+          const __pendingApproval = isAdminApprovalEnabledForGroup(ev.groupUrl, state) && !__approved; // not yet public via approval -> clock not started
+          if (!__pendingApproval && __evAt && (Date.now() - __evAt) > __maxAgeMs) { summary.stillMissing += 1; continue; } // public > N min + uncommented -> abandon
+        }
         let row = postingPlanRowForRecord({ planId: ev.planId, sequence: ev.sequence });
         if (!row || !String(row.commentTextPreview || row.link || "").trim()) {
           // DURABLE COMMENT-RECOVERY: the per-tick posting-plan.jsonl was overwritten so the live row is gone -> rebuild
