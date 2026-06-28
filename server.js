@@ -495,6 +495,7 @@ function defaultState() {
       blockedModeratorCooldownMinutes: 2, // DYNAMIC (operator 2026-06-28): minutes a moderator FB-walls on the account-switch is benched before retry. Was a hardcoded 24->2min const; now live-editable via PUT /api/state.
       commentRecoveryBackoffMinutes: 4, // DYNAMIC (operator 2026-06-28): minutes before a still-uncommented post is re-tried by the drain/sweep -> each post commented within ~5-6 min of going public. Was a hardcoded 22/8->4min const; now live-editable.
       commentMaxAgeMinutes: 6, // DYNAMIC (operator 2026-06-28): HARD cutoff -> ABANDON a post if uncommented this many minutes after it went PUBLIC (no late comment). For an approval-required group the clock starts at APPROVAL (status published_after_admin_approval), not submission; a still-pending post is exempt until approved.
+      autoBlacklistRetryMinutes: 60, // DYNAMIC (operator 2026-06-28): minutes a profile auto-blacklisted for REPEATED TRANSIENT failures (could not open composer / dead-but-flaky proxy / profile-open) stays benched before a fresh auto-retry. Was the 24h sticky budget -> a transient proxy blip stranded a whole group's assigned pool ALL DAY (the 4854 collapse: 22/22 benched 03:00->17:54). A GENUINE FB account block/suspension keeps the full sticky budget. Live-editable via PUT /api/state.
       parallelOpenStaggerSeconds: 8,
       cpuGovernorEnabled: true,
       cpuGovernorMaxPercent: 85,
@@ -7807,7 +7808,7 @@ function isProfileBlockedForPosting(label, state, groupUrl = "") {
   if (!latest) return false;
   if (/status=(resolved|approved|cleared|ignored)|action=(profile_unblocked|profile_group_unblocked)/i.test(latest)) return false;
   if (isTransientPostingProfileFailureLine(latest)) return false;
-  if (postingFailureLineExceededAgeBudget(latest)) return false;
+  if (postingFailureLineExceededAgeBudget(latest, state)) return false;
   return /status=(cannot_comment|cannot_post_in_any_group)|action=quarantined|skip_profile/i.test(latest);
 }
 
@@ -7824,7 +7825,7 @@ function isAutoBlacklistedStickyBench(profileId, state) {
     const latest = lines[lines.length - 1] || "";
     if (!latest) return false;
     if (/action=(profile_unblocked|profile_group_unblocked)|status=(resolved|approved|cleared|ignored)/i.test(latest)) return false;
-    if (postingFailureLineExceededAgeBudget(latest)) return false; // aged-out benches are fine to clear
+    if (postingFailureLineExceededAgeBudget(latest, state)) return false; // aged-out benches are fine to clear (repeated-transient auto-blacklist now expires per operator.autoBlacklistRetryMinutes, default 60min)
     return /auto_blocked=1|auto_blacklist_repeated_blocking_failures|opening times per day|error 1018|daily.*open.*quota/i.test(latest);
   } catch (_) { return false; }
 }
@@ -7862,6 +7863,24 @@ function isTransientPostingProfileFailureLine(line = "") {
 const PROFILE_FAILURE_STICKY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const PROFILE_TRANSIENT_FAILURE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const PROFILE_COMMENT_FAILURE_MAX_AGE_MS = 45 * 60 * 1000;
+const PROFILE_AUTO_BLACKLIST_REPEATED_MAX_AGE_MS = 60 * 60 * 1000; // default (operator.autoBlacklistRetryMinutes) — see isRepeatedTransientBlacklistLine
+
+// Is this the auto-blacklist line for REPEATED TRANSIENT/infra posting failures (could not open composer / dead
+// proxy / profile-open) — i.e. a bench that SHOULD self-heal after a short retry cooldown, NOT a genuine FB account
+// block? The auto-blacklist reason is the synthetic "auto_blacklist_repeated_blocking_failures_N" (the underlying
+// transient reason is no longer on the line), so it would otherwise fall to the 24h sticky budget and strand a whole
+// group's assigned pool all day on a flaky-proxy blip (the 4854 collapse, 2026-06-28). Exclude any line that ALSO
+// carries a hard-account-block / suspension marker so a real block keeps the full sticky budget.
+function isRepeatedTransientBlacklistLine(line = "") {
+  const text = String(line || "").toLowerCase();
+  if (!/auto_blacklist_repeated_blocking_failures/i.test(text)) return false;
+  if (/auto_blacklist_account_blocked|account_hard_blocked|issue=account_unusable|status=facebook_account_|account[_ ](?:suspended|disabled|locked|review)|checkpoint|cannot_use_facebook/i.test(text)) return false;
+  return true;
+}
+
+// In-memory throttle for the "configured group has 0 eligible profiles" fan-out alert (preparePostingPlan): the
+// loud event/flag is emitted ONLY when the missing-group set CHANGES, never on every plan build. Resets on restart.
+let __noEligibleGroupAlertKeys = "";
 
 // A profile whose ONLY failure was first-comment verification (the POST actually published) gets a SHORT
 // graduated cooldown — long enough for the tick to move on to fresh profiles, but NOT the full 24h sticky
@@ -7881,13 +7900,21 @@ function recordLineAgeMs(line) {
   return Math.max(0, Date.now() - at);
 }
 
-function postingFailureLineExceededAgeBudget(line) {
+function postingFailureLineExceededAgeBudget(line, state) {
   const ageMs = recordLineAgeMs(line);
   if (!Number.isFinite(ageMs)) return false;
   // Comment-verification-only failure (the post DID publish) → SHORT 45-min cooldown, checked FIRST, so
   // the tick skips the profile briefly then lets it back — instead of a 24h sticky block for a post that
   // actually worked (the cause of the p51 over-block + re-pick storm).
   if (isCommentVerificationFailureLine(line)) return ageMs > PROFILE_COMMENT_FAILURE_MAX_AGE_MS;
+  // REPEATED TRANSIENT/infra auto-blacklist (could not open composer / dead-flaky proxy / profile-open) → SHORT,
+  // operator-tunable retry cooldown (default 60min) so a stale whole-pool bench self-heals instead of stranding a
+  // configured group for 24h. A genuine FB account block is excluded by isRepeatedTransientBlacklistLine and keeps
+  // the full sticky budget below. (state optional: a missing state safely falls to the 60min default.)
+  if (isRepeatedTransientBlacklistLine(line)) {
+    const mins = clampNumber((state && state.operator) ? state.operator.autoBlacklistRetryMinutes : undefined, 5, 1440, 60);
+    return ageMs > mins * 60 * 1000;
+  }
   if (isTransientPostingProfileFailureLine(line)) return ageMs > PROFILE_TRANSIENT_FAILURE_MAX_AGE_MS;
   return ageMs > PROFILE_FAILURE_STICKY_MAX_AGE_MS;
 }
@@ -7925,7 +7952,7 @@ function isProfileGroupBlockedForPosting(label, groupUrl, state) {
   // do NOT match this and still block.
   if (/post published|first comment was not verified|comment_blocked|comment_not_submitted|comment_profile_cannot_access/i.test(latest)) return false;
   if (isTransientPostingProfileFailureLine(latest)) return false;
-  if (postingFailureLineExceededAgeBudget(latest)) return false;
+  if (postingFailureLineExceededAgeBudget(latest, state)) return false;
   return /status=cannot_post_in_group/i.test(latest);
 }
 
@@ -10324,6 +10351,28 @@ function preparePostingPlan(options = {}) {
     if (!__arr) { __arr = []; __fanoutProfilesByGroupKey.set(__gk, __arr); }
     if (!__arr.some((x) => x.profileKey === __s.profileKey)) __arr.push({ profile: __s.profile, profileId: __s.profileId, profileKey: __s.profileKey });
   }
+  // OBSERVABILITY (operator 2026-06-28): under fan-out EVERY configured group should receive every product. A
+  // configured group with NO eligible member profile in the slot pool (its whole assigned pool benched/logged-out)
+  // is silently skipped by the fan-out — the 4854 collapse (22/22 profiles benched) went UNNOTICED for hours. Surface
+  // it LOUDLY: a state flag (Prod/report) + a /report event, emitted only when the missing-set CHANGES (in-memory
+  // throttle, never per-tick spam). Detects the no-eligible-PROFILE case only — NOT the legitimate per-product
+  // 1x/group/24h reuse skip (which is handled per-product later, not pool-wide).
+  try {
+    if (__allPostingGroupUrls.length > 1 && state.operator?.postToAllGroups === true) {
+      const __missingGroupKeys = __allPostingGroupUrls
+        .map((g) => normalizedFacebookGroupKey(g))
+        .filter((k) => k && !__fanoutProfilesByGroupKey.has(k));
+      const __nowKeys = __missingGroupKeys.slice().sort().join(",");
+      if (__nowKeys !== __noEligibleGroupAlertKeys) {
+        __noEligibleGroupAlertKeys = __nowKeys;
+        state.operator = state.operator || {};
+        state.operator.groupsWithoutEligibleProfiles = __missingGroupKeys.map((k) => ({ group: k, at }));
+        writeState(state, { controlWrite: true });
+        if (__missingGroupKeys.length) logEvent("posting_group_no_eligible_profiles", { planId, groups: __missingGroupKeys.join(","), note: "whole assigned pool benched/logged-out -> fan-out skipping this configured group; release/fix its profiles" });
+        else logEvent("posting_group_no_eligible_profiles_cleared", { planId });
+      }
+    }
+  } catch (_) { /* observability only — never break plan building */ }
   const __fanoutCursorByGroupKey = new Map();
   const __pickFanoutProfileForGroup = (groupUrl, excludeProfileKey) => {
     const gk = normalizedFacebookGroupKey(groupUrl);
