@@ -2540,7 +2540,7 @@ function noteCommentAttemptOutcome(profileId, validation) {
 // AUTO-RETESTS on its next approval turn; a SUCCESSFUL approval auto-removes it (orchestrator). Admin can also
 // Release early from the Prod tab. Unlike the other parked lists this is TIME-BASED: the cooldown set excludes an
 // entry once 24min have elapsed, so the moderator becomes eligible again without manual action.
-const BLOCKED_MODERATOR_COOLDOWN_MS = 24 * 60 * 1000;
+const BLOCKED_MODERATOR_COOLDOWN_MS = 2 * 60 * 1000; // operator 2026-06-28: 24min -> 2min (operator wants the long wait gone). HONEST CAVEAT: FB itself walls a stuck moderator ~20min, so retrying this fast mostly re-fails until that clears — the real speed fix is MORE moderators. Not 0 (would instant-loop a walled mod).
 function blockedModeratorCooldownSet(state = readState()) {
   const now = Date.now();
   const ids = new Set();
