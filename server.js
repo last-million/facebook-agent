@@ -15049,7 +15049,7 @@ let __lastCommentResweepAt = 0;
 // approval / not yet visible) must NOT be re-cycled through profiles every 90s sweep — that was the overnight profile
 // churn (a stuck post burning profiles repeatedly). Skip it for ~20min, then retry (in case it went live/approved).
 const __commentRecoveryBackoff = new Map(); // postUrl -> last-attempt ms
-const COMMENT_RECOVERY_BACKOFF_MS = 22 * 60 * 1000; // operator 2026-06-16: re-check a pending post after ~22 min (FB approval window) instead of re-cycling it sooner — gives the moderator-approval time, then it gets approved + commented on the later pass
+const COMMENT_RECOVERY_BACKOFF_MS = 4 * 60 * 1000; // operator 2026-06-28: re-check every ~4 min so EVERY post is commented within ~5-6 min of going PUBLIC (was 22 min). TRADE-OFF: a still-pending post is re-tried (and re-fires moderator approval) every ~4 min instead of ~22 min — more approval attempts on the thin 2-moderator pool. Accepted for fast commenting.
 // PERSISTENT FIRST-COMMENT DRAIN (operator 2026-06-19): the armed-gated resweep + the run-end final passes all stop
 // within ~5 min of disarm, but FB's moderation queue makes a pending post public 10-30 min LATER — so a late-approved
 // post never got its money-comment (the 8.5% miss). This always-on, armed-INDEPENDENT drain keeps re-commenting any
@@ -15173,7 +15173,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         const commentText = String(row?.commentTextPreview || row?.link || "").trim();
         if (!row || !commentText) { summary.stillMissing += 1; continue; } // cannot reconstruct the comment (no live plan row AND no durable payload)
         const __boAt = __commentRecoveryBackoff.get(postUrl) || 0;
-        const __backoffMs = options.drain ? (8 * 60 * 1000) : COMMENT_RECOVERY_BACKOFF_MS; // drain re-checks a pending post every ~8 min so the comment lands soon after FB approves it (vs the 22-min run cadence)
+        const __backoffMs = options.drain ? (4 * 60 * 1000) : COMMENT_RECOVERY_BACKOFF_MS; // operator 2026-06-28: drain re-checks every ~4 min (was 8) so a post is commented within ~5-6 min of going public
         if (Date.now() - __boAt < __backoffMs) { summary.stillMissing += 1; continue; } // tried recently + still uncommented -> defer (don't re-cycle profiles on a stuck/pending post)
         // STARVATION FIX (operator 2026-06-20): the RECOVERY drains (persistent drain / stop-finish / run-end / forced)
         // must NOT yield-forever to an always-posting run — that left the drain checking only 1 post/cycle while 20 stayed
