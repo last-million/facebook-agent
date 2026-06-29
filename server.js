@@ -151,6 +151,14 @@ const FACEBOOK_LIVE_POST_TIMEOUT_MS = 600000;
 // guaranteed every first-attempt approval died before the post even appeared).
 const FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS = 1080000;
 const FACEBOOK_COMMENT_RECOVERY_TIMEOUT_MS = 240000;
+// A post FB has NOT yet made public (pending admin approval / not-ready): the first comment fails IDENTICALLY for every
+// profile, so the right response is to fire MODERATOR APPROVAL — not keep retrying the comment. SHARED predicate so the
+// comment-recovery "post pending, bail" break and the approval TRIGGER (approvalMayHelp) can NEVER drift again. (They
+// DID drift: the break matched comment_target_* but approvalMayHelp did not, so the dominant pending error
+// `comment_blocked:comment_target_unavailable_or_pending` triggered the bail but NEVER fired approval — posts sat
+// pending forever with 0 approval attempts.)
+const PENDING_POST_COMMENT_ERROR_RE = /comment_target_unavailable_or_pending|post_pending_or_unavailable|comment_target_not_ready|comment_target_pending|comment_target_unavailable/i;
+function isPendingPostCommentError(err) { return PENDING_POST_COMMENT_ERROR_RE.test(String(err || "")); }
 const HERMES_IMAGE_SELECTOR_TIMEOUT_MS = 120000;
 const TEST_HERMES_IMAGE_SELECTOR_TIMEOUT_MS = 90000;
 const REVIEW_IMAGE_CANDIDATE_COUNT = 5;
@@ -13510,6 +13518,13 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
   const attempts = [];
   const MAX_ADMIN_APPROVAL_ATTEMPTS = 6;
   const MAX_ADMIN_APPROVAL_WALL_CLOCK_MS = 8 * 60 * 1000;
+  // PER-ATTEMPT cap (operator 2026-06-29): one hung/empty-queue attempt used to consume the ENTIRE 8-min budget on a
+  // SINGLE moderator (budget_exceeded {attempts:1}), so the 2nd moderator was never tried and the session approved
+  // nothing. Cap each attempt to 4 min so the 8-min budget buys ~2 tries -> BOTH moderators get rotated within one
+  // session. Safe vs the old "patient 18-min single poll" (comment ~150): that long poll mattered only when approval
+  // fired ONCE; the pending-error fix above now RE-FIRES approval every ~commentRecoveryBackoffMinutes (~4min), so the
+  // post is re-polled across many short sessions and no longer needs one marathon attempt to outlast FB's queue.
+  const MAX_ADMIN_APPROVAL_ATTEMPT_MS = 4 * 60 * 1000;
   const approvalStartedAt = Date.now();
   let budgetExceeded = false;
   outer: for (const postUrl of targetUrls) {
@@ -13524,7 +13539,7 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
       if (remainingBudgetMs <= 20000) { budgetExceeded = true; break outer; }
       const attempt = await runFacebookAdminApprovalAttempt({
         row,
-        timeoutMs: Math.min(FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS, remainingBudgetMs),
+        timeoutMs: Math.min(MAX_ADMIN_APPROVAL_ATTEMPT_MS, remainingBudgetMs),
         profileId: adminProfile.profileId,
         profileLabel: adminProfile.profile,
         groupUrl,
@@ -14591,7 +14606,7 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
     // profile, so cycling more profiles is pure waste. STOP ON THE FIRST detection (operator 2026-06-16: stop
     // burning profiles on a pending post) — the ~22-min comment-recovery backoff then re-checks it later, by which
     // time FB has had time to approve it -> it gets approved + commented on a LATER pass instead of hammered now.
-    if (/comment_target_unavailable_or_pending|post_pending_or_unavailable|comment_target_not_ready|comment_target_pending|comment_target_unavailable/.test(failStr)) {
+    if (isPendingPostCommentError(failStr)) {
       postNotReadyCount += 1;
       if (postNotReadyCount >= 1) {
         logEvent("comment_recovery_post_not_ready_break", { postNotReadyCount, tried: attempts.length, postUrl, reason: "post_pending_break_on_first_detection_recheck_after_backoff" });
@@ -15023,7 +15038,8 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
   const recoveryErrors = Array.isArray(recovery.validation?.errors) ? recovery.validation.errors.map((error) => String(error || "").toLowerCase()) : [];
   const approvalMayHelp = recoveryErrors.some((error) => (
     error === "comment_profile_cannot_access_post_permalink" ||
-    /^comment_blocked:(comments_disabled|post_pending_or_unavailable|content_unavailable|page_unavailable)/i.test(error)
+    /^comment_blocked:(comments_disabled|post_pending_or_unavailable|content_unavailable|page_unavailable)/i.test(error) ||
+    isPendingPostCommentError(error) // PENDING post (FB not yet public) MUST fire moderator approval — same set the comment-recovery break uses; this drift left pending posts with 0 approval attempts
   ));
   if (!recovery.ok && approvalMayHelp) {
     const approvalResult = await approvePendingFacebookPostWithAdminProfiles({
