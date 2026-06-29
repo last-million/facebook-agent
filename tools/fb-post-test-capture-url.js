@@ -3232,7 +3232,13 @@ async function batchApproveAllPublisherPosts(page, gid, publisherId) {
   // LOAD-SPREAD CAP: approve at most ~5 per moderator SESSION, then stop — the least-used-first moderator
   // rotation (server side) hands the REST of the queue to the NEXT moderator. This shares the approval load
   // EVENLY across all moderators so no single account does too many and gets flagged/blocked by Facebook.
-  const MAX_EXTRA_PER_SESSION = 1; // +1 for the triggering post already approved => ~2 total per moderator/session (operator: spread approvals EVENLY, max ~2 per moderator, then the least-used-next moderator takes the rest)
+  // OPERATOR 2026-06-29: "approve ONLY the new posts we post in this run, NOT old ones." The #fb post-unique
+  // fingerprint was removed (2026-06-12), so a post is located by its PRODUCT hashtags only — which means this
+  // batch (scoped by publisher id ALONE, no marker, no run-set) could approve an OLD pending post of ours from a
+  // previous run. There is no reliable in-queue signal to tell "this run" from "old" without that fingerprint, so
+  // DISABLE the extra-batch: each pending post is approved ONLY by its own marker-matched session
+  // (clickApproveForVisibleMarker), guaranteeing we only ever approve the exact post we are currently processing.
+  const MAX_EXTRA_PER_SESSION = 0; // disabled (was 1): never batch-approve other publisher posts — they may be OLD; approve only the marker-matched post of THIS run
   for (let round = 0; round < MAX_EXTRA_PER_SESSION; round += 1) {
     const r = await page.evaluate(({ pub }) => {
       const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
@@ -3479,7 +3485,12 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
     base,
   ];
   const visited = [];
-  const MAX_SCROLLS_PER_TARGET = 12;
+  // OPERATOR 2026-06-29: "focus only on NEW posts of this run, don't go FAR for old ones." The pending queue is
+  // newest-first (proven live: our just-posted post was found on the FIRST screen, scrollsRequired:0), so our
+  // run's post is at/near the TOP and old pending posts sit DEEP. Keep the search SHALLOW so the moderator stays
+  // on recent posts and never scrolls down into the old backlog. If our post isn't in the top screens yet (FB's
+  // 10-30min propagation), the patient retry-poll below re-checks the top later instead of dredging old posts.
+  const MAX_SCROLLS_PER_TARGET = 4; // was 12 — stay near the top (recent posts), don't reach the old backlog
   const cleanPublisherId = String(publisherUserId || '').replace(/\D+/g, '');
   // EXPAND collapsed posts: a just-published post's unique marker (hashtags / #fb fingerprint) often sits at
   // the END of the caption behind a "See more" / "Ver más" fold, so it is NOT in body.innerText and the marker
