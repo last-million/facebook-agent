@@ -2568,11 +2568,12 @@ function markModeratorBlocked(profileId, label, reason) {
   const state = readState();
   const list = Array.isArray(state.posting.blockedModerators) ? state.posting.blockedModerators : [];
   const existing = list.find((p) => String(p.profileId) === id);
-  if (existing) { existing.at = new Date().toISOString(); existing.reason = String(reason || existing.reason || "stuck on forced_account_switch").slice(0, 200); } // re-stamp -> fresh 24-min cooldown
+  if (existing) { existing.at = new Date().toISOString(); existing.reason = String(reason || existing.reason || "stuck on forced_account_switch").slice(0, 200); } // re-stamp -> fresh cooldown (operator.blockedModeratorCooldownMinutes)
   else { list.push({ profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "Moderator stuck on forced_account_switch (Continue did not clear)").slice(0, 200) }); }
   state.posting.blockedModerators = list;
   writeState(state);
-  logEvent("moderator_blocked_temporary", { profileId: id, cooldownMinutes: 24, reason: String(reason || "").slice(0, 120) });
+  const __coolMin = clampNumber(state.operator?.blockedModeratorCooldownMinutes, 1, 60, 2); // actual enforced cooldown (was a misleading hardcoded 24 in this log)
+  logEvent("moderator_blocked_temporary", { profileId: id, cooldownMinutes: __coolMin, reason: String(reason || "").slice(0, 120) });
   return true;
 }
 function releaseModeratorBlocked(profileId) {
