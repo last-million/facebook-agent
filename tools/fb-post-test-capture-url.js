@@ -3104,8 +3104,22 @@ async function dismissForcedAccountSwitch(page) {
 }
 
 const MANAGE_PAGE_RE = /manage page|gestionar p[aá]gina|g[eé]rer la page/i;
+// LANGUAGE-INDEPENDENT identity arbiter (operator: approval must work in ALL languages). Facebook sets
+//   c_user = the logged-in PERSONAL account id (always present when logged in)
+//   i_user = the Page/business identity currently being ACTED-AS — present ONLY while acting as a Page.
+// So `i_user present and != c_user` == "I am currently the Page" with zero reliance on any visible text
+// (the /me h1 shows the PAGE NAME when acting as a Page, NOT the words "Manage Page", which is exactly why
+// the old MANAGE_PAGE_RE check was blind and never switched -> 0 Approve buttons rendered). Best-effort.
+async function readFbIdentityCookies(page) {
+  try {
+    const ctx = page.context();
+    const cookies = await ctx.cookies(['https://www.facebook.com', 'https://web.facebook.com']);
+    const pick = (name) => { const c = (cookies || []).find((x) => x && x.name === name && /^\d{5,}$/.test(String(x.value || ''))); return c ? String(c.value) : ''; };
+    return { cUser: pick('c_user'), iUser: pick('i_user') };
+  } catch (_) { return { cUser: '', iUser: '' }; }
+}
 async function ensureAdminIdentity(page) {
-  const out = { switched: false, wasPage: null, identity: '', target: '', reason: '' };
+  const out = { switched: false, wasPage: null, identity: '', target: '', reason: '', cUser: '', iUser: '', actingAsPage: null };
   try {
     await page.goto('https://www.facebook.com/me', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
     // FB may intercept with the forced_account_switch card ("Continue as <Name>") — click Continue IMMEDIATELY
@@ -3139,32 +3153,65 @@ async function ensureAdminIdentity(page) {
     }
     const h1 = await page.evaluate(() => ((document.querySelector('h1') || {}).innerText || '').trim()).catch(() => '');
     out.identity = h1;
-    out.wasPage = MANAGE_PAGE_RE.test(h1);
-    // Switch ONLY when the Page identity is POSITIVELY detected. Moderator profiles now default to the
-    // PERSONAL admin (operator changed this 2026-06-12), so on an unreadable/empty h1 the safe move is to
-    // NOT touch the switcher — blindly clicking row[1] would flip personal -> Page (the wrong direction)
-    // and the approval queue would render 0 Approve buttons.
-    if (!out.wasPage) { out.reason = h1 ? 'already_personal_profile' : 'identity_unreadable_skip_switch'; return out; }
-    await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-    await humanPause(2200, 3600);
-    await page.click('[aria-label="Your profile"], [aria-label="Tu perfil"], [aria-label="Votre profil"]', { timeout: 12000 }).catch(() => {});
-    await humanPause(1800, 3200);
-    const det = await detectIdentityRows(page);
-    if (!det.names || det.names.length < 2) { out.reason = det.reason || 'no_switch_target_found'; return out; }
-    const target = det.names[1]; // names[0] = active Page, names[1] = personal admin profile
-    out.target = target;
-    const esc = target.replace(/"/g, '\\"');
-    let clicked = false;
-    try { await page.click(`div[role="menuitem"]:has-text("${esc}"), div[role="button"]:has-text("${esc}"), a:has-text("${esc}")`, { timeout: 8000 }); clicked = true; }
-    catch (_) { try { await page.getByText(target, { exact: true }).first().click({ timeout: 6000 }); clicked = true; } catch (_2) {} }
-    if (!clicked) { out.reason = 'switch_click_failed'; return out; }
-    await humanPause(7000, 9500); // the identity switch performs a full reload
-    await page.goto('https://www.facebook.com/me', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-    await humanPause(2000, 3500);
-    const h1b = await page.evaluate(() => ((document.querySelector('h1') || {}).innerText || '').trim()).catch(() => '');
-    out.identity = h1b || out.identity;
-    out.switched = Boolean(h1b) && !MANAGE_PAGE_RE.test(h1b);
-    out.reason = out.switched ? 'switched_to_personal' : 'switch_did_not_take';
+    // POSITIVE, language-independent Page detection via the i_user cookie (authoritative), OR-ed with the old
+    // MANAGE_PAGE_RE heuristic so this can NEVER regress: when i_user is absent the behaviour is byte-identical
+    // to before. The log line prints c_user/i_user/h1 so the live run reveals exactly which signal FB uses.
+    let ids = await readFbIdentityCookies(page);
+    out.cUser = ids.cUser; out.iUser = ids.iUser;
+    const cookieSaysPage = Boolean(ids.iUser) && ids.iUser !== ids.cUser;
+    out.actingAsPage = cookieSaysPage;
+    out.wasPage = cookieSaysPage || MANAGE_PAGE_RE.test(h1);
+    console.log(JSON.stringify({ step: 'admin_identity_check', h1: String(h1 || '').slice(0, 80), cUser: ids.cUser, iUser: ids.iUser, cookieSaysPage, wasPage: out.wasPage }));
+    // Switch ONLY when the Page identity is POSITIVELY detected. Moderator profiles default to the PERSONAL
+    // admin, so on an unreadable/empty h1 AND no i_user cookie the safe move is to NOT touch the switcher —
+    // blindly clicking a row could flip personal -> Page (the wrong direction) and render 0 Approve buttons.
+    if (!out.wasPage) { out.reason = (ids.cUser && !ids.iUser) ? 'already_personal_profile' : (h1 ? 'already_personal_profile' : 'identity_unreadable_skip_switch'); return out; }
+    // We are acting as the Page -> switch to the personal admin. The switcher CLICK is unavoidably UI/language-
+    // dependent, so instead of trusting one fixed row + an h1 regex, VERIFY by cookie after each candidate and
+    // try the next personal row if i_user persists. names[0] is the active identity (the Page); names[1..] are
+    // the switch targets. Bounded to 3 candidates so a multi-account switcher can't loop. Worst case (switch to
+    // a non-admin personal account) is a harmless no-op approval — the server just rotates to the next moderator.
+    const openSwitcher = async () => {
+      await page.goto('https://www.facebook.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      await humanPause(2000, 3400);
+      await page.click('[aria-label="Your profile"], [aria-label="Tu perfil"], [aria-label="Votre profil"], [aria-label="ملفك الشخصي"], [aria-label="Seu perfil"], [aria-label="Dein Profil"]', { timeout: 12000 }).catch(() => {});
+      await humanPause(1600, 3000);
+      return detectIdentityRows(page);
+    };
+    const det = await openSwitcher();
+    const candidates = (det.names || []).slice(1).slice(0, 3); // skip names[0] (active Page); try up to 3 targets
+    if (!candidates.length) {
+      out.reason = det.reason || 'no_switch_target_found';
+      console.log(JSON.stringify({ step: 'admin_identity_not_personal', reason: out.reason, cUser: out.cUser, iUser: out.iUser }));
+      return out;
+    }
+    for (let ci = 0; ci < candidates.length; ci += 1) {
+      const target = candidates[ci];
+      out.target = target;
+      const esc = target.replace(/"/g, '\\"');
+      let clicked = false;
+      try { await page.click(`div[role="menuitem"]:has-text("${esc}"), div[role="button"]:has-text("${esc}"), a:has-text("${esc}")`, { timeout: 8000 }); clicked = true; }
+      catch (_) { try { await page.getByText(target, { exact: true }).first().click({ timeout: 6000 }); clicked = true; } catch (_2) {} }
+      if (!clicked) { if (ci < candidates.length - 1) await openSwitcher(); continue; }
+      await humanPause(7000, 9500); // the identity switch performs a full reload
+      await page.goto('https://www.facebook.com/me', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      await humanPause(2000, 3500);
+      ids = await readFbIdentityCookies(page);
+      out.cUser = ids.cUser || out.cUser; out.iUser = ids.iUser;
+      const h1b = await page.evaluate(() => ((document.querySelector('h1') || {}).innerText || '').trim()).catch(() => '');
+      out.identity = h1b || out.identity;
+      // POSITIVE verification: personal == i_user cleared (authoritative) AND h1 not a Page. Falls back to the
+      // h1 regex when i_user was never the active signal, so this is consistent with the detection above.
+      const stillPage = (Boolean(ids.iUser) && ids.iUser !== ids.cUser) || MANAGE_PAGE_RE.test(h1b);
+      if (!stillPage) {
+        out.switched = true; out.reason = 'switched_to_personal';
+        console.log(JSON.stringify({ step: 'admin_identity_switched', target, cUser: ids.cUser }));
+        return out;
+      }
+      if (ci < candidates.length - 1) await openSwitcher(); // wrong/ineffective row — try the next personal target
+    }
+    out.reason = 'switch_did_not_take';
+    console.log(JSON.stringify({ step: 'admin_identity_not_personal', reason: out.reason, cUser: out.cUser, iUser: out.iUser }));
     return out;
   } catch (e) {
     out.reason = 'error:' + String((e && e.message) || e).slice(0, 120);

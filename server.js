@@ -13614,6 +13614,7 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
   const MAX_ADMIN_APPROVAL_ATTEMPT_MS = 4 * 60 * 1000;
   const approvalStartedAt = Date.now();
   let budgetExceeded = false;
+  let clickedSoftResult = null; // a moderator CLICKED Approve on our scoped post but FB hasn't propagated it live yet (soft success)
   outer: for (const postUrl of targetUrls) {
     let urlMarkerMissing = false;
     for (const adminProfile of adminProfiles) {
@@ -13652,6 +13653,25 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
           approvalProfileId: attempt.profileId,
           approvalProfile: attempt.profile,
         };
+      }
+      // SOFT SUCCESS (operator: approve our pending post + COMMENT it): the moderator CLICKED Approve on OUR
+      // marker/publisher-scoped post, but FB has not yet propagated it to a strong-verifiable LIVE permalink in
+      // THIS session (the 10-30 min approval->live queue), so attempt.ok is false. The Approve ACTION still
+      // succeeded -> stop spinning up other moderators (they'd find nothing pending), capture the approved
+      // permalink, and let the caller settle + comment it. `ok` STAYS false (only a strong-verified permalink is
+      // "verified"); the comment trigger + published_after_admin_approval stamp key off `approvalClicked`
+      // explicitly, so this can never resurrect the old not-clicked-but-visible false positive.
+      if (attempt.validation?.approvalClicked && !clickedSoftResult) {
+        try { releaseModeratorBlocked(attempt.profileId); } catch (_) {}
+        clickedSoftResult = {
+          ...attempt,
+          ok: false,
+          approvalClicked: true,
+          postUrl: attempt.postUrl || postUrl || urls[0] || "",
+          approvalProfileId: attempt.profileId,
+          approvalProfile: attempt.profile,
+        };
+        break outer;
       }
       // FAST-BAIL: a moderator confirmed (via a real pending-queue scan) that this
       // publisher has NO post awaiting moderation — the post is already live (or never
@@ -13725,6 +13745,10 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
       elapsedMs: Date.now() - approvalStartedAt,
       maxElapsedMs: MAX_ADMIN_APPROVAL_WALL_CLOCK_MS,
     });
+  }
+  if (clickedSoftResult) {
+    clickedSoftResult.attemptedApprovalProfiles = attempts;
+    return clickedSoftResult; // Approve was clicked on our post; comment it after FB makes it live (soft success)
   }
   return {
     ok: false,
@@ -15138,7 +15162,10 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
       closeResults,
       reason: "Different-profile comment could not access or use the post; trying admin approval on the verified permalink before retrying comment.",
     });
-    if (approvalResult?.ok) {
+    if (approvalResult?.ok || approvalResult?.approvalClicked) {
+      // ok = strong-verified live permalink | approvalClicked = moderator clicked Approve on our post but FB
+      // hasn't propagated it live yet (soft success). BOTH fire the settle+retry below so the approved post gets
+      // commented the moment it goes live (was: only `ok` -> approved posts stuck pending 10-30min never commented).
       const retryState = readState();
       const retryConfigured = commentRecoveryFallbackProfilesForGroup(row, groupUrl, retryState, {
         excludeProfileId: ready.profileId,
@@ -15153,11 +15180,19 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
         .slice(0, MAX_COMMENT_FALLBACK_PROFILES);
       // PRIORITISE the just-approved post for commenting: a post FRESH from approval takes ~30-90s to become
       // commentable (pending -> live), so a single immediate retry often fails and the post falls to the slow
-      // periodic resweep (the 7-20 min post->comment gap the operator saw). Instead SETTLE + RETRY a few times
-      // right here so the comment lands within ~2-3 min of approval.
+      // periodic resweep (the 7-20 min post->comment gap the operator saw). Instead SETTLE + RETRY here.
+      // STRONG vs SOFT (adversarial review): on STRONG approval the live permalink is already verified, so probe
+      // immediately + retry up to 4x. On SOFT approval (Approve clicked but FB hasn't propagated it live yet) a
+      // commenter CANNOT see the still-pending post, so an immediate probe is wasted and FB's queue can be 10-30min
+      // — cap soft to 2 rounds and SETTLE BEFORE the first probe, then defer any still-pending post to the durable
+      // resweep (it has the published_after_admin_approval row + comment payload). Avoids burning commenter opens on
+      // the open-budget box for posts that physically can't be commented yet.
+      const __strongApproval = Boolean(approvalResult?.ok);
+      const __maxCommentRounds = __strongApproval ? 4 : 2;
       let retry;
-      for (let __attempt = 1; __attempt <= 4 && !(retry && retry.ok); __attempt += 1) {
-        if (__attempt > 1) await sleep(40000); // let the just-approved post finish going live, then retry
+      for (let __attempt = 1; __attempt <= __maxCommentRounds && !(retry && retry.ok); __attempt += 1) {
+        // strong: immediate first probe, then 40s between. soft: settle BEFORE every probe (post is still pending).
+        if (__attempt > 1 || !__strongApproval) await sleep(__strongApproval ? 40000 : 35000);
         retry = await recoverFacebookCommentWithProfiles({
           row,
           ready,
@@ -15166,7 +15201,7 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
           imagePath,
           ledgerKey,
           profiles: commentProfiles,
-          reason: `Admin approval verified; commenting the approved post now (attempt ${__attempt}/4).`,
+          reason: `Admin approval ${__strongApproval ? "verified" : "clicked"}; commenting the approved post now (attempt ${__attempt}/${__maxCommentRounds}).`,
         });
         closeResults.push(...((retry && retry.closeResults) || []));
       }
@@ -15188,6 +15223,7 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
             ...retry,
             approvalResult: {
               ok: Boolean(approvalResult.ok),
+              approvalClicked: Boolean(approvalResult.approvalClicked),
               approvalProfileId: approvalResult.approvalProfileId || approvalResult.profileId || "",
               approvalProfile: approvalResult.approvalProfile || approvalResult.profile || "",
               liveLogFile: approvalResult.liveLogFile || "",
@@ -15213,6 +15249,7 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
         ...retry,
         approvalResult: {
           ok: Boolean(approvalResult.ok),
+          approvalClicked: Boolean(approvalResult.approvalClicked),
           approvalProfileId: approvalResult.approvalProfileId || approvalResult.profileId || "",
           approvalProfile: approvalResult.approvalProfile || approvalResult.profile || "",
           liveLogFile: approvalResult.liveLogFile || "",
@@ -15499,8 +15536,15 @@ async function completeVerifiedFacebookPostWithComment({
     const lim = autopilotRunLimit(sNow);
     if (lim > 0 && newCount >= lim) autopilotAutoDisarm("run_limit_reached", `posted ${newCount}/${lim} this run`);
   }
+  // approvalResult.ok = strong-verified live permalink | approvalResult.approvalClicked = moderator clicked
+  // Approve on our post (soft success, FB still propagating). EITHER means the post went through moderation, so
+  // record the published event as published_after_admin_approval — it's what the /report counts as "approved"
+  // and what the durable resweep keys off to re-comment a slow-propagating post later (event is matched by
+  // /^published/ downstream, so this never double-counts). (The comment age-cutoff already exempts approval-group
+  // posts via isAdminApprovalEnabledForGroup, so a slow approval is not abandoned regardless of this stamp.)
+  const __wentThroughApproval = Boolean(approvalResult?.ok || approvalResult?.approvalClicked);
   appendFacebookLivePostLedger({
-    event: approvalResult?.ok ? "published_after_admin_approval" : "published",
+    event: __wentThroughApproval ? "published_after_admin_approval" : "published",
     key: ledgerKey,
     planId: row.planId,
     sequence: row.sequence,
@@ -15522,8 +15566,10 @@ async function completeVerifiedFacebookPostWithComment({
     actualGroupUrl,
     postUrl,
     status: validation?.warnings?.length ? "published_with_warning" : "published",
-    message: approvalResult?.ok
-      ? `Post permalink verified after admin approval by ${approvalResult.approvalProfile || approvalResult.profile || approvalResult.profileId}.`
+    message: __wentThroughApproval
+      ? (approvalResult?.ok
+        ? `Post permalink verified after admin approval by ${approvalResult.approvalProfile || approvalResult.profile || approvalResult.profileId}.`
+        : `Moderator ${approvalResult.approvalProfile || approvalResult.profile || approvalResult.profileId} clicked Approve on our post; commenting after FB makes it live.`)
       : "Post permalink verified before comment step.",
     validation,
     liveLogFile: postLiveLogFile || "",
@@ -15531,7 +15577,7 @@ async function completeVerifiedFacebookPostWithComment({
     approvalProfileId: approvalResult?.approvalProfileId || approvalResult?.profileId || "",
     approvalProfile: approvalResult?.approvalProfile || approvalResult?.profile || "",
   });
-  logEvent(approvalResult?.ok ? "facebook_live_post_completed_after_admin_approval" : "facebook_live_post_completed", {
+  logEvent(__wentThroughApproval ? "facebook_live_post_completed_after_admin_approval" : "facebook_live_post_completed", {
     planId: row.planId,
     sequence: row.sequence,
     profileId: ready.profileId,
