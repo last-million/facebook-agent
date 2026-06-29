@@ -1,1 +1,2 @@
 2026-06-25T17:45:03  watchdog: server DOWN (crashed_port_free) -> restarted node server.js
+2026-06-29T13:12:22  watchdog: FB server (port 9317) DOWN (wedged_3_misses) -> restarted
