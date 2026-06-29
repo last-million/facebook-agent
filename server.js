@@ -2557,23 +2557,41 @@ function blockedModeratorCooldownSet(state = readState()) {
   const now = Date.now();
   const ids = new Set();
   for (const p of (state.posting?.blockedModerators || [])) {
+    if (p && p.parkedUntilRelease === true) { ids.add(String(p.profileId || "")); continue; } // PERSISTENT bench (repeatedly stuck on forced_account_switch = broken profile, needs re-login) -> stays OUT of the rotation until the admin Releases it from the Prod tab, NOT time-based
     const at = Date.parse(String(p.at || "")) || 0;
     if (at && (now - at) < (clampNumber(state.operator?.blockedModeratorCooldownMinutes, 1, 60, 2) * 60000)) ids.add(String(p.profileId || "")); // still cooling down -> skip in the rotation (DYNAMIC: operator.blockedModeratorCooldownMinutes)
   }
   return ids;
 }
+const MODERATOR_FORCED_SWITCH_PARK_THRESHOLD = 3; // repeated forced_account_switch stuck = the moderator profile is genuinely broken (needs re-login), NOT a transient FB wall
 function markModeratorBlocked(profileId, label, reason) {
   const id = String(profileId || "").replace(/\D+/g, "");
   if (!id) return false;
   const state = readState();
   const list = Array.isArray(state.posting.blockedModerators) ? state.posting.blockedModerators : [];
-  const existing = list.find((p) => String(p.profileId) === id);
-  if (existing) { existing.at = new Date().toISOString(); existing.reason = String(reason || existing.reason || "stuck on forced_account_switch").slice(0, 200); } // re-stamp -> fresh cooldown (operator.blockedModeratorCooldownMinutes)
-  else { list.push({ profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "Moderator stuck on forced_account_switch (Continue did not clear)").slice(0, 200) }); }
+  const __stuck = /forced_account_switch|stuck/i.test(String(reason || ""));
+  let entry = list.find((p) => String(p.profileId) === id);
+  if (entry) {
+    entry.at = new Date().toISOString();
+    entry.reason = String(reason || entry.reason || "stuck on forced_account_switch").slice(0, 200);
+    if (__stuck) entry.stuckCount = (Number(entry.stuckCount) || 0) + 1;
+  } else {
+    entry = { profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "Moderator stuck on forced_account_switch (Continue did not clear)").slice(0, 200), stuckCount: __stuck ? 1 : 0 };
+    list.push(entry);
+  }
+  // PARK-UNTIL-RELEASE (operator 2026-06-29): after N consecutive forced_account_switch stucks the moderator is
+  // genuinely broken (needs a fresh re-login) — retrying it every 2min just wastes approval sessions. Park it
+  // PERSISTENTLY: it stays out of the moderator rotation until the admin re-logs it and Releases it from the Prod
+  // tab. A successful approval still auto-clears it (the orchestrator removes the whole entry).
+  if (__stuck && (Number(entry.stuckCount) || 0) >= MODERATOR_FORCED_SWITCH_PARK_THRESHOLD && !entry.parkedUntilRelease) {
+    entry.parkedUntilRelease = true;
+    entry.reason = `Moderator stuck on forced_account_switch ${entry.stuckCount}x — re-login this profile then Release it here`;
+    try { logEvent("moderator_parked_until_release", { profileId: id, stuckCount: entry.stuckCount }); } catch (_) {}
+  }
   state.posting.blockedModerators = list;
   writeState(state);
-  const __coolMin = clampNumber(state.operator?.blockedModeratorCooldownMinutes, 1, 60, 2); // actual enforced cooldown (was a misleading hardcoded 24 in this log)
-  logEvent("moderator_blocked_temporary", { profileId: id, cooldownMinutes: __coolMin, reason: String(reason || "").slice(0, 120) });
+  const __coolMin = clampNumber(state.operator?.blockedModeratorCooldownMinutes, 1, 60, 2);
+  logEvent("moderator_blocked_temporary", { profileId: id, cooldownMinutes: __coolMin, reason: String(reason || "").slice(0, 120), stuckCount: entry.stuckCount, parked: !!entry.parkedUntilRelease });
   return true;
 }
 function releaseModeratorBlocked(profileId) {
