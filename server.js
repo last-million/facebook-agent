@@ -3360,12 +3360,40 @@ function collectProductUrlsForPosting(state, options = {}) {
     // RE-ELIGIBLE: product-level window when posting to a single group; GROUP-AWARE (still owes a configured group)
     // when postToAllGroups, so a product posted to ONE group stays eligible for the remaining group(s) instead of
     // being dropped from the pool for the whole window (the "same product not in all groups" bug).
-    const reeligible = recs.filter((r) => onDisk(r) && (r.lastPostedAt || r.posted) && (
+    const reeligibleRecs = recs.filter((r) => onDisk(r) && (r.lastPostedAt || r.posted) && (
       __fanout
         ? harvestedProductOwesAnyConfiguredGroup(r, state, __reuseMs)
         : (lastMs(r) > 0 && (Date.now() - lastMs(r)) >= __reuseMs)
-    )).sort((a, b) => lastMs(a) - lastMs(b)).map((r) => r.productKey);
-    harvestedKeys = [...fresh, ...reeligible];
+    )).sort((a, b) => lastMs(a) - lastMs(b));
+    if (__fanout) {
+      // COVERAGE-PRIORITY (operator 2026-06-29): a product already posted to SOME configured group within the reuse
+      // window but still owing another group is PARTIALLY duplicated — FINISH it (post the missing group) BEFORE
+      // starting brand-new products. Without this, every fresh product is posted to its FIRST group first and the
+      // 2nd-group copies wait behind the entire fresh queue (~30-78min observed), so "same product in ALL groups"
+      // barely happens (~12%). Order: partial-coverage first -> fresh -> stale-recycle.
+      const __cfgGroupKeys = allConfiguredPostingGroupUrls(state).map(normalizedFacebookGroupKey).filter(Boolean);
+      const __coveredCount = (r) => { const bg = (r && r.lastPostedAtByGroup && typeof r.lastPostedAtByGroup === "object") ? r.lastPostedAtByGroup : {}; let n = 0; for (const g of __cfgGroupKeys) { const t = bg[g] ? Date.parse(bg[g]) : 0; if (t && Number.isFinite(t) && (Date.now() - t) < __reuseMs) n += 1; } return n; };
+      // SERVABLE-AWARE (review-flagged regression guard): only FRONT-LOAD a partial that owes a group which currently
+      // has >=1 eligible profile. A partial owing ONLY a benched/disconnected group emits no plan row but still burns a
+      // plan slot, so front-loading it would STARVE fresh products and stall the HEALTHY group for up to reuseHours
+      // during a group-pool outage. Such a partial falls to recycle (behind fresh) instead. `.some` short-circuits, so
+      // a healthy group costs ~1 isProfileBlockedForPosting call.
+      const __disconnectedIds = new Set((state.posting?.disconnectedProfiles || []).map((d) => String(d.profileId || "")));
+      const __servableGroupKeys = new Set();
+      for (const e of (state.posting?.groupAssignmentData || [])) {
+        const gk = normalizedFacebookGroupKey(e.url);
+        if (!gk) continue;
+        const servable = (e.profiles || []).some((p) => { const id = String(profileIdFromLabel(String(p)) || ""); return id && !__disconnectedIds.has(id) && !isProfileBlockedForPosting(String(p), state, e.url); });
+        if (servable) __servableGroupKeys.add(gk);
+      }
+      const __owesServableGroup = (r) => { const bg = (r && r.lastPostedAtByGroup && typeof r.lastPostedAtByGroup === "object") ? r.lastPostedAtByGroup : {}; for (const g of __cfgGroupKeys) { const t = bg[g] ? Date.parse(bg[g]) : 0; const owed = !t || !Number.isFinite(t) || (Date.now() - t) >= __reuseMs; if (owed && __servableGroupKeys.has(g)) return true; } return false; };
+      const __isPartial = (r) => __coveredCount(r) > 0 && __owesServableGroup(r); // mid-duplication AND the missing group can actually post now
+      const partial = reeligibleRecs.filter(__isPartial).map((r) => r.productKey); // complete the duplication NOW
+      const recycle = reeligibleRecs.filter((r) => !__isPartial(r)).map((r) => r.productKey); // stale-recycle, or owes only an unservable group -> behind fresh (don't starve the healthy group)
+      harvestedKeys = [...partial, ...fresh, ...recycle];
+    } else {
+      harvestedKeys = [...fresh, ...reeligibleRecs.map((r) => r.productKey)];
+    }
   }
   // EXCLUSIVE mode: post ONLY copied products (skip web-discovery products entirely). When off, copied
   // products are mixed in FIRST but web-discovery products still flow.
