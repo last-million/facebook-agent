@@ -1741,7 +1741,7 @@ function normalizeWorkflowState(state) {
   if (!Array.isArray(state.posting.blockedModerators)) state.posting.blockedModerators = [];
   state.posting.blockedModerators = state.posting.blockedModerators
     .filter((p) => p && (p.profileId || p.profile_id))
-    .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200) }))
+    .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200), stuckCount: Number(p.stuckCount) || 0, parkedUntilRelease: p.parkedUntilRelease === true })) // preserve stuckCount + parkedUntilRelease (park a broken moderator until admin Release)
     .slice(0, 1000);
   state.operator = state.operator || {};
   state.operator.contentSourcesEnabled = state.posting.contentSources.enabled === true;
