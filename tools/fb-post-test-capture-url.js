@@ -3119,6 +3119,21 @@ async function ensureAdminIdentity(page) {
     // it for a 24-min cooldown and rotates to the next moderator (it's auto-retested after the cooldown).
     if (/forced_account_switch|account_switcher/i.test(String(page.url() || ''))) {
       out.forcedSwitchStuck = true; out.reason = 'forced_account_switch_stuck';
+      // DIAGNOSTIC (operator 2026-06-29): the moderator approves fine MANUALLY, so the connector's Continue-click is
+      // the bug, not the account. Capture a screenshot + every visible clickable's tag/role/aria/text/href to disk so
+      // we can SEE the exact button to target and fix the selector. Best-effort; never throws.
+      try {
+        const ts = Date.now();
+        await page.screenshot({ path: `data/forced-switch-debug-${ts}.png`, fullPage: false }).catch(() => {});
+        const dbg = await page.evaluate(() => {
+          const vis = (el) => { try { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none'; } catch (e) { return false; } };
+          const h1 = ((document.querySelector('h1') || {}).innerText || '').trim();
+          const buttons = [...document.querySelectorAll('button,[role="button"],input[type="submit"],a[role="link"],a[href]')].filter(vis).slice(0, 50).map((el) => ({ tag: el.tagName, role: el.getAttribute('role') || '', aria: (el.getAttribute('aria-label') || '').slice(0, 70), text: ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim().slice(0, 70), href: (el.getAttribute('href') || '').slice(0, 90) }));
+          return { h1, bodyText: (document.body.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 600), buttons };
+        }).catch(() => ({}));
+        try { require('fs').writeFileSync(`data/forced-switch-debug-${ts}.json`, JSON.stringify({ url: page.url(), ...dbg }, null, 2)); } catch (e) {}
+        console.log(JSON.stringify({ step: 'forced_account_switch_debug_captured', file: `forced-switch-debug-${ts}` }));
+      } catch (e) {}
       console.log(JSON.stringify({ step: 'admin_approval_forced_account_switch_stuck', cleared: false, url: page.url() }));
       return out;
     }
