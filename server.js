@@ -12297,7 +12297,10 @@ async function runLiveFacebookPostScript(payload, options = {}) {
   // so moderator approval can scope to OUR pending posts (was always empty -> 0 approved). Only on a real POSTING run
   // (NOT approveOnly — that id would be the MODERATOR's). Numeric -> language-independent. Persist on change only.
   try {
-    if (payload && !payload.approveOnly && payload.profileId) {
+    // ONLY a real PUBLISH run emits publisher_identity_resolved (the composer actor); comment/pin/harvest runs only
+    // emit the personal c_user -> requiring this step prevents a later comment run from overwriting a profile's Page id.
+    const __isPublishRun = !payload?.approveOnly && objects.some((o) => o && o.step === "publisher_identity_resolved");
+    if (__isPublishRun && payload && payload.profileId) {
       const __fbUid = facebookPublisherUserIdFromLog(objects);
       if (__fbUid) {
         const __pid = String(payload.profileId);
