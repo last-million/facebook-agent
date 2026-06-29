@@ -551,6 +551,7 @@ function defaultState() {
       groups: "",
       commentLimitedProfiles: [], // profiles comment-limited by FB: blocked from COMMENTING, still allowed to POST (admin releases manually)
       blockedModerators: [], // moderators FB temporarily walls on forced_account_switch: skipped from approval rotation for a 24-min cooldown, then auto-retested; success auto-removes (admin can Release early)
+      facebookUserIdByProfile: {}, // profileId -> the publisher's numeric FB user id (the account our post appears under in /groups/{gid}/user/<id>/); captured at publish, used to scope moderator approval to OUR pending posts. Numeric = language-independent.
       groupAssignmentMode: "percentage_manual_review",
       groupProfileAssignments: "",
       groupAssignmentData: [],
@@ -11611,6 +11612,27 @@ function cdpEndpointFromLog(objects = []) {
   return endpoint;
 }
 
+// Extract the PUBLISHER's numeric FB user id the posting connector ALREADY resolves at publish time (the account our
+// post appears under in /groups/{gid}/user/<id>/). The server used to throw it away, so moderator approval always
+// scoped to an EMPTY id (even the moderator's OWN account) and clicked 0 Approve buttons. Priority:
+// publisher_identity_resolved.publisherUserIdForUrl (the composer ACTOR — the Page/profile the post was created as)
+// > facebook_user_id_detected.userId > facebook_user_id_provided.userId. Numeric-only, >=6 digits -> LANGUAGE-INDEPENDENT.
+function facebookPublisherUserIdFromLog(objects = []) {
+  const pick = (v) => { const s = String(v == null ? "" : v).replace(/\D+/g, ""); return /^\d{6,}$/.test(s) ? s : ""; };
+  let resolved = "", detected = "", provided = "";
+  for (const item of objects) {
+    if (!item || typeof item !== "object") continue;
+    const step = String(item.step || "");
+    if (step === "publisher_identity_resolved" && !resolved) resolved = pick(item.publisherUserIdForUrl);
+    else if (step === "facebook_user_id_detected" && !detected) detected = pick(item.userId);
+    else if (step === "facebook_user_id_provided" && !provided) provided = pick(item.userId);
+  }
+  return resolved || detected || provided || "";
+}
+function facebookUserIdByProfile(profileId) {
+  try { const m = readState().posting?.facebookUserIdByProfile || {}; return String(m[String(profileId)] || "").replace(/\D+/g, ""); } catch (_) { return ""; }
+}
+
 function firstFacebookPostUrlFromLog(objects = []) {
   const candidates = [];
   for (const item of objects) {
@@ -12271,6 +12293,21 @@ async function runLiveFacebookPostScript(payload, options = {}) {
   const payloadDeleted = cleanupPayload();
   const objects = parseJsonLogObjects(stdout);
   recordIxBrowserOpensFromObjects(objects); // ixBrowser open-budget: count real opens (ix_open/ix_open_fallback; reuse not counted)
+  // PUBLISHER FB USER ID (operator 2026-06-29): persist per profile the numeric id the connector resolved at publish,
+  // so moderator approval can scope to OUR pending posts (was always empty -> 0 approved). Only on a real POSTING run
+  // (NOT approveOnly — that id would be the MODERATOR's). Numeric -> language-independent. Persist on change only.
+  try {
+    if (payload && !payload.approveOnly && payload.profileId) {
+      const __fbUid = facebookPublisherUserIdFromLog(objects);
+      if (__fbUid) {
+        const __pid = String(payload.profileId);
+        const __s = readState();
+        __s.posting = __s.posting || {};
+        __s.posting.facebookUserIdByProfile = (__s.posting.facebookUserIdByProfile && typeof __s.posting.facebookUserIdByProfile === "object") ? __s.posting.facebookUserIdByProfile : {};
+        if (__s.posting.facebookUserIdByProfile[__pid] !== __fbUid) { __s.posting.facebookUserIdByProfile[__pid] = __fbUid; writeState(__s, { controlWrite: true }); try { logEvent("facebook_publisher_user_id_stored", { profileId: __pid, userId: __fbUid }); } catch (_) {} }
+      }
+    }
+  } catch (_) {}
   const validation = livePostLogValidation(objects, payload);
   const liveLogFile = writeLiveFacebookPostLogFile({ payloadRelative, scriptPath, stdout, stderr, objects, validation, outcome: "ok" });
   return {
@@ -13244,8 +13281,8 @@ async function runFacebookAdminApprovalAttempt({ row, profileId, profileLabel, g
   }
   const markerPayload = livePostPayloadForRow(row, groupUrl, "", numericProfileId, { includeComment: false });
   const publisherUserId = String(
-    row?.publisherFacebookUserId || row?.publisher_facebook_user_id || row?.facebookUserId || markerPayload?.facebookUserId || ""
-  ).replace(/\D+/g, "");
+    row?.publisherFacebookUserId || row?.publisher_facebook_user_id || row?.facebookUserId || facebookUserIdByProfile(row?.profileId) || markerPayload?.facebookUserId || ""
+  ).replace(/\D+/g, ""); // facebookUserIdByProfile(row.profileId) = the PUBLISHER's stored FB user id -> moderator scopes to OUR pending posts (was empty -> 0 approved)
   const payload = {
     profileId: numericProfileId,
     groupUrl,
