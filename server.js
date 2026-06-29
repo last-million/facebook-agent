@@ -20185,6 +20185,12 @@ function buildRunReports(force = false) {
   }
   let rows = [];
   try { rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 20000 }); } catch { rows = []; }
+  // OPERATOR "start fresh" CUTOFF (2026-06-29): hide every post before operator.reportSinceAt. Needed because a run
+  // relaunched <2h after the previous one MERGES into the old run's cluster (the >2h gap rule) and resurfaces it —
+  // dismiss-by-endedAt can't fix that (the merged run's endedAt keeps shifting as it posts). Setting reportSinceAt to
+  // the fresh-start instant wipes the report VIEW only; the durable ledger (guard rebuild + comment recovery) is left
+  // completely untouched.
+  try { const __since = Date.parse(readState().operator?.reportSinceAt || "") || 0; if (__since) rows = rows.filter((r) => r && r.at && (Date.parse(r.at) || 0) >= __since); } catch (_) {}
   const PUB = new Set(["published", "published_after_admin_approval"]);
   // earliest VERIFIED, DIFFERENT-profile comment per postUrl (mirrors latestDifferentProfileVerifiedCommentForPost)
   const commentByUrl = new Map();
