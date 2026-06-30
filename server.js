@@ -21850,6 +21850,19 @@ async function hungWindowReaperSweep() {
     if (normalIxProfileUseLocks.size === 0 && chromeN >= orphanHigh) {
       osReapOrphanIxBrowserChrome(`orphan_signature chrome=${chromeN} openLocks=0`);
     }
+    // TIER C — RESOURCE-CRITICAL EMERGENCY REAP (autonomy 2026-06-30): when free RAM is genuinely CRITICAL (near the
+    // adaptive's collapse + the waitForCpuHeadroom RAM gate) AND chrome is piled high, a pile of long-held browsers
+    // (e.g. workers stuck in 14-min approval chains) is dragging the box toward OOM, but Tier B can't fire because
+    // those workers still hold locks (size > 0) and Tier A's 25-min age hasn't elapsed. Reap ALL ixBrowser chrome
+    // anyway: the few live windows die + their workers retry (the hung-tick watchdog resets the tick, the per-
+    // (product,group) claim prevents double-posts) — FAR better than letting the box crash. Gated tightly (free RAM
+    // < 16% AND chrome >= orphanHigh) so it only ever fires in a real emergency, never under normal load.
+    let __freeRam = 100; try { __freeRam = currentFreeRamPercent(); } catch (_) {}
+    if (__freeRam < 16 && chromeN >= orphanHigh && normalIxProfileUseLocks.size > 0) {
+      try { logEvent("hung_window_reaper_resource_critical", { freeRamPercent: __freeRam, chrome: chromeN, openLocks: normalIxProfileUseLocks.size }); } catch (_) {}
+      try { for (const k of [...normalIxProfileUseLocks.keys()]) { normalIxProfileUseLocks.delete(k); __everOpenedIxProfiles.delete(k); } } catch (_) {} // free every slot; the emergency kill closes their browsers, the workers retry
+      osReapOrphanIxBrowserChrome(`resource_critical freeRam=${__freeRam}% chrome=${chromeN}`);
+    }
   } catch (_) { /* never throw from the heartbeat */ } finally { __hungReaperInFlight = false; }
 }
 
