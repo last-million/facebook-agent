@@ -9546,6 +9546,7 @@ function autopilotStatus(state = readState()) {
 }
 
 let __autopilotTickInFlight = false;
+let __autopilotTickStartedAt = 0; // when the in-flight tick started — drives the hung-tick watchdog (autonomy 2026-06-30)
 let __autopilotLastDecision = null;
 let __autopilotSchedulerTimer = null;
 let __autopilotDiscoveryInFlight = false;
@@ -9743,7 +9744,21 @@ function autopilotMayPostNow() {
 // it only LOGS the post it would make and never posts, builds/persists a plan,
 // or opens browsers. Set autopilotDryRun=false to go live.
 async function autopilotTickAsync(options = {}) {
-  if (__autopilotTickInFlight) return { skipped: "tick_in_flight" };
+  if (__autopilotTickInFlight) {
+    // HUNG-TICK WATCHDOG (autonomy 2026-06-30): a tick whose async work hangs (a posting worker awaiting a
+    // connector/lock that never resolves) holds __autopilotTickInFlight true FOREVER -> every later scheduled tick
+    // early-returns here -> POSTING silently stops (harvest + comment drains run on other drivers, so the run LOOKS
+    // alive — observed: no autopilot decision for ~49 min while harvest kept going). A normal tick completes in
+    // ~2-5 min and connectors self-kill at the 10-min execFile timeout, so a flag held > 18 min = the prior tick is
+    // WEDGED -> force-reset it and proceed. The orphaned tick's promise is harmless and the per-(product,group)
+    // claim store prevents any double-post even if the two briefly overlap.
+    if (__autopilotTickStartedAt && Date.now() - __autopilotTickStartedAt > 18 * 60 * 1000) {
+      try { logEvent("autopilot_tick_watchdog_reset", { heldMinutes: Math.round((Date.now() - __autopilotTickStartedAt) / 60000) }); } catch (_) {}
+      __autopilotTickInFlight = false;
+    } else {
+      return { skipped: "tick_in_flight" };
+    }
+  }
   const state = readState();
   if (!state.operator?.autopilotEnabled) return { skipped: "autopilot_disabled" };
   if (!state.operator?.armedForExternalActions) return { skipped: "not_armed" };
@@ -9755,6 +9770,7 @@ async function autopilotTickAsync(options = {}) {
     try { await reconcileProfilesWithIxBrowser(); } catch (_e) { /* reconcile never breaks a tick */ }
   }
   __autopilotTickInFlight = true;
+  __autopilotTickStartedAt = Date.now(); // stamp for the hung-tick watchdog above
   const decision = { at: new Date().toISOString(), dryRun, action: "", detail: "" };
   try {
     const scheduleOpen = autopilotPostingWindowOpen(state);
