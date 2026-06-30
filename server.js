@@ -9550,7 +9550,8 @@ function autopilotStatus(state = readState()) {
 let __autopilotTickInFlight = false;
 let __autopilotTickStartedAt = 0; // when the in-flight tick started — drives the hung-tick watchdog (autonomy 2026-06-30)
 let __autopilotTickGen = 0; // tick generation: a wedged tick's finally must NOT clear a NEWER tick's flag after a watchdog reset
-const AUTOPILOT_TICK_MAX_MS = 5 * 60 * 1000; // a tick wedged longer than this is force-reset (was 18min) — heartbeat-driven, race-safe via the gen guard
+let __lastPostProgressAt = 0; // when a post last LANDED — the watchdog only force-resets a tick that's stuck AND has made NO posting progress in the window (so a slow-but-working tick is never reset)
+const AUTOPILOT_TICK_MAX_MS = 3 * 60 * 1000; // a tick stuck > this WITH no post landed in the same window = a genuine FREEZE -> force-reset (operator wants the max freeze well under 5min; the no-progress guard makes 3min safe). Heartbeat-driven, race-safe via the gen guard.
 let __autopilotLastDecision = null;
 let __autopilotSchedulerTimer = null;
 let __autopilotDiscoveryInFlight = false;
@@ -9756,7 +9757,7 @@ async function autopilotTickAsync(options = {}) {
     // ~2-5 min and connectors self-kill at the 10-min execFile timeout, so a flag held > 18 min = the prior tick is
     // WEDGED -> force-reset it and proceed. The orphaned tick's promise is harmless and the per-(product,group)
     // claim store prevents any double-post even if the two briefly overlap.
-    if (__autopilotTickStartedAt && Date.now() - __autopilotTickStartedAt > AUTOPILOT_TICK_MAX_MS) {
+    if (__autopilotTickStartedAt && Date.now() - __autopilotTickStartedAt > AUTOPILOT_TICK_MAX_MS && Date.now() - __lastPostProgressAt > AUTOPILOT_TICK_MAX_MS) {
       try { logEvent("autopilot_tick_watchdog_reset", { heldMinutes: Math.round((Date.now() - __autopilotTickStartedAt) / 60000), via: "in_tick" }); } catch (_) {}
       __autopilotTickInFlight = false; __autopilotTickStartedAt = 0;
     } else {
@@ -15580,6 +15581,7 @@ async function completeVerifiedFacebookPostWithComment({
     profile: row.profile || ready.profileId,
     groupUrl: actualGroupUrl,
   });
+  __lastPostProgressAt = Date.now(); // a post LANDED -> the tick is making progress; the hung-tick watchdog won't reset a publishing tick
   // PER-POST run counter, bumped at the RECORD moment — so a post that LANDS but whose comment/cleanup
   // throws afterward is STILL counted exactly once (fixes the rare "stop at N could do N+1" under-count).
   // Gated to autopilot RUN posts (ready.__autopilotRunPost, set only by the tick via countTowardRun — NOT
