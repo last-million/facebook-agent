@@ -9549,6 +9549,8 @@ function autopilotStatus(state = readState()) {
 
 let __autopilotTickInFlight = false;
 let __autopilotTickStartedAt = 0; // when the in-flight tick started — drives the hung-tick watchdog (autonomy 2026-06-30)
+let __autopilotTickGen = 0; // tick generation: a wedged tick's finally must NOT clear a NEWER tick's flag after a watchdog reset
+const AUTOPILOT_TICK_MAX_MS = 5 * 60 * 1000; // a tick wedged longer than this is force-reset (was 18min) — heartbeat-driven, race-safe via the gen guard
 let __autopilotLastDecision = null;
 let __autopilotSchedulerTimer = null;
 let __autopilotDiscoveryInFlight = false;
@@ -9754,9 +9756,9 @@ async function autopilotTickAsync(options = {}) {
     // ~2-5 min and connectors self-kill at the 10-min execFile timeout, so a flag held > 18 min = the prior tick is
     // WEDGED -> force-reset it and proceed. The orphaned tick's promise is harmless and the per-(product,group)
     // claim store prevents any double-post even if the two briefly overlap.
-    if (__autopilotTickStartedAt && Date.now() - __autopilotTickStartedAt > 18 * 60 * 1000) {
-      try { logEvent("autopilot_tick_watchdog_reset", { heldMinutes: Math.round((Date.now() - __autopilotTickStartedAt) / 60000) }); } catch (_) {}
-      __autopilotTickInFlight = false;
+    if (__autopilotTickStartedAt && Date.now() - __autopilotTickStartedAt > AUTOPILOT_TICK_MAX_MS) {
+      try { logEvent("autopilot_tick_watchdog_reset", { heldMinutes: Math.round((Date.now() - __autopilotTickStartedAt) / 60000), via: "in_tick" }); } catch (_) {}
+      __autopilotTickInFlight = false; __autopilotTickStartedAt = 0;
     } else {
       return { skipped: "tick_in_flight" };
     }
@@ -9773,6 +9775,7 @@ async function autopilotTickAsync(options = {}) {
   }
   __autopilotTickInFlight = true;
   __autopilotTickStartedAt = Date.now(); // stamp for the hung-tick watchdog above
+  const __myGen = ++__autopilotTickGen; // this tick's generation — its finally only clears the flag if still current
   const decision = { at: new Date().toISOString(), dryRun, action: "", detail: "" };
   try {
     const scheduleOpen = autopilotPostingWindowOpen(state);
@@ -10192,7 +10195,9 @@ async function autopilotTickAsync(options = {}) {
     logEvent("autopilot_tick_error", decision);
     return decision;
   } finally {
-    __autopilotTickInFlight = false;
+    // GEN GUARD: only clear if a watchdog reset hasn't already replaced this tick with a newer one — else a tick that
+    // was force-reset (then finally resolves) would clear the NEW tick's in-flight flag and let a third tick overlap.
+    if (__autopilotTickGen === __myGen) { __autopilotTickInFlight = false; __autopilotTickStartedAt = 0; }
   }
 }
 
@@ -20317,6 +20322,17 @@ setInterval(() => {
   if (Date.now() - __lastHeartbeatCpuSampleAt > 12000) {
     __lastHeartbeatCpuSampleAt = Date.now();
     currentCpuLoadPercent().catch(() => {}); // notePeakCpu runs inside -> keeps the ceiling ramp-UP path alive during a stall
+  }
+  //  (3) HUNG-TICK WATCHDOG on the heartbeat (operator 2026-06-30: "18 min of freezing is a waste of time"): the
+  //      in-tick watchdog only runs when a NEW tick is ATTEMPTED, but the autopilot scheduler itself AWAITS the tick,
+  //      so a wedged tick blocks the scheduler from attempting one -> the watchdog never fires -> indefinite freeze
+  //      (needed a manual kick). Run it HERE on the always-on heartbeat instead: a tick in flight > AUTOPILOT_TICK_MAX_MS
+  //      is force-reset + a fresh tick kicked, so posting can never freeze longer than ~5 min. Race-safe: the gen guard
+  //      means the stale tick's finally won't clear the new flag; the per-(product,group) claim prevents any double-post.
+  if (__autopilotTickInFlight && __autopilotTickStartedAt && Date.now() - __autopilotTickStartedAt > AUTOPILOT_TICK_MAX_MS) {
+    try { logEvent("autopilot_tick_watchdog_reset", { heldMinutes: Math.round((Date.now() - __autopilotTickStartedAt) / 60000), via: "heartbeat" }); } catch (_) {}
+    __autopilotTickInFlight = false; __autopilotTickStartedAt = 0;
+    setTimeout(() => { autopilotTickAsync().catch(() => {}); }, 0); // kick a fresh tick immediately so posting resumes
   }
   const state = readState();
   // HARVEST WHILE PROD RUNS (operator 2026-06-17: "disable harvesting all day — harvest at the SAME TIME as prod").
