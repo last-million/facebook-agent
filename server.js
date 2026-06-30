@@ -15879,10 +15879,10 @@ async function completeVerifiedFacebookPostWithComment({
   // while fewer than MAX_BG_COMMENT_IN_FLIGHT comment+approval tasks are already outstanding — BACKPRESSURE: the
   // 14-slot open cap THROWS (not blocks), so unbounded bg tasks would churn 503s; past N we fall back to the inline
   // await, which naturally slows the tick until the backlog drains. (review: med/low fixes applied.)
-  const __bgApprovalComment = ready.__autopilotRunPost === true
+  const __isRunApprovalPost = ready.__autopilotRunPost === true
     && isAdminApprovalEnabledForGroup(actualGroupUrl, readState())
-    && readState().operator?.commentDrainDisabled !== true
-    && __bgCommentInFlight < MAX_BG_COMMENT_IN_FLIGHT;
+    && readState().operator?.commentDrainDisabled !== true;
+  const __bgApprovalComment = __isRunApprovalPost && __bgCommentInFlight < MAX_BG_COMMENT_IN_FLIGHT;
   if (__bgApprovalComment) {
     __bgCommentInFlight += 1;
     const __bgClose = [];
@@ -15911,6 +15911,46 @@ async function completeVerifiedFacebookPostWithComment({
       validation,
       commentBackgrounded: true,
       message: `Post published by ${row.profile || ready.profileId} (URL: ${postUrl}); comment + admin approval running in background (approval-required group) so posting stays continuous.`,
+      liveLog: compactLivePostLog(postLogObjects),
+      state: readState(),
+      registers: readRegisters(),
+    };
+  }
+  // DEFER-TO-DRAIN (2026-06-30 prod-throughput-audit wf_442b9c45, root cause #1 — the bursty "post a burst then stall
+  // for minutes" the operator reported). When an approval-group RUN post is OVER the bg cap, do NOT fall through to the
+  // inline `await addRequiredFirstCommentWithDifferentProfile` below: that call carries the ~8-min moderator approval +
+  // ~4-min comment-retry tail, and because the scheduler does `await autopilotTickAsync()` (single-flight, next timer
+  // armed only in its finally) and the tick awaits EVERY worker, one ~14-min inline await FREEZES the whole tick =
+  // the multi-minute stall (CPU ~25% the whole time because it's await/lock contention, not compute). The post is
+  // already DURABLE here (published ledger row + full comment payload + per-run counter bump + publisher-lock release
+  // all happened above), and the always-on resweepUncommentedFacebookPostsAsync re-comments published rows AND re-fires
+  // approval (double-comment + in-flight guarded), so comment+approval still land async on a different profile.
+  // Returning published-ok keeps the tick continuous. Gated on __isRunApprovalPost (which already requires
+  // commentDrainDisabled!==true) so with the drain OFF the code KEEPS the inline await — correctness preserved exactly.
+  // Counter was bumped at RECORD time (before this point) so this does NOT double-count.
+  if (__isRunApprovalPost) {
+    try { logEvent("facebook_post_published_comment_deferred_to_drain", { postUrl, groupUrl: actualGroupUrl, profileId: ready.profileId, bgInFlight: __bgCommentInFlight }); } catch (_) {}
+    return {
+      ok: true,
+      postUrl,
+      posted: true,
+      planId: row.planId,
+      sequence: row.sequence,
+      profileId: ready.profileId,
+      profile: row.profile || String(ready.profileId),
+      groupUrl: actualGroupUrl,
+      attemptedGroups,
+      closeResults,
+      postPayloadFile,
+      postPayloadDeleted,
+      postLiveLogFile,
+      postScript,
+      approvalResult: null,
+      postValidation: validation,
+      validation,
+      commentBackgrounded: false,
+      commentDeferred: true,
+      message: `Post published by ${row.profile || ready.profileId} (URL: ${postUrl}); comment + admin approval deferred to the durable drain (bg cap reached) so posting stays continuous.`,
       liveLog: compactLivePostLog(postLogObjects),
       state: readState(),
       registers: readRegisters(),
@@ -20421,7 +20461,15 @@ setInterval(() => {
     const __lastPub = latestPublishedFacebookPostAtMs();
     if (__lastPub > 0 && (Date.now() - __lastPub) < PERSISTENT_DRAIN_WINDOW_MS) {
       __lastPersistentDrainAt = Date.now();
-      resweepUncommentedFacebookPostsAsync({ drain: true, max: 50, windowHours: 6 }).catch(() => {}); // operator 2026-06-20: windowHours 1->6 so the drain can SEE a long run's first-half posts (1h silently excluded posts published >60min ago -> never recovered); max 25->50 to clear a whole run's tail in one cycle (aligns with the stop/run-end drains' windowHours:24/max:50).
+      // POSTING PRIORITY (2026-06-30 prod-throughput-audit amplifier #3, REFINED after adversarial verify): while a
+      // publish is IN FLIGHT, run the drain LIGHT (max 8) instead of the heavy max:50 — it still makes steady progress
+      // on deferred comments (so an approval-heavy burst can't pile past the ~6-min comment-max-age abandon and LOSE
+      // comments) but stops the heavy sweep from monopolizing the 2 comment-semaphore slots / open-slots / profiles
+      // posting needs; full max:50 catch-up fires the moment posting pauses (isLivePostingInFlight()==0 in the
+      // inter-tick gap). A FULL skip risked bounded comment LOSS in a sustained gapless burst (verifier flag) — a light
+      // floor keeps recovery alive there while still giving posting the lion's share of the slots.
+      const __drainMax = isLivePostingInFlight() ? 8 : 50;
+      resweepUncommentedFacebookPostsAsync({ drain: true, max: __drainMax, windowHours: 6 }).catch(() => {}); // operator 2026-06-20: windowHours 1->6 so the drain can SEE a long run's first-half posts (1h silently excluded posts published >60min ago -> never recovered); max 25->50 to clear a whole run's tail in one cycle (aligns with the stop/run-end drains' windowHours:24/max:50).
     }
   }
   const intervalMs = clampNumber(state.triggers?.heartbeatSeconds, 3, 120, 3) * 1000;
