@@ -2836,8 +2836,23 @@ async function verifyCandidate(context, url, marker) {
     }, { marker, expected });
     return data;
   } finally {
-    await p.close().catch(() => {});
+    try { await p.close(); } catch (_) { try { await p.close(); } catch (_2) {} } // double-try: a busy browser can drop the first close -> leaked verify-tab
   }
+}
+
+// TAB-LEAK GUARD (operator 2026-06-30: "he keeps MANY tabs open in the moderator profile — it may block chrome").
+// verifyCandidate opens a context.newPage() per candidate URL and closes it, but a close on a busy browser can fail
+// silently, so over a long approval session (verify runs many times across review_surface / group_after_approval /
+// group_search passes) leaked tabs pile up and bloat chrome. This sweeps EVERY extra tab in the context, keeping only
+// the main page. Safe + idempotent + never throws.
+async function closeExtraTabs(context, keepPage, reason) {
+  try {
+    let closed = 0;
+    for (const p of (context.pages ? context.pages() : [])) {
+      if (p !== keepPage && !p.isClosed()) { try { await p.close(); closed += 1; } catch (_) {} }
+    }
+    if (closed > 0) { try { console.log(JSON.stringify({ step: 'closed_extra_tabs', count: closed, reason: reason || '' })); } catch (_) {} }
+  } catch (_) {}
 }
 
 function summarizeCandidateVerification(result, fallbackUrl = '') {
@@ -3649,6 +3664,7 @@ async function approvePendingPost(page, context, payload, gid, marker) {
           if (candidateHasStrongPermalinkMarker(candidate)) verified.push({ candidate: u, source, ...candidate });
           if (candidateHasStrongPermalinkMarker(candidate) && candidate.hasPostMedia) break;
     }
+    try { await closeExtraTabs(context, page, 'after_collect_verified_urls'); } catch (_) {} // bound tabs: never let verify-tabs pile up in the moderator browser
     return { source, markerScopedUrls, domUrls, candidateUrls };
   };
   if (postUrl) {
