@@ -3054,10 +3054,27 @@ async function dismissForcedAccountSwitch(page) {
   // FB can re-throw the card on the next navigation, so LOOP: click Continue ASAP, verify the URL cleared,
   // and if FB re-renders it, click again (up to 4 passes). Click is immediate (wait for the button, not a
   // fixed pause) so the profile never visibly sits on the switch page.
-  let everCleared = false;
-  for (let attempt = 1; attempt <= 4; attempt += 1) {
+  // Detect the switch wall by URL **or by CONTENT** (operator 2026-06-30: the "Continue to switch" card sometimes
+  // appears as a MODAL on a normal page with NO forced_account_switch URL -> the old URL-only check returned early
+  // and never clicked Continue, so the moderator sat stuck on it). wallPresent requires BOTH a switch-account phrase
+  // AND a visible Continue button, so it never false-fires on a page that merely contains the word "continue".
+  const wallPresent = async () => {
+    if (/forced_account_switch|account_switcher/i.test(String(page.url() || ''))) return true;
     try {
-      if (!/forced_account_switch|account_switcher/i.test(String(page.url() || ''))) return everCleared;
+      return await page.evaluate(() => {
+        const SW = /(switch (to|account|now)|need to switch|continue as|changer de compte|basculer|continuer en tant que|passer (au|à)|cambiar de cuenta|continuar como|wechseln zu|التبديل|المتابعة باسم)/i;
+        const CONT = /^(continue|continuer|continuar|weiter|continua|prosseguir|devam|doorgaan|kontynuuj|متابعة|استمرار)\b/i;
+        const vis = (el) => { try { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 2 && r.height > 2 && s.visibility !== 'hidden' && s.display !== 'none'; } catch (e) { return false; } };
+        if (!SW.test(document.body.innerText || '')) return false;
+        return [...document.querySelectorAll('button,[role="button"],input[type="submit"],a[role="link"]')].filter(vis)
+          .some((b) => CONT.test(((b.innerText || b.value || '') + '').replace(/\s+/g, ' ').trim()));
+      }).catch(() => false);
+    } catch (_) { return false; }
+  };
+  let everCleared = false;
+  for (let attempt = 1; attempt <= 6; attempt += 1) { // was 4: a few more passes for an intermittent re-render
+    try {
+      if (!(await wallPresent())) return everCleared;
       console.log(JSON.stringify({ step: 'forced_account_switch_detected', attempt, url: page.url() }));
       let clicked = false;
       try {
@@ -3094,7 +3111,7 @@ async function dismissForcedAccountSwitch(page) {
         if (inPage === 'none') { await page.keyboard.press('Enter').catch(() => {}); } // (c) default action = Continue
       }
       await humanPause(2500, 4000); // FB reloads into the confirmed account
-      const cleared = !/forced_account_switch|account_switcher/i.test(String(page.url() || ''));
+      const cleared = !(await wallPresent()); // content-aware: a dismissed MODAL (no URL change) also counts as cleared
       console.log(JSON.stringify({ step: 'forced_account_switch_dismissed', attempt, cleared, url: page.url() }));
       if (cleared) { everCleared = true; return true; }
       // still on the card — FB re-rendered it; loop and click again
