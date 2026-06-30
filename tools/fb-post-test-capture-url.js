@@ -3229,19 +3229,25 @@ async function batchApproveAllPublisherPosts(page, gid, publisherId) {
   const cleanPub = String(publisherId || '').replace(/\D+/g, '');
   if (!cleanPub) return 0;
   let approved = 0;
-  // LOAD-SPREAD CAP: approve at most ~5 per moderator SESSION, then stop — the least-used-first moderator
-  // rotation (server side) hands the REST of the queue to the NEXT moderator. This shares the approval load
-  // EVENLY across all moderators so no single account does too many and gets flagged/blocked by Facebook.
-  // OPERATOR 2026-06-29: "approve ONLY the new posts we post in this run, NOT old ones." The #fb post-unique
-  // fingerprint was removed (2026-06-12), so a post is located by its PRODUCT hashtags only — which means this
-  // batch (scoped by publisher id ALONE, no marker, no run-set) could approve an OLD pending post of ours from a
-  // previous run. There is no reliable in-queue signal to tell "this run" from "old" without that fingerprint, so
-  // DISABLE the extra-batch: each pending post is approved ONLY by its own marker-matched session
-  // (clickApproveForVisibleMarker), guaranteeing we only ever approve the exact post we are currently processing.
-  const MAX_EXTRA_PER_SESSION = 0; // disabled (was 1): never batch-approve other publisher posts — they may be OLD; approve only the marker-matched post of THIS run
+  // BATCH WITH HARD-REFRESH (operator 2026-06-30: "hard refresh the moderator page to see new pendings"): instead of
+  // one slow moderator session PER post, approve up to ~4 MORE of OUR pendings in this SAME session. Before each
+  // approval HARD-RELOAD the pending queue so (a) posts that propagated into it DURING this session (FB's 10-30min
+  // queue) become visible, and (b) the view resets to the TOP = NEWEST pendings. We then approve ONLY our publisher's
+  // posts in the VISIBLE TOP area (NO scroll) + skip any with a days-old timestamp -> we clear THIS run's new pendings
+  // and NEVER reach the OLD backlog deep in the queue (honors "approve only this run's posts, not old ones"). With one
+  // moderator this is pure throughput; the per-session cap keeps any single account from being flagged for too many.
+  const MAX_EXTRA_PER_SESSION = 4;
   for (let round = 0; round < MAX_EXTRA_PER_SESSION; round += 1) {
+    try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch (_) {} // HARD REFRESH: surface newly-propagated pendings + reset scroll to TOP (newest = this run)
+    await humanPause(2500, 4200);
+    try { if (await dismissForcedAccountSwitch(page)) await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch (_) {} // a reload can re-throw the switch wall
     const r = await page.evaluate(({ pub }) => {
       const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+      // RECENCY GUARD (operator: never approve OLD posts): a post whose nearest SHORT time element shows a days/
+      // weeks/months-old stamp is from a previous run -> skip. Short-element-only so a caption like "30 days return"
+      // can't false-match; fail-open (no time found -> allow, since top-of-queue after a refresh already = newest).
+      const OLD_RE = /(^|[\s·])\d{1,3}\s?(d|days?|w|wks?|weeks?|mo|months?|y|yrs?|years?)([\s·]|$)|yesterday|hier|ayer|gestern|أمس|ontem|ieri/i;
+      const looksOld = (art) => { try { for (const e of art.querySelectorAll('a[role="link"],abbr,time,a[href*="permalink"],a[href*="/posts/"],span')) { const t = norm(e.innerText || e.getAttribute('aria-label') || ''); if (t && t.length <= 28 && OLD_RE.test(t)) return true; } } catch (_) {} return false; };
       const vis = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 20 && r.height > 12 && s.visibility !== 'hidden' && s.display !== 'none'; };
       const isPerPostApprove = (b) => {
         const al = norm(b.getAttribute('aria-label')); const tx = norm(b.innerText);
@@ -3274,6 +3280,7 @@ async function batchApproveAllPublisherPosts(page, gid, publisherId) {
         if (!resolved) continue;
         const byUs = [...resolved.querySelectorAll('a[href]')].some((l) => { const h = String(l.href || ''); return h.includes(`/user/${pub}/`) || h.includes(`profile.php?id=${pub}`); });
         if (!byUs) continue;
+        if (looksOld(resolved)) continue; // days-old pending post from a previous run -> never approve it
         b.scrollIntoView({ block: 'center' });
         b.click();
         return { clicked: true };
