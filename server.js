@@ -17933,6 +17933,20 @@ function autoBlacklistProfileIfNeeded(opts = {}) {
         return; // retry on Direct on the next open
       }
     }
+    // DISCONNECTED / LOGGED OUT OF FACEBOOK (operator 2026-06-30: "disconnected/suspended profiles must be detected
+    // AUTOMATICALLY, classified in the Prod tab, and skipped until the admin releases them"). A not-logged-in /
+    // session-expired signal will NEVER self-heal on its own, so it must NOT serve the 2-strike repeated-failure
+    // threshold and land in the generic bench — park it IMMEDIATELY in the releasable disconnectedProfiles list.
+    // postingSlots (~7822) and the comment picker (~14663) already SKIP that list, and the Prod tab surfaces it for
+    // one-click Release. This sits AFTER the open-infra (1004/CDP) and proxy-unreachable returns above, so it can only
+    // fire on a genuine Facebook login wall (the connector throws facebook_login_required_for_profile only after it
+    // detects the login URL/text AND waits) — not on a browser-open glitch or a dead proxy.
+    if (!hard && isFacebookNotLoggedInError(errorText)) {
+      try { markProfileDisconnected(pid, profile, oneLineField(errorText, 160)); } catch (_) {}
+      __profileBlockStreak[pid] = 0; // parked in the disconnected list now — don't also accrue a soft strike
+      try { logEvent("profile_disconnected_on_post_failure", { profileId: pid, error: oneLineField(errorText, 140) }); } catch (_) {}
+      return;
+    }
     // opts.profileRetryable is the connector's structured "profile open/login failed" signal —
     // robust even when the wrapper message hides/truncates the original reason. Treat it as soft.
     const soft = isTransientBlockingPostFailure(errorText) || isProxyUnreachableError(errorText) || opts.profileRetryable === true; // proxy-unreachable is SOFT: it counts toward the repeated-failure threshold but never instant-benches (a flaky proxy may work next time)
