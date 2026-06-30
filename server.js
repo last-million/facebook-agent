@@ -322,6 +322,15 @@ let lastIxBrowserAutoOpenAt = 0;
 const ixBrowserCdpEndpointCache = new Map();
 const ixBrowserProfileOpenLocks = new Map();
 const normalIxProfileUseLocks = new Map();
+// POSTING SLOT RESERVATION (2026-06-30 prod-throughput-audit cause #2): while a run is ARMED, reserve a few of the
+// GLOBAL_MAX_OPEN_PROFILES open-slots for facebook_live_post so the comment/approval/harvest drains can't fill all 14
+// and starve publisher opens (the 503/409 contention the audit found — the post-restart "posting won't start while the
+// backlog drains" symptom). Cached cheaply from the 1s heartbeat (NOT readState() in the hot acquireNormalIxProfileUse
+// path — the audit warned synchronous state re-reads on the hot path froze the loop). Gated on ARMED, not
+// isLivePostingInFlight(), so a cold start (re-arm with a backlog) can't deadlock (posting needs a slot to become
+// in-flight; if the gate required in-flight, the drain would fill every slot first and posting could never begin).
+let __armedForPostingReserve = false;
+let __postingReserveSlots = 4;
 
 function parseJsonFile(filePath) {
   let lastError = null;
@@ -6632,6 +6641,22 @@ function acquireNormalIxProfileUse(profileId, purpose) {
     err.statusCode = 503;
     err.publicError = "ixbrowser_profile_budget_exceeded";
     throw err;
+  }
+  // POSTING SLOT RESERVATION (2026-06-30 prod-throughput-audit cause #2): while a run is ARMED, NON-posting opens
+  // (comment recovery / admin approval / harvest / capture / url-recovery) are capped BELOW the global so
+  // facebook_live_post always has __postingReserveSlots free — the comment/approval drain can no longer consume all
+  // GLOBAL_MAX_OPEN_PROFILES and starve publisher opens (the audit's #2 cause; the post-restart "posting won't start"
+  // symptom). Posting itself is NEVER capped here (only the global 14 bounds it). A blocked drain open gets the same
+  // typed retryable 503 as the global cap, so it just defers + retries when a slot frees — comments still land via the
+  // next sweep (the drain keeps ~10 of 14 slots, ample for maxConcurrentComments=2 + bg comments + approvals).
+  if (__armedForPostingReserve && !/facebook_live_post/i.test(String(purpose || ""))) {
+    const __drainCap = GLOBAL_MAX_OPEN_PROFILES - __postingReserveSlots;
+    if (normalIxProfileUseLocks.size >= __drainCap) {
+      const err = new Error(`Posting headroom reserved (${normalIxProfileUseLocks.size}/${__drainCap} non-posting slots in use; ${__postingReserveSlots} held for posting); deferring this ${oneLineField(purpose || "open", 40)}.`);
+      err.statusCode = 503;
+      err.publicError = "ixbrowser_posting_reserved";
+      throw err;
+    }
   }
   normalIxProfileUseLocks.set(key, { purpose: oneLineField(purpose || "workflow", 120), startedAt: new Date().toISOString() });
   __everOpenedIxProfiles.add(key); // track for the finished-profile cleanup sweep
@@ -20438,6 +20463,12 @@ setInterval(() => {
     setTimeout(() => { autopilotTickAsync().catch(() => {}); }, 0); // kick a fresh tick immediately so posting resumes
   }
   const state = readState();
+  // POSTING SLOT RESERVATION cache (2026-06-30 audit cause #2): refresh the cheap flags the hot acquireNormalIxProfileUse
+  // gate reads, so it never has to readState() itself. Armed => reserve __postingReserveSlots open-slots for posting.
+  try {
+    __armedForPostingReserve = state.operator?.armedForExternalActions === true && state.operator?.autopilotEnabled === true && state.operator?.autopilotDryRun !== true;
+    __postingReserveSlots = clampNumber(Number(state.ixbrowser?.maxConcurrentProfiles) - 1, 2, GLOBAL_MAX_OPEN_PROFILES - 8, 4);
+  } catch (_) {}
   // HARVEST WHILE PROD RUNS (operator 2026-06-17: "disable harvesting all day — harvest at the SAME TIME as prod").
   // The harvest driver lives on the always-on 1s heartbeat but is now gated by harvestShouldRunNow (enabled + ARMED +
   // inside the posting window) so it fires ONLY during an active posting run, for BOTH the count and schedule modes.
