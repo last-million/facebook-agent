@@ -9972,15 +9972,31 @@ async function autopilotTickAsync(options = {}) {
     // GROUP FAIRNESS: today's per-group counts (from the same single ledger scan) so the picker
     // prefers the least-posted group first, then the least-used profile — equal across BOTH.
     const usageByGroupKey = autopilotPublishedTodayByProfile(state).byGroup || new Map();
-    const readyRows = orderReadyRowsLeastUsed(
+    let readyRows = orderReadyRowsLeastUsed(
       latestPostingPlanRows(readState()).filter((row) => row.runType === "full_posting_plan" && row.planId === plan.planId && String(row.liveExecution || "").startsWith("ready")),
       usageByPid,
       recentlyFailed,
       usageByGroupKey,
     );
+    // PRODUCT-ADJACENCY (operator 2026-06-30: "post each product to ALL groups together, then the NEXT product").
+    // The fairness sort above scatters a product's per-group fan-out rows and the picker takes one product per batch,
+    // so P lands in group A now + group B minutes later (the "décalage" the operator saw). Re-cluster so each
+    // product's rows are ADJACENT (keeping the fairness order of each product's FIRST appearance); the dedup below is
+    // made group-aware and same-product fan-out rows are exempt from the sibling guard, so the batch takes
+    // P-groupA + P-groupB TOGETHER, then the next product. No-op when not postToAllGroups (1 row/product = singletons).
+    readyRows = (() => {
+      const order = []; const byProd = new Map();
+      for (const row of readyRows) {
+        const pk = String(row.productKey || row.productUrl || row.link || "").toLowerCase();
+        if (!pk) { order.push([row]); continue; }
+        if (byProd.has(pk)) byProd.get(pk).push(row); else { const arr = [row]; byProd.set(pk, arr); order.push(arr); }
+      }
+      return order.flat();
+    })();
     const picked = [];
     const usedIds = new Set();
-    const usedProductKeys = new Set();
+    const usedProductKeys = new Set(); // (product|group) keys picked this batch — group-aware so a product's OTHER group-row is allowed
+    const usedProductKeysBare = new Set(); // product-alone keys picked this batch — their fan-out copies are exempt from the sibling guard
     const usedMarkers = new Set();
     // GROUP BALANCE: spread this batch EVENLY across the groups that have ready rows, so a multi-group run
     // never lands entirely in one group. Cap each group at ceil(maxWorkers / groupsWithReadyRows) on a first
@@ -10003,22 +10019,31 @@ async function autopilotTickAsync(options = {}) {
     const __skip = { not_eligible: 0, used_pid: 0, group_cap: 0, dup_product: 0, claimed: 0, sibling: 0 };
     const __pickPass = (enforceGroupCap) => {
       for (const row of readyRows) {
-        if (picked.length >= __batchCap) break;
+        const prodKey = String(row.productKey || row.productUrl || row.link || "").toLowerCase();
+        // CLUSTER-AWARE CAP (operator 2026-06-30: all groups of a product TOGETHER): once the cap is hit, only stop at
+        // a PRODUCT boundary — keep taking the CURRENT product's remaining group-rows (its productKey is already in
+        // usedProductKeysBare this batch) so a product is NEVER split across ticks (the décalage), even when adaptive
+        // load forces __batchCap=1. Worst case the batch exceeds cap by (groups-1) rows for ONE product; each extra
+        // open is still gated by the per-open CPU-headroom check, so it stays safe.
+        if (picked.length >= __batchCap && !(prodKey && usedProductKeysBare.has(prodKey))) break;
         const pid = Number(row.profileId || profileIdFromLabel(row.profile) || 0);
         if (!eligibleIds.has(pid)) { __skip.not_eligible += 1; continue; }
         if (usedIds.has(pid)) { __skip.used_pid += 1; continue; }
         const gKey = normalizedFacebookGroupKey(row.groupUrl);
         if (enforceGroupCap && (__pickedByGroup.get(gKey) || 0) >= __perGroupCap) { __skip.group_cap += 1; continue; } // hold this group at its fair share on the first pass
-        const prodKey = String(row.productKey || row.productUrl || row.link || "").toLowerCase();
-        if (prodKey && usedProductKeys.has(prodKey)) { __skip.dup_product += 1; continue; } // each post must use a UNIQUE product
+        const __prodGroupKey = prodKey ? prodKey + "|" + gKey : ""; // group-aware: a product's row in ANOTHER group is NOT a duplicate (fan-out to all groups together)
+        if (__prodGroupKey && usedProductKeys.has(__prodGroupKey)) { __skip.dup_product += 1; continue; } // same product in the SAME group twice -> skip (still unique per group)
         if (prodKey && isProductClaimedForRun(state, prodKey, row.groupUrl)) { __skip.claimed += 1; continue; } // ALREADY claimed/posted this run (for THIS group when postToAllGroups) -> skip at PICK time; advance to a fresh row
-        // CONCURRENCY SAFETY: two products whose markers are the same OR variant SIBLINGS (shared long title
-        // prefix, e.g. RC Lambo "...- Red" vs "...- White") must NOT be in the same parallel batch — their
-        // near-identical captions make feed-capture ambiguous. Skip siblings.
+        // CONCURRENCY SAFETY: two DIFFERENT products whose markers are the same OR variant SIBLINGS (shared long
+        // title prefix, e.g. RC Lambo "...- Red" vs "...- White") must NOT be in the same parallel batch — their
+        // near-identical captions make feed-capture ambiguous. EXEMPT a product's OWN fan-out copies (same product,
+        // different GROUP): they post into separate group feeds (no cross-capture ambiguity), and posting them
+        // together IS the operator's "all groups at once" goal.
         const markerKey = computePostMarkerPhrase(row).toLowerCase();
-        if (markerKey && [...usedMarkers].some((m) => markersAreSiblings(markerKey, m))) { __skip.sibling += 1; continue; }
+        if (markerKey && !(prodKey && usedProductKeysBare.has(prodKey)) && [...usedMarkers].some((m) => markersAreSiblings(markerKey, m))) { __skip.sibling += 1; continue; }
         usedIds.add(pid);
-        if (prodKey) usedProductKeys.add(prodKey);
+        if (__prodGroupKey) usedProductKeys.add(__prodGroupKey);
+        if (prodKey) usedProductKeysBare.add(prodKey);
         usedMarkers.add(markerKey);
         __pickedByGroup.set(gKey, (__pickedByGroup.get(gKey) || 0) + 1);
         picked.push(row);
@@ -10041,8 +10066,14 @@ async function autopilotTickAsync(options = {}) {
         const already = autopilotPostsThisRunCount(readState());
         const remaining = Math.max(0, lim - already);
         if (picked.length > remaining) {
-          logEvent("autopilot_run_limit_trim", { limit: lim, already, remaining, requested: picked.length });
-          picked.length = remaining;
+          // CLUSTER-AWARE TRIM (operator 2026-06-30: never split a product across groups): if the cut would land in
+          // the MIDDLE of a product's group-rows, extend it to include the whole product (overshoot the cap by
+          // <groups rows for the LAST product only) rather than orphan it to a single group.
+          let __cut = remaining;
+          const __pk = (r) => String((r && (r.productKey || r.productUrl || r.link)) || "").toLowerCase();
+          while (__cut > 0 && __cut < picked.length && __pk(picked[__cut]) && __pk(picked[__cut]) === __pk(picked[__cut - 1])) __cut += 1;
+          logEvent("autopilot_run_limit_trim", { limit: lim, already, remaining, requested: picked.length, cutTo: __cut });
+          picked.length = __cut;
         }
         if (!picked.length) {
           autopilotAutoDisarm("run_limit_reached", `posted ${already}/${lim} this run`);
