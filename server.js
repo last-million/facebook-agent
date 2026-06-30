@@ -2573,6 +2573,7 @@ function markModeratorBlocked(profileId, label, reason) {
   const state = readState();
   const list = Array.isArray(state.posting.blockedModerators) ? state.posting.blockedModerators : [];
   const __stuck = /forced_account_switch|stuck/i.test(String(reason || ""));
+  const __disconnected = /disconnected|not logged in|logged out|login required|session expired|facebook_login_required/i.test(String(reason || "")); // a logged-out moderator never self-heals -> park-until-release immediately (no 2min retry loop)
   let entry = list.find((p) => String(p.profileId) === id);
   if (entry) {
     entry.at = new Date().toISOString();
@@ -2586,10 +2587,12 @@ function markModeratorBlocked(profileId, label, reason) {
   // genuinely broken (needs a fresh re-login) — retrying it every 2min just wastes approval sessions. Park it
   // PERSISTENTLY: it stays out of the moderator rotation until the admin re-logs it and Releases it from the Prod
   // tab. A successful approval still auto-clears it (the orchestrator removes the whole entry).
-  if (__stuck && (Number(entry.stuckCount) || 0) >= MODERATOR_FORCED_SWITCH_PARK_THRESHOLD && !entry.parkedUntilRelease) {
+  if (((__stuck && (Number(entry.stuckCount) || 0) >= MODERATOR_FORCED_SWITCH_PARK_THRESHOLD) || __disconnected) && !entry.parkedUntilRelease) {
     entry.parkedUntilRelease = true;
-    entry.reason = `Moderator stuck on forced_account_switch ${entry.stuckCount}x — re-login this profile then Release it here`;
-    try { logEvent("moderator_parked_until_release", { profileId: id, stuckCount: entry.stuckCount }); } catch (_) {}
+    entry.reason = __disconnected
+      ? `Moderator DISCONNECTED (not logged into Facebook) — re-login this profile then Release it here`
+      : `Moderator stuck on forced_account_switch ${entry.stuckCount}x — re-login this profile then Release it here`;
+    try { logEvent("moderator_parked_until_release", { profileId: id, reason: __disconnected ? "disconnected" : "forced_account_switch", stuckCount: entry.stuckCount }); } catch (_) {}
   }
   state.posting.blockedModerators = list;
   writeState(state);
@@ -13436,6 +13439,16 @@ async function runFacebookAdminApprovalAttempt({ row, profileId, profileLabel, g
         reason: err.message || "Facebook admin/moderator account is suspended, disabled, locked, or requires review.",
         source: "facebook_admin_approval",
       });
+    } else if (isFacebookNotLoggedInError(err.message || String(err))) {
+      // MODERATOR LOGGED OUT / DISCONNECTED (operator 2026-06-30: "profile 42 is FB-disconnected but it never
+      // classified it as disconnected to be skipped"). A logged-out moderator can NEVER approve, so don't keep
+      // wasting an ~8-min approval session on it every turn: classify it in the releasable disconnected list
+      // (Prod tab + skipped from posting via postingSlots) AND park it OUT of the moderator rotation until the
+      // admin re-logs-in + Releases it. The posting path got the same treatment in autoBlacklistProfileIfNeeded
+      // (f3b5472); this closes the MODERATOR/approval path, which postingSlots never covers.
+      try { markProfileDisconnected(numericProfileId, cleanProfile, err.message || "moderator not logged into Facebook"); } catch (_) {}
+      try { markModeratorBlocked(numericProfileId, cleanProfile, "disconnected — moderator not logged into Facebook (re-login this profile then Release it here)"); } catch (_) {}
+      try { logEvent("moderator_disconnected_parked", { profileId: numericProfileId, error: oneLineField(err.message || String(err), 140) }); } catch (_) {}
     }
     appendFacebookLivePostLedger({
       event: "admin_approval_error",
