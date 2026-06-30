@@ -8484,6 +8484,7 @@ function __cpuTimesSnapshot() {
 // decays, self-tuning to the box's TRUE safe ceiling. Decay ~1.5%/sec (a 100 fades in ~60s, then it ramps back up).
 let __recentPeakCpu = 0, __recentPeakCpuAt = 0;
 let __learnedMaxWorkers = 4, __learnedMaxAt = 0;   // AIMD safe-concurrency ceiling: START at the operator's stated safe number (4), LEARN up/down from there
+let __lastCeilingDownAt = 0, __lastCeilingUpAt = 0; // DECOUPLED AIMD timers (autonomy fix 2026-06-30): a down burst must NOT reset the up clock, else the ceiling pins at the floor forever
 function recentPeakCpu() {
   return Math.max(0, __recentPeakCpu - Math.max(0, (Date.now() - __recentPeakCpuAt) / 1000) * 3);   // decay fast (~3%/s): a TRANSIENT burst clears in ~15s, only SUSTAINED load holds the count down
 }
@@ -8497,9 +8498,14 @@ function notePeakCpu(load) {
   // only costs 1). A stretch of genuine headroom (<70% for 80s) -> cautiously raise it by 1. Converges to the largest
   // worker count that keeps the box under ~90-95% on ANY hardware, and never sustains 100% / freezes.
   if (load >= 97) {                                          // brief 90-95% spikes are FINE (operator) -> only a near-100% sample backs the ceiling off, and never below 3
-    if (now - __learnedMaxAt > 20000) { __learnedMaxWorkers = Math.max(3, __learnedMaxWorkers - 1); __learnedMaxAt = now; try { logEvent("adaptive_ceiling_down", { cpu: load, ceiling: __learnedMaxWorkers }); } catch (_) {} }
-  } else if (load < 80 && now - __learnedMaxAt > 30000) {    // 30s of headroom -> climb back toward full speed FAST (operator: box handles 4-5)
-    __learnedMaxWorkers = Math.min(8, __learnedMaxWorkers + 1); __learnedMaxAt = now;
+    if (now - __lastCeilingDownAt > 20000) { __learnedMaxWorkers = Math.max(3, __learnedMaxWorkers - 1); __lastCeilingDownAt = now; __learnedMaxAt = now; try { logEvent("adaptive_ceiling_down", { cpu: load, ceiling: __learnedMaxWorkers }); } catch (_) {} }
+  } else if (__learnedMaxWorkers < 8 && recentPeakCpu() < 70 && now - __lastCeilingDownAt > 60000 && now - __lastCeilingUpAt > 30000) {
+    // RAMP UP on SUSTAINED headroom (autonomy fix 2026-06-30): gate on the DECAYING recentPeakCpu (not the raw
+    // 240ms sample) and on its OWN timer — so a single browser-launch burst can no longer BOTH ratchet the ceiling
+    // down AND reset the up clock (the bug that pinned the ceiling at the floor of 3 forever even at CPU 25% / RAM
+    // 79%). 60s since the last down + the peak decayed under 70 = the box is genuinely idle -> climb back to speed.
+    __learnedMaxWorkers = Math.min(8, __learnedMaxWorkers + 1); __lastCeilingUpAt = now; __learnedMaxAt = now;
+    try { logEvent("adaptive_ceiling_up", { peakCpu: Math.round(recentPeakCpu()), ceiling: __learnedMaxWorkers }); } catch (_) {}
   }
 }
 async function currentCpuLoadPercent(sampleMs = 240) {
@@ -20182,6 +20188,7 @@ let __assetBufferStatusCache = { at: 0, body: null };
 const STATUS_CACHE_TTL_MS = 300000;
 
 let lastHeartbeatTick = 0;
+let __lastHungReaperAt = 0, __hungReaperInFlight = false, __lastHeartbeatCpuSampleAt = 0; // autonomous self-heal: hung-window reaper + idle CPU sampler (heartbeat-driven, 2026-06-30)
 setInterval(() => {
   // Per-post-log retention: low-frequency (>=6h) fire-and-forget sweep so the detail-log dir
   // stays bounded. Gated independently of the heartbeat throttle; never blocks (async).
@@ -20226,6 +20233,20 @@ setInterval(() => {
   }
   // KEEP-OPEN reaper: close + release any kept-open session past its post/age cap so a held window can't linger.
   if (__keepOpenSession.size > 0) { try { closeStaleKeepOpenSessions(); } catch (_) {} }
+  // AUTONOMOUS SELF-HEAL (operator 2026-06-30: "tout doit être automatique/autonome" — never a manual chrome-kill):
+  //  (1) HUNG-WINDOW REAPER every ~45s — force-closes stuck profile locks (frees GLOBAL_MAX_OPEN_PROFILES slots) and
+  //      OS-reaps ORPHAN ixBrowser chrome the API-only close_finished sweep structurally cannot terminate.
+  //  (2) IDLE CPU SAMPLER every ~12s — feeds notePeakCpu an idle reading even when posting has STALLED (no connector
+  //      spawns -> currentCpuLoadPercent otherwise stops being called), so the AIMD ceiling RAMPS BACK UP from its
+  //      pinned floor instead of staying stuck. Both are no-ops at rest (size 0 / 0 orphans) -> zero browsers idle.
+  if (!__hungReaperInFlight && Date.now() - __lastHungReaperAt > 45000) {
+    __lastHungReaperAt = Date.now();
+    hungWindowReaperSweep().catch(() => {});
+  }
+  if (Date.now() - __lastHeartbeatCpuSampleAt > 12000) {
+    __lastHeartbeatCpuSampleAt = Date.now();
+    currentCpuLoadPercent().catch(() => {}); // notePeakCpu runs inside -> keeps the ceiling ramp-UP path alive during a stall
+  }
   const state = readState();
   // HARVEST WHILE PROD RUNS (operator 2026-06-17: "disable harvesting all day — harvest at the SAME TIME as prod").
   // The harvest driver lives on the always-on 1s heartbeat but is now gated by harvestShouldRunNow (enabled + ARMED +
@@ -21755,6 +21776,65 @@ function cleanOrphanIxBrowserChromeAtBoot() {
       logEvent("boot_orphan_ixbrowser_chrome_cleanup", { ok: !err, error: err ? oneLineField(err.message || String(err), 140) : "" });
     });
   } catch (e) { logEvent("boot_orphan_cleanup_error", { error: oneLineField(e.message || String(e), 140) }); }
+}
+
+// ── AUTONOMOUS SELF-HEAL: HUNG-WINDOW REAPER ──────────────────────────────────────────────────────────────────
+// (operator 2026-06-30: "everything must be automatic/autonomous — never a manual chrome-kill"). The existing
+// close_finished_profile_sweep only RETRIES the ixBrowser profile-close API — the SAME call that already
+// failed/wedged when a connector timed out — so genuinely-orphaned chrome (node connector self-killed at the
+// 10-min execFile timeout; chrome left parented to the ixBrowser desktop; API not terminating it) is NEVER reaped
+// and piles up (observed 92 chrome -> RAM 30% free -> posting auto-throttled to ~0). This adds the missing
+// OS-level reaper, called from the always-on heartbeat (~45s), single-flight, no-op at rest.
+function osReapOrphanIxBrowserChrome(reason) {
+  // SAME safe filter as cleanOrphanIxBrowserChromeAtBoot: ONLY ixBrowser-managed chrome.exe — never the operator's
+  // own chrome, NEVER Pinterest (it runs on msedge), never node (this server / its connectors). Fire-and-forget.
+  try {
+    const ps = "Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | Where-Object { $_.CommandLine -match 'ixBrowser' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } catch {} }";
+    require("child_process").execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], { windowsHide: true, timeout: 30000 }, (err) => {
+      try { logEvent("hung_window_reaper_os_orphan_kill", { reason: oneLineField(reason || "", 100), ok: !err, error: err ? oneLineField(err.message || String(err), 140) : "" }); } catch (_) {}
+    });
+  } catch (e) { try { logEvent("hung_window_reaper_error", { error: oneLineField(e.message || String(e), 140) }); } catch (_) {} }
+}
+async function hungWindowReaperSweep() {
+  if (__hungReaperInFlight) return;
+  __hungReaperInFlight = true;
+  try {
+    const now = Date.now();
+    // TIER A — TARGETED: force-close any profile whose use-lock is older than the connector timeout + margin. The
+    // connector self-kills at its ~10-min execFile timeout and the finally releases the lock, so a lock older than
+    // ~12 min means the release never fired (wedged) — it is holding a GLOBAL_MAX_OPEN_PROFILES slot, throttling
+    // posting. Force-close via the API and DROP the lock so the slot frees even if the API close itself fails.
+    // 25 min: safely ABOVE the longest LEGIT lock-hold. A single connector self-kills at its ~10-min execFile
+    // timeout, BUT the publisher lock is held through the whole post -> admin-approval (8-min cap) -> comment-
+    // recovery (4-min) chain (~14 min worst case), so 12 min would force-close a LIVE long chain and TOCTOU-race
+    // the flow's own finally (review finding). Only a lock older than 25 min is genuinely WEDGED. Keep-open
+    // sessions (which legitimately hold their lock up to ~40 min) are skipped — closeStaleKeepOpenSessions owns them.
+    const HUNG_MS = 25 * 60 * 1000;
+    const stuck = [];
+    for (const [key, lock] of normalIxProfileUseLocks.entries()) {
+      if (typeof __keepOpenSession !== "undefined" && __keepOpenSession && (__keepOpenSession.has(key) || __keepOpenSession.has(Number(key)))) continue; // keep-open owns its lock for its whole life
+      const startedMs = Date.parse((lock && lock.startedAt) || "") || 0;
+      if (startedMs && (now - startedMs) > HUNG_MS) stuck.push({ key, ageMs: now - startedMs, purpose: (lock && lock.purpose) || "" });
+    }
+    for (const s of stuck) {
+      try { await ixBrowserForceCloseForRecovery(Number(s.key), "hung_window_reaper"); } catch (_) {}
+      try { normalIxProfileUseLocks.delete(s.key); } catch (_) {}
+      try { __everOpenedIxProfiles.delete(s.key); } catch (_) {}
+      try { logEvent("hung_window_reaped_stuck_lock", { profileId: s.key, ageMinutes: Math.round(s.ageMs / 60000), purpose: s.purpose }); } catch (_) {}
+    }
+    // TIER B — OS-LEVEL ORPHAN REAP (the fallback the API-only sweep structurally cannot do): when chrome procs are
+    // piled high (>=~90) WHILE NO profile is tracked-open (size === 0), the pile is orphan -> blanket-kill ixBrowser
+    // chrome. size === 0 is the live-safe analogue of the boot cleanup's "no run armed" gate; the targeted Tier A
+    // above frees stuck slots so size CAN reach 0. Near-zero collateral: the only lock-less live windows are the SYL
+    // link-gen + warmup pre-open, and they would need ~90 chrome open simultaneously to coincide (i.e. a real orphan
+    // pile already exists) — and both self-heal by retrying. The high-water gate makes a false reap very unlikely.
+    let chromeN = 0; try { chromeN = await currentChromeProcessCount(); } catch (_) {}
+    const __st = readState();
+    const orphanHigh = clampNumber(__st && __st.operator && __st.operator.resourceGuardMaxChromeProcesses, 40, 600, 150) * 0.6;
+    if (normalIxProfileUseLocks.size === 0 && chromeN >= orphanHigh) {
+      osReapOrphanIxBrowserChrome(`orphan_signature chrome=${chromeN} openLocks=0`);
+    }
+  } catch (_) { /* never throw from the heartbeat */ } finally { __hungReaperInFlight = false; }
 }
 
 // ROOT-CAUSE FIX (2026-06-26): if another server instance already owns the port (a racing restart / watchdog +
