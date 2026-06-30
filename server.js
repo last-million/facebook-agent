@@ -12704,6 +12704,7 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
             // POST LANDED -> record it as published so the resweep comments it (no silent loss).
             const actualGroupUrl = facebookGroupUrlFromPostUrl(rec.postUrl) || groupUrl;
             try { recordPublishedFacebookPostUrl({ postUrl: rec.postUrl, row, planId, sequence, profile: row.profile || profileId, groupUrl: actualGroupUrl }); } catch (_) {}
+            __lastPostProgressAt = Date.now(); // reconcile recovered a landed post -> tick is making progress (hung-tick watchdog stays hands-off)
             appendFacebookLivePostLedger({ event: "published", key: it.key, planId, sequence, profileId, profile: row.profile || "", groupUrl, actualGroupUrl, postUrl: rec.postUrl, status: "published", message: "recovered after kill-mid-post (publish_intent reconcile)", validation: rec.validation || null,
               // DURABLE COMMENT-RECOVERY: stamp the payload here too — this kill-mid-post path lands a post WITHOUT going
               // through completeVerifiedFacebookPostWithComment, so without this the recovered post has no payload and is
@@ -20360,9 +20361,11 @@ setInterval(() => {
   //      in-tick watchdog only runs when a NEW tick is ATTEMPTED, but the autopilot scheduler itself AWAITS the tick,
   //      so a wedged tick blocks the scheduler from attempting one -> the watchdog never fires -> indefinite freeze
   //      (needed a manual kick). Run it HERE on the always-on heartbeat instead: a tick in flight > AUTOPILOT_TICK_MAX_MS
-  //      is force-reset + a fresh tick kicked, so posting can never freeze longer than ~5 min. Race-safe: the gen guard
+  //      is force-reset + a fresh tick kicked, so posting can never freeze longer than ~3 min. Race-safe: the gen guard
   //      means the stale tick's finally won't clear the new flag; the per-(product,group) claim prevents any double-post.
-  if (__autopilotTickInFlight && __autopilotTickStartedAt && Date.now() - __autopilotTickStartedAt > AUTOPILOT_TICK_MAX_MS) {
+  //      NO-PROGRESS GUARD: only reset when the tick has ALSO landed no post in the window (Date.now() - __lastPostProgressAt),
+  //      so a slow-but-publishing tick is never reset — lets the threshold sit at 3 min without churning healthy ticks.
+  if (__autopilotTickInFlight && __autopilotTickStartedAt && Date.now() - __autopilotTickStartedAt > AUTOPILOT_TICK_MAX_MS && Date.now() - __lastPostProgressAt > AUTOPILOT_TICK_MAX_MS) {
     try { logEvent("autopilot_tick_watchdog_reset", { heldMinutes: Math.round((Date.now() - __autopilotTickStartedAt) / 60000), via: "heartbeat" }); } catch (_) {}
     __autopilotTickInFlight = false; __autopilotTickStartedAt = 0;
     setTimeout(() => { autopilotTickAsync().catch(() => {}); }, 0); // kick a fresh tick immediately so posting resumes
