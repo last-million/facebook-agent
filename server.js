@@ -52,6 +52,8 @@ let __forcedCommentResweepActive = false;
 // __externalStopRequested) still hard-blocks them. A counter, not a boolean, so overlapping inline comments
 // across concurrent posts don't clear the exemption early.
 let __postCompletionExternalActionInFlight = 0;
+let __bgCommentInFlight = 0; // outstanding BACKGROUNDED comment+approval tasks (decouple backpressure 2026-06-30)
+const MAX_BG_COMMENT_IN_FLIGHT = 5; // past this, fall back to inline await so the tick slows + the backlog drains (the 14-slot open cap THROWS not blocks)
 // IN-MEMORY authoritative verified-comment index (DOUBLE-COMMENT GUARD, 2026-06-25): the single ledger append can be
 // EBUSY-dropped under parallel posting (forensic: a dropped comment_recovery_finished proof makes a COMMENTED post
 // LOOK uncommented -> the drain re-opens + re-comments it = a duplicate money-comment; the operator confirmed 25). This
@@ -15805,6 +15807,59 @@ async function completeVerifiedFacebookPostWithComment({
         attemptedApprovalProfiles: approvalResult.attemptedApprovalProfiles || [],
       } : null,
       liveLog: sameProfileRecovery?.liveLog?.length ? sameProfileRecovery.liveLog : compactLivePostLog(postLogObjects),
+      state: readState(),
+      registers: readRegisters(),
+    };
+  }
+  // DECOUPLE POSTING FROM APPROVAL (operator 2026-06-30: "posting must be continuous"). For an APPROVAL-REQUIRED
+  // group the comment step blocks on the moderator approval (~8min) + comment retries (~4min); since the tick awaits
+  // every worker (Promise.allSettled), that ~14-min tail wedges the WHOLE posting cadence (~4 posts / 20min). But
+  // everything the comment/approval needs is ALREADY durable at this point — the published ledger row + full comment
+  // payload (15568), the per-run counter bump (15549), and the publisher lock release (15683) all happened BEFORE
+  // here — and the always-on background drain (resweepUncommentedFacebookPostsAsync) re-comments published rows AND
+  // re-fires approval for still-pending posts (with double-comment + in-flight guards). So for approval groups, fire
+  // the comment+approval in the BACKGROUND (own closeResults, NOT awaited) and return immediately so the tick
+  // dispatches the next batch -> continuous posting; the comment/approval land async on different profiles. Kept the
+  // fast inline await for NON-approval groups (no moderator wait), and gated OFF when commentDrainDisabled (no
+  // background recovery then -> must stay inline). The bg wrapper holds __postCompletionExternalActionInFlight for
+  // its whole life, so the run-end/stop-finish resweep still waits for it before disarm.
+  // Only RUN posts are backgrounded (a manual/dashboard post keeps its synchronous inline comment result); and only
+  // while fewer than MAX_BG_COMMENT_IN_FLIGHT comment+approval tasks are already outstanding — BACKPRESSURE: the
+  // 14-slot open cap THROWS (not blocks), so unbounded bg tasks would churn 503s; past N we fall back to the inline
+  // await, which naturally slows the tick until the backlog drains. (review: med/low fixes applied.)
+  const __bgApprovalComment = ready.__autopilotRunPost === true
+    && isAdminApprovalEnabledForGroup(actualGroupUrl, readState())
+    && readState().operator?.commentDrainDisabled !== true
+    && __bgCommentInFlight < MAX_BG_COMMENT_IN_FLIGHT;
+  if (__bgApprovalComment) {
+    __bgCommentInFlight += 1;
+    const __bgClose = [];
+    addRequiredFirstCommentWithDifferentProfile({ row, ready, groupUrl: actualGroupUrl, postUrl, imagePath: ready.imagePath, postValidation: validation, ledgerKey, closeResults: __bgClose })
+      .then((r) => { try { logEvent("facebook_post_comment_backgrounded_done", { postUrl, ok: Boolean(r && r.ok) }); } catch (_) {} })
+      .catch((e) => { try { logEvent("facebook_post_comment_backgrounded_error", { postUrl, error: oneLineField((e && e.message) || String(e), 200) }); } catch (_) {} })
+      .finally(() => { __bgCommentInFlight = Math.max(0, __bgCommentInFlight - 1); });
+    try { logEvent("facebook_post_published_comment_backgrounded", { postUrl, groupUrl: actualGroupUrl, profileId: ready.profileId, bgInFlight: __bgCommentInFlight }); } catch (_) {}
+    return {
+      ok: true, // PUBLISHED ok — the post landed + is durably recorded; comment + admin approval run in the background
+      postUrl,
+      posted: true,
+      planId: row.planId,
+      sequence: row.sequence,
+      profileId: ready.profileId,
+      profile: row.profile || String(ready.profileId),
+      groupUrl: actualGroupUrl,
+      attemptedGroups,
+      closeResults,
+      postPayloadFile,
+      postPayloadDeleted,
+      postLiveLogFile,
+      postScript,
+      approvalResult: null,
+      postValidation: validation,
+      validation,
+      commentBackgrounded: true,
+      message: `Post published by ${row.profile || ready.profileId} (URL: ${postUrl}); comment + admin approval running in background (approval-required group) so posting stays continuous.`,
+      liveLog: compactLivePostLog(postLogObjects),
       state: readState(),
       registers: readRegisters(),
     };
