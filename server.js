@@ -15460,7 +15460,16 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       const payloadByPlan = new Map(); // DURABLE COMMENT-RECOVERY: planId|sequence -> ledger row carrying the stored comment payload
       for (const r of rows) {
         if (!r || !r.postUrl) continue;
-        const isPublished = /^published/.test(String(r.event || "")) || ["published", "published_with_warning", "published_after_admin_approval"].includes(String(r.status || ""));
+        // ONLY genuine PUBLISH-marking events may become the tracked row (mirrors buildRunReports' PUB set, which gets
+        // this right). BUG FOUND 2026-07-01 (operator: "why many didn't comment... check the approved ones"): the old
+        // check matched on STATUS ALONE (any row with status="published_with_warning"), and a SUCCESSFUL
+        // comment_recovery_finished row also carries status="published_with_warning" (1511 such rows found in the
+        // ledger vs 1321 genuine "published" rows) -> that comment-success row would CLOBBER this plan's publishedByPlan
+        // entry, replacing the true publisher's profileId with the COMMENTER's own profileId. The dedup check below then
+        // compared the commenter against ITSELF ("is there a comment from a DIFFERENT profile than pid") and always
+        // found none -> the post was misjudged as still uncommented FOREVER, wasting repeat comment/approval attempts on
+        // already-done posts (throughput waste) even though the comment had already landed and was verified.
+        const isPublished = r.event === "published" || r.event === "published_after_admin_approval";
         if (!isPublished) continue;
         const at = Date.parse(r.at || "") || 0;
         if (at && at < cutoff) continue;
@@ -15500,18 +15509,18 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         if (summary.recommented >= maxToFix || summary.checked >= maxToFix) break;
         const publisherId = Number(ev.profileId || 0);
         if (__hasDifferentProfileComment(postUrl, publisherId)) continue; // already has a different-profile comment (SWARM FIX #2: build-once index over the full 8000 selection window, not a smaller 5000 re-read)
-        // COMMENT MAX-AGE CUTOFF (operator 2026-06-28): only comment within ~N min of a post going PUBLIC; abandon later
-        // (no late comment). The clock starts at PUBLIC time = ev.at of the LATEST published-status row: for an approved
-        // post that row is published_after_admin_approval (approval time), for a direct post it's the publish time. A
-        // STILL-PENDING post in an approval-required group (status not yet *_after_admin_approval) is EXEMPT so the
-        // approval flow can run + the comment lands within N min of the LATER approval. Dynamic: operator.commentMaxAgeMinutes.
-        {
-          const __maxAgeMs = clampNumber(state.operator?.commentMaxAgeMinutes, 1, 240, 6) * 60 * 1000;
-          const __evAt = Date.parse(ev.at || "") || 0;
-          const __approved = String(ev.status || "") === "published_after_admin_approval";
-          const __pendingApproval = isAdminApprovalEnabledForGroup(ev.groupUrl, state) && !__approved; // not yet public via approval -> clock not started
-          if (!__pendingApproval && __evAt && (Date.now() - __evAt) > __maxAgeMs) { summary.stillMissing += 1; continue; } // public > N min + uncommented -> abandon
-        }
+        // REMOVED 2026-07-01 (operator: "find way to not skip comments man!"): there used to be a hard COMMENT MAX-AGE
+        // CUTOFF here (operator.commentMaxAgeMinutes, added 2026-06-28) that PERMANENTLY abandoned ("summary.stillMissing
+        // += 1; continue") any post uncommented more than ~6-10 min after going public — silently, with no log event,
+        // and FOREVER (ev.at never changes, so once a post crossed the threshold it was excluded from every future
+        // resweep for the rest of its life). Ledger audit found ~570 posts hit exactly this path. The exemption meant to
+        // protect still-pending approval posts was ALSO broken (it read ev.status === "published_after_admin_approval",
+        // but the ledger only ever stamps that as the EVENT NAME, never the status field -- so the exemption check was
+        // permanently false and never actually distinguished anything). Operator's directive overrides the 2026-06-28
+        // "no late comment" preference: always keep trying to comment a post, even late, rather than silently give up.
+        // The OUTER selection window (run-start clamp above for normal sweeps; windowHours for drain/force sweeps, up to
+        // 168h via the manual resweep endpoint) still bounds how far back any sweep ever looks -- removing this INNER
+        // per-post age check does not risk unbounded reach-back, it just stops giving up early within that window.
         let row = postingPlanRowForRecord({ planId: ev.planId, sequence: ev.sequence });
         if (!row || !String(row.commentTextPreview || row.link || "").trim()) {
           // DURABLE COMMENT-RECOVERY: the per-tick posting-plan.jsonl was overwritten so the live row is gone -> rebuild
