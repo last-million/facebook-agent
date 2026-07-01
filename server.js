@@ -21088,6 +21088,19 @@ const server = http.createServer(async (req, res) => {
         incoming.operator.commentDrainPaused = false; // a fresh launch re-enables the comment drain a prior operator STOP had paused (else this run's tail/late comments stay blocked)
         incoming.operator.autopilotRunId = String(Date.now()); // fresh per-run product-claim namespace (no cross-run carryover)
         try { const cr = path.join(DATA_DIR, "post-claims"); for (const d of (fs.existsSync(cr) ? fs.readdirSync(cr) : [])) { try { fs.rmSync(path.join(cr, d), { recursive: true, force: true }); } catch (_) {} } } catch (_) {} // drop stale claim dirs
+        // STALE STOP-FLAG (2026-07-01, operator: "he finished but detect why he didn't finish last comments"): a
+        // PRIOR stopAllExternalWork() call (operator STOP, or my own /api/operator/stop-all to pause the drain)
+        // sets __externalStopRequested = Date.now() and NEVER resets it back to 0 anywhere else in the codebase --
+        // it is a MODULE-LEVEL variable that outlives the run it stopped. requireExternalArmed()'s tail-comment
+        // exemption ("__postCompletionExternalActionInFlight > 0 && __externalStopRequested === 0") therefore stays
+        // permanently broken for the REST OF THE PROCESS'S LIFETIME after the FIRST stop-all call, silently
+        // failing every future run-limit auto-disarm's tail comments with "External actions are locked" for EVERY
+        // profile tried (not a profile-availability issue -- a global stale flag). Traced live: 2 tail posts of a
+        // just-finished 100/100 run each failed on ALL 6 fallback profiles with that identical error. Reset it here
+        // on a genuine fresh arm (false->true) so a stop from an EARLIER session/run can never poison a NEW run's
+        // tail comments. Fresh arms are already the correct place for this: gated by the stop-cooldown check above
+        // (a stale echo within 6s of a real stop won't hit this branch), and mirrors the other per-run resets here.
+        __externalStopRequested = 0;
         logEvent("autopilot_run_armed_counter_reset", { maxPostsPerRun: incoming.operator.autopilotMaxPostsPerRun, runId: incoming.operator.autopilotRunId });
       } else if (incoming.operator.autopilotPostsThisRun === undefined || incoming.operator.autopilotPostsThisRun === null) {
         // controlWrite skips the protected-preserve, so a PUT that omits the counter must NOT reset
