@@ -4,3 +4,5 @@
 2026-06-30T09:15:25  watchdog: FB server (port 9317) DOWN (wedged_3_misses) -> restarted
 2026-06-30T09:18:28  watchdog: FB server (port 9317) DOWN (wedged_3_misses) -> restarted
 2026-06-30T09:21:23  watchdog: FB server (port 9317) DOWN (wedged_3_misses) -> restarted
+2026-07-01T06:26:26  watchdog: FB server (port 9317) DOWN (wedged_3_misses) -> restarted
+2026-07-01T06:29:26  watchdog: FB server (port 9317) DOWN (wedged_3_misses) -> restarted
