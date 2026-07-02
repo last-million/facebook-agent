@@ -14145,6 +14145,10 @@ async function runFacebookCommentRecoveryAttempt({ row, profileId, profileLabel,
         profileLabel: cleanProfile,
         validation,
       });
+      // reset the commenter's in-memory failure streak + quota latch on a verified comment (pairs with the
+      // catch-side autoBlacklistProfileIfNeeded feed below — a comment success proves the profile opens + works,
+      // mirroring how a successful POST resets the same counters).
+      try { autoBlacklistProfileIfNeeded({ profileId: numericProfileId, profile: cleanProfile, ok: true }); } catch (_) {}
     }
     return {
       ok: validation.ok,
@@ -14177,6 +14181,19 @@ async function runFacebookCommentRecoveryAttempt({ row, profileId, profileLabel,
         reason: err.message || validation.facebookAccountBlockReason || "Facebook account is suspended, disabled, locked, or requires review.",
         source: "facebook_comment_recovery",
       });
+    } else {
+      // COMMENTER-PROFILE HEALTH FEED (2026-07-02, operator: "why doesn't it class them as profiles-having-issue if
+      // they do the SAME problem more than once, so admin can Release them?"): the whole strike/park machinery
+      // (autoBlacklistProfileIfNeeded -> 1018 quota latch / 1004 maybeParkPersistentOpen1004 with wedge-guard +
+      // threshold-4 park into the releasable errored list / dead-proxy auto-Direct / logged-out -> disconnected park /
+      // soft 2-strike -> issueProfiles) was ONLY fed by the POSTING outcome paths — a commenter-only profile could
+      // fail the SAME connector error forever and never record a single strike (measured live: profile 60 hit 32
+      // ixBrowser-1004 open failures in 24h on comment attempts, ~33min of burned browser time, zero strikes, never
+      // parked). Feed the connector-level error here (the catch = open/CDP/timeout-class failures; the classifier
+      // ignores post-caused reasons by design, so a pending post can never strike a healthy commenter). NOT passing
+      // postUrl (the classifier reads postUrl as proof-of-success). The hard-block case above keeps its dedicated
+      // recorder — this else prevents double-recording it.
+      try { autoBlacklistProfileIfNeeded({ profileId: numericProfileId, profile: cleanProfile, ok: false, errorText: err.message || String(err), source: "comment_recovery" }); } catch (_) {}
     }
     appendFacebookLivePostLedger({
       event: "comment_recovery_error",
