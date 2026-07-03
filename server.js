@@ -13606,16 +13606,24 @@ function autoEnableAdminApprovalIfPersistentFailures(groupUrl) {
   }
 }
 
-// Serialize moderator-approval sessions box-wide: the moderator profiles (p41/p42) are
-// shared, so two pending posts approving at once collide on iX profile-open and burn the
-// 8-min budget. This single-flight chain runs approvals one-at-a-time; each approval's
-// budget timer starts AFTER it acquires the lock (queue-wait is not charged against it).
-let __adminApprovalLockChain = Promise.resolve();
-function acquireAdminApprovalLock() {
+// Serialize moderator-approval sessions PER MODERATOR PROFILE, not box-wide (2026-07-03, operator: "why does he
+// sometimes break for 1 hour" -- traced live: facebook_admin_approval_lock_acquired queueWaitMs up to ~707s (11.8min),
+// stacking as each session's own up-to-8min budget blocked EVERY OTHER pending-post approval, producing the 30-60min
+// posting gaps he saw). The single global lock chain was built when only 2 shared moderator profiles existed (p41/p42)
+// and TWO sessions racing the SAME profile really did collide on iX profile-open. With 4 distinct moderators now
+// configured, that global serialization is unnecessary: keying the lock per moderator PROFILE ID (not globally) lets
+// DIFFERENT moderators approve DIFFERENT pending posts truly in parallel, while a genuine double-open of the SAME
+// profile still serializes correctly. Existing CPU/RAM guards (adaptive concurrency, GLOBAL_MAX_OPEN_PROFILES,
+// waitForCpuHeadroom) already bound total concurrent browser load, so up to N-moderators-worth of concurrent approval
+// sessions is safe. Each approval attempt's budget timer starts AFTER it acquires ITS profile's lock (queue-wait is
+// not charged against it).
+const __adminApprovalLockChains = new Map(); // profileId (string) -> Promise chain
+function acquireAdminApprovalLock(profileId) {
+  const key = String(profileId);
   let release;
   const next = new Promise((res) => { release = res; });
-  const prior = __adminApprovalLockChain;
-  __adminApprovalLockChain = prior.then(() => next);
+  const prior = __adminApprovalLockChains.get(key) || Promise.resolve();
+  __adminApprovalLockChains.set(key, prior.then(() => next));
   return prior.then(() => release);
 }
 async function approvePendingFacebookPostWithAdminProfiles(args) {
@@ -13683,9 +13691,6 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
     candidateUrls: urls.slice(0, 10),
   });
   if (!adminProfiles.length) return null;
-  const lockRequestedAt = Date.now();
-  const releaseApprovalLock = await acquireAdminApprovalLock();
-  logEvent("facebook_admin_approval_lock_acquired", { profileId: ready.profileId, queueWaitMs: Date.now() - lockRequestedAt });
   try {
   const publisherClose = await ixBrowserCloseAfterUse(ready.profileId, "facebook_live_post_before_admin_approval");
   closeResults.push(publisherClose);
@@ -13723,18 +13728,37 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
       // BETWEEN attempts, so a single 6-min attempt could hold the lock ~14 min and stall
       // every other pending-post approval. Never start an attempt with <20s of budget, and
       // cap this attempt's own timeout to the remaining budget.
+      if (MAX_ADMIN_APPROVAL_WALL_CLOCK_MS - (Date.now() - approvalStartedAt) <= 20000) { budgetExceeded = true; break outer; }
+      // PER-MODERATOR-PROFILE lock (see acquireAdminApprovalLock comment above): only serializes against another
+      // session trying this SAME profile; a different session using a different moderator runs concurrently. The
+      // wait for THIS profile's lock now counts against the session's own budget (recomputed AFTER the wait, not
+      // before) so a contended profile can't let an attempt overshoot MAX_ADMIN_APPROVAL_WALL_CLOCK_MS.
+      const lockRequestedAt = Date.now();
+      const releaseApprovalLock = await acquireAdminApprovalLock(adminProfile.profileId);
+      logEvent("facebook_admin_approval_lock_acquired", { profileId: adminProfile.profileId, queueWaitMs: Date.now() - lockRequestedAt });
       const remainingBudgetMs = MAX_ADMIN_APPROVAL_WALL_CLOCK_MS - (Date.now() - approvalStartedAt);
-      if (remainingBudgetMs <= 20000) { budgetExceeded = true; break outer; }
-      const attempt = await runFacebookAdminApprovalAttempt({
-        row,
-        timeoutMs: Math.min(MAX_ADMIN_APPROVAL_ATTEMPT_MS, remainingBudgetMs),
-        profileId: adminProfile.profileId,
-        profileLabel: adminProfile.profile,
-        groupUrl,
-        postUrl,
-        ledgerKey,
-        reason,
-      });
+      if (remainingBudgetMs <= 5000) {
+        releaseApprovalLock();
+        logEvent("facebook_admin_approval_lock_released", { profileId: adminProfile.profileId });
+        budgetExceeded = true;
+        break outer;
+      }
+      let attempt;
+      try {
+        attempt = await runFacebookAdminApprovalAttempt({
+          row,
+          timeoutMs: Math.min(MAX_ADMIN_APPROVAL_ATTEMPT_MS, remainingBudgetMs),
+          profileId: adminProfile.profileId,
+          profileLabel: adminProfile.profile,
+          groupUrl,
+          postUrl,
+          ledgerKey,
+          reason,
+        });
+      } finally {
+        releaseApprovalLock();
+        logEvent("facebook_admin_approval_lock_released", { profileId: adminProfile.profileId });
+      }
       closeResults.push(...(attempt.closeResults || []));
       attempts.push({
         profileId: attempt.profileId,
@@ -13861,8 +13885,8 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
       : "No admin approval attempt was made.",
   };
   } finally {
-    releaseApprovalLock();
-    logEvent("facebook_admin_approval_lock_released", { profileId: ready.profileId });
+    // per-attempt lock acquire/release now lives inside the profile loop above (see acquireAdminApprovalLock);
+    // nothing session-wide to release here.
   }
 }
 
