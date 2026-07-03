@@ -8066,8 +8066,17 @@ function isProfileGroupBlockedForPosting(label, groupUrl, state) {
   ].join("\n").toLowerCase().split(/\r?\n/);
   const matching = sources.filter((line) => {
     if (!/status=(cannot_post_in_group|resolved|approved|cleared|ignored)|action=(profile_unblocked|profile_group_unblocked)/i.test(line)) return false;
-    const lineGroup = normalizedFacebookGroupKey((line.match(/group_url=([^|]+)/i) || [])[1] || "");
-    if (lineGroup !== groupKey) return false;
+    const lineGroupRaw = (line.match(/group_url=([^|]+)/i) || [])[1] || "";
+    const lineGroup = normalizedFacebookGroupKey(lineGroupRaw);
+    // ALIAS-AWARE group match (2026-07-03, operator scale-up audit): a group configured with a VANITY url
+    // (e.g. o1498765421290862) but recorded in the ledger under FB's resolved NUMERIC id (e.g. 1098414320641851)
+    // used to fail this strict string-equality check, so a profile's own "cannot post in this group" bench never
+    // matched its OWN group -> the profile got wrongly bounced to try a DIFFERENT (unassigned) group instead.
+    // groupsMatchByAlias (built from the ledger's own groupUrl/actualGroupUrl pairing, ~13538-13570) already fixed
+    // the identical vanity<->numeric mismatch for attributedCommentProfileIdsForGroup -- mirrored here. Measured
+    // live: 65/65 posting_profile_group_issue events in a 3h9m window hit ONLY the 2 vanity-configured new groups,
+    // 0 on the numeric-configured old groups.
+    if (lineGroup !== groupKey && !groupsMatchByAlias(lineGroupRaw, groupUrl)) return false;
     if (profileId && line.includes(`profile_id=${profileId}`)) return true;
     return lowerLabel.length > 2 && line.includes(lowerLabel);
   });
@@ -8527,8 +8536,20 @@ function notePeakCpu(load) {
   // Any sample at/over the operator's 95% ceiling -> drop the safe worker count by 1 (>=20s between drops, so one burst
   // only costs 1). A stretch of genuine headroom (<70% for 80s) -> cautiously raise it by 1. Converges to the largest
   // worker count that keeps the box under ~90-95% on ANY hardware, and never sustains 100% / freezes.
-  if (load >= 97) {                                          // brief 90-95% spikes are FINE (operator) -> only a near-100% sample backs the ceiling off, and never below 3
-    if (now - __lastCeilingDownAt > 20000) { __learnedMaxWorkers = Math.max(3, __learnedMaxWorkers - 1); __lastCeilingDownAt = now; __learnedMaxAt = now; try { logEvent("adaptive_ceiling_down", { cpu: load, ceiling: __learnedMaxWorkers }); } catch (_) {} }
+  if (load >= 97) {                                          // brief 90-95% spikes are FINE (operator) -> only a near-100% sample backs the ceiling off
+    // FLOOR 3->1 (2026-07-03, operator: "he should work smoothly with any number of groupes and profiles ... quality
+    // first"). Root cause of a live crash-loop (4 groups/65 profiles: adaptive_ceiling_down hit the OLD floor of 3
+    // 129 times in 3h9m, CPU stayed pegged 97-100% the whole time, chrome piled to 121 -> RAM 15% -> hung-window
+    // reaper Tier C fired -> 3 auto-resumes made zero progress -> crash-spiral safety breaker halted the run). The
+    // per-tick emergency backstop (adaptiveMaxWorkers, a few lines below: "freeRam<12||chrome>120 -> n=1") already
+    // reacts correctly in the ACUTE moment, but by then the damage (121 chrome) is already done. THIS ratchet is the
+    // PREVENTIVE layer -- it should be free to keep de-escalating below 3 while CPU stays sustained-critical, so new
+    // concurrent chains stop piling on BEFORE RAM/chrome go critical, however many groups/profiles are configured.
+    // Never a manual per-scale tuning knob: this makes 3/4/8/20 groups all self-throttle to whatever concurrency the
+    // CURRENT box can sustain, floor 1 (fully sequential, still forward progress) instead of stalling at "at least 3
+    // no matter how bad it gets". Ramp-up (below) already climbs back one step at a time once genuine headroom
+    // returns, so this can never get stuck low on a box that's actually fine.
+    if (now - __lastCeilingDownAt > 20000) { __learnedMaxWorkers = Math.max(1, __learnedMaxWorkers - 1); __lastCeilingDownAt = now; __learnedMaxAt = now; try { logEvent("adaptive_ceiling_down", { cpu: load, ceiling: __learnedMaxWorkers }); } catch (_) {} }
   } else if (__learnedMaxWorkers < 8 && recentPeakCpu() < 70 && now - __lastCeilingDownAt > 60000 && now - __lastCeilingUpAt > 30000) {
     // RAMP UP on SUSTAINED headroom (autonomy fix 2026-06-30): gate on the DECAYING recentPeakCpu (not the raw
     // 240ms sample) and on its OWN timer — so a single browser-launch burst can no longer BOTH ratchet the ceiling
@@ -12711,18 +12732,30 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
         // (every tick regenerates planId + fully overwrites the plan), risking a wrong-post record OR a wrong
         // release (-> duplicate). If the exact row is gone, flag + KEEP the claim (never blind-release).
         const row = planRows.find((pr) => pr.planId === planId && Number(pr.sequence) === sequence);
+        // ALREADY RECORDED? checked BEFORE the row-missing bail (2026-07-03 fix, comment-latency root-cause
+        // workflow). The ledger lookup key (livePostLedgerKey) depends ONLY on planId/sequence/profileId/groupUrl
+        // -- all four already available as this orphan's OWN fields above, with zero dependency on the live plan
+        // `row` surviving a plan regeneration. The OLD order bailed to "needs_manual_review" the instant `row` was
+        // gone, even when the post had already published fine and was simply still queued behind a busy
+        // comment-lock (a single lock holder can occupy its slot across many sequential fallback-profile attempts,
+        // and every autopilot tick fully regenerates the plan -> a post queued longer than one tick cycle loses its
+        // `row` even though nothing is actually wrong). Proven live: key cc74c6a48bedeefd got a false
+        // needs_manual_review at 18:20:35 for a post that published at 18:09:45 and correctly finished
+        // commenting at 18:32:56 -- this reorder eliminates that exact false alarm (and the "2-3
+        // needs_manual_review at the same timestamp" clusters it produced) without changing any claim-release
+        // behavior, which stays fully inside the untouched `!row` branch below.
+        if (groupUrl && profileId) {
+          const already = latestPublishedFacebookLivePostForRow({ planId, sequence, groupUrl }, profileId);
+          if (already && already.postUrl) {
+            writeResolved("already_recorded", already.postUrl);
+            logEvent("publish_intent_reconcile_already_recorded", { planId, sequence, profileId, postUrl: already.postUrl });
+            continue;
+          }
+        }
         if (!row || !groupUrl || !profileId) {
           writeResolved("needs_manual_review", "");
           logEvent("publish_intent_reconcile_flagged", { planId, sequence, profileId, reason: !row ? "exact_plan_row_gone" : (!groupUrl ? "group_missing" : "profile_missing") });
           summary.flagged += 1;
-          continue;
-        }
-        // Already recorded? (kill landed AFTER the in-process `published` record but before the finally) -> resolve,
-        // never re-scan/release. Cheap ledger check, prevents a needless scan + any release of a recorded post.
-        const already = latestPublishedFacebookLivePostForRow(row, profileId);
-        if (already && already.postUrl) {
-          writeResolved("already_recorded", already.postUrl);
-          logEvent("publish_intent_reconcile_already_recorded", { planId, sequence, profileId, postUrl: already.postUrl });
           continue;
         }
         const approvalGroup = isAdminApprovalEnabledForGroup(groupUrl, reconState);
@@ -13532,18 +13565,49 @@ function groupKeyAliasSet(groupUrl) {
   const base = normalizedFacebookGroupKey(String(groupUrl || ""));
   if (!base) return new Set();
   if (!__groupAliasCache.map || Date.now() - __groupAliasCache.at > 300000) {
-    const pairs = new Map();
-    const link = (a, b) => { if (!pairs.has(a)) pairs.set(a, new Set()); pairs.get(a).add(b); };
+    // COUNTED pairs (2026-07-03, group-alias adversarial verify): the OLD version linked ANY k1!==k2 pair it ever
+    // saw, unconditionally and forever -- confirmed LIVE to have already cross-contaminated two genuinely DIFFERENT,
+    // independently-configured groups (o1498765421290862 <-> 1567661940074941, 9 rows, a URL-capture race per the
+    // "Fix B" comment near recordPublishedFacebookPostUrl) alongside the correct vanity<->numeric pairing for the
+    // SAME group (o1498765421290862 <-> 1098414320641851, 114 rows). Once aliased, a bench/unblock event logged
+    // against ONE of the two unrelated groups could wrongly apply to the OTHER via groupsMatchByAlias. FIX: count
+    // occurrences per (base, candidate) pair and keep ONLY the DOMINANT candidate per base — its count must be a
+    // strict majority of ALL alias occurrences for that base (count > sum of every other candidate for the same
+    // base) AND clear an absolute minimum (>=3, so a single stray capture-race glitch can never alias two groups).
+    // A genuine vanity<->numeric pair is overwhelmingly the dominant relationship (114 vs 9 here), so this keeps
+    // the real pairing and discards the minority contamination.
+    const counts = new Map(); // base -> Map(candidate -> count)
+    const bump = (a, b) => { if (!counts.has(a)) counts.set(a, new Map()); const m = counts.get(a); m.set(b, (m.get(b) || 0) + 1); };
     try {
-      const lines = fs.readFileSync(FB_LIVE_POST_LEDGER_FILE, "utf8").split(/\r?\n/);
-      for (const ln of lines) {
-        const t = ln.trim(); if (!t || t.indexOf('"postUrl":"http') === -1) continue;
-        let r; try { r = JSON.parse(t); } catch { continue; }
+      // Bounded, cached ledger read (was an uncapped fs.readFileSync of the full ~31MB/34k-line file every 5min on
+      // this hot path -- switched to the shared, size-limited reader every other ledger consumer in this file uses).
+      const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 20000 });
+      for (const r of rows) {
+        if (!r || !r.postUrl) continue;
         const k1 = normalizedFacebookGroupKey(String(r.groupUrl || ""));
         const k2 = normalizedFacebookGroupKey(String(r.actualGroupUrl || facebookGroupUrlFromPostUrl(r.postUrl) || ""));
-        if (k1 && k2 && k1 !== k2) { link(k1, k2); link(k2, k1); }
+        if (k1 && k2 && k1 !== k2) { bump(k1, k2); bump(k2, k1); }
       }
     } catch {}
+    const MIN_ALIAS_COUNT = 3;
+    const dominant = new Map(); // base -> its single dominant candidate (one-directional, pre-mutuality-check)
+    for (const [b, cands] of counts.entries()) {
+      let total = 0, bestKey = null, bestCount = 0;
+      for (const [cand, n] of cands.entries()) { total += n; if (n > bestCount) { bestCount = n; bestKey = cand; } }
+      if (bestKey && bestCount >= MIN_ALIAS_COUNT && bestCount > (total - bestCount)) dominant.set(b, bestKey);
+    }
+    // MUTUAL-DOMINANCE requirement: keep a pair ONLY if A's dominant candidate is B *and* B's dominant candidate is
+    // A. Without this, an asymmetric one-off contamination survives from the MINORITY side even after the majority
+    // side correctly rejects it: e.g. o1498765421290862's dominant candidate is (correctly) 1098414320641851, but
+    // 1567661940074941 -- an unrelated group whose ONLY-ever-observed neighbor happens to be a stray
+    // URL-capture-race artifact pointing at o1498765421290862 -- would still trivially "win" as ITS OWN dominant
+    // candidate (its sole observation), and groupsMatchByAlias checks both sets for ANY overlap, so the false alias
+    // would still fire from that one-sided direction. Requiring reciprocity discards any one-sided noise and keeps
+    // only genuine, symmetric vanity<->numeric pairs.
+    const pairs = new Map();
+    for (const [b, cand] of dominant.entries()) {
+      if (dominant.get(cand) === b) pairs.set(b, new Set([cand]));
+    }
     __groupAliasCache = { at: Date.now(), map: pairs };
   }
   const out = new Set([base]);
@@ -13582,7 +13646,15 @@ function autoEnableAdminApprovalIfPersistentFailures(groupUrl) {
     const event = String(item.event || "").toLowerCase();
     return /uncertain_after_post_click/.test(status) || /uncertain_after_click/.test(event);
   });
-  if (recentUncertain.length < 2) return false;
+  // THRESHOLD 2->1 (2026-07-03, operator: "he should work smoothly with any number of groupes and profiles").
+  // Measured live: a brand-new group ran for ~2.5-3h with admin-approval NOT actually active (this reactive
+  // self-heal is the ONLY thing that turns it on when the operator's initial config lags Facebook's true setting),
+  // during which ~26 posts on that group were tried by 8 different profiles and permanently abandoned because the
+  // moderator-rescue path was gated off. Reacting on the FIRST uncertain-after-click signal instead of waiting for
+  // a 2nd occurrence cuts that detection window substantially for any newly-added group, at low risk: this only
+  // flips requiresAdminApproval from false->true (never disables it), and a group that genuinely doesn't need
+  // moderation would need a false "uncertain_after_post_click" signal to mis-fire even once.
+  if (recentUncertain.length < 1) return false;
   const stateToUpdate = readState();
   let changed = false;
   for (const g of (Array.isArray(stateToUpdate.posting?.groupAssignmentData) ? stateToUpdate.posting.groupAssignmentData : [])) {
@@ -14705,6 +14777,25 @@ async function recoverFacebookCommentWithProfiles(args) {
   __postCompletionExternalActionInFlight += 1;
   try {
     const lockRequestedAt = Date.now();
+    // LEDGER-VISIBLE QUEUE START (2026-07-03, comment-latency root-cause workflow): a comment-lock wait is
+    // otherwise invisible in facebook-live-posts.jsonl (the ledger the operator actually checks) -- it only shows
+    // up AFTER acquisition, via logEvent (audit log) below. This durable ledger row lets a future long wait be
+    // spotted directly in the ledger (comment_lock_queue_started with no matching *_finished/failed for a while)
+    // instead of requiring a cross-reference with the audit log. Purely additive: no control-flow change, wrapped
+    // in its own try/catch so a logging failure can never block or break the lock chain.
+    try {
+      appendFacebookLivePostLedger({
+        event: "comment_lock_queue_started",
+        key: args?.ledgerKey,
+        planId: args?.row?.planId,
+        sequence: args?.row?.sequence,
+        profileId: args?.ready?.profileId,
+        groupUrl: args?.groupUrl,
+        postUrl: args?.postUrl,
+        status: "queued",
+        message: "Waiting for a free comment-recovery concurrency slot (operator.maxConcurrentComments).",
+      });
+    } catch (_) {}
     const release = await acquireCommentLock();
     // logEvent calls are INSIDE the try so that release() in finally is guaranteed even if
     // logEvent throws (e.g. fs.appendFileSync EMFILE/EACCES under load). If it threw between
@@ -18158,6 +18249,20 @@ function isReservedReconcileProfile(profileId, label, state) {
   if (id && RECONCILE_RESERVED_PROFILE_IDS.has(id)) return true;
   if (isDedicatedShopYourLikesProfileLabel(label || String(id || ""), state)) return true;
   if (isModeratorApprovalProfileLine(label || "")) return true;
+  // ID-MEMBERSHIP CHECK (2026-07-03, operator scale-up audit): isModeratorApprovalProfileLine's regex requires a
+  // word boundary right after "moderator" (\bmoderator\b), which digit-glued labels like "1 - moderator1" and
+  // "89 - moderator4" never produce (only "16 - moderator 2", with a space before the digit, matches) -- the SAME
+  // bug already found+fixed for the sibling function isFacebookAdminApprovalProfileLabel (~server.js:7499-7509,
+  // "ID membership ALONE = moderator") but never mirrored here. Confirmed live: ixbrowser_reconcile_unbench_skipped_sticky
+  // logged profileId 1 76 times in one 3h9m window, meaning profile "1 - moderator1" was riding the posting-profile
+  // reconcile/sticky-bench roster instead of being excluded as a reserved moderator. Check ID membership directly
+  // against the operator-curated moderator list so a label-formatting quirk can never let a moderator profile slip
+  // through, regardless of how it's punctuated.
+  if (id) {
+    for (const line of recordLines(state?.ixbrowser?.moderatorProfiles)) {
+      if (profileIdFromLabel(line) === id) return true;
+    }
+  }
   // Never touch anything still on the manual blacklist (wise, operator pins).
   if (isBlockedIxBrowserProfileLabel(label || String(id || ""), state)) return true;
   return false;

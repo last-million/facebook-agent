@@ -164,11 +164,11 @@ async function groupHasMembershipWall(page) {
   const snap = await facebookUiSnapshot(page);
   if (snap.error) return false;
   const text = `${snap.title || ''} ${snap.dialogText || ''}`.toLowerCase();
-  const membershipText = /join group|request to join|pending approval|cancel request|must be a member|you are not a member|join this group|only members can|members of this group|private group|visible to members|invitation only|invited to join/.test(text);
+  const membershipText = MEMBERSHIP_WALL_RE.test(text);
   const labels = (Array.isArray(snap.buttons) ? snap.buttons : [])
     .map((b) => String(b?.label || '').trim().toLowerCase())
     .filter(Boolean);
-  const membershipButton = labels.some((label) => /^(join group|join this group|join|request to join|cancel request)$/.test(label) || /join group|request to join|cancel request/.test(label));
+  const membershipButton = labels.some((label) => /^join$/.test(label) || MEMBERSHIP_WALL_RE.test(label)); // keep the bare "Join" exact-match the old code had (MEMBERSHIP_WALL_RE has no standalone "join" alternative, only "join group" etc.)
   return Boolean(membershipText || membershipButton);
 }
 
@@ -403,6 +403,16 @@ async function ensureFacebookLoggedIn(page, payload, stage = 'facebook') {
 // check below (composerIsOpen / openComposer locators + adaptive scorer / shouldRetryComposerOpen).
 const COMPOSER_PROMPT_RE_SRC = "write something|what's on your mind|create a public post|create post|start a post|post anonymously|answer as|exprimez-?vous|cr[eé]er une publication|cr[eé]ez une publication|[eé]crire quelque chose|escribe algo|escribir algo|qu[eé] est[aá]s pensando|crea una publicaci[oó]n|crear una publicaci[oó]n|crear publicaci[oó]n|crea una publicaci[oó]n p[uú]blica|empieza una publicaci[oó]n|publica algo|escreva algo|no que voc[eê] est[aá] pensando|criar publica[cç][aã]o|crie uma publica[cç][aã]o|comece uma publica[cç][aã]o|اكتب شي|بم تفكر|بماذا تفكر|إنشاء منشور|أنشئ منشور|كتابة منشور|انشاء منشور";
 const COMPOSER_PROMPT_RE = new RegExp(COMPOSER_PROMPT_RE_SRC, 'i');
+// MULTI-LANGUAGE membership-wall detection (2026-07-03, operator scale-up: adding many groups exposed a profile that
+// genuinely is NOT a member of a group, but Facebook rendered the wall in French ("Rejoindre le groupe" / "Groupe
+// (Privé)") -- the old EN-only regex never matched, so the connector fell through to the generic transient
+// "could not open composer" instead of the distinct, correctly-handled "facebook_group_membership_required_not_a_member"
+// (server.js unassigns the profile from just THAT group's roster, never globally benches it -- see
+// isFacebookGroupMembershipFailure). Same EN/FR/ES/PT/AR coverage as COMPOSER_PROMPT_RE_SRC above, single source of
+// truth feeding all 3 membership-wall checks below (groupHasMembershipWall, the pre-composer probe, and the final
+// composer-miss probe) so they can never drift out of sync with each other again.
+const MEMBERSHIP_WALL_RE_SRC = "join group|request to join|pending approval|cancel request|must be a member|you are not a member|join this group|only members can|members of this group|private group|visible to members|invitation only|invited to join|answer.*question.*join|membership question|rejoindre le groupe|demander [aà] rejoindre|groupe priv[eé]|demande en attente|annuler la demande|vous n'[eê]tes pas membre|seuls les membres|membres du groupe|sur invitation uniquement|unirse al grupo|solicitar unirse|grupo privado|solicitud pendiente|cancelar solicitud|no eres miembro|solo los miembros|solo por invitaci[oó]n|participar do grupo|solicitar participa[cç][aã]o|grupo privado|solicita[cç][aã]o pendente|cancelar solicita[cç][aã]o|voc[eê] n[aã]o [eé] membro|apenas membros|somente a convite|الانضمام إلى المجموعة|طلب الانضمام|مجموعة خاصة|طلب معلق|إلغاء الطلب|لست عضوا|الأعضاء فقط|بالدعوة فقط";
+const MEMBERSHIP_WALL_RE = new RegExp(MEMBERSHIP_WALL_RE_SRC, 'i');
 async function composerIsOpen(page) {
   return await page.evaluate((reSrc) => {
     const composerLabelRegex = new RegExp(reSrc, 'i');
@@ -492,7 +502,7 @@ function shouldRetryComposerOpen(result) {
   // block is permanent — never retry. A bare transient "content isn't available"
   // interstitial WITHOUT any membership signal is recoverable — allow the
   // recovery ladder (Home/scroll/reload/goto) to run.
-  const membershipWall = /join group|request to join|pending approval|cancel request|must be a member|temporarily blocked|not allowed|private group|only members can|members of this group|invitation only/.test(`${text} ${buttonText}`);
+  const membershipWall = MEMBERSHIP_WALL_RE.test(`${text} ${buttonText}`) || /temporarily blocked|not allowed/.test(`${text} ${buttonText}`); // MEMBERSHIP_WALL_RE = EN/FR/ES/PT/AR membership terms; "temporarily blocked|not allowed" kept separately (account-level block, not a membership term, no multilingual coverage claimed here)
   if (membershipWall) return false;
   const transientUnavailable = /not available|content isn't available|content isnt available|isn't available right now|isnt available right now|page not found|something went wrong/.test(text);
   if (transientUnavailable) return true;
@@ -4873,7 +4883,7 @@ async function main() {
     }
     const btns = Array.isArray(d.buttons) ? d.buttons : [];
     const probe = `${d.title || ''} ${d.dialogText || ''} ${btns.map((b) => String(b && b.label || '').toLowerCase()).join(' | ')}`.toLowerCase();
-    if (/join group|request to join|pending approval|cancel request|must be a member|you are not a member|only members can|members of this group|invitation only|invited to join|private group|answer.*question.*join|membership question/.test(probe)) {
+    if (MEMBERSHIP_WALL_RE.test(probe)) {
       throw new Error('facebook_group_membership_required_not_a_member');
     }
     // LOGGED-OUT CHECK: a logged-out profile has NO composer either — but it must be flagged as
