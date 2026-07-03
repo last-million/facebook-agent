@@ -11285,6 +11285,15 @@ function appendFacebookLivePostLedger(event = {}) {
       pinRequired: Boolean(event.validation.pinRequired),
       commentPinClicked: Boolean(event.validation.commentPinClicked),
       commentPinVerified: Boolean(event.validation.commentPinVerified),
+      // ADMIN-APPROVAL OBSERVABILITY (2026-07-03): these were silently dropped by this whitelist (this serializer
+      // rebuilds a fixed field set -- anything not listed here never reaches disk), so a persisted
+      // admin_approval_finished row could never be told apart from a real dead-end (moderator clicked Approve vs
+      // never found anything) after the fact. Added so future ledger audits can see the same signal the in-memory
+      // soft-success logic already correctly acted on (see facebookAdminApprovalValidationFromLog).
+      approvalClicked: event.validation.approvalClicked === true,
+      approverLacksAdminRole: event.validation.approverLacksAdminRole === true,
+      moderatorStuckForcedSwitch: event.validation.moderatorStuckForcedSwitch === true,
+      noPendingPostForPublisher: event.validation.noPendingPostForPublisher === true,
     } : null,
     closeResult: event.closeResult && typeof event.closeResult === "object" ? {
       ok: Boolean(event.closeResult.ok),
@@ -16543,7 +16552,12 @@ async function runLiveFacebookPostFromPlan(body = {}) {
       closeResults: recoveryCloseResults,
       reason: "Publisher marker scan did not recover the submitted post URL; checking admin/moderator pending review by marker before giving up.",
     });
-    if (approvalResult?.ok && approvalResult.postUrl) {
+    // SOFT-SUCCESS AWARE (2026-07-03): approvalClicked = moderator clicked Approve on our marker-scoped post but FB
+    // hasn't propagated a strong-verifiable permalink yet. Without this, a soft click here fell through to the
+    // throw below with ZERO published/published_after_admin_approval stamp -- permanently invisible to the durable
+    // comment resweep (which only tracks posts with a "published" event). Confirmed live: 66/297 marker-verify
+    // failures never got a published event and 100% never recovered, traced to exactly this gap.
+    if ((approvalResult?.ok || approvalResult?.approvalClicked) && approvalResult.postUrl) {
       return await completeVerifiedFacebookPostWithComment({
         row,
         ready,
@@ -16736,12 +16750,16 @@ async function runLiveFacebookPostFromPlan(body = {}) {
             closeResults,
             reason: "A permalink candidate exists but the post is not fully verified; checking whether admin approval is required.",
           });
-          if (approvalResult?.ok && approvalResult.postUrl) {
+          // SOFT-SUCCESS AWARE (2026-07-03): a soft click (approvalClicked, ok:false) still means the post went
+          // through moderation -- upgrade to its postUrl/validation so the guard below and completeVerified...
+          // downstream can recognize it (see the matching fix at approvePendingFacebookPostWithAdminProfiles's
+          // other call sites for the full rationale).
+          if ((approvalResult?.ok || approvalResult?.approvalClicked) && approvalResult.postUrl) {
             finalPostUrl = approvalResult.postUrl;
             validation = approvalResult.validation;
           }
         }
-        if (!validation.ok && !liveEnoughToComment) {
+        if (!validation.ok && !liveEnoughToComment && !approvalResult?.approvalClicked) {
           const message = `Facebook post URL was captured, but publish verification failed: ${validation.errors.join(", ") || "unknown_verification_error"}.`;
           logEvent("facebook_live_post_verification_failed", {
             planId: row.planId,
@@ -16803,7 +16821,8 @@ async function runLiveFacebookPostFromPlan(body = {}) {
           closeResults,
           reason: "Post click produced candidate permalink(s), but Facebook did not expose a verified visible post. Trying admin approval before failing.",
         });
-        if (approvalResult?.ok && approvalResult.postUrl) {
+        // SOFT-SUCCESS AWARE (2026-07-03): see the fix rationale at the first approvePendingFacebookPostWithAdminProfiles call site above.
+        if ((approvalResult?.ok || approvalResult?.approvalClicked) && approvalResult.postUrl) {
           return await completeVerifiedFacebookPostWithComment({
             row,
             ready,
@@ -16833,7 +16852,8 @@ async function runLiveFacebookPostFromPlan(body = {}) {
             closeResults,
             reason: "Facebook accepted the post click but no verified permalink appeared; checking admin/moderator pending review by marker before trying another profile/group.",
           });
-          if (approvalResult?.ok && approvalResult.postUrl) {
+          // SOFT-SUCCESS AWARE (2026-07-03): see the fix rationale at the first approvePendingFacebookPostWithAdminProfiles call site above.
+          if ((approvalResult?.ok || approvalResult?.approvalClicked) && approvalResult.postUrl) {
             return await completeVerifiedFacebookPostWithComment({
               row,
               ready,
@@ -16951,7 +16971,8 @@ async function runLiveFacebookPostFromPlan(body = {}) {
         closeResults,
         reason: "Submitted post URL recovery did not find the permalink; checking admin/moderator pending review by marker.",
       });
-      if (approvalResult?.ok && approvalResult.postUrl) {
+      // SOFT-SUCCESS AWARE (2026-07-03): see the fix rationale at the first approvePendingFacebookPostWithAdminProfiles call site above.
+      if ((approvalResult?.ok || approvalResult?.approvalClicked) && approvalResult.postUrl) {
         return await completeVerifiedFacebookPostWithComment({
           row,
           ready,
@@ -17055,12 +17076,13 @@ async function runLiveFacebookPostFromPlan(body = {}) {
               closeResults,
               reason: "A connector error happened after a candidate permalink was seen; checking whether admin approval is required.",
             });
-            if (approvalResult?.ok && approvalResult.postUrl) {
+            // SOFT-SUCCESS AWARE (2026-07-03): see the fix rationale at the first approvePendingFacebookPostWithAdminProfiles call site above.
+            if ((approvalResult?.ok || approvalResult?.approvalClicked) && approvalResult.postUrl) {
               finalPostUrl = approvalResult.postUrl;
               finalValidation = approvalResult.validation;
             }
           }
-          if (!finalValidation.ok) {
+          if (!finalValidation.ok && !approvalResult?.approvalClicked) {
             const message = `Facebook post URL was captured after a connector error, but publish verification failed: ${finalValidation.errors.join(", ") || "unknown_verification_error"}.`;
             logEvent("facebook_live_post_verification_failed_after_connector_error", {
               planId: row.planId,
@@ -17124,7 +17146,8 @@ async function runLiveFacebookPostFromPlan(body = {}) {
             closeResults,
             reason: "The connector saw submitted-post network activity without a verified URL; trying admin approval before failing.",
           });
-          if (approvalResult?.ok && approvalResult.postUrl) {
+          // SOFT-SUCCESS AWARE (2026-07-03): see the fix rationale at the first approvePendingFacebookPostWithAdminProfiles call site above.
+          if ((approvalResult?.ok || approvalResult?.approvalClicked) && approvalResult.postUrl) {
             return await completeVerifiedFacebookPostWithComment({
               row,
               ready,
@@ -17183,7 +17206,8 @@ async function runLiveFacebookPostFromPlan(body = {}) {
           closeResults,
           reason: "Connector failed after post submit and marker scan did not recover the permalink; checking admin/moderator pending review by marker.",
         });
-        if (markerApprovalResult?.ok && markerApprovalResult.postUrl) {
+        // SOFT-SUCCESS AWARE (2026-07-03): see the fix rationale at the first approvePendingFacebookPostWithAdminProfiles call site above.
+        if ((markerApprovalResult?.ok || markerApprovalResult?.approvalClicked) && markerApprovalResult.postUrl) {
           return await completeVerifiedFacebookPostWithComment({
             row,
             ready,
