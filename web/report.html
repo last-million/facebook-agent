@@ -54,6 +54,7 @@
   .rrate{font-weight:700;font-size:.98rem;white-space:nowrap;margin-left:auto}
   .rrate small{font-size:.72rem;color:var(--mut);font-weight:600}
   .runc{font-size:.72rem;color:var(--red);white-space:nowrap;font-weight:600}
+  .runc.pending{color:var(--amber)}
   .rdel{flex:0 0 auto;appearance:none;border:1px solid var(--line);background:transparent;color:var(--mut);width:30px;height:30px;border-radius:8px;cursor:pointer;font-size:.85rem;line-height:1;transition:.15s}
   .rdel:hover{background:rgba(240,98,90,.14);border-color:rgba(240,98,90,.5);color:#ff8a83}
   .rbody{padding:6px 15px 16px;border-top:1px solid var(--line)}
@@ -131,6 +132,7 @@
 
   <div id="err"></div>
   <div id="reco"></div>
+  <div id="pendingunclustered"></div>
   <div id="openbudget"></div>
   <div id="live"></div>
   <div id="runs"><div class="empty"><span class="spin"></span> Chargement du rapport…</div></div>
@@ -222,6 +224,7 @@ function runBody(r){
     + statCard("Délai médian", fmtGap(r.gap.medianSec), "max "+fmtGap(r.gap.maxSec), "v")
     + statCard("Pic Chrome", chrTxt, "RAM libre min "+ramTxt, (r.chromePeak&&r.chromePeak>120)?"r":"g")
     + statCard("Redémarrages", r.restarts, r.restarts? "serveur relancé":"aucun — stable", r.restarts?"a":"g")
+    + ((r.pendingApproval&&r.pendingApproval.count)? statCard("En attente d'approbation", r.pendingApproval.count, "modérateur pas encore passé", "a") : "")
     + '</div>';
   var gks = Object.keys(r.byGroup||{});
   if(gks.length){
@@ -266,11 +269,26 @@ function runBody(r){
       + '<td data-l="Produit">'+pnum+'</td>'
       + '<td data-l="Groupe">'+grpPill(d.group)+'</td>'
       + '<td data-l="Publié">'+fmtTime(d.publishedAt)+'</td>'
-      + '<td data-l="Commenté">'+(d.commentedAt?fmtTime(d.commentedAt):'<span class="no">non commenté</span>')+'</td>'
+      + '<td data-l="Commenté">'+(d.commentedAt?fmtTime(d.commentedAt):(d.approvalVerification==="soft_clicked"?'<span class="slow">approbation en cours…</span>':'<span class="no">non commenté</span>'))+'</td>'
       + '<td data-l="Délai" class="'+gapClass(d.gapSec)+'">'+fmtGap(d.gapSec)+'</td>'
       + '<td data-l="Profils">'+esc(prof)+'</td></tr>';
   }).join("");
   html += '</tbody></table></div>';
+  var pend = (r.pendingApproval && r.pendingApproval.items) || [];
+  if (pend.length) {
+    html += '<h2>En attente d\'approbation <span class="ln"></span> <span class="tag">'+pend.length+'</span></h2>';
+    html += '<div class="tablecard"><table class="detail"><thead><tr>'
+      + '<th>Groupe</th><th>Soumis</th><th>Attente</th><th>Profil</th></tr></thead><tbody>';
+    html += pend.map(function(p){
+      var old = p.ageMinutes>=60;
+      return '<tr>'
+        + '<td data-l="Groupe">'+grpPill(p.group)+'</td>'
+        + '<td data-l="Soumis">'+fmtTime(p.startedAt)+'</td>'
+        + '<td data-l="Attente" class="'+(old?"no":"slow")+'">'+p.ageMinutes+' min'+(old?' ⚠':'')+'</td>'
+        + '<td data-l="Profil">'+(p.profileId||'—')+'</td></tr>';
+    }).join("");
+    html += '</tbody></table></div>';
+  }
   return html;
 }
 
@@ -285,6 +303,18 @@ function renderGlobals(){
   if (rc.pending || rc.needsReview) recoEl.innerHTML = '<div class="reco warn">⚠ Reprise après interruption (kill mid-post) : ' + bits.join(' · ') + '</div>';
   else if (rc.recovered || rc.released) recoEl.innerHTML = '<div class="reco ok">✓ Reprise auto après interruption : ' + bits.join(' · ') + ' — aucune perte silencieuse</div>';
   else recoEl.innerHTML = '';
+
+  // PENDING, NO RUN YET (2026-07-04): posts awaiting moderator approval whose run has zero landed posts so far --
+  // clustering (buildRunReports) only sees LANDED posts, so without this banner a run that's 100% pending right
+  // now would be entirely invisible on the page.
+  var pu = DATA.pendingUnclustered || [];
+  var puEl = document.getElementById("pendingunclustered");
+  if (pu.length) {
+    var byG = {};
+    pu.forEach(function(p){ byG[p.group] = (byG[p.group]||0)+1; });
+    var bits2 = Object.keys(byG).map(function(g){ return '<b>'+byG[g]+'</b> '+g; });
+    puEl.innerHTML = '<div class="reco warn">⏳ '+pu.length+' post(s) soumis, en attente d\'approbation modérateur (aucune run affichée pour l\'instant) : ' + bits2.join(' · ') + '</div>';
+  } else { puEl.innerHTML = ''; }
 
   var ob = DATA.openBudget || null;
   var obEl = document.getElementById("openbudget");

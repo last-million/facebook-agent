@@ -2584,10 +2584,24 @@ function markProfileErrored(profileId, label, reason) {
   return true;
 }
 // COMMENT-LIMITED -> POST-ONLY (operator): FB limited the account's commenting. Block it from COMMENTING
-// only; it stays fully eligible for POSTING (deliberately NOT in any posting skip-set). Admin releases it
-// manually from the Prod-tab "Comment-limited" section (the shared release below clears it too).
+// only; it stays fully eligible for POSTING (deliberately NOT in any posting skip-set). Admin can still
+// Release manually from the Prod-tab "Comment-limited" section at any time (the shared release below clears
+// it too) -- entries also AUTO-EXPIRE (TIME-BASED, like blockedModerators' cooldown above) after
+// commentLimitedAutoReleaseHours so a whole profile batch parked at once (e.g. a mass 3-strike cascade) can't
+// leave a group's ENTIRE commenter pool permanently exhausted just because nobody clicked Release (2026-07-04:
+// this is exactly what starved group 4854972804605257 for ~10 hours straight -- 16 of its 17 profiles got
+// parked once and stayed parked across an entire subsequent run). Scales to any number of groups/profiles: no
+// group-specific logic, just an age check on whatever happens to be parked.
 function commentLimitedProfileIdSet(state = readState()) {
-  return new Set((state.posting?.commentLimitedProfiles || []).map((p) => String(p.profileId || "")));
+  const now = Date.now();
+  const hours = clampNumber(state.operator?.commentLimitedAutoReleaseHours, 1, 240, 48);
+  const ids = new Set();
+  for (const p of (state.posting?.commentLimitedProfiles || [])) {
+    const at = Date.parse(String(p?.at || "")) || 0;
+    if (at && (now - at) >= hours * 3600000) continue; // auto-expired -> eligible to comment again, re-tested live
+    ids.add(String(p?.profileId || ""));
+  }
+  return ids;
 }
 function markProfileCommentLimited(profileId, label, reason) {
   const id = String(profileId || "").replace(/\D+/g, "");
@@ -20823,7 +20837,11 @@ function __reportGroupName(url) {
     for (const k of aliasSet) { if (/groups\/o\d/i.test(k)) { canonicalKey = k; break; } }
   } catch (_) {}
   const m = canonicalKey.match(/groups\/([a-z0-9.]+)/i);
-  return m ? m[1].slice(0, 18) : "autre";
+  // NOT truncated (2026-07-04 review fix): this value is also used as the "Par groupe"/"Par produit" AGGREGATION
+  // KEY (groups[g], byGroup[g], pm.groups[g]), not just a display label -- truncating it risked two genuinely
+  // different groups whose id/slug shares the same prefix silently merging into one row. The UI pill has no
+  // fixed width, so a longer label just renders wider, no layout break.
+  return m ? m[1] : "autre";
 }
 function __reportMedian(nums) {
   if (!nums.length) return 0;
