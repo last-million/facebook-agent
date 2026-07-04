@@ -872,13 +872,19 @@ function defaultSecrets() {
 let __lastGoodStateRaw = null;
 let __lastReadWasDefaults = false; // true ONLY when readState fell all the way back to factory defaults
                                    // (cold cache + unreadable file). writeState refuses to persist over this.
-function readState() {
+
+// Always does a real disk parse (no cache) — the ONLY correct merge base for writeState's read-modify-write.
+// This codebase has been bitten multiple times by a STALE state snapshot clobbering a fresher concurrent write
+// (2026-06-08 selections wipe, 2026-06-17 group vanish, 2026-06-27 stale-controlWrite re-arm) — writeState's
+// own correctness must never depend on a cached value, so it calls this directly, never the cached readState().
+function readStateFresh() {
   try {
     const parsed = parseJsonFile(STATE_FILE);
     __lastGoodStateRaw = JSON.stringify(parsed);
     __lastReadWasDefaults = false;
     const state = deepMerge(defaultState(), parsed);
     normalizeWorkflowState(state);
+    __stateReadCache = { at: Date.now(), state };
     return state;
   } catch (err) {
     logEvent("workflow_state_read_failed", { error: String(err), usingLastGood: Boolean(__lastGoodStateRaw) });
@@ -891,6 +897,24 @@ function readState() {
     __lastReadWasDefaults = true; // no real state ever obtained this process — DANGER for any write merge base
     return defaultState();
   }
+}
+
+// PERFORMANCE CACHE (2026-07-04): readState() has ~350 call sites, including an unconditional 1-second heartbeat,
+// each doing a synchronous parse+deepMerge+normalize of the multi-MB state file on the main thread -- proven root
+// cause of the FB server periodically going unresponsive to its own health check for 3+ minutes at a stretch. A
+// short TTL collapses a burst of same-instant reads (the 1s heartbeat racing dozens of concurrent posting-tick
+// reads) into a single real disk parse. Every read-only caller (status checks, decision logic) tolerates this —
+// they already tolerated up to 1s of staleness from the heartbeat cadence alone. writeState() is the ONLY place
+// that must see the true latest disk state; it calls readStateFresh() directly, never this cache (see above).
+// Returns a fresh clone so no two callers can ever observe/mutate the SAME shared object (the pre-existing
+// behavior: every real parse already produced a brand-new deepMerge'd tree per call).
+let __stateReadCache = { at: 0, state: null };
+const STATE_READ_CACHE_MS = 250;
+function readState() {
+  if (__stateReadCache.state && (Date.now() - __stateReadCache.at) < STATE_READ_CACHE_MS) {
+    return structuredClone(__stateReadCache.state);
+  }
+  return structuredClone(readStateFresh());
 }
 
 function readSecrets() {
@@ -1040,7 +1064,7 @@ function maskHost(value) {
 }
 
 function writeState(state, opts = {}) {
-  const existing = readState();
+  const existing = readStateFresh(); // NEVER the cached readState() — see readStateFresh's comment above
   // ANTI-WIPE GUARD (the real residual hole): if readState could NOT obtain any real prior state this
   // process (cold last-good cache AND the file is unreadable — corrupt / empty / momentarily locked), then
   // `existing` is pure factory DEFAULTS. Merging over defaults would persist defaults for every field the
@@ -1152,6 +1176,9 @@ function writeState(state, opts = {}) {
   normalizeWorkflowState(clean);
   clean.updatedAt = new Date().toISOString();
   atomicWrite(STATE_FILE, JSON.stringify(clean, null, 2) + "\n");
+  // Update the read cache to this just-written state so the NEXT readState() (even within STATE_READ_CACHE_MS)
+  // reflects it immediately instead of serving a stale pre-write snapshot.
+  __stateReadCache = { at: Date.now(), state: clean };
   return clean;
 }
 
@@ -1603,6 +1630,23 @@ function normalizedProfileListLines(...sources) {
   return lines;
 }
 
+// TAIL-preserving cap for append-only newline-record logs (2026-07-04). Unlike the plain .slice(0,N) used below
+// for one-shot config blobs (fine to keep from the START), these two fields grow by APPENDING new records at the
+// END (appendUniqueRecordLine) -- a head-slice would keep the OLDEST, most-stale records forever and silently
+// discard the newest ones, the opposite of what every consumer needs (fairness/cooldown lookups want the RECENT
+// history). Confirmed root cause of the periodic multi-minute server wedge: these two fields grew unbounded
+// (2.80MB + 2.79MB) inside the ~6.7MB workflow-state.json, which readState()/writeState() parse/serialize/merge
+// synchronously on the main thread on nearly every tick. Keeps the last maxBytes, snapped to a full line boundary
+// so no record is corrupted. Longest confirmed consumer lookback is 7 days (PROFILE_USAGE_WINDOW_MS); the caps
+// below hold comfortably more than that.
+function capRecordLogTail(value, maxBytes) {
+  const str = String(value || "");
+  if (str.length <= maxBytes) return str;
+  const tail = str.slice(str.length - maxBytes);
+  const firstNewline = tail.indexOf("\n");
+  return firstNewline === -1 ? tail : tail.slice(firstNewline + 1);
+}
+
 function normalizeWorkflowState(state) {
   state.testRun = sanitizeTestRunState(state.testRun);
   state.rules.commentCooldownMinutes = clampNumber(state.rules.commentCooldownMinutes, 1, 1440, 5); // anti-burn: min minutes between comments by the SAME profile
@@ -1658,6 +1702,9 @@ function normalizeWorkflowState(state) {
     }
   })();
   state.posting.groupAssignmentMode = "percentage_manual_review";
+  state.posting.facebookProfileStatus = capRecordLogTail(state.posting.facebookProfileStatus, 1500000); // was unbounded, grew to 2.80MB
+  state.tracking = state.tracking || {};
+  state.tracking.dailyActionLog = capRecordLogTail(state.tracking.dailyActionLog, 1500000); // was unbounded, grew to 2.79MB
   state.posting.groupProfileAssignments = String(state.posting.groupProfileAssignments || "").slice(0, 200000);
   state.posting.equalSplitAssignments = state.posting.equalSplitAssignments === true; // Step-3 toggle: equal dispatch, each profile in exactly one group
   state.posting.groupPostFailCounts = String(state.posting.groupPostFailCounts || "{}").slice(0, 20000); // per-(group,profile) post-fail tally for auto-unassign
@@ -15215,12 +15262,15 @@ function recentGroupPosterCommentCandidates(groupUrl, state = readState(), optio
   // Fail-OPEN only when the group has NO attribution configured (size 0), matching every other tier.
   const __attrIds = attributedCommentProfileIdsForGroup(groupUrl, state);
   try {
-    const lines = fs.readFileSync(FB_LIVE_POST_LEDGER_FILE, "utf8").split(/\r?\n/);
-    for (let i = lines.length - 1; i >= 0 && out.length < 12; i -= 1) {
-      const t = lines[i].trim();
-      if (!t || t.indexOf('"postUrl":"http') === -1) continue; // successful publishes only
-      let r; try { r = JSON.parse(t); } catch { continue; }
-      if (!r.postUrl) continue;
+    // Was an uncapped raw fs.readFileSync of the full ~30MB ledger on EVERY call (this runs per comment attempt,
+    // i.e. frequently during posting bursts) -- switched to the shared, mtime-cached, size-limited reader every
+    // other ledger consumer in this file already uses (same fix already shipped for groupKeyAliasSet). 5000 most
+    // recent rows is comfortably more than enough to find 12 valid per-group candidates (mirrors the 5000-row
+    // limit facebookApprovalCountByProfile already uses for a similar recency scan).
+    const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 });
+    for (let i = rows.length - 1; i >= 0 && out.length < 12; i -= 1) {
+      const r = rows[i];
+      if (!r || !r.postUrl) continue; // successful publishes only
       if (normalizedFacebookGroupKey(String(r.groupUrl || r.actualGroupUrl || "")) !== gkey) continue;
       const ts = Date.parse(r.at || "");
       if (Number.isFinite(ts) && nowMs - ts > maxAgeMs) continue;
