@@ -873,18 +873,50 @@ let __lastGoodStateRaw = null;
 let __lastReadWasDefaults = false; // true ONLY when readState fell all the way back to factory defaults
                                    // (cold cache + unreadable file). writeState refuses to persist over this.
 
-// Always does a real disk parse (no cache) — the ONLY correct merge base for writeState's read-modify-write.
-// This codebase has been bitten multiple times by a STALE state snapshot clobbering a fresher concurrent write
-// (2026-06-08 selections wipe, 2026-06-17 group vanish, 2026-06-27 stale-controlWrite re-arm) — writeState's
-// own correctness must never depend on a cached value, so it calls this directly, never the cached readState().
+// FILE-CONTENT CACHE (2026-07-04, revised): readState() has ~350 call sites, including an unconditional 1-second
+// heartbeat, each doing a synchronous disk read+JSON.parse+deepMerge+normalize of the multi-MB state file on the
+// main thread -- proven root cause of the FB server periodically going unresponsive to its own health check for
+// 3+ minutes at a stretch (the expensive/risky part is parseJsonFile's raw fs.readFileSync + its retry-with-
+// Atomics.wait backoff on Windows file-locking contention, NOT the deepMerge/normalize step, which already ran on
+// every call before this fix and is cheap by comparison). This cache is keyed on the file's (mtimeMs, size) --
+// mirrors the exact pattern readJsonlAbsoluteFile already uses for the ledger file -- so it SKIPS the disk
+// read+parse only when the file provably has not changed since the last read, and ALWAYS re-parses immediately
+// after any real write (no TTL window, no risk of serving stale-relative-to-a-real-change data).
+// A FIRST DESIGN of this fix cached the fully-merged STATE OBJECT with a 250ms TTL and returned structuredClone()
+// of it on every call to keep callers from sharing a mutable object -- benchmarked at ~33ms per clone on the real
+// 4.75MB state tree, which under this codebase's real call volume (some ticks call readState() dozens of times)
+// measurably added CPU-bound seconds back, observed live post-deploy (a 14s health-check response, still much
+// better than the original 3+ minute wedge, but a real regression versus doing nothing extra). Caching only the
+// PARSED FILE (before deepMerge/normalize) avoids this entirely: deepMerge already allocates a brand-new object
+// tree from defaultState() on every single call exactly as before this fix, so every readState() call still
+// returns its own independent object (identical mutation-safety to pre-fix behavior) with ZERO added per-call
+// cost, while the disk I/O + retry-blocking risk -- the actual root cause -- is skipped whenever the file is
+// unchanged.
+let __stateFileCache = { mtimeMs: 0, size: -1, parsed: null };
+function readParsedStateFileCached() {
+  let st = null;
+  try { st = fs.statSync(STATE_FILE); } catch { /* missing/unreadable -> fall through to a real parse attempt below, which will throw the same way parseJsonFile always did */ }
+  if (st && __stateFileCache.parsed !== null && __stateFileCache.mtimeMs === st.mtimeMs && __stateFileCache.size === st.size) {
+    return __stateFileCache.parsed;
+  }
+  const parsed = parseJsonFile(STATE_FILE);
+  if (st) __stateFileCache = { mtimeMs: st.mtimeMs, size: st.size, parsed };
+  return parsed;
+}
+
+// Always does a real (cache-aware, see above) disk parse — the ONLY correct merge base for writeState's
+// read-modify-write. This codebase has been bitten multiple times by a STALE state snapshot clobbering a fresher
+// concurrent write (2026-06-08 selections wipe, 2026-06-17 group vanish, 2026-06-27 stale-controlWrite re-arm) —
+// writeState's own correctness must never depend on stale data; since this always re-checks the file's
+// (mtimeMs, size) before ever returning cached content, it is exactly as fresh as a full re-read whenever the
+// file has actually changed (which it always has immediately after writeState's own atomicWrite completes).
 function readStateFresh() {
   try {
-    const parsed = parseJsonFile(STATE_FILE);
+    const parsed = readParsedStateFileCached();
     __lastGoodStateRaw = JSON.stringify(parsed);
     __lastReadWasDefaults = false;
     const state = deepMerge(defaultState(), parsed);
     normalizeWorkflowState(state);
-    __stateReadCache = { at: Date.now(), state };
     return state;
   } catch (err) {
     logEvent("workflow_state_read_failed", { error: String(err), usingLastGood: Boolean(__lastGoodStateRaw) });
@@ -899,22 +931,8 @@ function readStateFresh() {
   }
 }
 
-// PERFORMANCE CACHE (2026-07-04): readState() has ~350 call sites, including an unconditional 1-second heartbeat,
-// each doing a synchronous parse+deepMerge+normalize of the multi-MB state file on the main thread -- proven root
-// cause of the FB server periodically going unresponsive to its own health check for 3+ minutes at a stretch. A
-// short TTL collapses a burst of same-instant reads (the 1s heartbeat racing dozens of concurrent posting-tick
-// reads) into a single real disk parse. Every read-only caller (status checks, decision logic) tolerates this —
-// they already tolerated up to 1s of staleness from the heartbeat cadence alone. writeState() is the ONLY place
-// that must see the true latest disk state; it calls readStateFresh() directly, never this cache (see above).
-// Returns a fresh clone so no two callers can ever observe/mutate the SAME shared object (the pre-existing
-// behavior: every real parse already produced a brand-new deepMerge'd tree per call).
-let __stateReadCache = { at: 0, state: null };
-const STATE_READ_CACHE_MS = 250;
 function readState() {
-  if (__stateReadCache.state && (Date.now() - __stateReadCache.at) < STATE_READ_CACHE_MS) {
-    return structuredClone(__stateReadCache.state);
-  }
-  return structuredClone(readStateFresh());
+  return readStateFresh();
 }
 
 function readSecrets() {
@@ -1176,9 +1194,9 @@ function writeState(state, opts = {}) {
   normalizeWorkflowState(clean);
   clean.updatedAt = new Date().toISOString();
   atomicWrite(STATE_FILE, JSON.stringify(clean, null, 2) + "\n");
-  // Update the read cache to this just-written state so the NEXT readState() (even within STATE_READ_CACHE_MS)
-  // reflects it immediately instead of serving a stale pre-write snapshot.
-  __stateReadCache = { at: Date.now(), state: clean };
+  // No manual cache update needed: __stateFileCache is keyed on the file's (mtimeMs, size), both of which the
+  // atomicWrite above just changed, so the next readState()/readStateFresh() call naturally detects a miss and
+  // re-parses — it can never serve stale-relative-to-this-write content.
   return clean;
 }
 
