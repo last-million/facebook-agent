@@ -11337,6 +11337,11 @@ function appendFacebookLivePostLedger(event = {}) {
     message: oneLineField(event.message || "", 700),
     liveLogFile: oneLineField(event.liveLogFile || "", 300),
     payloadFile: oneLineField(event.payloadFile || "", 300),
+    // REPORT ACCURACY (2026-07-04): "strong_verified" (live permalink confirmed) vs "soft_clicked" (moderator
+    // clicked Approve but FB hasn't propagated it live yet) vs "not_applicable" (group didn't need approval) --
+    // without this, published/published_after_admin_approval rows were indistinguishable, so /report counted a
+    // soft click as fully "posted" identically to a confirmed-live post (the operator's "no lies" complaint).
+    approvalVerification: ["strong_verified", "soft_clicked", "not_applicable"].includes(event.approvalVerification) ? event.approvalVerification : "not_applicable",
     // DURABLE COMMENT-RECOVERY (2026-06-22): persist the composed comment payload on the published ledger row so an
     // interrupted run's uncommented post stays re-commentable even after posting-plan.jsonl is overwritten. This
     // serializer is a FIXED WHITELIST (it silently drops any field not listed here — e.g. approvalProfileId), so these
@@ -15909,6 +15914,8 @@ async function completeVerifiedFacebookPostWithComment({
         ? `Post permalink verified after admin approval by ${approvalResult.approvalProfile || approvalResult.profile || approvalResult.profileId}.`
         : `Moderator ${approvalResult.approvalProfile || approvalResult.profile || approvalResult.profileId} clicked Approve on our post; commenting after FB makes it live.`)
       : "Post permalink verified before comment step.",
+    // REPORT ACCURACY (2026-07-04): see appendFacebookLivePostLedger's approvalVerification comment.
+    approvalVerification: !__wentThroughApproval ? "not_applicable" : (approvalResult?.ok ? "strong_verified" : "soft_clicked"),
     validation,
     liveLogFile: postLiveLogFile || "",
     payloadFile: postPayloadFile || "",
@@ -20797,11 +20804,25 @@ const __runReportCache = { at: 0, body: null };
 const RUN_REPORT_TTL_MS = 60 * 1000;
 const RUN_SPLIT_GAP_MS = 2 * 60 * 60 * 1000; // a >2h gap between posts starts a new "run"
 
+// GENERIC, N-GROUP-SCALABLE (2026-07-04): the old version hardcoded display names for exactly 2 of the operator's
+// groups (a leftover from the 2-group era) -- a THIRD and FOURTH group added later fell through to a raw per-row
+// URL slice with no alias awareness, so the SAME real group could silently split into two different-looking rows
+// in "Par groupe" (and inflate productsInBoth) whenever the ledger recorded it under both its vanity and FB-
+// resolved-numeric form (a proven, already-observed phenomenon -- see groupKeyAliasSet's own history this
+// session). This version hardcodes NOTHING: it reuses the generic, already-hardened groupKeyAliasSet/
+// normalizedFacebookGroupKey machinery so it collapses vanity<->numeric duplicates for however many groups are
+// configured -- adding a 5th, 10th, Nth group never needs a code change here.
 function __reportGroupName(url) {
-  const s = String(url || "");
-  if (/o?1498765421290862|1098414320641851/.test(s)) return "o-group";
-  if (/4854972804605257/.test(s)) return "4854";
-  const m = s.match(/groups\/([A-Za-z0-9.]+)/);
+  const base = normalizedFacebookGroupKey(String(url || ""));
+  if (!base) return "autre";
+  let canonicalKey = base;
+  try {
+    const aliasSet = groupKeyAliasSet(url);
+    // Prefer a human-readable vanity ("o<digits>") form if the alias set has one, purely cosmetic -- either form
+    // is equally correct as long as it's picked CONSISTENTLY for this group across every row.
+    for (const k of aliasSet) { if (/groups\/o\d/i.test(k)) { canonicalKey = k; break; } }
+  } catch (_) {}
+  const m = canonicalKey.match(/groups\/([a-z0-9.]+)/i);
   return m ? m[1].slice(0, 18) : "autre";
 }
 function __reportMedian(nums) {
@@ -20879,15 +20900,42 @@ function buildRunReports(force = false) {
   }
   // drop self-comments (publisher == commenter): not a valid different-profile comment
   for (const [url, c] of commentByUrl) { const pub = pubsByUrl.get(url); if (pub && c.profileId && pub === c.profileId) commentByUrl.delete(url); }
-  // dedup published rows by planId:sequence:url, keep EARLIEST, chronological
+  // dedup published rows by planId:sequence:groupKey (NOT postUrl, 2026-07-04): a retry that eventually captures a
+  // corrected/different postUrl string for the SAME logical post used to dedup as two distinct rows, inflating the
+  // run's posts count. planId+sequence+group is the plan's own row identity -- one row is always exactly one
+  // intended post to one group, so this can only ever collapse genuine duplicates, never drop a real distinct post
+  // (a postToAllGroups fan-out already allocates a distinct sequence per group). Also matches the pending-bucket
+  // key below so a pending wait and its eventual resolution are recognized as the same logical post.
+  const __postKey = (p) => (p.planId || "") + ":" + (p.sequence || 0) + ":" + normalizedFacebookGroupKey(p.groupUrl || p.actualGroupUrl || "");
   const seen = new Map();
   for (const p of pubs) {
     const t = Date.parse(p.at);
     if (!Number.isFinite(t)) continue;
-    const id = (p.planId || "") + ":" + (p.sequence || 0) + ":" + (p.postUrl || "");
+    const id = __postKey(p);
     if (!seen.has(id) || t < seen.get(id)._t) seen.set(id, { ...p, _t: t });
   }
   const posts = Array.from(seen.values()).sort((a, b) => a._t - b._t);
+  const resolvedPostKeys = new Set(posts.map(__postKey));
+  // PENDING APPROVAL (2026-07-04): a post genuinely submitted to Facebook and awaiting moderator approval, with NO
+  // resolution yet (no published/published_after_admin_approval row for the same logical post). admin_approval_started
+  // (not admin_approval_planned, which can fire with zero real attempt when no moderator profile is available) marks
+  // the start of a real wait. Key is planId:sequence:groupKey WITHOUT profileId -- a moderator hand-off across retries
+  // must not fork the identity (livePostLedgerKey includes profileId, which would make each retry look like a fresh,
+  // still-pending post). No fixed age cutoff is applied: FB's own approval queue can legitimately take 10-30+ min, so
+  // a pending item just carries its age and the UI decides how to color it.
+  const pendingStartByKey = new Map();
+  for (const r of rows) {
+    if (!r || r.event !== "admin_approval_started" || !r.at) continue;
+    const t = Date.parse(r.at);
+    if (!Number.isFinite(t)) continue;
+    const k = (r.planId || "") + ":" + (r.sequence || 0) + ":" + normalizedFacebookGroupKey(r.groupUrl || "");
+    const ex = pendingStartByKey.get(k);
+    if (!ex || t < ex.t) pendingStartByKey.set(k, { t, at: r.at, groupUrl: r.groupUrl || "", profileId: Number(r.profileId || 0) });
+  }
+  const pendingApproval = [...pendingStartByKey.entries()]
+    .filter(([k]) => !resolvedPostKeys.has(k))
+    .map(([k, v]) => ({ key: k, groupUrl: v.groupUrl, group: __reportGroupName(v.groupUrl), profileId: v.profileId, startedAt: v.at, ageMinutes: Math.round((Date.now() - v.t) / 60000) }))
+    .sort((a, b) => a.ageMinutes < b.ageMinutes ? 1 : -1);
   // cluster into runs (>2h gap = new run)
   const runsRaw = [];
   let cur = null;
@@ -20895,6 +20943,19 @@ function buildRunReports(force = false) {
     if (!cur || p._t - cur.lastT > RUN_SPLIT_GAP_MS) { cur = { posts: [], startT: p._t, lastT: p._t }; runsRaw.push(cur); }
     cur.lastT = p._t;
     cur.posts.push(p);
+  }
+  // ATTRIBUTE pending-approval items to a run window (2026-07-04): clustering above is built solely from LANDED
+  // (PUB) posts, so a run consisting entirely of not-yet-approved posts has no runsRaw entry to attach to yet --
+  // without this, those pending items would be silently invisible until their first post actually lands. Attach
+  // each pending item to the run whose [startT-60s, lastT+30min] window contains it (mirrors the governor-event
+  // windowing a few lines below); anything outside every run's window goes to pendingUnclustered (a run that is,
+  // right now, 100% pending with zero landed posts so far).
+  const pendingUnclustered = [];
+  for (const item of pendingApproval) {
+    const t = Date.now() - item.ageMinutes * 60000;
+    const run = runsRaw.find((r) => t >= r.startT - 60000 && t <= r.lastT + 30 * 60000);
+    if (run) { run.pendingItems = run.pendingItems || []; run.pendingItems.push(item); }
+    else pendingUnclustered.push(item);
   }
   // best-effort chrome peak / min free-RAM. Governor events live in events.log (rolling 600 lines) AND in the
   // DURABLE per-day audit log; merge both so the peak survives after events.log has rolled past it on a long run.
@@ -20924,6 +20985,7 @@ function buildRunReports(force = false) {
     const gaps = [];
     const detail = [];
     let commented = 0;
+    let softApproved = 0; // uncommented posts still in FB's soft-approval propagation window (expected, not overdue)
     // PER-PRODUCT TRACKING (operator 2026-06-28): give each harvested product a stable per-run NUMBER so the report
     // shows, per publication, WHICH product it is + a "Par produit" recap (how many times posted, in which groups, by
     // which profiles) — so the operator can verify the same product is duplicated across BOTH groups vs only one.
@@ -20946,7 +21008,8 @@ function buildRunReports(force = false) {
         if (p.profileId) pm.profiles.add(Number(p.profileId));
         pnum = pm.num;
       }
-      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profileCom: c ? c.profileId : null, productNum: pnum, productKey: pk, title: String(p.title || "") });
+      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profileCom: c ? c.profileId : null, productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable" });
+      if (p.approvalVerification === "soft_clicked" && !c) softApproved += 1;
     }
     const products = productOrder.map((pm) => ({ num: pm.num, key: pm.key, shortKey: pm.key.replace(/^harvested:/, ""), title: pm.title, total: pm.total, groups: pm.groups, groupCount: Object.keys(pm.groups).length, profiles: Array.from(pm.profiles) }));
     const productsInBoth = products.filter((p) => p.groupCount >= 2).length;
@@ -20960,6 +21023,7 @@ function buildRunReports(force = false) {
     const gapStats = gaps.length
       ? { minSec: Math.min(...gaps), medianSec: __reportMedian(gaps), avgSec: Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length), maxSec: Math.max(...gaps) }
       : { minSec: 0, medianSec: 0, avgSec: 0, maxSec: 0 };
+    const pendingItems = run.pendingItems || [];
     return {
       index: idx,
       startedAt: run.posts[0].at,
@@ -20968,6 +21032,10 @@ function buildRunReports(force = false) {
       posts: run.posts.length,
       commented,
       uncommented: run.posts.length - commented,
+      // of the uncommented posts, how many are still inside FB's normal soft-approval propagation window (expected,
+      // not a problem) vs genuinely overdue (uncommented - softApprovedPending, everything else uncommented) --
+      // see report.html for the color split this drives.
+      softApprovedPending: softApproved,
       commentRate: __reportPct(commented, run.posts.length),
       byGroup,
       gap: gapStats,
@@ -20978,6 +21046,9 @@ function buildRunReports(force = false) {
       products,
       uniqueProducts: products.length,
       productsInBoth,
+      // PENDING APPROVAL (2026-07-04): posts submitted and awaiting moderator approval, not yet resolved either way
+      // -- see the pendingApproval/pendingUnclustered computation above buildRunReports' run-clustering.
+      pendingApproval: { count: pendingItems.length, items: pendingItems },
     };
   }).reverse(); // most recent run first
   // KILL-MID-POST RECONCILE STATUS (silent-loss guard visibility): an intent with no resolution older than
@@ -21029,7 +21100,7 @@ function buildRunReports(force = false) {
       if (Number.isFinite(__lastT) && Date.now() - __lastT < RUN_SPLIT_GAP_MS) outVisible[0].live = true;
     }
   } catch (_) {}
-  const body = { generatedAt: new Date().toISOString(), runCount: outVisible.length, latest: outVisible[0] || null, runs: outVisible.slice(0, 30), live, reconcile, problemProfiles, openBudget };
+  const body = { generatedAt: new Date().toISOString(), runCount: outVisible.length, latest: outVisible[0] || null, runs: outVisible.slice(0, 30), live, reconcile, problemProfiles, openBudget, pendingUnclustered };
   __runReportCache.at = Date.now();
   __runReportCache.body = body;
   return body;

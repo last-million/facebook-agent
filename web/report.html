@@ -205,6 +205,7 @@ function runCard(r,i){
       + '<span class="rposts">'+r.posts+' posts &middot; '+r.durationMin+'m</span>'
       + '<span class="rrate '+(rate>=90?"ok":rate>=70?"slow":"no")+'">'+rate+'%<small> comm.</small></span>'
       + (r.uncommented? '<span class="runc">'+r.uncommented+' sans</span>':'')
+      + ((r.pendingApproval&&r.pendingApproval.count)? '<span class="runc pending">'+r.pendingApproval.count+' en attente</span>':'')
       + '<button class="rdel" title="Supprimer cette run du rapport" onclick="dismiss(event,\''+sa+'\',\''+ea+'\')">✕</button>'
     + '</summary>'
     + '<div class="rbody">'+runBody(r)+'</div>'
