@@ -15688,16 +15688,18 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
       // ORPHAN GUARD (2026-07-04): this whole branch runs inside the one-shot, fire-and-forget background task
       // that comment+approval work is decoupled onto for approval-required groups (see "DECOUPLE POSTING FROM
       // APPROVAL" above). If every post-approval comment retry above still failed (retry.ok is false), this
-      // function was about to return silently -- no backoff stamp, no ledger trace -- leaving the post with
-      // ZERO per-post state, entirely dependent on the periodic resweep noticing it on some future pass (which
-      // can itself be minutes-deep in other approval-required posts). Traced live: this let 2 posts sit
-      // uncommented 100+ minutes despite a 4-minute configured backoff. Stamping __commentRecoveryBackoff here
-      // makes the resweep's own bookkeeping consistent immediately (it will pick this postUrl up on its very
-      // next pass instead of treating it as untouched), and the explicit ledger event makes this exact state
-      // ("approved but still couldn't land a comment") directly greppable/alertable instead of only inferable
-      // from a raw publish-to-comment gap.
+      // function was about to return silently -- no ledger trace at all -- leaving the post entirely dependent
+      // on the periodic resweep noticing it on some future pass (which can itself be minutes-deep in other
+      // approval-required posts). Traced live: this let 2 posts sit uncommented 100+ minutes. The explicit
+      // ledger event below makes this exact state ("approved but still couldn't land a comment") directly
+      // greppable/alertable instead of only inferable from a raw publish-to-comment gap.
+      // DELIBERATELY DOES NOT touch __commentRecoveryBackoff (2026-07-04, caught by adversarial review before
+      // deploy): that Map's OWN read (resweepUncommentedFacebookPostsAsync) treats a RECENT stamp as "tried
+      // already, defer for the full backoff window" -- stamping it here would make the resweep SKIP this post
+      // for minutes instead of retrying it sooner, the opposite of the intended effect, and could even ratchet
+      // the delay further on repeated failures. Leaving the Map untouched preserves the correct pre-existing
+      // behavior: an unstamped postUrl is immediately eligible on the resweep's very next pass.
       if (!retry.ok) {
-        try { __commentRecoveryBackoff.set(approvalResult.postUrl || postUrl, Date.now()); } catch (_) {}
         try {
           appendFacebookLivePostLedger({
             event: "admin_approved_but_comment_still_pending",
@@ -21129,14 +21131,33 @@ function buildRunReports(force = false) {
   // post gets held (not published) for that tick -- a group stuck here shows up as 0 posts and would otherwise be
   // completely ABSENT from "Par groupe" below (which only lists groups that landed at least one post), silently
   // hiding the exact situation the operator most needs to see ("why does this group show nothing at all").
+  // Merge LOG_FILE (rolling ~600 lines) AND the durable per-day AUDIT_DIR, same reasoning/pattern as the gov-event
+  // merge above (2026-07-04 review fix: the first version only read LOG_FILE, so a held event could silently roll
+  // out of the small rolling log before the report ever rendered it, undercounting the exact thing this exists to
+  // surface). logEvent() writes every event to both destinations, so AUDIT_DIR always has the durable copy.
   const held = [];
-  try {
-    for (const e of readJsonlAbsoluteFile(LOG_FILE, { limit: 8000 })) {
-      if (e && e.message === "post_held_no_free_commenter" && e.at) held.push(e);
+  const __heldSeen = new Set();
+  const __addHeld = (arr) => {
+    for (const e of arr) {
+      if (!e || e.message !== "post_held_no_free_commenter" || !e.at) continue;
+      const k = e.at + "|" + (e.groupUrl || "") + "|" + (e.planId || "");
+      if (__heldSeen.has(k)) continue;
+      __heldSeen.add(k);
+      held.push(e);
     }
+  };
+  try { __addHeld(readJsonlAbsoluteFile(LOG_FILE, { limit: 8000 })); } catch {}
+  try {
+    const auditFiles = fs.readdirSync(AUDIT_DIR).filter((n) => /^audit-\d{4}-\d{2}-\d{2}\.log$/.test(n)).sort().slice(-2);
+    for (const f of auditFiles) { try { __addHeld(readJsonlAbsoluteFile(path.join(AUDIT_DIR, f), { limit: 40000 })); } catch {} }
   } catch {}
   let wdLines = [];
   try { wdLines = String(fs.readFileSync(path.join(DATA_DIR, "server-watchdog.log"), "utf8") || "").split(/\r?\n/).filter(Boolean).slice(-5000); } catch {}
+  // HOISTED (2026-07-04 review fix): was called once PER RUN inside the map below even though the configured
+  // group roster is identical for every run in this pass -- with a 5MB+ workflow-state.json and this session's own
+  // history of a wedge tied to redundant reads of that file, avoid the repeated deepMerge/normalize/stringify cost.
+  let __configuredGroupUrls = [];
+  try { __configuredGroupUrls = (readState().posting?.groupAssignmentData || []).map((e) => e?.url || "").filter(Boolean); } catch (_) {}
   const out = runsRaw.map((run, idx) => {
     const groups = {};
     const gaps = [];
@@ -21178,13 +21199,15 @@ function buildRunReports(force = false) {
     // ALL CONFIGURED GROUPS, NOT JUST ONES THAT LANDED A POST (2026-07-04 review fix): a group with zero posts
     // (e.g. every attempt is held for lack of a free commenter) used to be silently ABSENT from "Par groupe" --
     // looking like it doesn't exist rather than showing the operator exactly what's stuck. Scales to any number
-    // of configured groups: no hardcoded names/count.
-    try {
-      for (const entry of (readState().posting?.groupAssignmentData || [])) {
-        const g = __reportGroupName(entry?.url || "");
+    // of configured groups: no hardcoded names/count. ONLY for the most-recent run (idx === last, runsRaw is
+    // chronological before the final .reverse()) -- the roster is CURRENT config, so injecting it into an old,
+    // already-closed historical run would show groups that may not even have existed at that run's time window.
+    if (idx === runsRaw.length - 1) {
+      for (const url of __configuredGroupUrls) {
+        const g = __reportGroupName(url);
         if (g && !byGroup[g]) byGroup[g] = { posts: 0, commented: 0, commentRate: 0, gapMedianSec: 0, held: heldByGroup[g] || 0 };
       }
-    } catch (_) {}
+    }
     const winGov = gov.filter((e) => { const t = Date.parse(e.at || 0); return Number.isFinite(t) && t >= run.startT - 60000 && t <= run.lastT + 600000; });
     const chromePeak = winGov.reduce((m, e) => Math.max(m, Number(e.chrome != null ? e.chrome : e.chromeProcs || 0)), 0);
     const ramVals = winGov.map((e) => Number(e.freeRam != null ? e.freeRam : e.freeRamPercent)).filter((n) => Number.isFinite(n));

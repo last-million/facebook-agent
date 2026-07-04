@@ -251,7 +251,7 @@ function runBody(r){
         + (v.posts ? '<div class="row"><span>Commentés</span><b>'+v.commented+'/'+v.posts+'</b></div>'
           + '<div class="row"><span>Taux</span><b class="'+(v.commentRate>=90?"ok":v.commentRate>=70?"slow":"no")+'">'+v.commentRate+'%</b></div>'
           + '<div class="row"><span>Délai médian</span><b>'+fmtGap(v.gapMedianSec)+'</b></div>'
-          + rateBar(v.commentRate) : '<div class="row"><span class="no">⚠ Aucun post — bloqué</span></div>')
+          + rateBar(v.commentRate) : (stuck ? '<div class="row"><span class="no">⚠ Aucun post — bloqué</span></div>' : '<div class="row"><span style="opacity:.6">Aucun post pour l\'instant</span></div>'))
         + (v.held>0 ? '<div class="row"><span>Retenus (aucun commentateur libre)</span><b class="'+(stuck?"no":"slow")+'">'+v.held+'</b></div>' : '')
         + '</div>';
     }).join("");
