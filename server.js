@@ -8133,6 +8133,17 @@ function isProfileGroupBlockedForPosting(label, groupUrl, state) {
     state.posting?.facebookProfileStatus,
     state.ixbrowser?.failedProfiles,
   ].join("\n").toLowerCase().split(/\r?\n/);
+  // PERF (2026-07-04): groupKeyAliasSet(groupUrl) depends only on the FIXED target group, not on the per-line
+  // lineGroupRaw -- computed ONCE here instead of via groupsMatchByAlias() (2 groupKeyAliasSet calls) inside the
+  // filter callback below. Profiled live (node --prof) and found THIS was the actual cause of the recurring
+  // multi-minute server wedge (not the workflow-state.json size): this function runs its filter over every
+  // facebookProfileStatus/failedProfiles line (thousands), and is itself called per profile-per-group from
+  // postingSlots (hundreds of times per tick) -- the per-line groupsMatchByAlias call meant MILLIONS of redundant
+  // groupKeyAliasSet invocations per tick (67.6% of all CPU ticks in the captured profile), each allocating a
+  // fresh Set even on a "cached" hit. A membership check on one precomputed Set is equivalent by construction
+  // (groupKeyAliasSet's mutual-dominance design means lineGroup is in targetAliasSet iff groupsMatchByAlias would
+  // have returned true) and costs a single Set.has() per line instead of two function calls + two fresh Sets.
+  const targetAliasSet = groupKeyAliasSet(groupUrl);
   const matching = sources.filter((line) => {
     if (!/status=(cannot_post_in_group|resolved|approved|cleared|ignored)|action=(profile_unblocked|profile_group_unblocked)/i.test(line)) return false;
     const lineGroupRaw = (line.match(/group_url=([^|]+)/i) || [])[1] || "";
@@ -8145,7 +8156,7 @@ function isProfileGroupBlockedForPosting(label, groupUrl, state) {
     // the identical vanity<->numeric mismatch for attributedCommentProfileIdsForGroup -- mirrored here. Measured
     // live: 65/65 posting_profile_group_issue events in a 3h9m window hit ONLY the 2 vanity-configured new groups,
     // 0 on the numeric-configured old groups.
-    if (lineGroup !== groupKey && !groupsMatchByAlias(lineGroupRaw, groupUrl)) return false;
+    if (lineGroup !== groupKey && !targetAliasSet.has(lineGroup)) return false;
     if (profileId && line.includes(`profile_id=${profileId}`)) return true;
     return lowerLabel.length > 2 && line.includes(lowerLabel);
   });
