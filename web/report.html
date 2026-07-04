@@ -246,11 +246,14 @@ function runBody(r){
     html += '<h2>Par groupe <span class="ln"></span></h2><div class="cards2">';
     html += gks.map(function(g){
       var v=r.byGroup[g];
+      var stuck = !v.posts && v.held>0;
       return '<div class="grp"><div class="gh"><span>'+grpPill(g)+'</span><span class="tag">'+v.posts+' posts</span></div>'
-        + '<div class="row"><span>Commentés</span><b>'+v.commented+'/'+v.posts+'</b></div>'
-        + '<div class="row"><span>Taux</span><b class="'+(v.commentRate>=90?"ok":v.commentRate>=70?"slow":"no")+'">'+v.commentRate+'%</b></div>'
-        + '<div class="row"><span>Délai médian</span><b>'+fmtGap(v.gapMedianSec)+'</b></div>'
-        + rateBar(v.commentRate)+'</div>';
+        + (v.posts ? '<div class="row"><span>Commentés</span><b>'+v.commented+'/'+v.posts+'</b></div>'
+          + '<div class="row"><span>Taux</span><b class="'+(v.commentRate>=90?"ok":v.commentRate>=70?"slow":"no")+'">'+v.commentRate+'%</b></div>'
+          + '<div class="row"><span>Délai médian</span><b>'+fmtGap(v.gapMedianSec)+'</b></div>'
+          + rateBar(v.commentRate) : '<div class="row"><span class="no">⚠ Aucun post — bloqué</span></div>')
+        + (v.held>0 ? '<div class="row"><span>Retenus (aucun commentateur libre)</span><b class="'+(stuck?"no":"slow")+'">'+v.held+'</b></div>' : '')
+        + '</div>';
     }).join("");
     html += '</div>';
   }

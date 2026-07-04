@@ -15685,6 +15685,34 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
         }
         retry.pinRecoveryResult = pinRecovery || null;
       }
+      // ORPHAN GUARD (2026-07-04): this whole branch runs inside the one-shot, fire-and-forget background task
+      // that comment+approval work is decoupled onto for approval-required groups (see "DECOUPLE POSTING FROM
+      // APPROVAL" above). If every post-approval comment retry above still failed (retry.ok is false), this
+      // function was about to return silently -- no backoff stamp, no ledger trace -- leaving the post with
+      // ZERO per-post state, entirely dependent on the periodic resweep noticing it on some future pass (which
+      // can itself be minutes-deep in other approval-required posts). Traced live: this let 2 posts sit
+      // uncommented 100+ minutes despite a 4-minute configured backoff. Stamping __commentRecoveryBackoff here
+      // makes the resweep's own bookkeeping consistent immediately (it will pick this postUrl up on its very
+      // next pass instead of treating it as untouched), and the explicit ledger event makes this exact state
+      // ("approved but still couldn't land a comment") directly greppable/alertable instead of only inferable
+      // from a raw publish-to-comment gap.
+      if (!retry.ok) {
+        try { __commentRecoveryBackoff.set(approvalResult.postUrl || postUrl, Date.now()); } catch (_) {}
+        try {
+          appendFacebookLivePostLedger({
+            event: "admin_approved_but_comment_still_pending",
+            key: ledgerKey,
+            planId: row.planId,
+            sequence: row.sequence,
+            profileId: ready.profileId,
+            profile: row.profile || "",
+            groupUrl,
+            postUrl: approvalResult.postUrl || postUrl,
+            status: approvalResult.ok ? "strong_verified" : "soft_clicked",
+            message: `Admin approval ${approvalResult.ok ? "verified" : "clicked"} but ${__maxCommentRounds} post-approval comment attempt(s) still failed; handing off to the periodic resweep.`,
+          });
+        } catch (_) {}
+      }
       return {
         ...retry,
         approvalResult: {
@@ -21097,6 +21125,16 @@ function buildRunReports(force = false) {
     const auditFiles = fs.readdirSync(AUDIT_DIR).filter((n) => /^audit-\d{4}-\d{2}-\d{2}\.log$/.test(n)).sort().slice(-2);
     for (const f of auditFiles) { try { __addGov(readJsonlAbsoluteFile(path.join(AUDIT_DIR, f), { limit: 40000 })); } catch {} }
   } catch {}
+  // HELD EVENTS (2026-07-04): post_held_no_free_commenter fires when a group has zero available commenter and a
+  // post gets held (not published) for that tick -- a group stuck here shows up as 0 posts and would otherwise be
+  // completely ABSENT from "Par groupe" below (which only lists groups that landed at least one post), silently
+  // hiding the exact situation the operator most needs to see ("why does this group show nothing at all").
+  const held = [];
+  try {
+    for (const e of readJsonlAbsoluteFile(LOG_FILE, { limit: 8000 })) {
+      if (e && e.message === "post_held_no_free_commenter" && e.at) held.push(e);
+    }
+  } catch {}
   let wdLines = [];
   try { wdLines = String(fs.readFileSync(path.join(DATA_DIR, "server-watchdog.log"), "utf8") || "").split(/\r?\n/).filter(Boolean).slice(-5000); } catch {}
   const out = runsRaw.map((run, idx) => {
@@ -21132,8 +21170,21 @@ function buildRunReports(force = false) {
     }
     const products = productOrder.map((pm) => ({ num: pm.num, key: pm.key, shortKey: pm.key.replace(/^harvested:/, ""), title: pm.title, total: pm.total, groups: pm.groups, groupCount: Object.keys(pm.groups).length, profiles: Array.from(pm.profiles) }));
     const productsInBoth = products.filter((p) => p.groupCount >= 2).length;
+    const winHeld = held.filter((e) => { const t = Date.parse(e.at || 0); return Number.isFinite(t) && t >= run.startT - 60000 && t <= (run.lastT || Date.now()) + 600000; });
+    const heldByGroup = {};
+    for (const e of winHeld) { const g = __reportGroupName(e.groupUrl || ""); heldByGroup[g] = (heldByGroup[g] || 0) + 1; }
     const byGroup = {};
-    for (const [g, v] of Object.entries(groups)) byGroup[g] = { posts: v.posts, commented: v.commented, commentRate: __reportPct(v.commented, v.posts), gapMedianSec: __reportMedian(v.gaps) };
+    for (const [g, v] of Object.entries(groups)) byGroup[g] = { posts: v.posts, commented: v.commented, commentRate: __reportPct(v.commented, v.posts), gapMedianSec: __reportMedian(v.gaps), held: heldByGroup[g] || 0 };
+    // ALL CONFIGURED GROUPS, NOT JUST ONES THAT LANDED A POST (2026-07-04 review fix): a group with zero posts
+    // (e.g. every attempt is held for lack of a free commenter) used to be silently ABSENT from "Par groupe" --
+    // looking like it doesn't exist rather than showing the operator exactly what's stuck. Scales to any number
+    // of configured groups: no hardcoded names/count.
+    try {
+      for (const entry of (readState().posting?.groupAssignmentData || [])) {
+        const g = __reportGroupName(entry?.url || "");
+        if (g && !byGroup[g]) byGroup[g] = { posts: 0, commented: 0, commentRate: 0, gapMedianSec: 0, held: heldByGroup[g] || 0 };
+      }
+    } catch (_) {}
     const winGov = gov.filter((e) => { const t = Date.parse(e.at || 0); return Number.isFinite(t) && t >= run.startT - 60000 && t <= run.lastT + 600000; });
     const chromePeak = winGov.reduce((m, e) => Math.max(m, Number(e.chrome != null ? e.chrome : e.chromeProcs || 0)), 0);
     const ramVals = winGov.map((e) => Number(e.freeRam != null ? e.freeRam : e.freeRamPercent)).filter((n) => Number.isFinite(n));
