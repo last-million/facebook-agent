@@ -124,6 +124,7 @@
     <div class="controls">
       <label class="toggle"><input type="checkbox" id="auto" checked> Auto 30s</label>
       <span class="upd" id="upd"></span>
+      <button class="btn" id="hideAll" title="Masquer toutes les runs actuellement affichées (non destructif — les posts restent sur Facebook)">🗑 Masquer tout</button>
       <button class="btn" id="refresh">↻ Rafraîchir</button>
     </div>
   </div>
@@ -321,8 +322,19 @@ function dismiss(ev, sa, ea){
     .catch(function(e){ alert("Erreur suppression : "+e.message); });
 }
 
+function hideAll(){
+  var n = (DATA && DATA.runs ? DATA.runs.length : 0);
+  if (!n) { alert("Aucune run affichée à masquer."); return; }
+  if(!confirm("Masquer les "+n+" run(s) actuellement affichées ? (les posts ne sont pas supprimés de Facebook — c'est juste masqué ici, tu peux annuler via l'API restore si besoin)")) return;
+  fetch("/api/reports/runs/dismiss", { method:"POST", headers:{ "x-dashboard-token":TOKEN, "Content-Type":"application/json" }, body:JSON.stringify({ dismissAllVisible: true }) })
+    .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
+    .then(function(){ OPEN.clear(); load(true); })
+    .catch(function(e){ alert("Erreur : "+e.message); });
+}
+
 function arm(){ if(timer) clearInterval(timer); if(document.getElementById("auto").checked){ timer=setInterval(function(){ load(false); }, 30000); } }
 document.getElementById("refresh").addEventListener("click", function(){ load(true); });
+document.getElementById("hideAll").addEventListener("click", hideAll);
 document.getElementById("auto").addEventListener("change", arm);
 load(false); arm();
 </script>

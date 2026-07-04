@@ -165,6 +165,34 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   flex-wrap: wrap;
 }
 
+/* Report link: moved out of the horizontally-scrolling .topNav (with 12 tabs it was scrolled off-screen /
+   easy to miss there) into the always-visible topActions row, with a distinct accent style so it reads as
+   "leave the dashboard, open the report" rather than another internal tab. */
+.topNavReport {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 7px 14px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-sm);
+  background: var(--accent-dim);
+  color: var(--accent-strong);
+  font-weight: 700;
+  font-size: 13px;
+  white-space: nowrap;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.topNavReport:hover { background: var(--accent-glow); border-color: var(--accent); }
+.topNavReportDot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent-strong);
+  box-shadow: 0 0 0 3px var(--accent-dim);
+  flex: 0 0 auto;
+}
+
 .topNav {
   grid-column: 1 / -1;
   display: flex;

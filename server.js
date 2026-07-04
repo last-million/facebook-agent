@@ -21105,24 +21105,34 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/api/reports/runs/dismiss") {
     // OPERATOR: remove (hide) a run from the report by its startedAt — NON-destructive (the post ledger is untouched;
-    // only data/report-dismissed-runs.json filters the view). body.restore:true un-hides it; body.clear:true clears all.
+    // only data/report-dismissed-runs.json filters the view). body.restore:true un-hides it; body.clear:true clears all
+    // (un-hides everything); body.dismissAllVisible:true hides every run CURRENTLY shown in one action ("start fresh").
     const body = await readJson(req);
     const f = path.join(DATA_DIR, "report-dismissed-runs.json");
     let arr = []; try { arr = JSON.parse(fs.readFileSync(f, "utf8")); } catch (_) {}
     if (!Array.isArray(arr)) arr = [];
+    let dismissedNowCount = 0;
     if (body.clear === true) { arr = []; }
-    else {
+    else if (body.dismissAllVisible === true) {
+      const seen = new Set(arr.map(String));
+      let visible = [];
+      try { visible = buildRunReports(true).runs || []; } catch (_) {}
+      for (const r of visible) {
+        const key = String(r?.endedAt || r?.startedAt || "").trim();
+        if (key && !seen.has(key)) { seen.add(key); arr.push(key); dismissedNowCount++; }
+      }
+    } else {
       // KEY = the run's ENDED-AT (restart-stable; see buildRunReports). Accept endedAt; fall back to key/startedAt for
       // older callers. Store whatever stable id the page sends; the filter matches endedAt OR startedAt.
       const key = String(body.endedAt || body.key || body.startedAt || "").trim();
-      if (!key) return json(res, 400, { error: "endedAt required (or clear:true)" });
+      if (!key) return json(res, 400, { error: "endedAt required (or clear:true / dismissAllVisible:true)" });
       if (body.restore === true) arr = arr.filter((x) => String(x) !== key);
-      else if (!arr.map(String).includes(key)) arr.push(key); // operator may dismiss ANY run incl. the latest (restore/clear undo it)
+      else if (!arr.map(String).includes(key)) { arr.push(key); dismissedNowCount = 1; } // operator may dismiss ANY run incl. the latest (restore/clear undo it)
     }
     try { fs.writeFileSync(f, JSON.stringify(arr.slice(-500))); } catch (_) {}
     __runReportCache.at = 0; // bust the 60s cache so the change shows on the next load immediately
-    logEvent("report_run_dismissed", { key: body.endedAt || body.startedAt || "", restore: !!body.restore, clear: !!body.clear, total: arr.length });
-    return json(res, 200, { ok: true, dismissed: arr.length });
+    logEvent("report_run_dismissed", { key: body.endedAt || body.startedAt || "", restore: !!body.restore, clear: !!body.clear, dismissAllVisible: !!body.dismissAllVisible, dismissedNowCount, total: arr.length });
+    return json(res, 200, { ok: true, dismissed: arr.length, dismissedNow: dismissedNowCount });
   }
 
   if (req.method === "GET" && url.pathname === "/api/status") {
