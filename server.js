@@ -1702,9 +1702,13 @@ function normalizeWorkflowState(state) {
     }
   })();
   state.posting.groupAssignmentMode = "percentage_manual_review";
-  state.posting.facebookProfileStatus = capRecordLogTail(state.posting.facebookProfileStatus, 1500000); // was unbounded, grew to 2.80MB
+  state.posting.facebookProfileStatus = capRecordLogTail(state.posting.facebookProfileStatus, 1500000); // was unbounded (2.80MB); 1.5MB spans ~19 days at the current rate, well over the 7-day requirement
   state.tracking = state.tracking || {};
-  state.tracking.dailyActionLog = capRecordLogTail(state.tracking.dailyActionLog, 1500000); // was unbounded, grew to 2.79MB
+  // 4MB (was unbounded, 2.79MB): adversarial re-verify measured dailyActionLog's growth rate ACCELERATING sharply
+  // (+148% recent vs early, tracking the 2->4 group scale-up) -- 2MB only retained ~5.4 days at the recent peak-day
+  // rate, under the 7-day PROFILE_USAGE_WINDOW_MS fairness-lookup requirement. 4MB restores a >=2x margin even if
+  // growth keeps accelerating with further scale-up.
+  state.tracking.dailyActionLog = capRecordLogTail(state.tracking.dailyActionLog, 4000000);
   state.posting.groupProfileAssignments = String(state.posting.groupProfileAssignments || "").slice(0, 200000);
   state.posting.equalSplitAssignments = state.posting.equalSplitAssignments === true; // Step-3 toggle: equal dispatch, each profile in exactly one group
   state.posting.groupPostFailCounts = String(state.posting.groupPostFailCounts || "{}").slice(0, 20000); // per-(group,profile) post-fail tally for auto-unassign
@@ -15264,10 +15268,14 @@ function recentGroupPosterCommentCandidates(groupUrl, state = readState(), optio
   try {
     // Was an uncapped raw fs.readFileSync of the full ~30MB ledger on EVERY call (this runs per comment attempt,
     // i.e. frequently during posting bursts) -- switched to the shared, mtime-cached, size-limited reader every
-    // other ledger consumer in this file already uses (same fix already shipped for groupKeyAliasSet). 5000 most
-    // recent rows is comfortably more than enough to find 12 valid per-group candidates (mirrors the 5000-row
-    // limit facebookApprovalCountByProfile already uses for a similar recency scan).
-    const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 });
+    // other ledger consumer in this file already uses (same fix already shipped for groupKeyAliasSet). This
+    // function's own default maxAgeHours is 72 (no caller currently overrides it) -- adversarial review found a
+    // 5000-row cap shared across ALL groups' interleaved ledger traffic only covers ~30h at today's volume (a
+    // newly-added group already sits at zero headroom for its 12-candidate target), well short of the function's
+    // own 72h window. 20000 mirrors the identical limit commentCooldownBenchedSet already uses on this same file
+    // for the same reason ("SWARM FIX #5: cover the FULL 48h bench window... well above a day's volume") and
+    // comfortably covers 72h+ even as the ongoing 2->4 group scale-up keeps raising daily ledger volume.
+    const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 20000 });
     for (let i = rows.length - 1; i >= 0 && out.length < 12; i -= 1) {
       const r = rows[i];
       if (!r || !r.postUrl) continue; // successful publishes only
@@ -19933,7 +19941,10 @@ function requireExternalArmed() {
   // let them finish after a run-limit auto-disarm, but NEVER after a real operator STOP (which sets
   // __externalStopRequested and also kills connector children). New posts stay capped via autopilotMayPostNow.
   if (__postCompletionExternalActionInFlight > 0 && __externalStopRequested === 0) return;
-  if (!readState().operator.armedForExternalActions) {
+  // Reads FRESH, never the cached readState() (2026-07-04 hardening, cheap here — only ~24 call sites, none of
+  // them the hot 1s heartbeat): this is the final kill-switch gate before every connector spawn, so it must never
+  // depend on the cache-vs-write ordering argument even as insurance against a future refactor.
+  if (!readStateFresh().operator.armedForExternalActions) {
     const err = new Error("External actions are locked. Arm external actions first.");
     err.statusCode = 409;
     err.publicError = "external_actions_locked";

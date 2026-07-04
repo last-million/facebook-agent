@@ -36,3 +36,4 @@ hermes-config/
 /_spinprof.js
 /_*.cpuprofile
 data/_*
+isolate-*.log
