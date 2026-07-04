@@ -560,7 +560,7 @@ function defaultState() {
     },
     posting: {
       groups: "",
-      commentLimitedProfiles: [], // profiles comment-limited by FB: blocked from COMMENTING, still allowed to POST (admin releases manually)
+      commentLimitedProfiles: [], // profiles comment-limited by FB: blocked from COMMENTING, still allowed to POST; auto-expires after commentLimitedAutoReleaseHours, or admin can Release early
       blockedModerators: [], // moderators FB temporarily walls on forced_account_switch: skipped from approval rotation for a 24-min cooldown, then auto-retested; success auto-removes (admin can Release early)
       facebookUserIdByProfile: {}, // profileId -> the publisher's numeric FB user id (the account our post appears under in /groups/{gid}/user/<id>/); captured at publish, used to scope moderator approval to OUR pending posts. Numeric = language-independent.
       groupAssignmentMode: "percentage_manual_review",
@@ -1813,7 +1813,10 @@ function normalizeWorkflowState(state) {
     .map((p) => ({ profileId: String(p.profileId || p.profile_id), label: String(p.label || ""), at: String(p.at || ""), reason: String(p.reason || "").slice(0, 200) }))
     .slice(0, 1000);
   // COMMENT-LIMITED profiles (FB limited the account's COMMENTING) — blocked from commenting only; still
-  // fully eligible for POSTING. Admin releases manually from the Prod-tab section. NOT in any posting skip-set.
+  // fully eligible for POSTING. NOT in any posting skip-set. Admin can Release manually from the Prod-tab
+  // section at any time, and entries also AUTO-EXPIRE after commentLimitedAutoReleaseHours (see
+  // commentLimitedProfileIdSet) -- this array itself is only pruned by manual release/the shape cap below,
+  // the auto-expiry is enforced at READ time by whoever gates on commentLimitedProfileIdSet.
   if (!Array.isArray(state.posting.commentLimitedProfiles)) state.posting.commentLimitedProfiles = [];
   state.posting.commentLimitedProfiles = state.posting.commentLimitedProfiles
     .filter((p) => p && (p.profileId || p.profile_id))
@@ -2598,10 +2601,27 @@ function commentLimitedProfileIdSet(state = readState()) {
   const ids = new Set();
   for (const p of (state.posting?.commentLimitedProfiles || [])) {
     const at = Date.parse(String(p?.at || "")) || 0;
-    if (at && (now - at) >= hours * 3600000) continue; // auto-expired -> eligible to comment again, re-tested live
+    // FAIL-OPEN on a missing/unparseable `at` (2026-07-04 review fix): mirrors blockedModeratorCooldownSet's own
+    // fail-open default a few hundred lines above. Without this, an entry lacking a valid timestamp (e.g. hand-
+    // edited state) would never satisfy `at && ...` and would stay parked FOREVER regardless of the auto-release
+    // window -- silently defeating the whole point of this fix for exactly that entry.
+    if (!at || (now - at) >= hours * 3600000) continue; // auto-expired (or no valid timestamp) -> eligible again
     ids.add(String(p?.profileId || ""));
   }
   return ids;
+}
+// ADMIN-FACING ENRICHMENT (2026-07-04 review fix): mirrors GET /api/profiles/blocked-moderators' cooldownRemainingMs/
+// retesting pattern so the Prod-tab "Comment-limited" list can show an entry as already-expired (silently re-eligible
+// to comment, per commentLimitedProfileIdSet above) instead of looking permanently/indefinitely parked with only a
+// Release button and no age/expiry information.
+function commentLimitedProfilesWithExpiry(state = readState()) {
+  const now = Date.now();
+  const hours = clampNumber(state.operator?.commentLimitedAutoReleaseHours, 1, 240, 48);
+  return (state.posting?.commentLimitedProfiles || []).map((p) => {
+    const at = Date.parse(String(p?.at || "")) || 0;
+    const remain = at ? Math.max(0, hours * 3600000 - (now - at)) : 0;
+    return { ...p, autoReleaseHoursRemaining: Math.round((remain / 3600000) * 10) / 10, expired: !at || remain <= 0 };
+  });
 }
 function markProfileCommentLimited(profileId, label, reason) {
   const id = String(profileId || "").replace(/\D+/g, "");
@@ -20939,20 +20959,27 @@ function buildRunReports(force = false) {
   // (not admin_approval_planned, which can fire with zero real attempt when no moderator profile is available) marks
   // the start of a real wait. Key is planId:sequence:groupKey WITHOUT profileId -- a moderator hand-off across retries
   // must not fork the identity (livePostLedgerKey includes profileId, which would make each retry look like a fresh,
-  // still-pending post). No fixed age cutoff is applied: FB's own approval queue can legitimately take 10-30+ min, so
-  // a pending item just carries its age and the UI decides how to color it.
+  // still-pending post); falls back to actualGroupUrl like __postKey so the two keys can never disagree on a group.
   const pendingStartByKey = new Map();
   for (const r of rows) {
     if (!r || r.event !== "admin_approval_started" || !r.at) continue;
     const t = Date.parse(r.at);
     if (!Number.isFinite(t)) continue;
-    const k = (r.planId || "") + ":" + (r.sequence || 0) + ":" + normalizedFacebookGroupKey(r.groupUrl || "");
+    const k = (r.planId || "") + ":" + (r.sequence || 0) + ":" + normalizedFacebookGroupKey(r.groupUrl || r.actualGroupUrl || "");
     const ex = pendingStartByKey.get(k);
     if (!ex || t < ex.t) pendingStartByKey.set(k, { t, at: r.at, groupUrl: r.groupUrl || "", profileId: Number(r.profileId || 0) });
   }
+  // MAX AGE (2026-07-04 review fix): a real moderator-approval wait resolves in minutes (10-30+ per the code's own
+  // observed range), never hours. Without a cap, a post whose plan row retried a DIFFERENT group/profile after this
+  // admin_approval_started fired (runLiveFacebookPostFromPlan's fallbackGroupUrls loop, or a hard admin_approval_error
+  // that's simply abandoned) leaves this key permanently unresolved -- it would sit in the report forever as a false
+  // "pending" ghost. Past this bound it's overwhelmingly more likely to be an orphaned key than a genuine wait, so it
+  // is dropped from the view entirely (the underlying ledger/posting logic is untouched -- this only affects display).
+  const PENDING_GHOST_CUTOFF_MIN = 240;
   const pendingApproval = [...pendingStartByKey.entries()]
     .filter(([k]) => !resolvedPostKeys.has(k))
-    .map(([k, v]) => ({ key: k, groupUrl: v.groupUrl, group: __reportGroupName(v.groupUrl), profileId: v.profileId, startedAt: v.at, ageMinutes: Math.round((Date.now() - v.t) / 60000) }))
+    .map(([k, v]) => ({ key: k, groupUrl: v.groupUrl, group: __reportGroupName(v.groupUrl), profileId: v.profileId, startedAt: v.at, _t: v.t, ageMinutes: Math.round((Date.now() - v.t) / 60000) }))
+    .filter((item) => item.ageMinutes < PENDING_GHOST_CUTOFF_MIN)
     .sort((a, b) => a.ageMinutes < b.ageMinutes ? 1 : -1);
   // cluster into runs (>2h gap = new run)
   const runsRaw = [];
@@ -20969,8 +20996,9 @@ function buildRunReports(force = false) {
   // windowing a few lines below); anything outside every run's window goes to pendingUnclustered (a run that is,
   // right now, 100% pending with zero landed posts so far).
   const pendingUnclustered = [];
-  for (const item of pendingApproval) {
-    const t = Date.now() - item.ageMinutes * 60000;
+  for (const { _t: t, ...item } of pendingApproval) {
+    // exact submission instant (not reconstructed from the already-rounded ageMinutes, which could flip a
+    // boundary-adjacent item to the wrong side of a run's window by up to ~30s -- 2026-07-04 review fix)
     const run = runsRaw.find((r) => t >= r.startT - 60000 && t <= r.lastT + 30 * 60000);
     if (run) { run.pendingItems = run.pendingItems || []; run.pendingItems.push(item); }
     else pendingUnclustered.push(item);
@@ -21051,8 +21079,9 @@ function buildRunReports(force = false) {
       commented,
       uncommented: run.posts.length - commented,
       // of the uncommented posts, how many are still inside FB's normal soft-approval propagation window (expected,
-      // not a problem) vs genuinely overdue (uncommented - softApprovedPending, everything else uncommented) --
-      // see report.html for the color split this drives.
+      // not a problem) vs genuinely overdue (uncommented - softApprovedPending, everything else uncommented).
+      // NOTE: report.html's actual color split is driven per-row off detail[].approvalVerification, not this
+      // aggregate -- this field is a summary count only, not itself read by the UI today.
       softApprovedPending: softApproved,
       commentRate: __reportPct(commented, run.posts.length),
       byGroup,
@@ -21338,7 +21367,7 @@ const server = http.createServer(async (req, res) => {
     // Comment-limited section; Release via /api/profiles/release. (Auto-fires too, after 3 commenter-specific failures.)
     const id = url.searchParams.get("profileId") || "";
     const ok = markProfileCommentLimited(id, url.searchParams.get("label") || "", url.searchParams.get("reason") || "manually comment-limited by admin (broken commenter)");
-    return json(res, 200, { ok, profileId: id, commentLimited: (readState().posting?.commentLimitedProfiles || []) });
+    return json(res, 200, { ok, profileId: id, commentLimited: commentLimitedProfilesWithExpiry(readState()) });
   }
   if (req.method === "GET" && url.pathname === "/api/profiles/on-direct") {
     // profiles the agent switched to Direct (machine IP) because their proxy was dead — operator visibility (FB-safety)
@@ -21359,7 +21388,7 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, { ok: true, restored, remaining: Object.keys(bks2).filter((p) => bks2[p]).length });
   }
   if (req.method === "GET" && url.pathname === "/api/profiles/comment-limited") {
-    return json(res, 200, { commentLimited: (readState().posting?.commentLimitedProfiles || []) }); // post-only profiles; Release via /api/profiles/release
+    return json(res, 200, { commentLimited: commentLimitedProfilesWithExpiry(readState()) }); // post-only profiles; Release via /api/profiles/release, or auto-expires (see autoReleaseHoursRemaining/expired)
   }
   if (req.method === "GET" && url.pathname === "/api/profiles/blocked-moderators") {
     // moderators FB temporarily walls on forced_account_switch; skipped from the approval rotation for ~24min then
@@ -21390,7 +21419,7 @@ const server = http.createServer(async (req, res) => {
     const id = url.searchParams.get("profileId") || "";
     const ok = releaseParkedProfile(id); // clears ANY parked list (disconnected / account error / suspended / comment-limited / issue)
     const stx = readState();
-    return json(res, 200, { ok, profileId: id, disconnected: (stx.posting?.disconnectedProfiles || []), errored: (stx.posting?.erroredProfiles || []), suspended: (stx.posting?.suspendedProfiles || []), commentLimited: (stx.posting?.commentLimitedProfiles || []) });
+    return json(res, 200, { ok, profileId: id, disconnected: (stx.posting?.disconnectedProfiles || []), errored: (stx.posting?.erroredProfiles || []), suspended: (stx.posting?.suspendedProfiles || []), commentLimited: commentLimitedProfilesWithExpiry(stx) });
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/release-issue") {
     // Release a "Profiles having issue" entry: clear BOTH the issueProfiles array AND the text bench

@@ -88,9 +88,13 @@
   tbody tr:last-child td{border-bottom:0}
   tbody tr:hover{background:#192129}
   .pill{display:inline-block;font-size:.7rem;font-weight:700;border-radius:6px;padding:2px 8px}
-  .pill.o{color:#b98bff;background:rgba(167,121,233,.13)}
-  .pill.f{color:#5fb6ff;background:rgba(78,161,255,.13)}
   .pill.x{color:var(--mut);background:rgba(139,152,168,.12)}
+  .pill.c0{color:#b98bff;background:rgba(167,121,233,.13)}
+  .pill.c1{color:#5fb6ff;background:rgba(78,161,255,.13)}
+  .pill.c2{color:#6bcf8f;background:rgba(63,185,80,.13)}
+  .pill.c3{color:#f0cd72;background:rgba(214,165,49,.13)}
+  .pill.c4{color:#ff9d7a;background:rgba(240,120,80,.13)}
+  .pill.c5{color:#7ad4d0;background:rgba(60,180,175,.13)}
   .ok{color:var(--green)} .no{color:var(--red);font-weight:600} .slow{color:var(--amber)}
   .empty{padding:46px 20px;text-align:center;color:var(--mut)}
   .err{background:rgba(240,98,90,.1);border:1px solid rgba(240,98,90,.35);color:#ffb4ae;border-radius:12px;padding:14px 16px;margin:14px 0;font-size:.86rem}
@@ -152,7 +156,18 @@ function fmtDate(iso){ if(!iso) return "—"; try{ var d=new Date(iso); return d
 function fmtGap(s){ if(s==null) return "—"; if(s<90) return s+"s"; return (s/60).toFixed(1)+"m"; }
 function gapClass(s){ if(s==null) return "no"; if(s>180) return "slow"; return "ok"; }
 function esc(x){ return String(x==null?"":x).replace(/[&<>"]/g,function(c){return({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c];}); }
-function grpPill(g){ var c = g==="o-group"?"o":(g==="4854"?"f":"x"); return '<span class="pill '+c+'">'+esc(g)+'</span>'; }
+// GENERIC, N-GROUP-SCALABLE (2026-07-04 review fix): __reportGroupName no longer emits fixed literal names
+// ("o-group"/"4854") for a hardcoded 2-group set, so a literal-string check here left every group looking
+// identically grey. Hash the (arbitrary, any-length) group name into one of a small color palette instead --
+// deterministic (the same group always gets the same color across a whole report) and scales to any group count
+// without a code change; colors may repeat past 6 concurrent groups, but the group's real name/id is always the
+// visible label, so identity is never ambiguous even if two groups share a color.
+function grpPill(g){
+  if (!g || g === "autre") return '<span class="pill x">'+esc(g)+'</span>';
+  var h = 0; for (var i = 0; i < g.length; i++) { h = (h * 31 + g.charCodeAt(i)) | 0; }
+  var idx = Math.abs(h) % 6;
+  return '<span class="pill c'+idx+'">'+esc(g)+'</span>';
+}
 function rateBar(p){ var cls = p>=90?"":(p>=70?"warn":"bad"); return '<div class="bar '+cls+'"><i style="width:'+Math.max(2,Math.min(100,p))+'%"></i></div>'; }
 function statCard(k,v,x,cls){ return '<div class="stat '+(cls||"")+'"><div class="k">'+esc(k)+'</div><div class="v">'+v+'</div><div class="x">'+esc(x)+'</div></div>'; }
 

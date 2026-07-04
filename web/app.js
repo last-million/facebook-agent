@@ -5963,7 +5963,8 @@ function uxAttachCommentLimitedPostOnlyProfiles() {
       for (const r of rows) {
         const row = document.createElement("div"); row.className = "discRow";
         const info = document.createElement("div"); info.className = "di-info";
-        info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "comment-limited (still posting)") + (r.at ? ' · ' + r.at : '') + '</div>';
+        const status = r.expired ? "auto-released — eligible to comment again" : ("~" + r.autoReleaseHoursRemaining + "h until auto-release");
+        info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "comment-limited (still posting)") + (r.at ? ' · ' + r.at : '') + ' · ' + status + '</div>';
         const btn = document.createElement("button"); btn.type = "button"; btn.textContent = "Release";
         btn.addEventListener("click", async () => { btn.disabled = true; try { await api("/api/profiles/release?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
         row.appendChild(info); row.appendChild(btn); list.appendChild(row);
