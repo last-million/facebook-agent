@@ -1727,13 +1727,16 @@ function normalizeWorkflowState(state) {
   // rate, under the 7-day PROFILE_USAGE_WINDOW_MS fairness-lookup requirement. 4MB restores a >=2x margin even if
   // growth keeps accelerating with further scale-up.
   state.tracking.dailyActionLog = capRecordLogTail(state.tracking.dailyActionLog, 4000000);
-  state.posting.groupProfileAssignments = String(state.posting.groupProfileAssignments || "").slice(0, 200000);
+  state.posting.groupProfileAssignments = capRecordLogTail(state.posting.groupProfileAssignments, 200000); // 2026-07-04: was head-slice (dropped newest), see writeRegisters
   state.posting.equalSplitAssignments = state.posting.equalSplitAssignments === true; // Step-3 toggle: equal dispatch, each profile in exactly one group
   state.posting.groupPostFailCounts = String(state.posting.groupPostFailCounts || "{}").slice(0, 20000); // per-(group,profile) post-fail tally for auto-unassign
   state.posting.postTextsList = String(state.posting.postTextsList || "").slice(0, 100000); // old-method (web-scraping) post captions, one per line
   state.posting.groupFallbackPolicy = String(state.posting.groupFallbackPolicy || defaultState().posting.groupFallbackPolicy).slice(0, 600);
   state.posting.profileGroupIssueLogEndpoint = "/api/posting/profile-group-issue";
-  state.posting.publishedPostUrls = String(state.posting.publishedPostUrls || "").slice(0, 200000);
+  // TAIL-KEEP (2026-07-04 review fix): this backs the duplicate-post-URL collision detector -- a head-slice here
+  // silently dropped the NEWEST posted URLs once the field crossed 200KB, letting a since-forgotten recent post
+  // pass the collision check again.
+  state.posting.publishedPostUrls = capRecordLogTail(state.posting.publishedPostUrls, 200000);
   state.posting.groupAssignmentData = Array.isArray(state.posting.groupAssignmentData)
     ? state.posting.groupAssignmentData.slice(0, 500).map((entry) => ({
       url: String(entry?.url || "").slice(0, 1000),
@@ -1849,7 +1852,7 @@ function normalizeWorkflowState(state) {
   state.productDiscovery.walmartCategorySources = String(state.productDiscovery.walmartCategorySources || "").slice(0, 50000);
   state.productDiscovery.walmartSearchQueries = String(state.productDiscovery.walmartSearchQueries || "").slice(0, 50000);
   state.productDiscovery.otherStoreSourceUrls = String(state.productDiscovery.otherStoreSourceUrls || "").slice(0, 100000);
-  state.productDiscovery.generatedSourceUrls = String(state.productDiscovery.generatedSourceUrls || "").slice(0, 200000);
+  state.productDiscovery.generatedSourceUrls = capRecordLogTail(state.productDiscovery.generatedSourceUrls, 200000); // 2026-07-04: was head-slice (dropped newest)
   state.productDiscovery.minActivitySignal = String(state.productDiscovery.minActivitySignal || "").slice(0, 500);
   const assignedProfileCount = countAssignedProfiles(state);
   const postsPerDay = clampNumber(state.rules.postsPerProfilePerDay, 1, 20, 5);
@@ -2151,7 +2154,13 @@ function writeRegisters(registers) {
       throw new Error(`Register file cannot be a symlink: ${filePath}`);
     }
     const merged = mergeProtectedRecordLines(registers[key], existing[key]);
-    atomicWrite(filePath, merged.slice(0, 200000));
+    // TAIL-KEEP, NOT HEAD-KEEP (2026-07-04 review fix): `.slice(0, 200000)` kept the OLDEST 200,000 characters and
+    // silently discarded every NEWLY-appended line past that length -- backwards, since appendUniqueRecordLine always
+    // appends to the END. This directly broke `usedProducts` (backs assertProductNotUsedToday + the 7-day-reuse
+    // candidate filter): once the register crossed 200KB, every subsequent "this product was just posted" stamp was
+    // silently dropped forever, letting the SAME product repost to the SAME group. Mirrors the capRecordLogTail fix
+    // already applied to dailyActionLog/facebookProfileStatus for the identical bug class.
+    atomicWrite(filePath, capRecordLogTail(merged, 200000));
   }
   return readRegisters();
 }
@@ -4281,7 +4290,7 @@ function recordProductRealTitle(productKey, title) {
     }
     if (!found) { out.push(`${key}\t${t}`); changed = true; }
     if (changed) {
-      registers.productTitles = (out.filter(Boolean).join("\n") + "\n").slice(0, 200000);
+      registers.productTitles = capRecordLogTail(out.filter(Boolean).join("\n") + "\n", 200000); // 2026-07-04: was head-slice (dropped newest)
       writeRegisters(registers);
       logEvent("product_real_title_recorded", { productKey: key, title: oneLineField(t, 120) });
     }
@@ -8972,6 +8981,28 @@ async function stopAllExternalWork(reason) {
 // repeats, but a product posted in tick N can still look "ready" in tick N+1 before its posted-status
 // propagates -> double-post. An atomic fs claim keyed by the run survives across ticks AND concurrent
 // workers (exclusive create = first wins). Released on a FAILED post so it can be retried in the same run.
+// PRUNE STALE CLAIM DIRS ONLY (2026-07-04 review fix): a fresh arm/relaunch/reset-all used to blanket-delete
+// EVERY post-claims/<runId> directory, including the JUST-ENDED run's -- even for a product posted MINUTES
+// earlier whose lastPostedAtByGroup stamp never got written (still-pending admin approval, or a mid-flight
+// kill). A new runId already gets its own empty claim directory regardless (postClaimDirForRun keys strictly by
+// runId), so wiping old directories serves ONLY disk hygiene, not correctness -- but doing it unconditionally
+// throws away the one remaining safety net for a product that's ambiguous (not yet stamped) right when a
+// restart is most likely to have just happened. Only remove directories whose runId (an epoch-ms timestamp) is
+// older than reuseHours -- by then any real claim inside is moot anyway since the product is legitimately
+// reusable, so nothing of value is lost, and today's claims survive a restart.
+function pruneStaleClaimDirs(state = readState()) {
+  try {
+    const cr = path.join(DATA_DIR, "post-claims");
+    if (!fs.existsSync(cr)) return;
+    const cutoffMs = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 24) * 3600000;
+    const now = Date.now();
+    for (const d of fs.readdirSync(cr)) {
+      const runIdMs = Number(d);
+      if (Number.isFinite(runIdMs) && runIdMs > 0 && (now - runIdMs) < cutoffMs) continue; // still within its reuse window -- keep
+      try { fs.rmSync(path.join(cr, d), { recursive: true, force: true }); } catch (_) {}
+    }
+  } catch (_) {}
+}
 function postClaimDirForRun(state) {
   const runId = String(state.operator?.autopilotRunId || "default").replace(/[^a-z0-9_-]/gi, "");
   return path.join(DATA_DIR, "post-claims", runId || "default");
@@ -10784,6 +10815,17 @@ function preparePostingPlan(options = {}) {
     if (__postToAll) {
       const __reuseMs = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 24) * 3600 * 1000;
       const __byGroup = (harvestedRec && harvestedRec.lastPostedAtByGroup && typeof harvestedRec.lastPostedAtByGroup === "object") ? harvestedRec.lastPostedAtByGroup : {};
+      // ALIAS-AWARE STAMP LOOKUP (2026-07-04 review fix): __byGroup is keyed by plain normalizedFacebookGroupKey,
+      // which doesn't unify a group's vanity URL with its FB-resolved numeric-permalink form -- mirrors the fix
+      // already applied to isProfileGroupBlockedForPosting/__reportGroupName so a real group's two identities
+      // can't be double-counted as "two different, both-owed" groups.
+      const __groupStampAlias = (g) => {
+        const k = normalizedFacebookGroupKey(g);
+        if (!k) return null;
+        if (__byGroup[k]) return __byGroup[k];
+        try { for (const ak of groupKeyAliasSet(g)) { if (__byGroup[ak]) return __byGroup[ak]; } } catch (_) {}
+        return null;
+      };
       const __seen = new Set();
       __targetGroups = [];
       // COVERAGE-FIRST (operator 2026-06-28): while ANY configured group has NEVER received this harvested product,
@@ -10791,7 +10833,7 @@ function preparePostingPlan(options = {}) {
       // reuse window has elapsed. This caps the "one group floods while another is still owed" failure (e.g. the owed
       // group's pool is temporarily down) and enforces the operator intent: the SAME product reaches EVERY group once
       // before any group gets it a 2nd time. Once every group has it, independent 1x/reuse windows resume.
-      const __coverageIncomplete = !!harvestedRec && [slot.groupUrl, ...__allPostingGroupUrls].some((g) => { const k = normalizedFacebookGroupKey(g); return k && !__byGroup[k]; });
+      const __coverageIncomplete = !!harvestedRec && [slot.groupUrl, ...__allPostingGroupUrls].some((g) => normalizedFacebookGroupKey(g) && !__groupStampAlias(g));
       // ALL posting groups (primary first) — NOT fallbackGroupUrlsForSlot(slot), which drops any group the PRIMARY
       // profile can't post to and so collapsed the fan-out to one group. Group membership is now satisfied per-group
       // at emit time by __pickFanoutProfileForGroup (a profile assigned to that group), not by the primary profile.
@@ -10799,8 +10841,9 @@ function preparePostingPlan(options = {}) {
         const __k = normalizedFacebookGroupKey(__g);
         if (!__g || !__k || __seen.has(__k)) continue;
         __seen.add(__k);
-        if (__coverageIncomplete && __byGroup[__k]) continue; // coverage-first: don't re-post an already-served group until EVERY configured group has this product once
-        if (harvestedRec) { const __t = Date.parse(__byGroup[__k] || ""); if (Number.isFinite(__t) && (Date.now() - __t) < __reuseMs) continue; } // 1x per group per reuse window
+        const __stampedAt = harvestedRec ? __groupStampAlias(__g) : null;
+        if (__coverageIncomplete && __stampedAt) continue; // coverage-first: don't re-post an already-served group until EVERY configured group has this product once
+        if (__stampedAt) { const __t = Date.parse(__stampedAt || ""); if (Number.isFinite(__t) && (Date.now() - __t) < __reuseMs) continue; } // 1x per group per reuse window
         if (normalizedFacebookGroupKey(__g) !== normalizedFacebookGroupKey(slot.groupUrl) && !__fanoutProfilesByGroupKey.has(__k)) continue; // no profile assigned to this group -> skip it (don't emit an unpostable row)
         __targetGroups.push(__g);
       }
@@ -11625,7 +11668,12 @@ function recordPublishedFacebookPostUrl(body) {
       // PER-GROUP reuse stamp (operator 2026-06-18 post-to-all-groups): also remember the last-posted time PER
       // GROUP so plan-build can let the same product post into a different group while still honoring 1x/group/24h.
       const __nowISO = new Date().toISOString();
-      const __grpKey = normalizedFacebookGroupKey(row.groupUrl || "");
+      // FB-RESOLVED GROUP, NOT THE PRE-POST PLANNED ONE (2026-07-04 review fix): `groupUrl` (outer scope, line
+      // ~11637) already prefers postedGroupUrl (derived from the actual permalink) over row.groupUrl (the
+      // planned/configured URL) -- using the resolved form here keeps this stamp on the SAME key the alias-aware
+      // fan-out gate above ultimately compares against, instead of whichever of a group's two identity strings
+      // happened to be configured for this row.
+      const __grpKey = normalizedFacebookGroupKey(groupUrl || row.groupUrl || "");
       const __byGroup = Object.assign({}, (__prevRec.lastPostedAtByGroup && typeof __prevRec.lastPostedAtByGroup === "object") ? __prevRec.lastPostedAtByGroup : {});
       if (__grpKey) __byGroup[__grpKey] = __nowISO;
       updateHarvestedProductRecord(row.productKey, { lastPostedAt: __nowISO, lastPostedAtByGroup: __byGroup, postedCount: (Number(__prevRec.postedCount) || 0) + 1, postUrl: String(postUrl || ""), posted: "" });
@@ -13055,12 +13103,16 @@ function dateKeyForTimezone(date = new Date(), timezone = "America/New_York") {
   return date.toISOString().slice(0, 10);
 }
 
-function productKeysUsedOnDate(text, state, dayKey) {
+// ELAPSED-TIME, NOT CALENDAR-DAY (2026-07-04 review fix, renamed from productKeysUsedOnDate): the old version
+// matched a CALENDAR DAY key, which resets at local midnight -- a product posted at 23:50 could be reposted at
+// 00:05 (15 minutes later!) since that's technically a "new day". cutoffMs is an absolute epoch-ms threshold;
+// only lines whose timestamp is AFTER it count as "still used".
+function productKeysUsedSince(text, state, cutoffMs) {
   const keys = new Set();
   for (const line of recordLines(text)) {
     const firstField = String(line).split("|")[0].trim();
-    const match = firstField.match(/^(\d{4}-\d{2}-\d{2})/);
-    if (!match || match[1] !== dayKey) continue;
+    const t = Date.parse(firstField);
+    if (!Number.isFinite(t) || t < cutoffMs) continue;
     for (const key of productKeysFromText(line, state)) keys.add(key);
   }
   return keys;
@@ -13069,28 +13121,31 @@ function productKeysUsedOnDate(text, state, dayKey) {
 function assertProductNotUsedToday(row, state = readState()) {
   const key = String(row?.productKey || canonicalProduct(row?.productUrl || "", state)?.key || "").toLowerCase();
   if (!key) return;
-  const timezone = state.operator?.scheduleTimezone || state.rules?.peakHoursTimezone || "America/New_York";
-  const dayKey = dateKeyForTimezone(new Date(), timezone);
-  // PER-GROUP (operator 2026-06-18 post-to-all-groups): when posting each product into EVERY group, "used today"
-  // must be scoped to the GROUP — otherwise posting to group A blocks the SAME product from posting to group B.
-  // Block only a same-product + same-group repeat in the same day; different group => allowed.
+  const reuseMs = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 24) * 3600000;
+  const cutoffMs = Date.now() - reuseMs;
+  // PER-GROUP (operator 2026-06-18 post-to-all-groups): when posting each product into EVERY group, "already
+  // used" must be scoped to the GROUP — otherwise posting to group A blocks the SAME product from posting to
+  // group B. Block only a same-product + same-group repeat within the reuse window; different group => allowed.
   if (state.operator?.postToAllGroups === true) {
-    const rowGroupKey = normalizedFacebookGroupKey(row.groupUrl || "");
+    // ALIAS-AWARE GROUP MATCH (2026-07-04 review fix): a vanity-URL group and its FB-resolved numeric-ID form are
+    // the SAME real group but compare unequal under plain normalizedFacebookGroupKey -- mirrors the fix already
+    // applied to isProfileGroupBlockedForPosting, so this gate can't be fooled into treating one real group as two.
+    const rowAliasSet = groupKeyAliasSet(row.groupUrl || "");
     for (const line of recordLines(readRegisters().usedProducts)) {
       const firstField = String(line).split("|")[0].trim();
-      const m = firstField.match(/^(\d{4}-\d{2}-\d{2})/);
-      if (!m || m[1] !== dayKey) continue;
+      const t = Date.parse(firstField);
+      if (!Number.isFinite(t) || t < cutoffMs) continue;
       if (!productKeysFromText(line, state).has(key)) continue;
       const lineGroupKey = normalizedFacebookGroupKey((String(line).match(/group_url=([^|]+)/i) || [])[1] || "");
-      if (lineGroupKey !== rowGroupKey) continue; // same product, DIFFERENT group -> not a conflict
-      const e = new Error(`Product already used today in this group (${dayKey} ${timezone}): ${row.productUrl || row.productKey}.`);
+      if (!lineGroupKey || !rowAliasSet.has(lineGroupKey)) continue; // same product, DIFFERENT group -> not a conflict
+      const e = new Error(`Product already used within the reuse window in this group: ${row.productUrl || row.productKey}.`);
       e.statusCode = 409; throw e;
     }
     return;
   }
-  const usedToday = productKeysUsedOnDate(readRegisters().usedProducts, state, dayKey);
-  if (!usedToday.has(key)) return;
-  const err = new Error(`Product already used today (${dayKey} ${timezone}): ${row.productUrl || row.productKey}. Refresh product discovery and rebuild the production plan.`);
+  const usedRecently = productKeysUsedSince(readRegisters().usedProducts, state, cutoffMs);
+  if (!usedRecently.has(key)) return;
+  const err = new Error(`Product already used within the reuse window: ${row.productUrl || row.productKey}. Refresh product discovery and rebuild the production plan.`);
   err.statusCode = 409;
   throw err;
 }
@@ -21475,7 +21530,7 @@ const server = http.createServer(async (req, res) => {
         incoming.operator.autopilotPostsThisRun = 0; // fresh arm => count THIS run only
         incoming.operator.commentDrainPaused = false; // a fresh launch re-enables the comment drain a prior operator STOP had paused (else this run's tail/late comments stay blocked)
         incoming.operator.autopilotRunId = String(Date.now()); // fresh per-run product-claim namespace (no cross-run carryover)
-        try { const cr = path.join(DATA_DIR, "post-claims"); for (const d of (fs.existsSync(cr) ? fs.readdirSync(cr) : [])) { try { fs.rmSync(path.join(cr, d), { recursive: true, force: true }); } catch (_) {} } } catch (_) {} // drop stale claim dirs
+        pruneStaleClaimDirs(incoming); // drop only claim dirs past their reuse window -- see pruneStaleClaimDirs comment
         // STALE STOP-FLAG (2026-07-01, operator: "he finished but detect why he didn't finish last comments"): a
         // PRIOR stopAllExternalWork() call (operator STOP, or my own /api/operator/stop-all to pause the drain)
         // sets __externalStopRequested = Date.now() and NEVER resets it back to 0 anywhere else in the codebase --
@@ -21906,7 +21961,7 @@ const server = http.createServer(async (req, res) => {
       // clear the post-claims dirs, exactly as a fresh arm does. ('continue' deliberately KEEPS runId+claims so it
       // never re-posts the segment it already completed.)
       state.operator.autopilotRunId = String(Date.now());
-      try { fs.rmSync(path.join(DATA_DIR, "post-claims"), { recursive: true, force: true }); } catch (_) {}
+      pruneStaleClaimDirs(state); // drop only claim dirs past their reuse window -- see pruneStaleClaimDirs comment
     }
     state.operator.lastIncompleteRun = { ...run, status: action === "continue" ? "continued" : "relaunched", resolvedAt: new Date().toISOString() };
     const next = writeState(state, { controlWrite: true, operatorControl: true }); // explicit relaunch/continue — may set armed/enabled true
