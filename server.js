@@ -4278,6 +4278,7 @@ function recordProductRealTitle(productKey, title) {
     const out = [];
     let found = false;
     let changed = false;
+    let updatedLine = null;
     for (const line of lines) {
       if (!line || line.startsWith("#")) { out.push(line); continue; }
       const i = line.indexOf("\t");
@@ -4285,10 +4286,16 @@ function recordProductRealTitle(productKey, title) {
       if (k.trim().toLowerCase() === key.toLowerCase()) {
         found = true;
         const v = i < 0 ? "" : line.slice(i + 1);
-        if (v.trim() !== t) { out.push(`${key}\t${t}`); changed = true; } else out.push(line);
+        // TAIL-KEEP SAFE (2026-07-04 review fix): this is a keyed upsert, not a pure append log -- an in-place
+        // rewrite would leave the freshest write sitting at this key's ORIGINAL (possibly old/early) position,
+        // where a byte-cap tail-trim could silently drop it even though it was just written. Instead, drop the
+        // key from its old position and re-push it at the END below (alongside how a brand-new key is already
+        // appended), so any update is always the newest content and survives a tail-trim.
+        if (v.trim() !== t) { updatedLine = `${key}\t${t}`; changed = true; } else out.push(line);
       } else out.push(line);
     }
-    if (!found) { out.push(`${key}\t${t}`); changed = true; }
+    if (!found) { updatedLine = `${key}\t${t}`; changed = true; }
+    if (updatedLine) out.push(updatedLine);
     if (changed) {
       registers.productTitles = capRecordLogTail(out.filter(Boolean).join("\n") + "\n", 200000); // 2026-07-04: was head-slice (dropped newest)
       writeRegisters(registers);
@@ -11668,12 +11675,20 @@ function recordPublishedFacebookPostUrl(body) {
       // PER-GROUP reuse stamp (operator 2026-06-18 post-to-all-groups): also remember the last-posted time PER
       // GROUP so plan-build can let the same product post into a different group while still honoring 1x/group/24h.
       const __nowISO = new Date().toISOString();
-      // FB-RESOLVED GROUP, NOT THE PRE-POST PLANNED ONE (2026-07-04 review fix): `groupUrl` (outer scope, line
-      // ~11637) already prefers postedGroupUrl (derived from the actual permalink) over row.groupUrl (the
-      // planned/configured URL) -- using the resolved form here keeps this stamp on the SAME key the alias-aware
-      // fan-out gate above ultimately compares against, instead of whichever of a group's two identity strings
-      // happened to be configured for this row.
-      const __grpKey = normalizedFacebookGroupKey(groupUrl || row.groupUrl || "");
+      // DELIBERATELY row.groupUrl, NOT the resolved `groupUrl` (2026-07-04, reverted after adversarial review):
+      // an earlier version of this fix keyed by `groupUrl` (postedGroupUrl-first, parsed from the captured
+      // postUrl) to match the fan-out gate's alias-aware read -- but postUrl capture has an ALREADY-DOCUMENTED
+      // race (see "Fix B" a few lines below in recordPublishedFacebookPostUrl: a stale/shared permalink from a
+      // DIFFERENT plan's post) that row.groupUrl is immune to (it's fixed at plan-build time, never touches the
+      // captured URL). Keying by the racy resolved URL would stamp the WRONG group on a race hit -- the true
+      // served group stays looking "owed" (re-postable -> duplicate) while an unrelated group falsely looks
+      // "served" (a coverage stall). It also disagreed with two OTHER lastPostedAtByGroup readers
+      // (harvestedProductOwesAnyConfiguredGroup, __coveredCount/__owesServableGroup in
+      // collectProductUrlsForPosting) that key off the plain CONFIGURED group form and were not updated to
+      // match. row.groupUrl is deterministic and race-immune, and is what every other consumer of this field
+      // already expects -- the fan-out gate's groupKeyAliasSet fallback (see __groupStampAlias above) is the
+      // right place for cross-form robustness, not the write.
+      const __grpKey = normalizedFacebookGroupKey(row.groupUrl || "");
       const __byGroup = Object.assign({}, (__prevRec.lastPostedAtByGroup && typeof __prevRec.lastPostedAtByGroup === "object") ? __prevRec.lastPostedAtByGroup : {});
       if (__grpKey) __byGroup[__grpKey] = __nowISO;
       updateHarvestedProductRecord(row.productKey, { lastPostedAt: __nowISO, lastPostedAtByGroup: __byGroup, postedCount: (Number(__prevRec.postedCount) || 0) + 1, postUrl: String(postUrl || ""), posted: "" });
@@ -13112,7 +13127,10 @@ function productKeysUsedSince(text, state, cutoffMs) {
   for (const line of recordLines(text)) {
     const firstField = String(line).split("|")[0].trim();
     const t = Date.parse(firstField);
-    if (!Number.isFinite(t) || t < cutoffMs) continue;
+    // FAIL-SAFE on an unparseable timestamp (2026-07-04 review fix): a malformed/undated line is treated as
+    // STILL-USED (blocked), not "not used" -- matches the sibling recentlyUsedProductKeys' explicit fail-safe
+    // design over this same file ("undated legacy records stay blocked, safer than a surprise re-post").
+    if (Number.isFinite(t) && t < cutoffMs) continue;
     for (const key of productKeysFromText(line, state)) keys.add(key);
   }
   return keys;
@@ -13134,7 +13152,7 @@ function assertProductNotUsedToday(row, state = readState()) {
     for (const line of recordLines(readRegisters().usedProducts)) {
       const firstField = String(line).split("|")[0].trim();
       const t = Date.parse(firstField);
-      if (!Number.isFinite(t) || t < cutoffMs) continue;
+      if (Number.isFinite(t) && t < cutoffMs) continue; // fail-safe: an unparseable timestamp counts as still-used
       if (!productKeysFromText(line, state).has(key)) continue;
       const lineGroupKey = normalizedFacebookGroupKey((String(line).match(/group_url=([^|]+)/i) || [])[1] || "");
       if (!lineGroupKey || !rowAliasSet.has(lineGroupKey)) continue; // same product, DIFFERENT group -> not a conflict
