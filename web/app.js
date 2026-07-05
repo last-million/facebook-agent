@@ -6078,7 +6078,7 @@ function uxAttachIncompleteRunBanner() {
       // (server disarmed but the client cache not yet refreshed) -> the Stop button wrongly stayed visible. ap.armed is live.
       const armedNow = (ap.armed != null) ? ap.armed : op.armedForExternalActions;
       const runActive = Boolean(armedNow) || Boolean(enabled);
-      setProdCtlButtons(runActive, Boolean(op.paused));
+      if (!prodActionInFlight) setProdCtlButtons(runActive, Boolean(op.paused)); // don't let a stale poll stomp an in-flight action's optimistic button state
       document.querySelectorAll(".prodCtl-draintoggle").forEach(function (el) { el.textContent = op.commentDrainPaused ? "▶ Resume drain" : "❚❚ Pause drain"; });
       const buf = ap.buffer || {};
       const cap = ap.capacity || {};
@@ -6160,6 +6160,15 @@ function uxAttachIncompleteRunBanner() {
   }
   // ── Prod run mode: "stop after N posts" (count) OR "run between start & end time" (time) ─────
   let prodRunModeTouched = false;
+  // START/STOP BUTTON FLICKER FIX (2026-07-05, operator: "takes much time to show stop button... i think
+  // prod didn't launch"). Root cause: prodPatchState does a full GET+PUT of the whole (multi-MB) state file
+  // for even a tiny operator-field patch, which can take a few seconds. Meanwhile the 4s status poll
+  // (startProdPoll) keeps calling renderProdTab(), which sets the Start/Stop buttons from the SERVER's
+  // armed/enabled flags -- still stale (not-yet-written) mid-patch -- so it was flipping the just-clicked
+  // optimistic "Stop" view back to "Start" for a few seconds until the write actually landed. Looked like a
+  // failed launch and risked a double-click. While a doProd* action's own patch is in flight, the poll-driven
+  // render leaves the button row alone (the action already set the correct optimistic state itself).
+  let prodActionInFlight = false;
   function prodRunModeValue() { const r = document.querySelector('input[name="prodRunMode"]:checked'); return r ? r.value : "count"; }
   function prodApplyRunModeVisibility() {
     const mode = prodRunModeValue();
@@ -6263,7 +6272,8 @@ function uxAttachIncompleteRunBanner() {
       prodResult("Launching…");
       setProdCtlButtons(true, false); // optimistic running view — no double-start window before the re-render
       prodSyncFormAndCache(patch.operator, patch.rules);
-      await prodPatchState(patch);
+      prodActionInFlight = true;
+      try { await prodPatchState(patch); } finally { prodActionInFlight = false; }
       prodResult(msg);
       prodRunModeTouched = false;
       renderProdTab();
@@ -6272,8 +6282,11 @@ function uxAttachIncompleteRunBanner() {
       prodResult("Stopping everything…");
       setProdCtlButtons(false, false);
       prodSyncFormAndCache({ armedForExternalActions: false, autopilotEnabled: false, paused: false });
-      try { await api("/api/operator/stop-all", { method: "POST", body: JSON.stringify({}) }); } catch (_) {}
-      await prodPatchState({ operator: { armedForExternalActions: false, autopilotEnabled: false, paused: false } });
+      prodActionInFlight = true;
+      try {
+        try { await api("/api/operator/stop-all", { method: "POST", body: JSON.stringify({}) }); } catch (_) {}
+        await prodPatchState({ operator: { armedForExternalActions: false, autopilotEnabled: false, paused: false } });
+      } finally { prodActionInFlight = false; }
       prodResult("Stopped — disarmed, in-flight posting/harvest/comment work killed, profiles closing.");
       renderProdTab();
     }
@@ -6281,7 +6294,8 @@ function uxAttachIncompleteRunBanner() {
       prodResult("Pausing…");
       setProdCtlButtons(true, true);
       prodSyncFormAndCache({ paused: true });
-      await prodPatchState({ operator: { paused: true } });
+      prodActionInFlight = true;
+      try { await prodPatchState({ operator: { paused: true } }); } finally { prodActionInFlight = false; }
       prodResult("⏸ Paused — no NEW posts until you Resume (any in-flight post finishes). The run stays armed.");
       renderProdTab();
     }
@@ -6289,7 +6303,8 @@ function uxAttachIncompleteRunBanner() {
       prodResult("Resuming…");
       setProdCtlButtons(true, false);
       prodSyncFormAndCache({ paused: false });
-      await prodPatchState({ operator: { paused: false } });
+      prodActionInFlight = true;
+      try { await prodPatchState({ operator: { paused: false } }); } finally { prodActionInFlight = false; }
       prodResult("▶ Resumed — posting continues.");
       renderProdTab();
     }
