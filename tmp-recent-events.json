@@ -1,0 +1,1655 @@
+[
+ {
+  "at": "2026-07-05T19:15:31.246Z",
+  "message": "adaptive_concurrency",
+  "cpu": 22,
+  "freeRam": 82,
+  "chrome": 0,
+  "workers": 3,
+  "cap": 3,
+  "learned": 8
+ },
+ {
+  "at": "2026-07-05T19:15:12.928Z",
+  "message": "autopilot_publishing",
+  "dryRun": false,
+  "action": "publishing",
+  "detail": "",
+  "capacity": {
+   "totalRemaining": 56999266,
+   "totalPostedToday": 823
+  },
+  "buffer": {
+   "readyCount": 71,
+   "target": 200,
+   "shortfall": 129
+  },
+  "maxWorkers": 3,
+  "workers": 4,
+  "targets": [
+   {
+    "planId": "plan_1783278939894_a584b9",
+    "sequence": 2,
+    "profile": "73 - 39",
+    "profileId": 73,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:d01b3ebc109f"
+   },
+   {
+    "planId": "plan_1783278939894_a584b9",
+    "sequence": 1,
+    "profile": "95 - f6",
+    "profileId": 95,
+    "groupUrl": "https://www.facebook.com/groups/4854972804605257/",
+    "productUrl": "harvested:d01b3ebc109f"
+   },
+   {
+    "planId": "plan_1783278939894_a584b9",
+    "sequence": 24,
+    "profile": "83 - 49",
+    "profileId": 83,
+    "groupUrl": "https://www.facebook.com/groups/o38679876833911/",
+    "productUrl": "harvested:bc57ad7f150c"
+   },
+   {
+    "planId": "plan_1783278939894_a584b9",
+    "sequence": 27,
+    "profile": "44 - 4",
+    "profileId": 44,
+    "groupUrl": "https://www.facebook.com/groups/1567661940074941/",
+    "productUrl": "harvested:bc57ad7f150c"
+   }
+  ]
+ },
+ {
+  "at": "2026-07-05T19:15:40.538Z",
+  "message": "autopilot_posting_concurrent",
+  "workers": 4,
+  "openStaggerMs": 8000,
+  "profileIds": [
+   73,
+   95,
+   83,
+   44
+  ]
+ },
+ {
+  "at": "2026-07-05T19:15:41.104Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 8000,
+  "profileId": 95
+ },
+ {
+  "at": "2026-07-05T19:15:41.105Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 16000,
+  "profileId": 83
+ },
+ {
+  "at": "2026-07-05T19:15:41.106Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 24000,
+  "profileId": 44
+ },
+ {
+  "at": "2026-07-05T19:15:42.092Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783278939894_a584b9",
+  "sequence": 2,
+  "profileId": 73,
+  "groupUrl": "https://www.facebook.com/groups/o1498765421290862"
+ },
+ {
+  "at": "2026-07-05T19:15:55.592Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783278939894_a584b9",
+  "sequence": 1,
+  "profileId": 95,
+  "groupUrl": "https://www.facebook.com/groups/4854972804605257/"
+ },
+ {
+  "at": "2026-07-05T19:16:01.301Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783278939894_a584b9",
+  "sequence": 24,
+  "profileId": 83,
+  "groupUrl": "https://www.facebook.com/groups/o38679876833911/"
+ },
+ {
+  "at": "2026-07-05T19:16:06.278Z",
+  "message": "cpu_governor_waiting",
+  "load": 99,
+  "freeRam": 72,
+  "chrome": 37,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "autopilot_worker_p44"
+ },
+ {
+  "at": "2026-07-05T19:16:09.520Z",
+  "message": "cpu_governor_resumed",
+  "load": 72,
+  "freeRam": 72,
+  "chrome": 37,
+  "waitedMs": 4367,
+  "label": "autopilot_worker_p44"
+ },
+ {
+  "at": "2026-07-05T19:16:10.328Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783278939894_a584b9",
+  "sequence": 27,
+  "profileId": 44,
+  "groupUrl": "https://www.facebook.com/groups/1567661940074941/"
+ },
+ {
+  "at": "2026-07-05T19:16:58.223Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783278939894_a584b9",
+  "sequence": 27,
+  "profileId": 44,
+  "groupUrl": "https://www.facebook.com/groups/1567661940074941",
+  "postUrl": "https://www.facebook.com/groups/1567661940074941/permalink/3543213492519766/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T19:17:08.943Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783278939894_a584b9",
+  "sequence": 24,
+  "profileId": 83,
+  "groupUrl": "https://www.facebook.com/groups/1076334503593333",
+  "postUrl": "https://www.facebook.com/groups/1076334503593333/permalink/1689168585643252/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T19:20:46.769Z",
+  "message": "adaptive_concurrency",
+  "cpu": 22,
+  "freeRam": 75,
+  "chrome": 11,
+  "workers": 3,
+  "cap": 3,
+  "learned": 8
+ },
+ {
+  "at": "2026-07-05T19:20:10.572Z",
+  "message": "autopilot_publishing",
+  "dryRun": false,
+  "action": "publishing",
+  "detail": "",
+  "capacity": {
+   "totalRemaining": 56999262,
+   "totalPostedToday": 827
+  },
+  "buffer": {
+   "readyCount": 73,
+   "target": 200,
+   "shortfall": 127
+  },
+  "maxWorkers": 3,
+  "workers": 4,
+  "targets": [
+   {
+    "planId": "plan_1783279255166_2a012c",
+    "sequence": 8,
+    "profile": "73 - 39",
+    "profileId": 73,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:bc57ad7f150c"
+   },
+   {
+    "planId": "plan_1783279255166_2a012c",
+    "sequence": 9,
+    "profile": "98 - f9",
+    "profileId": 98,
+    "groupUrl": "https://www.facebook.com/groups/4854972804605257/",
+    "productUrl": "harvested:bc57ad7f150c"
+   },
+   {
+    "planId": "plan_1783279255166_2a012c",
+    "sequence": 4,
+    "profile": "62 - 28",
+    "profileId": 62,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:3be1707f4f7c"
+   },
+   {
+    "planId": "plan_1783279255166_2a012c",
+    "sequence": 3,
+    "profile": "95 - f6",
+    "profileId": 95,
+    "groupUrl": "https://www.facebook.com/groups/4854972804605257/",
+    "productUrl": "harvested:3be1707f4f7c"
+   }
+  ]
+ },
+ {
+  "at": "2026-07-05T19:20:55.821Z",
+  "message": "autopilot_posting_concurrent",
+  "workers": 4,
+  "openStaggerMs": 8000,
+  "profileIds": [
+   73,
+   98,
+   62,
+   95
+  ]
+ },
+ {
+  "at": "2026-07-05T19:20:56.369Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 8000,
+  "profileId": 98
+ },
+ {
+  "at": "2026-07-05T19:20:56.370Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 16000,
+  "profileId": 62
+ },
+ {
+  "at": "2026-07-05T19:20:56.371Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 24000,
+  "profileId": 95
+ },
+ {
+  "at": "2026-07-05T19:21:05.568Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783279255166_2a012c",
+  "sequence": 9,
+  "profileId": 98,
+  "groupUrl": "https://www.facebook.com/groups/4854972804605257/"
+ },
+ {
+  "at": "2026-07-05T19:21:13.645Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783279255166_2a012c",
+  "sequence": 4,
+  "profileId": 62,
+  "groupUrl": "https://www.facebook.com/groups/o1498765421290862"
+ },
+ {
+  "at": "2026-07-05T19:23:09.514Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783279255166_2a012c",
+  "sequence": 4,
+  "profileId": 62,
+  "groupUrl": "https://www.facebook.com/groups/1098414320641851",
+  "postUrl": "https://www.facebook.com/groups/1098414320641851/permalink/2452868208529782/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T19:26:44.969Z",
+  "message": "adaptive_concurrency",
+  "cpu": 30,
+  "freeRam": 73,
+  "chrome": 0,
+  "workers": 3,
+  "cap": 3,
+  "learned": 8
+ },
+ {
+  "at": "2026-07-05T19:26:10.424Z",
+  "message": "autopilot_publishing",
+  "dryRun": false,
+  "action": "publishing",
+  "detail": "",
+  "capacity": {
+   "totalRemaining": 56999257,
+   "totalPostedToday": 833
+  },
+  "buffer": {
+   "readyCount": 74,
+   "target": 200,
+   "shortfall": 126
+  },
+  "maxWorkers": 3,
+  "workers": 3,
+  "targets": [
+   {
+    "planId": "plan_1783279613571_aecb57",
+    "sequence": 1,
+    "profile": "73 - 39",
+    "profileId": 73,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:6728d06f33da"
+   },
+   {
+    "planId": "plan_1783279613571_aecb57",
+    "sequence": 2,
+    "profile": "66 - 32",
+    "profileId": 66,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:6b9d2aabd28a"
+   },
+   {
+    "planId": "plan_1783279613571_aecb57",
+    "sequence": 3,
+    "profile": "95 - f6",
+    "profileId": 95,
+    "groupUrl": "https://www.facebook.com/groups/4854972804605257/",
+    "productUrl": "harvested:31563d4a9f1d"
+   }
+  ]
+ },
+ {
+  "at": "2026-07-05T19:26:54.243Z",
+  "message": "autopilot_posting_concurrent",
+  "workers": 3,
+  "openStaggerMs": 8000,
+  "profileIds": [
+   73,
+   66,
+   95
+  ]
+ },
+ {
+  "at": "2026-07-05T19:26:54.777Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 8000,
+  "profileId": 66
+ },
+ {
+  "at": "2026-07-05T19:26:54.778Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 16000,
+  "profileId": 95
+ },
+ {
+  "at": "2026-07-05T19:27:03.928Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783279613571_aecb57",
+  "sequence": 2,
+  "profileId": 66,
+  "groupUrl": "https://www.facebook.com/groups/o1498765421290862"
+ },
+ {
+  "at": "2026-07-05T19:27:11.417Z",
+  "message": "cpu_governor_waiting",
+  "load": 96,
+  "freeRam": 72,
+  "chrome": 31,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "autopilot_worker_p95"
+ },
+ {
+  "at": "2026-07-05T19:27:15.179Z",
+  "message": "cpu_governor_resumed",
+  "load": 30,
+  "freeRam": 72,
+  "chrome": 31,
+  "waitedMs": 4387,
+  "label": "autopilot_worker_p95"
+ },
+ {
+  "at": "2026-07-05T19:27:15.954Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783279613571_aecb57",
+  "sequence": 3,
+  "profileId": 95,
+  "groupUrl": "https://www.facebook.com/groups/4854972804605257/"
+ },
+ {
+  "at": "2026-07-05T19:28:31.634Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783279613571_aecb57",
+  "sequence": 2,
+  "profileId": 66,
+  "groupUrl": "https://www.facebook.com/groups/1098414320641851",
+  "postUrl": "https://www.facebook.com/groups/1098414320641851/permalink/2452871495196120/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T19:30:08.388Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783279255166_2a012c",
+  "sequence": 9,
+  "profileId": 98,
+  "groupUrl": "https://www.facebook.com/groups/4854972804605257",
+  "postUrl": "https://www.facebook.com/groups/4854972804605257/permalink/26414407134901846/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T19:32:46.240Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 64,
+  "chrome": 49,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:32:49.504Z",
+  "message": "cpu_governor_resumed",
+  "load": 19,
+  "freeRam": 64,
+  "chrome": 49,
+  "waitedMs": 3843,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:33:37.293Z",
+  "message": "adaptive_concurrency",
+  "cpu": 64.994,
+  "freeRam": 60,
+  "chrome": 53,
+  "workers": 3,
+  "cap": 3,
+  "learned": 5
+ },
+ {
+  "at": "2026-07-05T19:33:14.432Z",
+  "message": "autopilot_publishing",
+  "dryRun": false,
+  "action": "publishing",
+  "detail": "",
+  "capacity": {
+   "totalRemaining": 56999252,
+   "totalPostedToday": 841
+  },
+  "buffer": {
+   "readyCount": 74,
+   "target": 200,
+   "shortfall": 126
+  },
+  "maxWorkers": 3,
+  "workers": 3,
+  "targets": [
+   {
+    "planId": "plan_1783280025587_7b0923",
+    "sequence": 1,
+    "profile": "73 - 39",
+    "profileId": 73,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:6728d06f33da"
+   },
+   {
+    "planId": "plan_1783280025587_7b0923",
+    "sequence": 2,
+    "profile": "75 - 41",
+    "profileId": 75,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:6884b028b8a3"
+   },
+   {
+    "planId": "plan_1783280025587_7b0923",
+    "sequence": 14,
+    "profile": "95 - f6",
+    "profileId": 95,
+    "groupUrl": "https://www.facebook.com/groups/4854972804605257/",
+    "productUrl": "harvested:1db9c3aa137a"
+   }
+  ]
+ },
+ {
+  "at": "2026-07-05T19:33:46.596Z",
+  "message": "autopilot_posting_concurrent",
+  "workers": 3,
+  "openStaggerMs": 8000,
+  "profileIds": [
+   73,
+   75,
+   95
+  ]
+ },
+ {
+  "at": "2026-07-05T19:33:47.158Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 8000,
+  "profileId": 75
+ },
+ {
+  "at": "2026-07-05T19:33:47.159Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 16000,
+  "profileId": 95
+ },
+ {
+  "at": "2026-07-05T19:33:48.294Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783280025587_7b0923",
+  "sequence": 1,
+  "profileId": 73,
+  "groupUrl": "https://www.facebook.com/groups/o1498765421290862"
+ },
+ {
+  "at": "2026-07-05T19:34:08.698Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 57,
+  "chrome": 63,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "autopilot_worker_p75"
+ },
+ {
+  "at": "2026-07-05T19:34:13.647Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 58,
+  "chrome": 63,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "autopilot_worker_p95"
+ },
+ {
+  "at": "2026-07-05T19:34:30.190Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 55,
+  "chrome": 0,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:35:04.237Z",
+  "message": "cpu_governor_resumed",
+  "load": 87,
+  "freeRam": 55,
+  "chrome": 76,
+  "waitedMs": 68920,
+  "label": "autopilot_worker_p75"
+ },
+ {
+  "at": "2026-07-05T19:35:04.834Z",
+  "message": "cpu_governor_resumed",
+  "load": 56,
+  "freeRam": 55,
+  "chrome": 76,
+  "waitedMs": 34999,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:35:04.842Z",
+  "message": "cpu_governor_resumed",
+  "load": 56,
+  "freeRam": 55,
+  "chrome": 76,
+  "waitedMs": 60299,
+  "label": "autopilot_worker_p95"
+ },
+ {
+  "at": "2026-07-05T19:35:08.751Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783280025587_7b0923",
+  "sequence": 2,
+  "profileId": 75,
+  "groupUrl": "https://www.facebook.com/groups/o1498765421290862"
+ },
+ {
+  "at": "2026-07-05T19:35:17.317Z",
+  "message": "cpu_governor_waiting",
+  "load": 98,
+  "freeRam": 53,
+  "chrome": 0,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:35:31.203Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783279613571_aecb57",
+  "sequence": 3,
+  "profileId": 95,
+  "groupUrl": "https://www.facebook.com/groups/4854972804605257",
+  "postUrl": "https://www.facebook.com/groups/4854972804605257/permalink/26414449538230939/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T19:35:34.012Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 52,
+  "chrome": 85,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:36:00.366Z",
+  "message": "cpu_governor_resumed",
+  "load": 68,
+  "freeRam": 59,
+  "chrome": 71,
+  "waitedMs": 51567,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:36:00.381Z",
+  "message": "cpu_governor_resumed",
+  "load": 69,
+  "freeRam": 59,
+  "chrome": 71,
+  "waitedMs": 26955,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:37:49.615Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783280025587_7b0923",
+  "sequence": 2,
+  "profileId": 75,
+  "groupUrl": "https://www.facebook.com/groups/1098414320641851",
+  "postUrl": "https://www.facebook.com/groups/1098414320641851/permalink/2452877215195548/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T19:41:09.752Z",
+  "message": "adaptive_concurrency",
+  "cpu": 26,
+  "freeRam": 60,
+  "chrome": 72,
+  "workers": 3,
+  "cap": 3,
+  "learned": 7
+ },
+ {
+  "at": "2026-07-05T19:40:50.291Z",
+  "message": "autopilot_publishing",
+  "dryRun": false,
+  "action": "publishing",
+  "detail": "",
+  "capacity": {
+   "totalRemaining": 56999248,
+   "totalPostedToday": 846
+  },
+  "buffer": {
+   "readyCount": 73,
+   "target": 200,
+   "shortfall": 127
+  },
+  "maxWorkers": 3,
+  "workers": 3,
+  "targets": [
+   {
+    "planId": "plan_1783280478302_51b9b6",
+    "sequence": 5,
+    "profile": "73 - 39",
+    "profileId": 73,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:31563d4a9f1d"
+   },
+   {
+    "planId": "plan_1783280478302_51b9b6",
+    "sequence": 2,
+    "profile": "74 - 40",
+    "profileId": 74,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:d01b3ebc109f"
+   },
+   {
+    "planId": "plan_1783280478302_51b9b6",
+    "sequence": 12,
+    "profile": "110 - F21",
+    "profileId": 110,
+    "groupUrl": "https://www.facebook.com/groups/4854972804605257/",
+    "productUrl": "harvested:1db9c3aa137a"
+   }
+  ]
+ },
+ {
+  "at": "2026-07-05T19:41:18.978Z",
+  "message": "autopilot_posting_concurrent",
+  "workers": 3,
+  "openStaggerMs": 8000,
+  "profileIds": [
+   73,
+   74,
+   110
+  ]
+ },
+ {
+  "at": "2026-07-05T19:41:19.601Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 8000,
+  "profileId": 74
+ },
+ {
+  "at": "2026-07-05T19:41:19.602Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 16000,
+  "profileId": 110
+ },
+ {
+  "at": "2026-07-05T19:41:28.499Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783280478302_51b9b6",
+  "sequence": 2,
+  "profileId": 74,
+  "groupUrl": "https://www.facebook.com/groups/o1498765421290862"
+ },
+ {
+  "at": "2026-07-05T19:41:37.249Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783280478302_51b9b6",
+  "sequence": 12,
+  "profileId": 110,
+  "groupUrl": "https://www.facebook.com/groups/4854972804605257/"
+ },
+ {
+  "at": "2026-07-05T19:41:37.543Z",
+  "message": "cpu_governor_waiting",
+  "load": 98,
+  "freeRam": 60,
+  "chrome": 70,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:41:40.785Z",
+  "message": "cpu_governor_resumed",
+  "load": 65,
+  "freeRam": 60,
+  "chrome": 70,
+  "waitedMs": 3487,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:42:34.718Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783280478302_51b9b6",
+  "sequence": 2,
+  "profileId": 74,
+  "groupUrl": "https://www.facebook.com/groups/1098414320641851",
+  "postUrl": "https://www.facebook.com/groups/1098414320641851/permalink/2452880515195218/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T19:44:20.342Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 54,
+  "chrome": 80,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:45:24.065Z",
+  "message": "cpu_governor_resumed",
+  "load": 40,
+  "freeRam": 57,
+  "chrome": 75,
+  "waitedMs": 64320,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:45:58.681Z",
+  "message": "adaptive_concurrency",
+  "cpu": 52,
+  "freeRam": 55,
+  "chrome": 78,
+  "workers": 3,
+  "cap": 3,
+  "learned": 4
+ },
+ {
+  "at": "2026-07-05T19:45:36.599Z",
+  "message": "autopilot_publishing",
+  "dryRun": false,
+  "action": "publishing",
+  "detail": "",
+  "capacity": {
+   "totalRemaining": 56999246,
+   "totalPostedToday": 848
+  },
+  "buffer": {
+   "readyCount": 73,
+   "target": 200,
+   "shortfall": 127
+  },
+  "maxWorkers": 3,
+  "workers": 4,
+  "targets": [
+   {
+    "planId": "plan_1783280768192_120387",
+    "sequence": 1,
+    "profile": "73 - 39",
+    "profileId": 73,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:6728d06f33da"
+   },
+   {
+    "planId": "plan_1783280768192_120387",
+    "sequence": 22,
+    "profile": "80 - 46",
+    "profileId": 80,
+    "groupUrl": "https://www.facebook.com/groups/o38679876833911/",
+    "productUrl": "harvested:15051ae172e4"
+   },
+   {
+    "planId": "plan_1783280768192_120387",
+    "sequence": 24,
+    "profile": "58 - 24",
+    "profileId": 58,
+    "groupUrl": "https://www.facebook.com/groups/1567661940074941/",
+    "productUrl": "harvested:15051ae172e4"
+   },
+   {
+    "planId": "plan_1783280768192_120387",
+    "sequence": 21,
+    "profile": "104 - F15",
+    "profileId": 104,
+    "groupUrl": "https://www.facebook.com/groups/4854972804605257/",
+    "productUrl": "harvested:15051ae172e4"
+   }
+  ]
+ },
+ {
+  "at": "2026-07-05T19:46:09.288Z",
+  "message": "autopilot_posting_concurrent",
+  "workers": 4,
+  "openStaggerMs": 8000,
+  "profileIds": [
+   73,
+   80,
+   58,
+   104
+  ]
+ },
+ {
+  "at": "2026-07-05T19:46:09.951Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 8000,
+  "profileId": 80
+ },
+ {
+  "at": "2026-07-05T19:46:09.952Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 16000,
+  "profileId": 58
+ },
+ {
+  "at": "2026-07-05T19:46:09.953Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 24000,
+  "profileId": 104
+ },
+ {
+  "at": "2026-07-05T19:46:10.440Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783280768192_120387",
+  "sequence": 1,
+  "profileId": 73,
+  "groupUrl": "https://www.facebook.com/groups/o1498765421290862"
+ },
+ {
+  "at": "2026-07-05T19:46:19.062Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 53,
+  "chrome": 87,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "autopilot_worker_p80"
+ },
+ {
+  "at": "2026-07-05T19:46:25.923Z",
+  "message": "cpu_governor_resumed",
+  "load": 55,
+  "freeRam": 53,
+  "chrome": 89,
+  "waitedMs": 7943,
+  "label": "autopilot_worker_p80"
+ },
+ {
+  "at": "2026-07-05T19:46:26.678Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783280768192_120387",
+  "sequence": 22,
+  "profileId": 80,
+  "groupUrl": "https://www.facebook.com/groups/o38679876833911/"
+ },
+ {
+  "at": "2026-07-05T19:46:27.816Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783280768192_120387",
+  "sequence": 24,
+  "profileId": 58,
+  "groupUrl": "https://www.facebook.com/groups/1567661940074941/"
+ },
+ {
+  "at": "2026-07-05T19:46:35.913Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 51,
+  "chrome": 104,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "autopilot_worker_p104"
+ },
+ {
+  "at": "2026-07-05T19:47:44.464Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783280768192_120387",
+  "sequence": 22,
+  "profileId": 80,
+  "groupUrl": "https://www.facebook.com/groups/1076334503593333",
+  "postUrl": "https://www.facebook.com/groups/1076334503593333/permalink/1689186268974817/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T19:47:45.122Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783280768192_120387",
+  "sequence": 24,
+  "profileId": 58,
+  "groupUrl": "https://www.facebook.com/groups/1567661940074941",
+  "postUrl": "https://www.facebook.com/groups/1567661940074941/permalink/3543237649184017/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T19:47:49.468Z",
+  "message": "cpu_governor_waiting",
+  "load": 42,
+  "freeRam": 52,
+  "chrome": 106,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:47:49.520Z",
+  "message": "cpu_governor_waiting",
+  "load": 33,
+  "freeRam": 52,
+  "chrome": 106,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:47:52.627Z",
+  "message": "cpu_governor_resumed",
+  "load": 63,
+  "freeRam": 52,
+  "chrome": 88,
+  "waitedMs": 78604,
+  "label": "autopilot_worker_p104"
+ },
+ {
+  "at": "2026-07-05T19:47:53.386Z",
+  "message": "cpu_governor_resumed",
+  "load": 71,
+  "freeRam": 52,
+  "chrome": 88,
+  "waitedMs": 4160,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:47:53.394Z",
+  "message": "cpu_governor_resumed",
+  "load": 71,
+  "freeRam": 52,
+  "chrome": 88,
+  "waitedMs": 4115,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:47:53.470Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783280768192_120387",
+  "sequence": 21,
+  "profileId": 104,
+  "groupUrl": "https://www.facebook.com/groups/4854972804605257/"
+ },
+ {
+  "at": "2026-07-05T19:50:03.076Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 52,
+  "chrome": 83,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:50:10.189Z",
+  "message": "cpu_governor_resumed",
+  "load": 67,
+  "freeRam": 52,
+  "chrome": 86,
+  "waitedMs": 7355,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:50:42.206Z",
+  "message": "cpu_governor_waiting",
+  "load": 51,
+  "freeRam": 48,
+  "chrome": 91,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "harvest_sources"
+ },
+ {
+  "at": "2026-07-05T19:50:42.433Z",
+  "message": "cpu_governor_waiting",
+  "load": 67,
+  "freeRam": 48,
+  "chrome": 91,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:50:42.436Z",
+  "message": "cpu_governor_waiting",
+  "load": 70,
+  "freeRam": 48,
+  "chrome": 91,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:51:06.435Z",
+  "message": "adaptive_concurrency",
+  "cpu": 55,
+  "freeRam": 50,
+  "chrome": 90,
+  "workers": 2,
+  "cap": 3,
+  "learned": 2
+ },
+ {
+  "at": "2026-07-05T19:50:46.866Z",
+  "message": "autopilot_publishing",
+  "dryRun": false,
+  "action": "publishing",
+  "detail": "",
+  "capacity": {
+   "totalRemaining": 56999242,
+   "totalPostedToday": 852
+  },
+  "buffer": {
+   "readyCount": 73,
+   "target": 200,
+   "shortfall": 127
+  },
+  "maxWorkers": 2,
+  "workers": 4,
+  "targets": [
+   {
+    "planId": "plan_1783281075687_5a746a",
+    "sequence": 5,
+    "profile": "73 - 39",
+    "profileId": 73,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:15051ae172e4"
+   },
+   {
+    "planId": "plan_1783281075687_5a746a",
+    "sequence": 23,
+    "profile": "85 - 51",
+    "profileId": 85,
+    "groupUrl": "https://www.facebook.com/groups/o38679876833911/",
+    "productUrl": "harvested:d6a4d72b19c1"
+   },
+   {
+    "planId": "plan_1783281075687_5a746a",
+    "sequence": 26,
+    "profile": "58 - 24",
+    "profileId": 58,
+    "groupUrl": "https://www.facebook.com/groups/1567661940074941/",
+    "productUrl": "harvested:d6a4d72b19c1"
+   },
+   {
+    "planId": "plan_1783281075687_5a746a",
+    "sequence": 24,
+    "profile": "103 - F14",
+    "profileId": 103,
+    "groupUrl": "https://www.facebook.com/groups/4854972804605257/",
+    "productUrl": "harvested:d6a4d72b19c1"
+   }
+  ]
+ },
+ {
+  "at": "2026-07-05T19:51:16.426Z",
+  "message": "autopilot_posting_concurrent",
+  "workers": 4,
+  "openStaggerMs": 8000,
+  "profileIds": [
+   73,
+   85,
+   58,
+   103
+  ]
+ },
+ {
+  "at": "2026-07-05T19:51:16.989Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 8000,
+  "profileId": 85
+ },
+ {
+  "at": "2026-07-05T19:51:16.990Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 16000,
+  "profileId": 58
+ },
+ {
+  "at": "2026-07-05T19:51:16.990Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 24000,
+  "profileId": 103
+ },
+ {
+  "at": "2026-07-05T19:51:18.381Z",
+  "message": "cpu_governor_resumed",
+  "load": 53,
+  "freeRam": 51,
+  "chrome": 81,
+  "waitedMs": 36820,
+  "label": "harvest_sources"
+ },
+ {
+  "at": "2026-07-05T19:51:18.399Z",
+  "message": "cpu_governor_resumed",
+  "load": 53,
+  "freeRam": 51,
+  "chrome": 81,
+  "waitedMs": 36514,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:51:18.409Z",
+  "message": "cpu_governor_resumed",
+  "load": 53,
+  "freeRam": 51,
+  "chrome": 81,
+  "waitedMs": 36537,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:51:28.377Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 47,
+  "chrome": 0,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "autopilot_worker_p85"
+ },
+ {
+  "at": "2026-07-05T19:51:33.246Z",
+  "message": "cpu_governor_waiting",
+  "load": 98,
+  "freeRam": 46,
+  "chrome": 0,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "autopilot_worker_p58"
+ },
+ {
+  "at": "2026-07-05T19:51:51.587Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 41,
+  "chrome": 0,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "autopilot_worker_p103"
+ },
+ {
+  "at": "2026-07-05T19:51:52.296Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 40,
+  "chrome": 0,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:53:35.870Z",
+  "message": "cpu_governor_resumed",
+  "load": 67,
+  "freeRam": 45,
+  "chrome": 98,
+  "waitedMs": 130847,
+  "label": "autopilot_worker_p85"
+ },
+ {
+  "at": "2026-07-05T19:53:36.537Z",
+  "message": "cpu_governor_resumed",
+  "load": 68,
+  "freeRam": 45,
+  "chrome": 98,
+  "waitedMs": 123537,
+  "label": "autopilot_worker_p58"
+ },
+ {
+  "at": "2026-07-05T19:53:37.249Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783281075687_5a746a",
+  "sequence": 23,
+  "profileId": 85,
+  "groupUrl": "https://www.facebook.com/groups/o38679876833911/"
+ },
+ {
+  "at": "2026-07-05T19:53:37.324Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783281075687_5a746a",
+  "sequence": 26,
+  "profileId": 58,
+  "groupUrl": "https://www.facebook.com/groups/1567661940074941/"
+ },
+ {
+  "at": "2026-07-05T19:53:37.535Z",
+  "message": "cpu_governor_waiting",
+  "load": 55,
+  "freeRam": 45,
+  "chrome": 98,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:53:37.590Z",
+  "message": "cpu_governor_waiting",
+  "load": 62,
+  "freeRam": 45,
+  "chrome": 98,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:54:09.867Z",
+  "message": "cpu_governor_resumed",
+  "load": 94,
+  "freeRam": 45,
+  "chrome": 98,
+  "waitedMs": 137832,
+  "label": "connector_spawn"
+ },
+ {
+  "at": "2026-07-05T19:54:09.875Z",
+  "message": "cpu_governor_resumed",
+  "load": 94,
+  "freeRam": 45,
+  "chrome": 98,
+  "waitedMs": 138974,
+  "label": "autopilot_worker_p103"
+ },
+ {
+  "at": "2026-07-05T19:54:10.733Z",
+  "message": "adaptive_concurrency",
+  "cpu": 92,
+  "freeRam": 45,
+  "chrome": 98,
+  "workers": 1,
+  "cap": 3,
+  "learned": 1
+ },
+ {
+  "at": "2026-07-05T19:53:48.855Z",
+  "message": "autopilot_publishing",
+  "dryRun": false,
+  "action": "publishing",
+  "detail": "",
+  "capacity": {
+   "totalRemaining": 56999242,
+   "totalPostedToday": 854
+  },
+  "buffer": {
+   "readyCount": 73,
+   "target": 200,
+   "shortfall": 127
+  },
+  "maxWorkers": 1,
+  "workers": 1,
+  "targets": [
+   {
+    "planId": "plan_1783281273431_9b2f61",
+    "sequence": 5,
+    "profile": "73 - 39",
+    "profileId": 73,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:15051ae172e4"
+   }
+  ]
+ },
+ {
+  "at": "2026-07-05T19:55:12.596Z",
+  "message": "adaptive_concurrency",
+  "cpu": 100,
+  "freeRam": 39,
+  "chrome": 108,
+  "workers": 1,
+  "cap": 3,
+  "learned": 1
+ },
+ {
+  "at": "2026-07-05T19:55:38.161Z",
+  "message": "cpu_governor_waiting",
+  "load": 100,
+  "freeRam": 41,
+  "chrome": 102,
+  "maxPercent": 90,
+  "minFreeRam": 20,
+  "maxChrome": 90,
+  "label": "harvest_sources"
+ },
+ {
+  "at": "2026-07-05T19:55:59.760Z",
+  "message": "adaptive_concurrency",
+  "cpu": 43.864000000000004,
+  "freeRam": 85,
+  "chrome": 0,
+  "workers": 3,
+  "cap": 3,
+  "learned": 3
+ },
+ {
+  "at": "2026-07-05T19:55:40.973Z",
+  "message": "autopilot_publishing",
+  "dryRun": false,
+  "action": "publishing",
+  "detail": "",
+  "capacity": {
+   "totalRemaining": 56999242,
+   "totalPostedToday": 854
+  },
+  "buffer": {
+   "readyCount": 73,
+   "target": 200,
+   "shortfall": 127
+  },
+  "maxWorkers": 3,
+  "workers": 4,
+  "targets": [
+   {
+    "planId": "plan_1783281368092_2ded90",
+    "sequence": 5,
+    "profile": "73 - 39",
+    "profileId": 73,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:15051ae172e4"
+   },
+   {
+    "planId": "plan_1783281368092_2ded90",
+    "sequence": 27,
+    "profile": "85 - 51",
+    "profileId": 85,
+    "groupUrl": "https://www.facebook.com/groups/o38679876833911/",
+    "productUrl": "harvested:5a9f5ecbdfc9"
+   },
+   {
+    "planId": "plan_1783281368092_2ded90",
+    "sequence": 30,
+    "profile": "12 - 11",
+    "profileId": 12,
+    "groupUrl": "https://www.facebook.com/groups/1567661940074941/",
+    "productUrl": "harvested:5a9f5ecbdfc9"
+   },
+   {
+    "planId": "plan_1783281368092_2ded90",
+    "sequence": 28,
+    "profile": "103 - F14",
+    "profileId": 103,
+    "groupUrl": "https://www.facebook.com/groups/4854972804605257/",
+    "productUrl": "harvested:5a9f5ecbdfc9"
+   }
+  ]
+ },
+ {
+  "at": "2026-07-05T19:56:08.814Z",
+  "message": "autopilot_posting_concurrent",
+  "workers": 4,
+  "openStaggerMs": 8000,
+  "profileIds": [
+   73,
+   85,
+   12,
+   103
+  ]
+ },
+ {
+  "at": "2026-07-05T19:56:09.376Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 8000,
+  "profileId": 85
+ },
+ {
+  "at": "2026-07-05T19:56:09.377Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 16000,
+  "profileId": 12
+ },
+ {
+  "at": "2026-07-05T19:56:09.378Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 24000,
+  "profileId": 103
+ },
+ {
+  "at": "2026-07-05T19:56:09.466Z",
+  "message": "cpu_governor_resumed",
+  "load": 18,
+  "freeRam": 84,
+  "chrome": 0,
+  "waitedMs": 32007,
+  "label": "harvest_sources"
+ },
+ {
+  "at": "2026-07-05T19:56:09.515Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783281368092_2ded90",
+  "sequence": 5,
+  "profileId": 73,
+  "groupUrl": "https://www.facebook.com/groups/o1498765421290862"
+ },
+ {
+  "at": "2026-07-05T19:56:45.121Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783281368092_2ded90",
+  "sequence": 27,
+  "profileId": 85,
+  "groupUrl": "https://www.facebook.com/groups/o38679876833911/"
+ },
+ {
+  "at": "2026-07-05T19:56:45.154Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783281368092_2ded90",
+  "sequence": 30,
+  "profileId": 12,
+  "groupUrl": "https://www.facebook.com/groups/1567661940074941/"
+ },
+ {
+  "at": "2026-07-05T19:56:45.184Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783281368092_2ded90",
+  "sequence": 28,
+  "profileId": 103,
+  "groupUrl": "https://www.facebook.com/groups/4854972804605257/"
+ },
+ {
+  "at": "2026-07-05T19:58:01.008Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783281368092_2ded90",
+  "sequence": 30,
+  "profileId": 12,
+  "groupUrl": "https://www.facebook.com/groups/1567661940074941",
+  "postUrl": "https://www.facebook.com/groups/1567661940074941/permalink/3543246439183138/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T19:59:56.141Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783281368092_2ded90",
+  "sequence": 27,
+  "profileId": 85,
+  "groupUrl": "https://www.facebook.com/groups/1076334503593333",
+  "postUrl": "https://www.facebook.com/groups/1076334503593333/permalink/1689192342307543/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T20:03:21.000Z",
+  "message": "adaptive_concurrency",
+  "cpu": 42,
+  "freeRam": 73,
+  "chrome": 23,
+  "workers": 3,
+  "cap": 3,
+  "learned": 6
+ },
+ {
+  "at": "2026-07-05T20:02:58.787Z",
+  "message": "autopilot_publishing",
+  "dryRun": false,
+  "action": "publishing",
+  "detail": "",
+  "capacity": {
+   "totalRemaining": 56999237,
+   "totalPostedToday": 860
+  },
+  "buffer": {
+   "readyCount": 72,
+   "target": 200,
+   "shortfall": 128
+  },
+  "maxWorkers": 3,
+  "workers": 4,
+  "targets": [
+   {
+    "planId": "plan_1783281809513_61ce73",
+    "sequence": 5,
+    "profile": "73 - 39",
+    "profileId": 73,
+    "groupUrl": "https://www.facebook.com/groups/o1498765421290862",
+    "productUrl": "harvested:5a9f5ecbdfc9"
+   },
+   {
+    "planId": "plan_1783281809513_61ce73",
+    "sequence": 26,
+    "profile": "77 - 43",
+    "profileId": 77,
+    "groupUrl": "https://www.facebook.com/groups/o38679876833911/",
+    "productUrl": "harvested:17b7e190c98b"
+   },
+   {
+    "planId": "plan_1783281809513_61ce73",
+    "sequence": 29,
+    "profile": "49 - 13",
+    "profileId": 49,
+    "groupUrl": "https://www.facebook.com/groups/1567661940074941/",
+    "productUrl": "harvested:17b7e190c98b"
+   },
+   {
+    "planId": "plan_1783281809513_61ce73",
+    "sequence": 27,
+    "profile": "97 - f8",
+    "profileId": 97,
+    "groupUrl": "https://www.facebook.com/groups/4854972804605257/",
+    "productUrl": "harvested:17b7e190c98b"
+   }
+  ]
+ },
+ {
+  "at": "2026-07-05T20:03:30.243Z",
+  "message": "autopilot_posting_concurrent",
+  "workers": 4,
+  "openStaggerMs": 8000,
+  "profileIds": [
+   73,
+   77,
+   49,
+   97
+  ]
+ },
+ {
+  "at": "2026-07-05T20:03:30.771Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 8000,
+  "profileId": 77
+ },
+ {
+  "at": "2026-07-05T20:03:30.772Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 16000,
+  "profileId": 49
+ },
+ {
+  "at": "2026-07-05T20:03:30.773Z",
+  "message": "autopilot_worker_open_stagger",
+  "waitMs": 24000,
+  "profileId": 97
+ },
+ {
+  "at": "2026-07-05T20:03:45.035Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783281809513_61ce73",
+  "sequence": 26,
+  "profileId": 77,
+  "groupUrl": "https://www.facebook.com/groups/o38679876833911/"
+ },
+ {
+  "at": "2026-07-05T20:03:49.649Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783281809513_61ce73",
+  "sequence": 29,
+  "profileId": 49,
+  "groupUrl": "https://www.facebook.com/groups/1567661940074941/"
+ },
+ {
+  "at": "2026-07-05T20:03:59.665Z",
+  "message": "facebook_live_post_started",
+  "planId": "plan_1783281809513_61ce73",
+  "sequence": 27,
+  "profileId": 97,
+  "groupUrl": "https://www.facebook.com/groups/4854972804605257/"
+ },
+ {
+  "at": "2026-07-05T20:05:02.038Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783281809513_61ce73",
+  "sequence": 29,
+  "profileId": 49,
+  "groupUrl": "https://www.facebook.com/groups/1567661940074941",
+  "postUrl": "https://www.facebook.com/groups/1567661940074941/permalink/3543251812515934/",
+  "approvalProfileId": ""
+ },
+ {
+  "at": "2026-07-05T20:05:19.826Z",
+  "message": "facebook_live_post_completed",
+  "planId": "plan_1783281809513_61ce73",
+  "sequence": 26,
+  "profileId": 77,
+  "groupUrl": "https://www.facebook.com/groups/1076334503593333",
+  "postUrl": "https://www.facebook.com/groups/1076334503593333/permalink/1689197122307065/",
+  "approvalProfileId": ""
+ }
+]
