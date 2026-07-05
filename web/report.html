@@ -287,7 +287,7 @@ function runBody(r){
       + '<td data-l="Produit">'+pnum+'</td>'
       + '<td data-l="Groupe">'+grpPill(d.group)+'</td>'
       + '<td data-l="Publié">'+fmtTime(d.publishedAt)+'</td>'
-      + '<td data-l="Commenté">'+(d.commentedAt?fmtTime(d.commentedAt):(d.approvalVerification==="soft_clicked"?'<span class="slow">approbation en cours…</span>':'<span class="no">non commenté</span>'))+'</td>'
+      + '<td data-l="Commenté">'+(d.commentedAt?(fmtTime(d.commentedAt)+(d.wasPendingApproval?' <span class="pill x" title="Ce post a attendu l\'approbation d\'un modérateur avant de pouvoir être commenté.">⏳ attente '+(d.approvalWaitMinutes!=null?d.approvalWaitMinutes+'min':'?')+'</span>':'')):(d.approvalVerification==="soft_clicked"?'<span class="slow">approbation en cours…</span>':'<span class="no">non commenté</span>'))+'</td>'
       + '<td data-l="Délai" class="'+gapClass(d.gapSec)+'">'+fmtGap(d.gapSec)+'</td>'
       + '<td data-l="Profils">'+esc(prof)+'</td></tr>';
   }).join("");

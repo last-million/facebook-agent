@@ -21323,7 +21323,13 @@ function buildRunReports(force = false) {
         if (p.profileId) pm.profiles.add(Number(p.profileId));
         pnum = pm.num;
       }
-      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profileCom: c ? c.profileId : null, productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable" });
+      // PENDING-APPROVAL HISTORY (operator: keep how long a post waited for admin approval, and label
+      // commented posts that went through that wait): look up this post's own admin_approval_started entry
+      // (if any) by the SAME stable key the pending-approval bucket above uses -- a resolved post that had
+      // one waited approvalWaitMinutes before it landed (and, if commented, before that comment could happen).
+      const __pendingStart = pendingStartByKey.get(__postKey(p));
+      const approvalWaitMinutes = __pendingStart ? Math.max(0, Math.round((p._t - __pendingStart.t) / 60000)) : null;
+      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profileCom: c ? c.profileId : null, productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable", wasPendingApproval: Boolean(__pendingStart), approvalWaitMinutes });
       if (p.approvalVerification === "soft_clicked" && !c) softApproved += 1;
     }
     const products = productOrder.map((pm) => ({ num: pm.num, key: pm.key, shortKey: pm.key.replace(/^harvested:/, ""), title: pm.title, total: pm.total, groups: pm.groups, groupCount: Object.keys(pm.groups).length, profiles: Array.from(pm.profiles) }));
