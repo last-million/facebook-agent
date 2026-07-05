@@ -2679,10 +2679,22 @@ function markProfileCommentLimited(profileId, label, reason) {
 // pool, surfaced in the Prod-tab "Comment-limited" section for the admin to fix + Release). A verified comment resets it.
 const __commentFailStreak = {}; // commenter pid -> consecutive commenter-specific comment failures
 const COMMENTER_AUTO_LIMIT_THRESHOLD = 3;
+// CORROBORATION REQUIREMENT for the single-shot "genuine FB block" park (2026-07-05, operator: "he should
+// really be sure 100% ... not just put them without being sure"). Confirmed via a live-data audit that the
+// single-shot path (below, near "AUTO COMMENT-LIMITED -> POST-ONLY") parked profiles off ONE ambiguous
+// signal with no retry -- and real production incidents (18 profiles in one ~26min window on 2026-07-03;
+// 16/17 of a whole group on 2026-07-04) were caused by exactly this pattern. isTransientCommentProfileFailure
+// now excludes the specific tokens that caused those two incidents, but as defense in depth against any
+// FUTURE ambiguous/misclassified signal, a genuine-looking block must now be seen twice (not once) for the
+// SAME profile before it's parked -- mirroring the already-careful COMMENTER_AUTO_LIMIT_THRESHOLD pattern
+// just above, but with a lower bar since these reasons are individually more FB-specific. Resets to 0 on any
+// verified comment success, same as __commentFailStreak.
+const __commentBlockStreak = {}; // commenter pid -> consecutive "genuine FB block" signals (single-shot path)
+const COMMENT_BLOCK_LIMIT_THRESHOLD = 2;
 function isCommenterSpecificCommentFailure(validation) {
   const errs = (validation && Array.isArray(validation.errors) ? validation.errors : []).join(" ").toLowerCase();
   if (!errs) return false;
-  if (/comment_target_unavailable_or_pending|post_pending|cannot_access|comments_disabled|content_unavailable|page_unavailable|external actions are locked|already in flight/.test(errs)) return false; // post-state / not the commenter's fault
+  if (/comment_target_unavailable_or_pending|comment_target_permalink_mismatch|post_pending|cannot_access|comments_disabled|content_unavailable|page_unavailable|external actions are locked|already in flight/.test(errs)) return false; // post-state / not the commenter's fault (comment_target_permalink_mismatch added 2026-07-05: a pure URL/navigation check, not a real FB restriction -- see isTransientCommentProfileFailure's identical fix)
   return /marker_scoped_comment_box|marker_scoped_comment_button_not_found|comment_not_submitted|comment_not_verified|comment_box|could not open (?:the )?comment|comment_blocked/.test(errs); // the commenter itself can't comment here
 }
 function noteCommentAttemptOutcome(profileId, validation) {
@@ -13335,7 +13347,21 @@ function isTransientCommentProfileFailure(validation = {}) {
   // "comment_blocked:marker_scoped_comment_button_not_found"), so scan BOTH. Genuine FB
   // rejections (comment_did_not_persist..., cannot_comment, action_blocked,
   // comment_profile_cannot_access_post_permalink) are NOT in this list and stay benchable.
-  const locateMissRe = /target_marker_root_not_found|target_marker_not_visible|target_marker_article_not_visible|expected_post_permalink_mismatch|marker_scoped_comment_button_not_found|marker_scoped_comment_box_not_found|permalink_scoped_comment_box_not_found|target_marker_not_visible_for_permalink_comment_fallback|comment_box_not_found|comment_button_not_found|no_comment_box|0_comment_boxes|comment_box_count_0|comment_(?:box|button|composer)_(?:locate|selector)_timeout|comment_selector_timeout|comment_target_unavailable|comment_target_unavailable_or_pending|comment_target_not_ready|comment_target_pending|ixbrowser_profile_busy|comment_recovery_profile_busy|profile_busy|profile_in_use/i;
+  // NAMING-DRIFT FIX (2026-07-05, task: comment-limited false-positive audit): added
+  // comment_target_permalink_mismatch -- a pure URL/groupId/postId navigation-state check in the
+  // connector (commentTargetPreflight), NOT an FB-issued restriction -- which was already excluded
+  // under its near-identical sibling name expected_post_permalink_mismatch, but this differently-named
+  // token slipped through and drove TWO confirmed real mass-false-park incidents in production (18
+  // profiles parked in one ~26min window on 2026-07-03; 16/17 of a whole group's profiles on
+  // 2026-07-04, per this file's own park-threshold comment below). Also added page_unavailable (a raw
+  // Playwright "target page/context/browser closed" artifact, never Facebook-authored -- the 3-strike
+  // path already excludes it via isCommenterSpecificCommentFailure below but this single-shot gate
+  // didn't) and the post/group-STATE reasons (comments_disabled, content_unavailable,
+  // post_pending_or_unavailable) that server.js already treats as "not this profile's fault" in two
+  // OTHER places (livePostValidationAllowsCommentProfileFallback, approvalMayHelp) but never here --
+  // a post with comments disabled fails IDENTICALLY for every profile that tries it, so it can never
+  // be evidence this specific profile is restricted.
+  const locateMissRe = /target_marker_root_not_found|target_marker_not_visible|target_marker_article_not_visible|expected_post_permalink_mismatch|comment_target_permalink_mismatch|marker_scoped_comment_button_not_found|marker_scoped_comment_box_not_found|permalink_scoped_comment_box_not_found|target_marker_not_visible_for_permalink_comment_fallback|comment_box_not_found|comment_button_not_found|no_comment_box|0_comment_boxes|comment_box_count_0|comment_(?:box|button|composer)_(?:locate|selector)_timeout|comment_selector_timeout|comment_target_unavailable|comment_target_unavailable_or_pending|comment_target_not_ready|comment_target_pending|ixbrowser_profile_busy|comment_recovery_profile_busy|profile_busy|profile_in_use|page_unavailable|comments_disabled|content_unavailable|post_pending_or_unavailable/i;
   if (locateMissRe.test(blockReason) || errors.some((e) => locateMissRe.test(e))) {
     return true;
   }
@@ -15195,6 +15221,7 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
       });
     }
     if (attempt.ok) {
+      try { __commentBlockStreak[Number(attempt.profileId || profileId) || 0] = 0; } catch (_) {} // verified comment clears the block streak, same as __commentFailStreak
       return {
         ok: true,
         posted: true,
@@ -15223,10 +15250,21 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
     // AUTO COMMENT-LIMITED -> POST-ONLY (operator): a GENUINE FB comment block (cannot_comment /
     // action_blocked — non-transient) parks this profile in commentLimitedProfiles: blocked from
     // commenting, still posts. Admin releases it from the Prod-tab section.
+    // REQUIRE 2 HITS, NOT 1 (2026-07-05, see __commentBlockStreak/COMMENT_BLOCK_LIMIT_THRESHOLD above):
+    // this used to park on the FIRST occurrence, with no retry -- confirmed via live-data audit to have
+    // caused real mass false-parking incidents when a signal was misclassified as "genuine." A profile is
+    // still free to comment on other posts between the 1st and 2nd hit (this doesn't exclude it from
+    // candidacy), so the 2nd confirmation is a real, independent data point, not a rubber stamp.
     const __blockStr = `${Array.isArray(attempt.validation?.errors) ? attempt.validation.errors.join(" ") : ""} ${String(attempt.validation?.commentBlockReason || "")} ${attempt.message || ""}`.toLowerCase();
     if (/cannot_comment|action_blocked|comment[ _-]?(blocked|restricted|limit(ed)?)|blocked from commenting|temporarily (blocked|restricted).*comment/i.test(__blockStr)
       && !isTransientCommentProfileFailure(attempt.validation || {})) {
-      markProfileCommentLimited(attempt.profileId || profileId, attempt.profile || profileLabel, `FB comment block during live comment: ${__blockStr.slice(0, 140)}`);
+      const __bpid = Number(attempt.profileId || profileId) || 0;
+      const __streak = (__commentBlockStreak[__bpid] || 0) + 1;
+      __commentBlockStreak[__bpid] = __streak;
+      if (__streak >= COMMENT_BLOCK_LIMIT_THRESHOLD) {
+        markProfileCommentLimited(attempt.profileId || profileId, attempt.profile || profileLabel, `FB comment block during live comment (confirmed ${__streak}x): ${__blockStr.slice(0, 140)}`);
+        __commentBlockStreak[__bpid] = 0;
+      }
     }
     // NO-ACCESS CAP: if this profile failed because it can't reach the group, count it; after
     // `maxNoAccess` such dead-ends stop cycling (give up fast -> post kept, comment skipped)
