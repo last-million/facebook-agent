@@ -10597,8 +10597,9 @@ function harvestedShortTitle(raw) {
 }
 
 // UNIQUE tracking hashtags for a harvested post: up to <maxTags> #CamelCase tags distilled from the product
-// title/description, PLUS one deterministic #fb<4hex> fingerprint (seeded from the productKey) so two products
-// with the SAME title still get distinct tags -> a unique post marker -> reliable, unambiguous permalink capture.
+// title/description, PLUS one deterministic #fb<6hex> fingerprint (seeded from uniqueSeed, a per-POST-INSTANCE
+// value -- NOT just productKey) so the SAME product posted again later still gets a distinct fingerprint ->
+// a unique post marker -> reliable, unambiguous permalink/approval matching even across re-posts of one product.
 const HASHTAG_STOPWORDS = new Set(["the","a","an","and","or","but","for","of","to","in","on","at","by","as","it","is","with","from","your","you","our","new","set","pack","piece","pieces","pcs","size","color","colour","inch","inches","count","free","sale","deal","deals","off","buy","shop","now","best","great","super","plus","more","get"]);
 function harvestedHashtags(title, description = "", productKey = "", maxTags = 8, uniqueSeed = "") {
   const src = `${String(title || "")} ${String(description || "")}`.slice(0, 240);
@@ -10616,10 +10617,24 @@ function harvestedHashtags(title, description = "", productKey = "", maxTags = 8
     if (HASHTAG_STOPWORDS.has(m[1].toLowerCase())) continue;
     add("#" + m[1].charAt(0).toUpperCase() + m[1].slice(1).slice(0, 23));
   }
-  // NO reference tag (operator 2026-06-12): the #fb<hex> tracking fingerprint is REMOVED from the tags — the
-  // visible tags are ONLY product words from the link's og:title/description. Post matching now keys on the
-  // full tag line + caption (matchKey falls back to the marker when no #fb fingerprint exists); the /user/
-  // surface lists newest-first, so a re-posted same product still resolves to the newest post.
+  // PER-INSTANCE fingerprint (RESTORED 2026-07-05, see fb-admin-approval-marker-uniqueness memory): the
+  // 2026-06-12 removal of this tag made the marker unique only per PRODUCT, not per POST INSTANCE -- since the
+  // same harvested product is legitimately reposted weeks/months later (harvest-seen-keys is permanent), a
+  // repost generated the IDENTICAL marker text as any earlier post of that product. The admin-approval
+  // connector's exact-match-only logic (tools/fb-post-test-capture-url.js, clickApproveForVisibleMarker /
+  // openGroupReviewSurface) then risked latching onto an OLD, unrelated pending post of the same product still
+  // sitting in the group's queue instead of the current one -- confirmed live by the operator. `uniqueSeed` is
+  // the caller's per-instance value (plan id + product key/id + sequence + link; see trackingSeed in
+  // livePostPayloadForRow) -- NOT just productKey -- so the SAME product posted again in a LATER run/plan gets
+  // a DIFFERENT fingerprint here. Pushed AFTER the product tags and not counted against maxTags (matches the
+  // pre-2026-06-12 "up to maxTags PLUS one fingerprint" design), so it reads as one trailing incidental tag,
+  // not the headline one -- the natural product-tag selection/count is unaffected.
+  // FORMAT IS LOAD-BEARING: the connector regex-extracts /#fb[0-9a-f]{6}/i as its preferred, reflow-robust
+  // matchKey (tools/fb-post-test-capture-url.js ~line 3357, 3560) -- do not change the "fb" prefix or the
+  // 6-hex-char length without updating both call sites there.
+  const seedBasis = String(uniqueSeed || "").trim() || String(productKey || "").trim() || String(title || "").trim();
+  const fp = crypto.createHash("sha1").update(seedBasis).digest("hex").slice(0, 6);
+  tags.push("#fb" + fp);
   return tags;
 }
 
