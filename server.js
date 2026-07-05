@@ -21386,6 +21386,20 @@ const server = http.createServer(async (req, res) => {
         const key = String(r?.endedAt || r?.startedAt || "").trim();
         if (key && !seen.has(key)) { seen.add(key); arr.push(key); dismissedNowCount++; }
       }
+      // HARD CUTOFF (2026-07-05, operator: relaunching a new run <2h after the dismissed one made the OLD run's
+      // posts reappear): dismiss-by-endedAt alone is NOT enough here -- if the operator starts a new run soon
+      // after, its posts fall inside the >2h clustering window and MERGE into this same-day run cluster; the
+      // merged run's endedAt then keeps shifting forward as it posts, stops matching the key(s) just recorded
+      // above, and the whole thing (including the old dismissed posts) resurfaces. reportSinceAt is immune to
+      // this: it filters the raw ledger rows by an ABSOLUTE timestamp before clustering ever happens, so it
+      // can't be defeated by a later run merging into the same cluster. "Masquer tout" now means "hide
+      // everything up to right now, permanently" -- not just "hide today's current run shape".
+      try {
+        const s = readState();
+        s.operator = s.operator || {};
+        s.operator.reportSinceAt = new Date().toISOString();
+        writeState(s);
+      } catch (_) {}
     } else {
       // KEY = the run's ENDED-AT (restart-stable; see buildRunReports). Accept endedAt; fall back to key/startedAt for
       // older callers. Store whatever stable id the page sends; the filter matches endedAt OR startedAt.
