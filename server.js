@@ -2524,6 +2524,7 @@ function markProfileDisconnected(profileId, label, reason) {
   list.push({ profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "not logged into Facebook").slice(0, 200) });
   state.posting.disconnectedProfiles = list;
   writeState(state);
+  try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {} // see releaseParkedProfile's comment
   logEvent("profile_disconnected_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
   return true;
 }
@@ -2598,6 +2599,7 @@ async function restoreIxProfileProxy(profileId) {
     await ixBrowserRequest("profile-update", { profile_id: Number(pid), proxy_config: { proxy_mode: Number(bak.proxy_mode) || 2, proxy_type: bak.proxy_type, proxy_id: bak.proxy_id, proxy_ip: bak.proxy_ip, proxy_port: bak.proxy_port } });
   } catch (e) { try { logEvent("ix_profile_proxy_restore_failed", { profileId: pid, error: oneLineField(e.message || String(e), 140) }); } catch (_) {} return false; }
   const s2 = readState(); if (s2.posting?.proxyBackups) { s2.posting.proxyBackups[pid] = null; writeState(s2); } // null overwrites (delete wouldn't survive writeState's deep-merge)
+  try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {} // see releaseParkedProfile's comment
   try { logEvent("ix_profile_proxy_restored", { profileId: pid }); } catch (_) {}
   return true;
 }
@@ -2617,6 +2619,7 @@ function markProfileErrored(profileId, label, reason) {
   list.push({ profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "Facebook account error").slice(0, 200) });
   state.posting.erroredProfiles = list;
   writeState(state);
+  try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {} // see releaseParkedProfile's comment
   logEvent("profile_account_error_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
   return true;
 }
@@ -2766,8 +2769,27 @@ function releaseParkedProfile(profileId) {
   state.posting.blockedModerators = (state.posting.blockedModerators || []).filter((p) => String(p.profileId) !== id);
   state.posting.issueProfiles = (state.posting.issueProfiles || []).filter((p) => String(p.profileId) !== id);
   const after = state.posting.disconnectedProfiles.length + state.posting.erroredProfiles.length + state.posting.suspendedProfiles.length + state.posting.commentLimitedProfiles.length + state.posting.blockedModerators.length + state.posting.issueProfiles.length;
-  if (after !== before) { writeState(state); logEvent("profile_released_reconnected", { profileId: id }); return true; }
-  return false;
+  const changed = after !== before;
+  if (changed) { writeState(state); logEvent("profile_released_reconnected", { profileId: id }); }
+  // TEXT-BENCH QUARANTINE (2026-07-05, equal-split release audit): the six arrays above are only HALF of the
+  // exclusion story. A profile that ALSO tripped the separate text-log quarantine (e.g. a real FB account
+  // suspension/hard-block via autoBlacklistProfileIfNeeded/recordFacebookAccountHardBlock, which append an
+  // "action=quarantined"/"status=cannot_post_in_any_group" line to posting.facebookProfileStatus /
+  // ixbrowser.failedProfiles) stays excluded from postingSlots (isProfileBlockedForPosting /
+  // isFacebookProfileQuarantinedForFacebook both read that SAME text bench independently, server.js ~8075-8136)
+  // for up to 24h even after this Release click -- and vanishes from every parked-list UI at the same time, so
+  // the operator gets no visible sign the profile is still silently benched. Clear that gate too, unconditionally,
+  // so a single Release always fully re-admits the profile no matter which gate(s) it tripped. Covers every
+  // category that shares this function: Disconnected, Errored (account/access), Suspended, Blocked moderators,
+  // Comment-limited, and Profiles-having-issue.
+  if (id) { try { unblockPostingProfile({ profileId: id }); } catch (_) {} }
+  // FAIRNESS-CACHE BUST: the lifetime post-history tie-break cache can otherwise serve a stale count as the
+  // secondary sort key in orderFreshFirst/orderReadyRowsLeastUsed for up to 5 minutes right after a release.
+  try { __postHistoryCache = { at: 0, map: null }; } catch (_) {}
+  // DASHBOARD-CACHE BUST: /api/autopilot/status (Prod-tab capacity/posted-today tiles) is cached up to 5min and
+  // has no other hook tied to profile-list mutations -- bust it so the dashboard reflects this release immediately.
+  try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {}
+  return changed;
 }
 function suspendedProfileIdSet(state = readState()) {
   return new Set((state.posting?.suspendedProfiles || []).map((p) => String(p.profileId || "")));
@@ -2784,6 +2806,7 @@ function markProfileSuspended(profileId, label, reason) {
   list.push({ profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "Facebook suspended/disabled this account").slice(0, 200) });
   state.posting.suspendedProfiles = list;
   writeState(state);
+  try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {} // see releaseParkedProfile's comment
   logEvent("profile_suspended_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
   return true;
 }
@@ -15408,16 +15431,29 @@ const RECENT_FAILURE_WINDOW_MS = 60 * 60 * 1000;
 // getting re-picked and STALL a run. Single scan of the failure registers.
 function recentlyFailedProfileSet(state = readState(), windowMs = RECENT_FAILURE_WINDOW_MS) {
   const cutoff = Date.now() - windowMs;
-  const set = new Set();
+  // LATEST-LINE-PER-PROFILE WINS (2026-07-05 fix, mirrors isProfileBlockedForPosting's own pattern at ~8075-8097):
+  // the old version judged every line independently, so an OLDER failure line kept a profile_id in this
+  // "recently failed" set even after a LATER resolved/profile_unblocked line (e.g. an admin Release) for that
+  // SAME id -- deprioritizing a just-released profile in fairness ordering (orderReadyRowsLeastUsed /
+  // orderProfilesLeastUsedFirst) for up to the rest of the 1h window, working against "release -> immediately
+  // eligible and naturally catches up to equal usage." Lines are append-only/chronological, so the LAST matching
+  // line per profile_id in iteration order is authoritative.
+  const latestByPid = new Map(); // pid -> { at, isFailure }
   for (const line of [state.posting?.facebookProfileStatus, state.ixbrowser?.failedProfiles].join("\n").split(/\r?\n/)) {
-    if (/status=(resolved|approved|cleared|ignored)|action=(profile_unblocked|profile_group_unblocked)/i.test(line)) continue;
-    if (!/status=cannot_post_in_any_group|action=skip_profile|auto_soft_strike=1|soft_failure_pending/i.test(line)) continue;
     const idM = line.match(/profile_id=(\d{1,20})/i);
     if (!idM) continue;
+    const isResolve = /status=(resolved|approved|cleared|ignored)|action=(profile_unblocked|profile_group_unblocked)/i.test(line);
+    const isFailure = !isResolve && /status=cannot_post_in_any_group|action=skip_profile|auto_soft_strike=1|soft_failure_pending/i.test(line);
+    if (!isResolve && !isFailure) continue;
     const tsM = line.match(/(\d{4}-\d{2}-\d{2}T[0-9:.]+Z)/);
     const at = tsM ? Date.parse(tsM[1]) : NaN;
-    if (Number.isFinite(at) && at < cutoff) continue;
-    set.add(Number(idM[1]));
+    latestByPid.set(Number(idM[1]), { at, isFailure }); // last matching line wins (append-only log)
+  }
+  const set = new Set();
+  for (const [pid, v] of latestByPid) {
+    if (!v.isFailure) continue;
+    if (Number.isFinite(v.at) && v.at < cutoff) continue;
+    set.add(pid);
   }
   return set;
 }
@@ -18245,7 +18281,19 @@ function unblockPostingProfile(body = {}) {
       })
       .join("\n");
   }
+  // BIDIRECTIONAL CONSISTENCY (2026-07-05): an operator who clicks the generic "Unblock" button (Blocked/
+  // restricted panel) instead of "Release" (Profiles-having-issue panel) used to leave a stale issueProfiles
+  // entry behind even though the profile is now functionally re-eligible -- issueProfiles is only a releasable
+  // UI surface (never read for posting-eligibility gating), but the stale entry is confusing. Clear it here too
+  // when unblocking the whole profile (not a single group), mirroring what releaseParkedProfile already does
+  // in the other direction (it also calls this function).
+  if (record.profileId && !groupUrl) {
+    state.posting.issueProfiles = (state.posting.issueProfiles || []).filter((p) => String(p.profileId) !== String(record.profileId));
+  }
   const nextState = writeState(state);
+  // DASHBOARD-CACHE BUST: see releaseParkedProfile's identical comment -- keeps /api/autopilot/status from
+  // showing a stale (pre-unblock) capacity/eligibility snapshot for up to 5 minutes.
+  try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {}
   logEvent("posting_profile_unblocked", {
     profileId: record.profileId || "",
     profileName: record.name || record.label,
