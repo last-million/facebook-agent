@@ -21728,10 +21728,12 @@ const server = http.createServer(async (req, res) => {
     const incoming = body.state || {};
     let __disarmTransition = false; // operator just turned a run OFF -> trigger a real STOP (kill in-flight work)
     let __armTransition = false; // operator just turned a run ON (false->true) -> kick an immediate tick so batch 1 fires NOW
+    let __beforeOpForCacheBust = {}; // hoisted out of the try block below so the status-cache-bust check after writeState can see it
     // ARM = a fresh run: when the operator transitions autopilotEnabled false->true, reset the
     // per-run post counter so the hard limiter (autopilotMaxPostsPerRun) counts THIS run only.
     try {
       const before = readState();
+      __beforeOpForCacheBust = before.operator || {};
       const wasEnabled = before.operator?.autopilotEnabled === true;
       const nowEnabled = incoming.operator?.autopilotEnabled === true;
       const wasArmed = before.operator?.armedForExternalActions === true;
@@ -21780,6 +21782,21 @@ const server = http.createServer(async (req, res) => {
     // background writeState preserves the on-disk groups, so a stale snapshot can never drop a group the operator added.
     const state = writeState(incoming, { controlWrite: true, allowOperatorConfig: true, operatorControl: true }); // explicit operator state write (arm/disarm/config) — may change armed/enabled
     logEvent("workflow_state_saved");
+    // STATUS-CACHE BUST (2026-07-05, operator: "even i cliqued stop i still see stop button" -- the Prod tab's
+    // Start/Stop buttons are driven by /api/autopilot/status, which is cached for STATUS_CACHE_TTL_MS (5 MIN,
+    // see line ~20876) to keep the 4s dashboard poll cheap. That cache has no invalidation hook, so a real
+    // Start/Stop/Pause/Resume here could keep serving the PRE-click armed/enabled snapshot for up to 5 minutes
+    // even though workflow-state.json (and the actual posting behavior) already flipped correctly -- the
+    // buttons were lying about a real state change, not failing to make one. Bust it immediately whenever this
+    // write actually changes any of the 3 run-control flags the buttons key off.
+    try {
+      const afterOp = state.operator || {};
+      if (__beforeOpForCacheBust.armedForExternalActions !== afterOp.armedForExternalActions
+        || __beforeOpForCacheBust.autopilotEnabled !== afterOp.autopilotEnabled
+        || __beforeOpForCacheBust.paused !== afterOp.paused) {
+        __autopilotStatusCache = { at: 0, body: null };
+      }
+    } catch (_) {}
     // #1b SELF-DRIVE: on a fresh arm (false->true), kick an immediate single-flight tick so the first batch
     // launches NOW instead of waiting up to the full scheduler interval (~120s). autopilotTickAsync is
     // single-flight (__autopilotTickInFlight) and early-returns when not armed, so it can never double-run
@@ -21801,6 +21818,7 @@ const server = http.createServer(async (req, res) => {
     // recurring mystery stop is traceable. IP is localhost for all dashboard calls; UA/referer are the useful signal.
     try { logEvent("operator_stop_all_requested", { ua: oneLineField(req.headers["user-agent"] || "", 140), referer: oneLineField(req.headers["referer"] || req.headers["referrer"] || "", 160), remote: String(req.socket?.remoteAddress || "") }); } catch (_) {}
     const r = await stopAllExternalWork("operator_stop_all").catch((e) => ({ stopped: false, error: String((e && e.message) || e) }));
+    __autopilotStatusCache = { at: 0, body: null }; // see the PUT /api/state cache-bust comment above -- this endpoint can be called on its own, not only via that PUT
     return json(res, 200, r);
   }
   if (req.method === "POST" && url.pathname === "/api/test-progress") {
