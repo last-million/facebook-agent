@@ -21128,7 +21128,23 @@ function buildRunReports(force = false) {
     const id = __postKey(p);
     if (!seen.has(id) || t < seen.get(id)._t) seen.set(id, { ...p, _t: t });
   }
-  const posts = Array.from(seen.values()).sort((a, b) => a._t - b._t);
+  // PER-POST DISMISS (2026-07-05, operator: dismissing ONE run's report, then launching a new task the same
+  // day, made the dismissed run's posts REAPPEAR -- "each task should be isolated... if i delete it he should
+  // not restore it automatically"). Root cause: dismissing a single run only recorded its cluster-boundary
+  // endedAt/startedAt key (see report-dismissed-runs.json below), which is exactly the fragile mechanism
+  // reportSinceAt already had to work around for "dismiss all" -- if the NEW task's posts land within the
+  // >2h clustering gap of the dismissed run's last post, they MERGE into the same cluster, the cluster's
+  // endedAt shifts forward to the new run's latest post, no longer matches the recorded key, and the whole
+  // merged cluster (old dismissed posts included) resurfaces. Filtering individual posts by their OWN stable
+  // identity (__postKey), BEFORE clustering ever happens, can never be defeated by a later merge -- mirrors
+  // reportSinceAt's own "filter before clustering" principle, just keyed per-post instead of per-timestamp so
+  // dismissing ONE run never has to hide any other (older or newer) run.
+  let __dismissedPostKeys = new Set();
+  try {
+    const arr = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "report-dismissed-posts.json"), "utf8"));
+    if (Array.isArray(arr)) __dismissedPostKeys = new Set(arr.map(String));
+  } catch (_) {}
+  const posts = Array.from(seen.values()).filter((p) => !__dismissedPostKeys.has(__postKey(p))).sort((a, b) => a._t - b._t);
   const resolvedPostKeys = new Set(posts.map(__postKey));
   // PENDING APPROVAL (2026-07-04): a post genuinely submitted to Facebook and awaiting moderator approval, with NO
   // resolution yet (no published/published_after_admin_approval row for the same logical post). admin_approval_started
@@ -21294,6 +21310,9 @@ function buildRunReports(force = false) {
       index: idx,
       startedAt: run.posts[0].at,
       endedAt: run.posts[run.posts.length - 1].at,
+      // INTERNAL ONLY (2026-07-05, not read by report.html): this run's own post identities, so a single-run
+      // dismiss can permanently exclude exactly these posts by __postKey, immune to future cluster merges.
+      postKeys: run.posts.map(__postKey),
       durationMin: Math.round((run.lastT - run.startT) / 60000),
       posts: run.posts.length,
       commented,
@@ -21480,8 +21499,31 @@ const server = http.createServer(async (req, res) => {
       if (!key) return json(res, 400, { error: "endedAt required (or clear:true / dismissAllVisible:true)" });
       if (body.restore === true) arr = arr.filter((x) => String(x) !== key);
       else if (!arr.map(String).includes(key)) { arr.push(key); dismissedNowCount = 1; } // operator may dismiss ANY run incl. the latest (restore/clear undo it)
+      // PER-POST DISMISS (2026-07-05, task: single-run dismiss must survive a same-day relaunch merging into
+      // this run's cluster): look up THIS run's own posts and hide them by stable __postKey, not just by the
+      // cluster's endedAt/startedAt boundary -- see buildRunReports' own comment on why the boundary alone is
+      // fragile. Mirrors dismissAllVisible's reportSinceAt fix, at single-run granularity.
+      try {
+        const visible = buildRunReports(true).runs || [];
+        const match = visible.find((r) => String(r?.endedAt || "").trim() === key || String(r?.startedAt || "").trim() === key);
+        const postKeys = Array.isArray(match?.postKeys) ? match.postKeys.map(String) : [];
+        if (postKeys.length) {
+          const pf = path.join(DATA_DIR, "report-dismissed-posts.json");
+          let parr = []; try { parr = JSON.parse(fs.readFileSync(pf, "utf8")); } catch (_) {}
+          if (!Array.isArray(parr)) parr = [];
+          if (body.restore === true) {
+            const drop = new Set(postKeys);
+            parr = parr.filter((k) => !drop.has(String(k)));
+          } else {
+            const have = new Set(parr.map(String));
+            for (const k of postKeys) if (!have.has(k)) { have.add(k); parr.push(k); }
+          }
+          fs.writeFileSync(pf, JSON.stringify(parr.slice(-20000)));
+        }
+      } catch (_) {}
     }
     try { fs.writeFileSync(f, JSON.stringify(arr.slice(-500))); } catch (_) {}
+    if (body.clear === true) { try { fs.writeFileSync(path.join(DATA_DIR, "report-dismissed-posts.json"), "[]"); } catch (_) {} }
     __runReportCache.at = 0; // bust the 60s cache so the change shows on the next load immediately
     logEvent("report_run_dismissed", { key: body.endedAt || body.startedAt || "", restore: !!body.restore, clear: !!body.clear, dismissAllVisible: !!body.dismissAllVisible, dismissedNowCount, total: arr.length });
     return json(res, 200, { ok: true, dismissed: arr.length, dismissedNow: dismissedNowCount });
