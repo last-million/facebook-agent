@@ -2287,9 +2287,34 @@ function readHarvestedProducts(state = readState()) {
   // APPEND-ONLY log: dedup by firstCommentUrl, LAST occurrence wins (reflects the latest update). This makes
   // appends + updates clobber-proof under concurrent harvest+post — no read-all-then-write-all that could
   // drop a record (the live-run record-loss bug). The file only grows by ~1 line per post; small for the use case.
+  // lastPostedAtByGroup is the one exception: it's MERGED (union, newest timestamp per group key wins) across
+  // EVERY line for that URL, not just taken from the last line (2026-07-05, task #214). postToAllGroups posts
+  // the SAME product to multiple groups CONCURRENTLY by design; each fan-out copy's completion calls
+  // updateHarvestedProductRecord with a read-then-append snapshot of this map, so when two copies land close
+  // together the second append's snapshot (read before the first one's write landed) doesn't know about the
+  // first group yet -- a naive "last line wins" would silently DISCARD that earlier group's stamp, making
+  // collectProductUrlsForPosting think the group is still un-owed forever. Confirmed live: harvested products
+  // with real "published" ledger rows for 3-4 groups were showing an EMPTY lastPostedAtByGroup here.
   const byUrl = new Map();
-  for (const r of rows) { if (r && r.firstCommentUrl) byUrl.set(String(r.firstCommentUrl), r); }
-  return [...byUrl.values()];
+  const mergedGroupsByUrl = new Map();
+  for (const r of rows) {
+    if (!r || !r.firstCommentUrl) continue;
+    const url = String(r.firstCommentUrl);
+    byUrl.set(url, r);
+    const bg = (r.lastPostedAtByGroup && typeof r.lastPostedAtByGroup === "object") ? r.lastPostedAtByGroup : null;
+    if (!bg) continue;
+    let acc = mergedGroupsByUrl.get(url);
+    if (!acc) { acc = {}; mergedGroupsByUrl.set(url, acc); }
+    for (const gk of Object.keys(bg)) {
+      const t = Date.parse(bg[gk] || "");
+      const prevT = acc[gk] ? Date.parse(acc[gk]) : 0;
+      if (!acc[gk] || (Number.isFinite(t) && t > prevT)) acc[gk] = bg[gk];
+    }
+  }
+  return [...byUrl.values()].map((r) => {
+    const merged = mergedGroupsByUrl.get(String(r.firstCommentUrl));
+    return merged ? Object.assign({}, r, { lastPostedAtByGroup: merged }) : r;
+  });
 }
 function harvestedRecordForKey(key, state = readState()) {
   const k = String(key || "");
@@ -3479,6 +3504,29 @@ function harvestedProductOwesAnyConfiguredGroup(rec, state, reuseMs) {
     }
     return false; // posted to EVERY configured group within reuseMs -> not owed
   } catch (_) { return true; }
+}
+// COVERAGE-SAFETY GATE (2026-07-05, task #214): the pool-selection fix above (2026-06-28) made
+// collectProductUrlsForPosting group-aware so a partially-covered product stays ELIGIBLE, but the age-based
+// retention prune (sweepHarvestedProductsByAgeAsync) and image sweep (sweepHarvestedImagesAsync) both still
+// keyed PURELY on harvestedAt age -- so a product harvested well before its first post (a routine supply-side
+// delay) could cross the 2-day retention cutoff, and get its record deleted / image deleted, BEFORE its
+// remaining configured groups were ever served. Once deleted it is gone from harvested-products.jsonl forever
+// (harvestedSeenKeySet still blocks re-harvesting the same URL as "new"), so the missing group(s) are lost
+// PERMANENTLY and silently -- confirmed live: 8/10 of the oldest partially-covered products in the current run
+// were already-pruned ghosts (present in the ledger as published, absent from harvested-products.jsonl), and
+// the other 2 had reached the 45.5h mark with their per-group stamps still empty. Only applies when
+// postToAllGroups is on (no cross-group coverage concept otherwise); "ever fully covered" is a ONE-TIME
+// achievement check (NOT re-derived from the reuse window), so a product that already completed all groups
+// once is still pruned normally on its next aging pass -- this only protects a product that has NEVER yet
+// reached every configured group.
+function harvestedProductEverCoveredAllConfiguredGroups(rec, state) {
+  try {
+    if (state?.operator?.postToAllGroups !== true) return true; // no cross-group coverage concept -> normal age-based lifecycle applies
+    const groups = allConfiguredPostingGroupUrls(state).map(normalizedFacebookGroupKey).filter(Boolean);
+    if (!groups.length) return true;
+    const byGroup = (rec && rec.lastPostedAtByGroup && typeof rec.lastPostedAtByGroup === "object") ? rec.lastPostedAtByGroup : {};
+    return groups.every((g) => Boolean(byGroup[g]));
+  } catch (_) { return true; } // fail-open: never block a sweep on an unexpected error
 }
 
 function collectProductUrlsForPosting(state, options = {}) {
@@ -9774,6 +9822,7 @@ async function sweepHarvestedImagesAsync() {
       if (!rec || !rec.imageLocalPath || rec.imageDeleted) continue;
       const h = Date.parse(rec.harvestedAt || "");
       if (!Number.isFinite(h) || (now - h) < cutoffMs) continue; // keys on harvest age, not last-post
+      if (!harvestedProductEverCoveredAllConfiguredGroups(rec, state)) continue; // COVERAGE-SAFETY (task #214): don't delete the image a still-owed group needs to post
       try {
         const fp = safeProjectPath(rec.imageLocalPath);
         if (fs.existsSync(fp)) { fs.unlinkSync(fp); deleted += 1; }
@@ -9810,17 +9859,24 @@ async function sweepHarvestedProductsByAgeAsync() {
     let raw = [];
     try { raw = readJsonlFile(file); } catch { raw = []; }
     if (!raw.length) return { ok: true, prunedCount: 0, keptCount: 0 };
-    // dedup by firstCommentUrl, last-wins (mirror readHarvestedProducts) so the rewrite keeps the freshest record
-    const byUrl = new Map();
-    for (const r of raw) { if (r && r.firstCommentUrl) byUrl.set(String(r.firstCommentUrl), r); }
-    const recs = [...byUrl.values()];
+    // dedup by firstCommentUrl via readHarvestedProducts (SAME merge logic, not a re-implementation) so a
+    // compact-rewrite can never silently drop a lastPostedAtByGroup entry that a naive last-line-wins dedup
+    // would have discarded (task #214, see readHarvestedProducts' own comment).
+    const recs = readHarvestedProducts(state);
     const retentionDays = clampNumber(state.posting?.contentSources?.imageRetentionDays, 1, 90, 2);
     const cutoffMs = retentionDays * 86400 * 1000;
     const now = Date.now();
     const keep = [], prune = [];
     for (const r of recs) {
       const h = Date.parse(r.harvestedAt || "");
-      if (Number.isFinite(h) && (now - h) >= cutoffMs) prune.push(r); else keep.push(r);
+      const aged = Number.isFinite(h) && (now - h) >= cutoffMs;
+      // COVERAGE-SAFETY (2026-07-05, task #214): never permanently delete a record that still owes a
+      // configured group -- it would strand that group's coverage forever (harvestedSeenKeys still blocks
+      // re-harvesting the same URL as "new"). Confirmed live: 8/10 of the oldest partially-covered products
+      // in the running plan were already-pruned ghosts this way. Once a product has reached EVERY configured
+      // group at least once, normal age-based pruning resumes on its next pass.
+      if (aged && !harvestedProductEverCoveredAllConfiguredGroups(r, state)) { keep.push(r); continue; }
+      if (aged) prune.push(r); else keep.push(r);
     }
     if (!prune.length) {
       // nothing aged out — still COMPACT if the append-only log has bloated well past the unique count
