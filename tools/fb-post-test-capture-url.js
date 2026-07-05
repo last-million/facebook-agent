@@ -3354,7 +3354,10 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
   // a full tag-line includes()). Prefer it; fall back to the full marker only when no fingerprint is present.
   // This is what guarantees we approve ONLY our exact post — never a member's post or another of our posts
   // that merely shares the same Page author.
-  const fingerprint = (String(marker || '').match(/#fb[0-9a-f]{6}/i) || [])[0] || '';
+  // Use the LAST match, not the first: the real fingerprint is always the trailing tag (server.js
+  // harvestedHashtags pushes it after all product-word tags), so if a scraped product word ever
+  // coincidentally starts with "fb"+hex letters, a first-match .match() would pick that decoy instead.
+  const fingerprint = (String(marker || '').match(/#fb[0-9a-f]{6}/gi) || []).pop() || '';
   const matchKey = fingerprint || marker;
   const markerVisible = await page.evaluate((matchKey) => {
     const text = document.body.innerText || '';
@@ -3557,7 +3560,8 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
   // EXACT-MATCH ONLY: scroll the queue until OUR post's unique #fb fingerprint (or full tag marker) is visible.
   // Do NOT stop on a post that merely shares our Page author — members' posts and our other posts live in the
   // same queue, so an author match would point approval at the wrong post.
-  const reviewFingerprint = (String(marker || '').match(/#fb[0-9a-f]{6}/i) || [])[0] || '';
+  // Last match, not first — see clickApproveForVisibleMarker: the real fingerprint is always the trailing tag.
+  const reviewFingerprint = (String(marker || '').match(/#fb[0-9a-f]{6}/gi) || []).pop() || '';
   const reviewMatchKey = reviewFingerprint || marker;
   const markerCheck = async () => page.evaluate((key) => {
     try { const bodyText = document.body.innerText || ''; return Boolean(key && bodyText.includes(key)); } catch { return false; }

@@ -15926,6 +15926,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
               pinFirstComment: __p.pinFirstComment !== false,
               harvested: Boolean(__p.harvested),
               title: __p.title || "", ogDescription: __p.ogDescription || "", productKey: __p.productKey || "",
+              productId: __p.productId || "", // marker-uniqueness fix (2026-07-05): trackingSeed needs this too, not just productKey
               imagePath: __p.commentImagePath || ev.imagePath || "",
             };
           }
@@ -16057,6 +16058,7 @@ async function completeVerifiedFacebookPostWithComment({
     title: row.title || "",
     ogDescription: row.ogDescription || "",
     productKey: row.productKey || "",
+    productId: row.productId || "", // marker-uniqueness fix (2026-07-05): trackingSeed (livePostPayloadForRow) needs this to reproduce the same #fb<hex> fingerprint if this row is later rebuilt from the ledger (durable comment-recovery)
     groupUrl,
     actualGroupUrl,
     postUrl,
