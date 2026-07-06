@@ -13684,7 +13684,7 @@ function facebookAdminApprovalValidationFromLog(objects = [], postUrl = "") {
   };
 }
 
-async function runFacebookAdminApprovalAttempt({ row, profileId, profileLabel, groupUrl, postUrl, ledgerKey, reason, timeoutMs }) {
+async function runFacebookAdminApprovalAttempt({ row, profileId, profileLabel, groupUrl, postUrl, ledgerKey, reason, timeoutMs, deadlineAt }) {
   const numericProfileId = Number(profileId);
   const cleanProfile = oneLineField(profileLabel || numericProfileId || "", 180);
   const closeResults = [];
@@ -13762,6 +13762,32 @@ async function runFacebookAdminApprovalAttempt({ row, profileId, profileLabel, g
     closeResults.push(preOpenClose);
     assertIxBrowserPreOpenCleanupOk(preOpenClose, numericProfileId, "facebook_admin_approval_preopen_cleanup");
     if (preOpenClose?.status === "closed") await sleep(700);
+    // LATE BUDGET RE-CHECK (2026-07-05, task: decouple/pacing audit): the caller's `timeoutMs` is a STALE value
+    // computed from the session's remaining budget BEFORE this function's own pre-flight overhead (profile-use
+    // acquire, pre-open cleanup, the 700ms settle sleep above) actually elapsed. That overhead was never charged
+    // against the 8-min session cap, so a genuinely-stuck attempt could silently overrun past
+    // MAX_ADMIN_APPROVAL_WALL_CLOCK_MS (confirmed live: real sessions up to 618.8s / ~10.3min observed against an
+    // 8-min=480s nominal cap). If the caller passed an absolute `deadlineAt`, re-derive the REAL remaining budget
+    // now, right before the timed work actually starts, and bail cleanly (no dangling "started" ledger row) if
+    // pre-flight overhead alone already ate it.
+    let __freshTimeoutMs = timeoutMs;
+    if (deadlineAt) {
+      const freshRemainingMs = deadlineAt - Date.now();
+      if (freshRemainingMs <= 5000) {
+        return {
+          ok: false,
+          profileId: numericProfileId,
+          profile: cleanProfile,
+          closeResults,
+          validation: { ok: false, errors: ["admin_approval_attempt_budget_exhausted_before_start"], warnings: [] },
+          message: "Admin approval attempt's remaining wall-clock budget was consumed by pre-flight overhead (profile open/cleanup/settle) before the timed attempt could start.",
+          liveLog: [],
+          liveLogFile: "",
+          budgetExhaustedBeforeStart: true,
+        };
+      }
+      __freshTimeoutMs = Math.min(timeoutMs, freshRemainingMs);
+    }
     appendFacebookLivePostLedger({
       event: "admin_approval_started",
       key: ledgerKey,
@@ -13774,7 +13800,7 @@ async function runFacebookAdminApprovalAttempt({ row, profileId, profileLabel, g
       status: "running",
       message: oneLineField(reason || "Trying admin/moderator approval for a pending group post.", 700),
     });
-    const scriptResult = await runLiveFacebookPostScript(payload, { timeoutMs: clampNumber(timeoutMs, 30000, FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS, FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS) });
+    const scriptResult = await runLiveFacebookPostScript(payload, { timeoutMs: clampNumber(__freshTimeoutMs, 30000, FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS, FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS) });
     const approvedUrl = firstFacebookPostUrlFromLog(scriptResult.objects) || postUrl;
     const validation = facebookAdminApprovalValidationFromLog(scriptResult.objects, approvedUrl);
     appendFacebookLivePostLedger({
@@ -14141,6 +14167,7 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
         attempt = await runFacebookAdminApprovalAttempt({
           row,
           timeoutMs: Math.min(MAX_ADMIN_APPROVAL_ATTEMPT_MS, remainingBudgetMs),
+          deadlineAt: approvalStartedAt + MAX_ADMIN_APPROVAL_WALL_CLOCK_MS,
           profileId: adminProfile.profileId,
           profileLabel: adminProfile.profile,
           groupUrl,
@@ -14151,6 +14178,22 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
       } finally {
         releaseApprovalLock();
         logEvent("facebook_admin_approval_lock_released", { profileId: adminProfile.profileId });
+      }
+      // LATE BUDGET RE-CHECK (2026-07-05): pre-flight overhead (profile acquire/cleanup/settle) alone already
+      // consumed the remaining session budget -- stop cleanly instead of starting another doomed attempt.
+      if (attempt.budgetExhaustedBeforeStart) {
+        closeResults.push(...(attempt.closeResults || []));
+        attempts.push({
+          profileId: attempt.profileId,
+          profile: attempt.profile,
+          postUrl: postUrl,
+          ok: false,
+          validation: attempt.validation,
+          liveLogFile: "",
+          message: oneLineField(attempt.message || "", 300),
+        });
+        budgetExceeded = true;
+        break outer;
       }
       closeResults.push(...(attempt.closeResults || []));
       attempts.push({
