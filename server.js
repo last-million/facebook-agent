@@ -10351,7 +10351,7 @@ async function autopilotTickAsync(options = {}) {
     // SWARM FIX #10: tally WHY ready rows were skipped so the no_ready_row detail names the real blocker (claimed /
     // sibling / dup / group_cap / not_eligible) instead of always blaming "no eligible profile" — the misattribution
     // that made the claim-leak stall hard to diagnose. Counters are approximate (both pick passes increment).
-    const __skip = { not_eligible: 0, used_pid: 0, group_cap: 0, dup_product: 0, claimed: 0, sibling: 0 };
+    const __skip = { not_eligible: 0, used_pid: 0, locked: 0, group_cap: 0, dup_product: 0, claimed: 0, sibling: 0 };
     const __pickPass = (enforceGroupCap) => {
       for (const row of readyRows) {
         const prodKey = String(row.productKey || row.productUrl || row.link || "").toLowerCase();
@@ -10364,6 +10364,15 @@ async function autopilotTickAsync(options = {}) {
         const pid = Number(row.profileId || profileIdFromLabel(row.profile) || 0);
         if (!eligibleIds.has(pid)) { __skip.not_eligible += 1; continue; }
         if (usedIds.has(pid)) { __skip.used_pid += 1; continue; }
+        // STILL MID-ATTEMPT FROM AN EARLIER TICK (2026-07-06 review fix): usedIds only tracks profiles picked
+        // THIS tick's own pick pass -- it says nothing about a profile whose PRIOR tick's worker is still
+        // running (e.g. stuck in a long, still-synchronous admin-approval retry chain or a slow connector call).
+        // Without this check, the least-used-fairness sort keeps re-selecting that exact profile every single
+        // tick (it never lands a post, so it never stops looking "least used"), and acquireNormalIxProfileUse
+        // instantly 409s on it -- confirmed live: two profiles burned 2 of 3 dispatch slots on instant failures,
+        // tick after tick, for over 2 hours, while their own earlier attempt was still open. Skip it here so the
+        // slot goes to a genuinely available profile instead of a guaranteed instant failure.
+        if (normalIxProfileUseLocks.has(String(pid))) { __skip.locked += 1; continue; }
         const gKey = normalizedFacebookGroupKey(row.groupUrl);
         if (enforceGroupCap && (__pickedByGroup.get(gKey) || 0) >= __perGroupCap) { __skip.group_cap += 1; continue; } // hold this group at its fair share on the first pass
         const __prodGroupKey = prodKey ? prodKey + "|" + gKey : ""; // group-aware: a product's row in ANOTHER group is NOT a duplicate (fan-out to all groups together)
@@ -10388,7 +10397,7 @@ async function autopilotTickAsync(options = {}) {
     if (picked.length < __batchCap) __pickPass(false); // fill the remainder if a group had too few ready rows
     if (!picked.length) {
       decision.action = "no_ready_row";
-      decision.detail = `plan ${plan.planId}: ${readyRows.length} ready, 0 picked — claimed=${__skip.claimed}, sibling=${__skip.sibling}, dup_product=${__skip.dup_product}, group_cap=${__skip.group_cap}, not_eligible=${__skip.not_eligible}, used_pid=${__skip.used_pid} (${eligibleIds.size} eligible profiles)`;
+      decision.detail = `plan ${plan.planId}: ${readyRows.length} ready, 0 picked — claimed=${__skip.claimed}, sibling=${__skip.sibling}, dup_product=${__skip.dup_product}, group_cap=${__skip.group_cap}, not_eligible=${__skip.not_eligible}, used_pid=${__skip.used_pid}, locked=${__skip.locked} (${eligibleIds.size} eligible profiles)`;
       __autopilotLastDecision = decision;
       logEvent("autopilot_no_ready_row", decision);
       return decision;
