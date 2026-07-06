@@ -54,6 +54,16 @@ let __forcedCommentResweepActive = false;
 let __postCompletionExternalActionInFlight = 0;
 let __bgCommentInFlight = 0; // outstanding BACKGROUNDED comment+approval tasks (decouple backpressure 2026-06-30)
 const MAX_BG_COMMENT_IN_FLIGHT = 5; // past this, fall back to inline await so the tick slows + the backlog drains (the 14-slot open cap THROWS not blocks)
+// PER-POST APPROVAL MUTEX (2026-07-05, "background the pre-publish approval for full high-scale prod"):
+// backgrounding the pre-publish admin-approval decision (see runLiveFacebookPostFromPlan) means an approval
+// attempt for a post can now be in flight at the SAME time other code (e.g. the comment-stage's own
+// approvalMayHelp fallback, or a resweep/recovery path) might also try to approve the SAME post. Nothing else
+// in this codebase serializes across DIFFERENT call sites of approvePendingFacebookPostWithAdminProfiles for
+// the same post (acquireAdminApprovalLock only serializes same-MODERATOR-profile use, not same-POST use) --
+// so a double Approve click on the same post from two different code paths was a real, if narrow, risk once
+// backgrounding was introduced. Keyed by ledgerKey (the plan row's own stable identity) and checked/set in the
+// single shared wrapper below, so EVERY call site is protected uniformly with no per-call-site change needed.
+const __approvalInFlightKeys = new Set();
 // IN-MEMORY authoritative verified-comment index (DOUBLE-COMMENT GUARD, 2026-06-25): the single ledger append can be
 // EBUSY-dropped under parallel posting (forensic: a dropped comment_recovery_finished proof makes a COMMENTED post
 // LOOK uncommented -> the drain re-opens + re-comments it = a duplicate money-comment; the operator confirmed 25). This
@@ -11676,6 +11686,28 @@ function latestSubmittedUrlMissingFacebookLivePostForRow(row = {}, profileId = "
   return null;
 }
 
+// PENDING-BACKGROUND-APPROVAL LOOKUP (2026-07-05): mirrors latestSubmittedUrlMissingFacebookLivePostForRow's
+// pattern exactly. When the pre-publish admin-approval decision is backgrounded (runLiveFacebookPostFromPlan),
+// a durable "post_captured_awaiting_admin_approval" row is written BEFORE the background task starts, so a
+// crash mid-approval (or a stray re-attempt at this exact row) can recognize a real FB submission already
+// exists and is still pending, instead of silently re-posting. A later published*/submitted_url_missing row
+// for the SAME key supersedes and clears this (the background task resolved one way or the other).
+function latestPendingAdminApprovalFacebookLivePostForRow(row = {}, profileId = "") {
+  const key = livePostLedgerKey(row, profileId);
+  const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 });
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const item = rows[index];
+    if (!item || item.key !== key) continue;
+    if (item.postUrl && ["published", "published_with_warning", "published_verification_failed"].includes(String(item.status || ""))) return null;
+    if (String(item.event || "") === "submitted_url_missing" || /^submitted_url_missing/.test(String(item.event || ""))) return null;
+    const event = String(item.event || "");
+    if (event === "post_captured_awaiting_admin_approval") {
+      return { ...item, actualGroupUrl: item.actualGroupUrl || item.groupUrl || "" };
+    }
+    if (event === "admin_approval_background_gave_up") return null; // background task already gave up -> safe to retry fresh
+  }
+  return null;
+}
 function latestDifferentProfileVerifiedCommentForPost(postUrl = "", publishingProfileId = "") {
   let cleanPostUrl = "";
   try {
@@ -14048,9 +14080,23 @@ function acquireAdminApprovalLock(profileId) {
 async function approvePendingFacebookPostWithAdminProfiles(args) {
   // Moderator approval finishes an ALREADY-published (pending) post — let it complete through a run-limit
   // auto-disarm (a real operator STOP still hard-blocks it via requireExternalArmed's __externalStopRequested).
+  const __lk = String(args?.ledgerKey || "");
+  if (__lk && __approvalInFlightKeys.has(__lk)) {
+    try { logEvent("admin_approval_skipped_already_in_flight", { ledgerKey: __lk, planId: args?.row?.planId, sequence: args?.row?.sequence }); } catch (_) {}
+    return {
+      ok: false, approvalClicked: false, alreadyInFlight: true, profileId: 0, profile: "",
+      closeResults: [], validation: { ok: false, errors: ["admin_approval_already_in_flight_elsewhere"], warnings: [] },
+      message: "Another admin-approval attempt for this exact post is already in flight (background or foreground); skipping to avoid a double Approve click.",
+      liveLog: [], liveLogFile: "",
+    };
+  }
+  if (__lk) __approvalInFlightKeys.add(__lk);
   __postCompletionExternalActionInFlight += 1;
   try { return await approvePendingFacebookPostWithAdminProfilesImpl(args); }
-  finally { __postCompletionExternalActionInFlight = Math.max(0, __postCompletionExternalActionInFlight - 1); }
+  finally {
+    __postCompletionExternalActionInFlight = Math.max(0, __postCompletionExternalActionInFlight - 1);
+    if (__lk) __approvalInFlightKeys.delete(__lk);
+  }
 }
 async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, groupUrl, candidateUrls, ledgerKey, closeResults, reason }) {
   let state = readState();
@@ -17007,6 +17053,29 @@ async function runLiveFacebookPostFromPlan(body = {}) {
       },
     );
   }
+  // ALREADY AWAITING BACKGROUND APPROVAL (2026-07-05): a real FB submission for this exact row may already
+  // exist and be mid-flight in a backgrounded admin-approval task (see the pre-publish backgrounding below).
+  // Recognize it and do NOT attempt a fresh post -- that would risk a genuine duplicate live submission for
+  // the same product+group while the background task is still resolving the first one.
+  const priorPendingApproval = latestPendingAdminApprovalFacebookLivePostForRow(row, ready.profileId);
+  if (priorPendingApproval) {
+    return {
+      ok: true,
+      posted: true,
+      pendingApproval: true,
+      postUrl: priorPendingApproval.postUrl,
+      planId: row.planId,
+      sequence: row.sequence,
+      profileId: ready.profileId,
+      profile: row.profile || "",
+      groupUrl: priorPendingApproval.actualGroupUrl || priorPendingApproval.groupUrl || ready.groupUrl,
+      attemptedGroups: [],
+      closeResults: [],
+      message: "A real Facebook submission for this row is already awaiting admin approval in the background; not re-posting.",
+      state: readState(),
+      registers: readRegisters(),
+    };
+  }
   let lastError = null;
   const groupErrors = [];
   const closeResults = [];
@@ -17162,6 +17231,111 @@ async function runLiveFacebookPostFromPlan(body = {}) {
         // approves THIS post via its unique marker / author-id — never another member's pending post.)
         const groupRequiresApproval = isAdminApprovalEnabledForGroup(groupUrl, readState());
         if (!liveEnoughToComment && (!validation.ok || groupRequiresApproval)) {
+          // BACKGROUND THE PRE-PUBLISH APPROVAL (2026-07-05, "ready for full high-scale prod": posting must
+          // not block for the ~5-10min+ a moderator approval can take -- confirmed live median 5.46min at
+          // this exact call site). Unlike the 2026-06-30 comment-stage decouple (which only defers work AFTER
+          // the post is already durably recorded), this decides whether the post gets recorded at all -- so
+          // it needs its own durable marker (post_captured_awaiting_admin_approval, checked by
+          // latestPendingAdminApprovalFacebookLivePostForRow above so a later attempt never re-posts this
+          // row), and the return here MUST be ok:true (never ok:false) so runWorker's
+          // releasePostProductForRun does NOT fire while a real FB submission is still pending review --
+          // that's what prevents a different profile/tick from re-posting the same product+group as a
+          // duplicate. Reuses the SAME __bgCommentInFlight/MAX_BG_COMMENT_IN_FLIGHT backpressure budget as
+          // the comment-stage decouple (no second, independent concurrency pool), and the
+          // __approvalInFlightKeys mutex inside approvePendingFacebookPostWithAdminProfiles prevents a
+          // double-Approve-click race against any other approval attempt for this same ledgerKey.
+          const __bgPreApprovalEligible = ready.__autopilotRunPost === true
+            && groupRequiresApproval
+            && readState().operator?.commentDrainDisabled !== true
+            && __bgCommentInFlight < MAX_BG_COMMENT_IN_FLIGHT
+            && !__approvalInFlightKeys.has(ledgerKey);
+          if (__bgPreApprovalEligible) {
+            appendFacebookLivePostLedger({
+              event: "post_captured_awaiting_admin_approval",
+              key: ledgerKey,
+              planId: row.planId,
+              sequence: row.sequence,
+              profileId: ready.profileId,
+              profile: row.profile || "",
+              groupUrl,
+              postUrl,
+              status: "pending",
+              message: "Post click captured; moderator approval running in background so posting stays continuous.",
+            });
+            __bgCommentInFlight += 1;
+            const __bgClose = [];
+            const __bgScriptResult = scriptResult;
+            const __bgValidationStart = validation;
+            (async () => {
+              let __bgApprovalResult = null;
+              let __bgFinalPostUrl = postUrl;
+              let __bgValidation = __bgValidationStart;
+              try {
+                __bgApprovalResult = await approvePendingFacebookPostWithAdminProfiles({
+                  row,
+                  ready,
+                  groupUrl,
+                  candidateUrls: [postUrl, ...facebookPostCandidateUrlsFromLog(__bgScriptResult.objects, groupUrl)],
+                  ledgerKey,
+                  closeResults: __bgClose,
+                  reason: "A permalink candidate exists but the post is not fully verified; checking whether admin approval is required.",
+                });
+                if ((__bgApprovalResult?.ok || __bgApprovalResult?.approvalClicked) && __bgApprovalResult.postUrl) {
+                  __bgFinalPostUrl = __bgApprovalResult.postUrl;
+                  __bgValidation = __bgApprovalResult.validation;
+                }
+                if (!__bgValidation.ok && !__bgApprovalResult?.approvalClicked) {
+                  try {
+                    logEvent("facebook_live_post_verification_failed", {
+                      planId: row.planId, sequence: row.sequence, profileId: ready.profileId, groupUrl,
+                      postUrl: __bgFinalPostUrl, errors: __bgValidation.errors, backgrounded: true,
+                    });
+                  } catch (_) {}
+                  appendFacebookLivePostLedger({
+                    event: "admin_approval_background_gave_up",
+                    key: ledgerKey, planId: row.planId, sequence: row.sequence, profileId: ready.profileId,
+                    profile: row.profile || "", groupUrl, postUrl: __bgFinalPostUrl, status: "abandoned",
+                    message: `Backgrounded pre-publish admin approval did not succeed: ${(__bgValidation.errors || []).join(", ") || "unknown_verification_error"}`,
+                  });
+                  return;
+                }
+                await completeVerifiedFacebookPostWithComment({
+                  row, ready, groupUrl, postUrl: __bgFinalPostUrl, validation: __bgValidation, ledgerKey,
+                  attemptedGroups, closeResults: __bgClose,
+                  postPayloadFile: __bgScriptResult.payloadFile, postPayloadDeleted: __bgScriptResult.payloadDeleted,
+                  postLiveLogFile: __bgScriptResult.liveLogFile || "", postScript: __bgScriptResult.script,
+                  postLogObjects: __bgScriptResult.objects, approvalResult: __bgApprovalResult,
+                });
+              } catch (e) {
+                try { logEvent("facebook_post_preapproval_backgrounded_error", { postUrl, groupUrl, error: oneLineField((e && e.message) || String(e), 200) }); } catch (_) {}
+              } finally {
+                __bgCommentInFlight = Math.max(0, __bgCommentInFlight - 1);
+              }
+            })();
+            return {
+              ok: true,
+              posted: true,
+              postUrl,
+              planId: row.planId,
+              sequence: row.sequence,
+              profileId: ready.profileId,
+              profile: row.profile || "",
+              groupUrl,
+              attemptedGroups,
+              closeResults,
+              payloadFile: scriptResult.payloadFile,
+              payloadDeleted: scriptResult.payloadDeleted,
+              liveLogFile: scriptResult.liveLogFile || "",
+              script: scriptResult.script,
+              approvalResult: null,
+              validation,
+              preApprovalBackgrounded: true,
+              message: `Post click captured by ${row.profile || ready.profileId}; moderator approval running in background (approval-required group) so posting stays continuous.`,
+              liveLog: compactLivePostLog(scriptResult.objects),
+              state: readState(),
+              registers: readRegisters(),
+            };
+          }
           approvalResult = await approvePendingFacebookPostWithAdminProfiles({
             row,
             ready,
