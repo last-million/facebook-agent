@@ -6424,3 +6424,25 @@ function uxAttachIncompleteRunBanner() {
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot); else boot();
 })();
 
+// ============================== SCROLL-TO-TOP BUTTON ==============================
+(() => {
+  const setup = () => {
+    const btn = document.getElementById("scrollTopBtn");
+    if (!btn) return;
+    const SHOW_AFTER_PX = 320;
+    let ticking = false;
+    const update = () => {
+      ticking = false;
+      btn.classList.toggle("isVisible", (window.scrollY || document.documentElement.scrollTop || 0) > SHOW_AFTER_PX);
+    };
+    window.addEventListener("scroll", () => {
+      if (ticking) return;
+      ticking = true;
+      window.requestAnimationFrame(update);
+    }, { passive: true });
+    btn.addEventListener("click", () => window.scrollTo({ top: 0, behavior: "smooth" }));
+    update();
+  };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", setup); else setup();
+})();
+

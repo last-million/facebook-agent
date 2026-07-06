@@ -117,6 +117,13 @@
     table.detail td{border:0;padding:4px 12px;display:flex;justify-content:space-between;gap:12px}
     table.detail td::before{content:attr(data-l);color:var(--mut);font-size:.74rem;font-weight:600;text-transform:uppercase;letter-spacing:.3px}
   }
+  .scrollTopBtn{position:fixed;right:20px;bottom:20px;z-index:89;width:44px;height:44px;display:grid;place-items:center;
+    border:1px solid var(--line);border-radius:50%;background:var(--card2);color:var(--tx);font-size:1.05rem;line-height:1;
+    cursor:pointer;box-shadow:var(--sh);opacity:0;transform:translateY(8px);pointer-events:none;
+    transition:opacity .18s ease,transform .18s ease,border-color .15s}
+  .scrollTopBtn.isVisible{opacity:1;transform:translateY(0);pointer-events:auto}
+  .scrollTopBtn:hover{border-color:var(--blue);color:var(--blue)}
+  .scrollTopBtn:active{transform:translateY(1px)}
 </style>
 </head>
 <body>
@@ -144,6 +151,8 @@
 
   <div class="foot" id="foot"></div>
 </div>
+
+<button id="scrollTopBtn" class="scrollTopBtn" type="button" title="Remonter en haut" aria-label="Remonter en haut">&#8593;</button>
 
 <script>
 "use strict";
@@ -386,6 +395,16 @@ document.getElementById("refresh").addEventListener("click", function(){ load(tr
 document.getElementById("hideAll").addEventListener("click", hideAll);
 document.getElementById("auto").addEventListener("change", arm);
 load(false); arm();
+
+(function(){
+  var btn = document.getElementById("scrollTopBtn");
+  if (!btn) return;
+  var ticking = false;
+  function update(){ ticking = false; btn.classList.toggle("isVisible", (window.scrollY || document.documentElement.scrollTop || 0) > 320); }
+  window.addEventListener("scroll", function(){ if (ticking) return; ticking = true; window.requestAnimationFrame(update); }, { passive:true });
+  btn.addEventListener("click", function(){ window.scrollTo({ top:0, behavior:"smooth" }); });
+  update();
+})();
 </script>
 </body>
 </html>

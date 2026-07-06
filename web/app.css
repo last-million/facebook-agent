@@ -978,6 +978,31 @@ body[data-active-view="integrations"] .mainGrid .prodRoles.viewVisible { order: 
 .failedProfilesLabel { display: grid; gap: 6px; }
 .failedProfilesActions { margin-top: 4px; }
 
+/* ============================== SCROLL-TO-TOP ============================== */
+
+.scrollTopBtn {
+  position: fixed;
+  right: 22px; bottom: 78px;
+  z-index: 89;
+  width: 44px; height: 44px;
+  display: grid; place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 1.05rem;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 12px 30px -12px var(--shadow-lg);
+  opacity: 0;
+  transform: translateY(8px);
+  pointer-events: none;
+  transition: opacity .18s ease, transform .18s ease, background .15s, border-color .15s;
+}
+.scrollTopBtn.isVisible { opacity: 1; transform: translateY(0); pointer-events: auto; }
+.scrollTopBtn:hover { background: var(--surface-3); border-color: var(--accent-line); color: var(--accent-strong); }
+.scrollTopBtn:active { transform: translateY(1px); }
+
 /* ============================== TOAST / WIZARD / LAUNCHER ============================== */
 
 .toast {
