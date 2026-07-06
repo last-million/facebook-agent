@@ -16216,7 +16216,29 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         if (__memHasDifferentProfileComment(u, pid)) return true; // DOUBLE-COMMENT GUARD: in-memory proof (EBUSY-immune) — catches a verified comment whose ledger row was dropped
         return false;
       };
-      for (const ev of publishedByPlan.values()) {
+      // DEPRIORITIZE CHRONIC FAILURES (2026-07-06 review fix): a post that has already exhausted every
+      // commenter and hit the last-resort skip repeatedly can effectively never succeed (confirmed live:
+      // 65 such posts, one retried 45+ times over 6+ hours, 0% eventual success) -- yet plain chronological
+      // (oldest-first) order let it occupy the front of EVERY bounded sweep pass (maxToFix), starving
+      // fresher, genuinely-recoverable posts of resweep attention (2 fresh posts confirmed sitting
+      // un-retried 30-40+ min while a chronic post's slot stayed "hot"). This does NOT give up on any post
+      // (per the 2026-07-01 "don't skip comments" policy) -- it only reorders so posts with fewer prior
+      // failures get first crack at each pass's limited budget; a chronic post still gets retried, just
+      // after the fresher ones have had their chance this pass.
+      const __lastResortCountByUrl = new Map();
+      for (const r of rows) {
+        if (!r || r.event !== "publisher_comment_last_resort_skipped" || !r.postUrl) continue;
+        let u = ""; try { u = sanitizeFacebookPostUrl(String(r.postUrl || "")); } catch { u = String(r.postUrl || ""); }
+        if (!u) continue;
+        __lastResortCountByUrl.set(u, (__lastResortCountByUrl.get(u) || 0) + 1);
+      }
+      const __failCountFor = (pUrl) => { let u = ""; try { u = sanitizeFacebookPostUrl(pUrl || ""); } catch { return 0; } return __lastResortCountByUrl.get(u) || 0; };
+      const __orderedPending = [...publishedByPlan.values()].sort((a, b) => {
+        const fa = __failCountFor(a.postUrl), fb = __failCountFor(b.postUrl);
+        if (fa !== fb) return fa - fb;
+        return (Date.parse(a.at || 0) || 0) - (Date.parse(b.at || 0) || 0);
+      });
+      for (const ev of __orderedPending) {
         if (!options.ignoreArmedGate && __externalStopRequested > resweepStartedAt) { logEvent("comment_resweep_aborted_by_stop", { checked: summary.checked }); break; } // operator hit STOP -> halt now. EXCEPTION (operator 2026-06-20): the ignoreArmedGate FINISH-drains (stop-drain 8270 / run-end 9075) run to COMPLETION — a 2nd/stale/double STOP must NOT bump __externalStopRequested past this drain's resweepStartedAt and abandon the comments the run already owes (that left 20 uncommented forever). Posting+harvest are already hard-killed before the finish-drain starts, so this only lets the cheap comment-finish complete.
         const postUrl = ev.postUrl;
         // Bound by ATTEMPTS, not just successes: a post that can never be commented (no eligible
@@ -18763,7 +18785,13 @@ function isTransientBlockingPostFailure(errorText) {
   // — that string also wraps product/image/content failures (NOT profile-health), and
   // counting those would wrongly streak a healthy profile. The genuine profile-health
   // sub-reasons below are present in real dead-profile errors and still match.
-  return /could not open composer|composer not found|facebook[ _]login[ _]required|log in to continue|profile[ _-]?(?:open|login)[^.|]{0,24}fail|profile[ _-]?open[ _-]?(?:error|failed)|could not open profile|ixbrowser[^|]{0,20}error 100\d|\berror 1009\b|process not found|target page.*(?:closed)|browser has been closed|connector[ _]timed?[ _]?out|connector[ _]failed|connectovercdp/i.test(t);
+  // COVERAGE GAP (2026-07-06 review fix): "uncertain after clicking Post" / "did not expose a
+  // verified visible post" are genuine profile/connector-health failures (isRetryableOnePostProfileGroupFailure,
+  // ~18260, already treats them as non-retryable for the SAME reason) but were never counted here -- confirmed
+  // live: profile 73 ran 90+ minutes / 6 attempt cycles hitting exactly these two error shapes repeatedly
+  // (falling through the `!hard && !soft -> return` early-exit, never incrementing the block streak) before
+  // finally also hitting an already-covered string and only THEN getting parked.
+  return /could not open composer|composer not found|facebook[ _]login[ _]required|log in to continue|profile[ _-]?(?:open|login)[^.|]{0,24}fail|profile[ _-]?open[ _-]?(?:error|failed)|could not open profile|ixbrowser[^|]{0,20}error 100\d|\berror 1009\b|process not found|target page.*(?:closed)|browser has been closed|connector[ _]timed?[ _]?out|connector[ _]failed|connectovercdp|uncertain after clicking|did not expose a verified visible post|facebook_publish_uncertain_after_post_click/i.test(t);
 }
 
 function recentProfileBlockingFailureCount(pid, state) {
