@@ -2558,6 +2558,7 @@ function markProfileDisconnected(profileId, label, reason) {
   state.posting.disconnectedProfiles = list;
   writeState(state);
   try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {} // see releaseParkedProfile's comment
+  try { __profilesBlockedCache = { at: 0, body: null }; } catch (_) {} // 2026-07-06: keep the Blocked panel in sync with this same mutation, not stale up to 15s
   logEvent("profile_disconnected_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
   return true;
 }
@@ -2633,6 +2634,7 @@ async function restoreIxProfileProxy(profileId) {
   } catch (e) { try { logEvent("ix_profile_proxy_restore_failed", { profileId: pid, error: oneLineField(e.message || String(e), 140) }); } catch (_) {} return false; }
   const s2 = readState(); if (s2.posting?.proxyBackups) { s2.posting.proxyBackups[pid] = null; writeState(s2); } // null overwrites (delete wouldn't survive writeState's deep-merge)
   try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {} // see releaseParkedProfile's comment
+  try { __profilesBlockedCache = { at: 0, body: null }; } catch (_) {} // 2026-07-06: keep the Blocked panel in sync with this same mutation, not stale up to 15s
   try { logEvent("ix_profile_proxy_restored", { profileId: pid }); } catch (_) {}
   return true;
 }
@@ -2653,6 +2655,7 @@ function markProfileErrored(profileId, label, reason) {
   state.posting.erroredProfiles = list;
   writeState(state);
   try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {} // see releaseParkedProfile's comment
+  try { __profilesBlockedCache = { at: 0, body: null }; } catch (_) {} // 2026-07-06: keep the Blocked panel in sync with this same mutation, not stale up to 15s
   logEvent("profile_account_error_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
   return true;
 }
@@ -2834,6 +2837,7 @@ function releaseParkedProfile(profileId) {
   // DASHBOARD-CACHE BUST: /api/autopilot/status (Prod-tab capacity/posted-today tiles) is cached up to 5min and
   // has no other hook tied to profile-list mutations -- bust it so the dashboard reflects this release immediately.
   try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {}
+  try { __profilesBlockedCache = { at: 0, body: null }; } catch (_) {} // 2026-07-06: same reasoning, Blocked panel
   return changed;
 }
 function suspendedProfileIdSet(state = readState()) {
@@ -2852,6 +2856,7 @@ function markProfileSuspended(profileId, label, reason) {
   state.posting.suspendedProfiles = list;
   writeState(state);
   try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {} // see releaseParkedProfile's comment
+  try { __profilesBlockedCache = { at: 0, body: null }; } catch (_) {} // 2026-07-06: keep the Blocked panel in sync with this same mutation, not stale up to 15s
   logEvent("profile_suspended_parked", { profileId: id, reason: String(reason || "").slice(0, 120) });
   return true;
 }
@@ -12522,22 +12527,44 @@ function commentRecoveryFallbackProfilesForGroup(row, groupUrl, state = readStat
       source: oneLineField(source || "same_group_assignment", 80),
     });
   };
+  // EARLY-BREAK (2026-07-06 wedge audit): each addCandidate() call pays its own facebookCommentProfileStatusForGroup
+  // ledger scan (server.js:13659). This function only ever returns the first MAX_COMMENT_FALLBACK_PROFILES
+  // candidates anyway (the slice(0, ...) below), so once the array reaches that length every further scan is
+  // provably wasted work -- the sibling ixBrowserCommentFallbackProfilesForGroup already does this. With today's
+  // roster (4 groups, ~18-19 profiles each) this cut ~1-1.5s of synchronous blocking per comment-recovery pool
+  // build, a real contributor to the periodic multi-minute server wedges (watchdog "wedged_3_misses").
   for (const profile of successfulFacebookCommentProfilesForGroup(groupUrl, { excludeProfileIds: [...excludedIds] })) {
     addCandidate(profile.profile, profile.source);
+    if (candidates.length >= MAX_COMMENT_FALLBACK_PROFILES) break;
   }
-  for (const entry of Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : []) {
-    if (normalizedFacebookGroupKey(entry?.url) !== targetGroupKey) continue;
-    for (const label of Array.isArray(entry?.profiles) ? entry.profiles : []) addCandidate(label, "same_group_assignment");
+  if (candidates.length < MAX_COMMENT_FALLBACK_PROFILES) {
+    for (const entry of Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : []) {
+      if (normalizedFacebookGroupKey(entry?.url) !== targetGroupKey) continue;
+      for (const label of Array.isArray(entry?.profiles) ? entry.profiles : []) {
+        addCandidate(label, "same_group_assignment");
+        if (candidates.length >= MAX_COMMENT_FALLBACK_PROFILES) break;
+      }
+      if (candidates.length >= MAX_COMMENT_FALLBACK_PROFILES) break;
+    }
   }
-  for (const entry of Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : []) {
-    if (normalizedFacebookGroupKey(entry?.url) === targetGroupKey) continue;
-    for (const label of Array.isArray(entry?.profiles) ? entry.profiles : []) addCandidate(label, "other_assignment_probe_same_group_access");
+  if (candidates.length < MAX_COMMENT_FALLBACK_PROFILES) {
+    for (const entry of Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : []) {
+      if (normalizedFacebookGroupKey(entry?.url) === targetGroupKey) continue;
+      for (const label of Array.isArray(entry?.profiles) ? entry.profiles : []) {
+        addCandidate(label, "other_assignment_probe_same_group_access");
+        if (candidates.length >= MAX_COMMENT_FALLBACK_PROFILES) break;
+      }
+      if (candidates.length >= MAX_COMMENT_FALLBACK_PROFILES) break;
+    }
   }
-  for (const label of [
-    ...recordLines(state.ixbrowser?.profilesForNextRun),
-    ...recordLines(state.ixbrowser?.activeProfiles),
-  ]) {
-    addCandidate(label, "ixbrowser_profile_pool_probe_same_group_access");
+  if (candidates.length < MAX_COMMENT_FALLBACK_PROFILES) {
+    for (const label of [
+      ...recordLines(state.ixbrowser?.profilesForNextRun),
+      ...recordLines(state.ixbrowser?.activeProfiles),
+    ]) {
+      addCandidate(label, "ixbrowser_profile_pool_probe_same_group_access");
+      if (candidates.length >= MAX_COMMENT_FALLBACK_PROFILES) break;
+    }
   }
   return candidates.slice(0, MAX_COMMENT_FALLBACK_PROFILES);
 }
@@ -18987,6 +19014,7 @@ function unblockPostingProfile(body = {}) {
   // DASHBOARD-CACHE BUST: see releaseParkedProfile's identical comment -- keeps /api/autopilot/status from
   // showing a stale (pre-unblock) capacity/eligibility snapshot for up to 5 minutes.
   try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {}
+  try { __profilesBlockedCache = { at: 0, body: null }; } catch (_) {} // 2026-07-06: same reasoning, Blocked panel
   logEvent("posting_profile_unblocked", {
     profileId: record.profileId || "",
     profileName: record.name || record.label,
@@ -21663,6 +21691,14 @@ const IX_PROFILES_CACHE_TTL_MS = 45000;
 let __autopilotStatusCache = { at: 0, body: null };
 let __assetBufferStatusCache = { at: 0, body: null };
 const STATUS_CACHE_TTL_MS = 300000;
+// /api/profiles/blocked (2026-07-06 wedge audit): same class of problem as the two caches above -- polled
+// unconditionally every 3s by any open dashboard tab (web/app.js refresh(), setInterval 3000ms), and the
+// handler ran commentCooldownProfilesSummary() UNCACHED on every poll (its own uncached 20,000-line ledger
+// JSON.parse). Unlike the two caches above this is a load-INDEPENDENT, always-on tax -- confirmed as a real
+// contributor to the periodic multi-minute "wedged_3_misses" watchdog restarts. Short TTL (15s vs 300s) keeps
+// the operator's Blocked panel responsive to a manual unblock/release click while cutting call frequency ~5x.
+let __profilesBlockedCache = { at: 0, body: null };
+const PROFILES_BLOCKED_CACHE_TTL_MS = 15000;
 
 let lastHeartbeatTick = 0;
 let __lastHungReaperAt = 0, __hungReaperInFlight = false, __lastHeartbeatCpuSampleAt = 0; // autonomous self-heal: hung-window reaper + idle CPU sampler (heartbeat-driven, 2026-06-30)
@@ -23290,8 +23326,12 @@ const server = http.createServer(async (req, res) => {
     return json(res, 200, result);
   }
   if (req.method === "GET" && url.pathname === "/api/profiles/blocked") {
-    const st = readState();
-    return json(res, 200, { ok: true, blocked: currentlyBlockedProfilesSummary(st), cooldown: commentCooldownProfilesSummary(st) });
+    const __now = Date.now();
+    if (!__profilesBlockedCache.body || __now - __profilesBlockedCache.at >= PROFILES_BLOCKED_CACHE_TTL_MS) {
+      const st = readState();
+      __profilesBlockedCache = { at: __now, body: { ok: true, blocked: currentlyBlockedProfilesSummary(st), cooldown: commentCooldownProfilesSummary(st) } };
+    }
+    return json(res, 200, __profilesBlockedCache.body);
   }
   if (req.method === "POST" && url.pathname === "/api/ixbrowser/profile-unblock") {
     const body = await readJson(req);
