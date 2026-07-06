@@ -537,6 +537,8 @@ function defaultState() {
       autopilotProfileAllowlist: "",
       commentCooldownHours: 24, // a profile whose comment fails/gets auto-removed is benched from commenting this long, then retried (was 48h; operator 2026-07-06)
       commentCooldownProbeHours: 4, // operator 2026-07-06: re-test a benched profile every N hours instead of waiting the full commentCooldownHours -- a real recovery re-enters rotation sooner
+      commentCorroborationMinProfiles: 3, // 2026-07-06 review fix: minimum distinct profiles that must hit the identical comment_profile_cannot_access_post_permalink wall on the same post before treating it as a post-state (not profile-state) issue -- raised from a bare 2 so 2 correlated-broken profiles (shared dead proxy/restriction) can't mutually exonerate each other in one sweep
+      commentCorroborationMinSpreadMinutes: 30, // 2026-07-06 review fix: those distinct-profile failures must also span at least this many minutes -- a same-sweep burst from correlated-broken profiles can't pass, while genuine slow-building corroboration (the calibration incident: 8 profiles/3.5h) still can
       autopilotMaxPostsPerRun: 0, // HARD per-run cap: 0 = unlimited; >0 = auto-disarm after exactly N confirmed posts
       autopilotPostsThisRun: 0, // counter of confirmed posts since the run was armed (reset on each fresh arm)
       autopilotWorkerStaggerSeconds: 25,
@@ -11545,6 +11547,16 @@ function sanitizeFacebookPostUrl(value) {
   return parsed.toString();
 }
 
+// Shared canonical key for corroboration Map/Set lookups (2026-07-06 review fix), mirroring the double-comment
+// dedup guard's pattern (search "DOUBLE-COMMENT GUARD"): sanitize so a trailing-slash/query/hash format diff
+// for the SAME post can't split one corroborating Set into two under-threshold ones. Falls back to the raw
+// string (never drops the row) if the value isn't a well-formed FB post URL.
+function commentCorroborationPostUrlKey(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try { return sanitizeFacebookPostUrl(raw); } catch { return raw; }
+}
+
 function facebookGroupUrlFromPostUrl(postUrl) {
   try {
     const parsed = new URL(String(postUrl || "").trim());
@@ -11573,6 +11585,10 @@ function appendFacebookLivePostLedger(event = {}) {
     at: new Date().toISOString(),
     event: oneLineField(event.event || "event", 80),
     key: oneLineField(event.key || "", 180),
+    // 2026-07-06 review fix: debug-only traceback to the original publish_intent's random-hex id for a
+    // kill-mid-post-recovered "published" row (whose canonical `key` is now livePostLedgerKey, not the intent
+    // id) -- no consumer matches on this field, purely for manual ledger inspection.
+    intentKey: oneLineField(event.intentKey || "", 60),
     planId: oneLineField(event.planId || "", 140),
     sequence: Number(event.sequence || 0),
     profileId: Number(event.profileId || 0),
@@ -13152,7 +13168,15 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
             const actualGroupUrl = facebookGroupUrlFromPostUrl(rec.postUrl) || groupUrl;
             try { recordPublishedFacebookPostUrl({ postUrl: rec.postUrl, row, planId, sequence, profile: row.profile || profileId, groupUrl: actualGroupUrl }); } catch (_) {}
             __lastPostProgressAt = Date.now(); // reconcile recovered a landed post -> tick is making progress (hung-tick watchdog stays hands-off)
-            appendFacebookLivePostLedger({ event: "published", key: it.key, planId, sequence, profileId, profile: row.profile || "", groupUrl, actualGroupUrl, postUrl: rec.postUrl, status: "published", message: "recovered after kill-mid-post (publish_intent reconcile)", validation: rec.validation || null,
+            // CANONICAL KEY (2026-07-06 review fix): this "published" row used to be keyed by `it.key` (the
+            // publish_intent's own random-hex intent id), a DIFFERENT namespace than livePostLedgerKey(row,
+            // profileId) -- the key every other "was this published" check (latestPublishedFacebookLivePostForRow,
+            // the new post_captured_awaiting_admin_approval/admin_approval_started self-heal checks) matches
+            // against. Under the old key, a recovered-landed post was invisible to those checks, so a LATER
+            // crash during a post-publish re-approval retry (approvalMayHelp) could wrongly self-heal as "never
+            // published" and release the claim -- a genuine live duplicate-post risk. intentKey preserves the
+            // original orphan-tracking id for debugging; nothing else matches "published" rows by intent id.
+            appendFacebookLivePostLedger({ event: "published", key: livePostLedgerKey(row, profileId), intentKey: it.key, planId, sequence, profileId, profile: row.profile || "", groupUrl, actualGroupUrl, postUrl: rec.postUrl, status: "published", message: "recovered after kill-mid-post (publish_intent reconcile)", validation: rec.validation || null,
               // DURABLE COMMENT-RECOVERY: stamp the payload here too — this kill-mid-post path lands a post WITHOUT going
               // through completeVerifiedFacebookPostWithComment, so without this the recovered post has no payload and is
               // permanently uncommentable once the plan is overwritten (the exact interrupted-run case the fix targets).
@@ -13227,18 +13251,20 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
 // (and its file-based product+group claim) would be stranded FOREVER. This sweep finds rows stuck past a safe
 // bound with no later resolving event and writes a synthetic give-up + releases the claim, exactly like a
 // genuine give-up already does.
-// Deep, TARGETED check for one exact ledgerKey (2026-07-06 review fix): the bounded 8000-line window used
-// for the rest of this sweep only spans ~21.6h of history, but a post's "published" row could be older than
-// that (e.g. a late comment-stage re-approval retry, addRequiredFirstCommentWithDifferentProfileImpl's
-// approvalMayHelp fallback, confirmed live to fire hours after the original publish). Releasing a claim for a
-// key that ALREADY published -- just outside the bounded window -- would let the plan-builder re-pick and
-// genuinely duplicate-post it. Only called for the rare handful of stale candidates per 5-min pass, so an
-// unbounded read here is cheap; never used for the bulk scan above.
-function __keyEverPublished(key) {
+// Full, UNBOUNDED "ever published" key set (2026-07-06 review fix). The bounded 8000-line window used for the
+// rest of this sweep only spans ~21.6h of history, but a post's "published" row could be older than that (e.g.
+// a late comment-stage re-approval retry, addRequiredFirstCommentWithDifferentProfileImpl's approvalMayHelp
+// fallback, confirmed live to fire hours after the original publish). Releasing a claim for a key that ALREADY
+// published -- just outside the bounded window -- would let the plan-builder re-pick and genuinely duplicate-
+// post it. Computed LAZILY, at most ONCE per sweep pass (not once per stale candidate -- a full ~48MB ledger
+// JSON.parse is cheap once but not repeated N times back-to-back on the event loop, matching this codebase's
+// own prior blocking-I/O incident class, task #211).
+function __allEverPublishedKeysFullScan() {
+  const set = new Set();
   for (const r of readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 0 })) {
-    if (r && r.key === key && (r.event === "published" || r.event === "published_after_admin_approval")) return true;
+    if (r && r.key && (r.event === "published" || r.event === "published_after_admin_approval")) set.add(String(r.key));
   }
-  return false;
+  return set;
 }
 async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
   if (__staleApprovalSelfHealInFlight) return __staleApprovalSelfHealInFlight;
@@ -13257,6 +13283,14 @@ async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
         latestByKey.set(String(r.key), r); // append-only ledger -> last write per key wins
         if (r.event === "published" || r.event === "published_after_admin_approval") publishedKeys.add(String(r.key));
       }
+      // Lazy, pass-scoped cache: the full unbounded scan runs at most once total for this whole sweep pass,
+      // shared by BOTH loops below, no matter how many stale candidates either one finds.
+      let __fullPublishedKeysThisPass = null;
+      const __everPublished = (key) => {
+        if (publishedKeys.has(key)) return true;
+        if (!__fullPublishedKeysThisPass) __fullPublishedKeysThisPass = __allEverPublishedKeysFullScan();
+        return __fullPublishedKeysThisPass.has(key);
+      };
       for (const [key, r] of latestByKey) {
         if (String(r.event || "") !== "post_captured_awaiting_admin_approval") continue;
         // Genuinely still running in THIS process (merely slow, e.g. an IXBrowser desktop-recovery wait) --
@@ -13267,16 +13301,32 @@ async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
         if (!at || (Date.now() - at) < staleMs) continue;
         summary.checked += 1;
         try {
-          appendFacebookLivePostLedger({
-            event: "admin_approval_background_gave_up",
-            key, planId: r.planId, sequence: r.sequence, profileId: r.profileId,
-            profile: r.profile || "", groupUrl: r.groupUrl || "", postUrl: r.postUrl || "",
-            status: "abandoned",
-            message: `Self-heal: no resolution ${Math.round((Date.now() - at) / 60000)}min after backgrounding (process restart or unhandled error presumed) -- releasing claim for retry.`,
-          });
-          releasePostProductForRun(state, String(r.productKey || "").toLowerCase(), r.groupUrl || "");
-          logEvent("admin_approval_stale_self_healed", { key, planId: r.planId, sequence: r.sequence, ageMin: Math.round((Date.now() - at) / 60000) });
-          summary.healed += 1;
+          // SAME wrong-key blind spot this loop's sibling below closes (2026-07-06 review fix): a comment-stage
+          // re-approval retry for an ALREADY-published post reuses this row's key too (see approvalMayHelp) --
+          // without this check, a crash during that later retry would make this loop release a still-live
+          // post's claim, letting the plan-builder duplicate-post it.
+          if (__everPublished(key)) {
+            appendFacebookLivePostLedger({
+              event: "admin_approval_started_stale_ignored_already_published",
+              key, planId: r.planId, sequence: r.sequence, profileId: r.profileId,
+              profile: r.profile || "", groupUrl: r.groupUrl || "", postUrl: r.postUrl || "",
+              status: "ignored_already_published",
+              message: `Self-heal: no resolution ${Math.round((Date.now() - at) / 60000)}min after backgrounding (process restart or unhandled error presumed); this post already published earlier, so NO claim is released.`,
+            });
+            logEvent("admin_approval_started_stale_ignored_published", { key, planId: r.planId, sequence: r.sequence, ageMin: Math.round((Date.now() - at) / 60000) });
+            summary.ignoredPublished += 1;
+          } else {
+            appendFacebookLivePostLedger({
+              event: "admin_approval_background_gave_up",
+              key, planId: r.planId, sequence: r.sequence, profileId: r.profileId,
+              profile: r.profile || "", groupUrl: r.groupUrl || "", postUrl: r.postUrl || "",
+              status: "abandoned",
+              message: `Self-heal: no resolution ${Math.round((Date.now() - at) / 60000)}min after backgrounding (process restart or unhandled error presumed) -- releasing claim for retry.`,
+            });
+            releasePostProductForRun(state, String(r.productKey || "").toLowerCase(), r.groupUrl || "");
+            logEvent("admin_approval_stale_self_healed", { key, planId: r.planId, sequence: r.sequence, ageMin: Math.round((Date.now() - at) / 60000) });
+            summary.healed += 1;
+          }
         } catch (err) {
           logEvent("admin_approval_stale_self_heal_error", { key, error: oneLineField((err && err.message) || String(err), 200) });
           summary.errors += 1;
@@ -13300,13 +13350,7 @@ async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
         summary.checked += 1;
         try {
           const ageMin = Math.round((Date.now() - at) / 60000);
-          // BOUNDED-WINDOW BLIND SPOT (2026-07-06 review fix): publishedKeys above only covers the same 8000-
-          // line (~21.6h) window as the rest of this sweep. A comment-stage re-approval retry (approvalMayHelp)
-          // can fire hours after the original publish, so a crash during THAT retry could leave this exact key
-          // looking "never published" if its original publish row has since scrolled out of the bounded window.
-          // Do one cheap, TARGETED unbounded check per rare stale candidate before ever releasing.
-          const everPublished = publishedKeys.has(key) || __keyEverPublished(key);
-          if (everPublished) {
+          if (__everPublished(key)) {
             // This key ALREADY published earlier -- a comment-stage retry re-triggered admin approval on the
             // live permalink (e.g. the approvalMayHelp fallback). The product+group is legitimately used;
             // releasing its claim here would let the plan-builder re-pick and RE-POST it as a live duplicate.
@@ -13631,13 +13675,20 @@ function facebookCommentProfileStatusForGroup(profileId, groupUrl, corroboration
   if (!latest) return { hasSuccess: false, hasRecentFailure: false, latest: null };
   // Same corroboration signal commentCooldownBenchedSet uses (2026-07-06): this per-profile scan can't see
   // OTHER profiles' rows, so a caller with a per-group scan (commentAccessCorroborationForGroup) passes it in.
-  // Callers that omit it keep prior behavior exactly (corroboratedPostStateIssue stays false).
-  const postUrl = String(latest.postUrl || "");
-  const corroboratedPostStateIssue = Boolean(
-    corroboration && postUrl &&
-    (corroboration.failuresByPostUrl?.get(postUrl)?.size || 0) > 1 &&
-    !corroboration.successByPostUrl?.has(postUrl)
-  );
+  // Callers that omit it keep prior behavior exactly (corroboratedPostStateIssue stays false). Requires
+  // >=commentCorroborationMinProfiles distinct profiles (default 3, not a bare 2) spread across
+  // >=commentCorroborationMinSpreadMinutes (default 30min) -- see commentCooldownBenchedSet's matching comment
+  // for why a bare ">1, no time check" bar was too easy for 2 correlated-broken profiles to satisfy.
+  const postUrl = commentCorroborationPostUrlKey(latest.postUrl);
+  let corroboratedPostStateIssue = false;
+  if (corroboration && postUrl && !corroboration.successByPostUrl?.has(postUrl)) {
+    const m = corroboration.failuresByPostUrl?.get(postUrl);
+    if (m && m.size >= clampNumber(readState().operator?.commentCorroborationMinProfiles, 2, 20, 3)) {
+      const times = [...m.values()];
+      const spreadMs = Math.max(...times) - Math.min(...times);
+      corroboratedPostStateIssue = spreadMs >= clampNumber(readState().operator?.commentCorroborationMinSpreadMinutes, 0, 720, 30) * 60 * 1000;
+    }
+  }
   const isTransientFailure = isTransientCommentProfileFailure(latest.validation || {}, { corroboratedPostStateIssue });
   const hasRecentFailure = !hasSuccess && !isTransientFailure && (latest.validation?.errors || []).some((error) => {
     const text = String(error || "").toLowerCase();
@@ -13647,9 +13698,10 @@ function facebookCommentProfileStatusForGroup(profileId, groupUrl, corroboration
 }
 
 // Shared by commentCooldownBenchedSet + facebookCommentProfileStatusForGroup (2026-07-06): one ledger scan per
-// group producing, per exact postUrl, the Set of profileIds that hit comment_profile_cannot_access_post_permalink
-// and whether anyone ever landed a verified comment on it (within the SAME cooldown window as the bench check
-// itself). Compute ONCE per pool-build and pass down instead of re-scanning per candidate.
+// group producing, per exact postUrl, the Map(profileId -> firstFailAt) of profiles that hit comment_profile_
+// cannot_access_post_permalink and whether anyone ever landed a verified comment on it (within the SAME
+// cooldown window as the bench check itself). Compute ONCE per pool-build and pass down instead of re-scanning
+// per candidate.
 function commentAccessCorroborationForGroup(groupUrl, state = readState()) {
   const failuresByPostUrl = new Map();
   const successByPostUrl = new Set();
@@ -13665,13 +13717,14 @@ function commentAccessCorroborationForGroup(groupUrl, state = readState()) {
     if (k !== groupKey) continue;
     const at = Date.parse(item.at || "");
     if (!Number.isFinite(at) || at < cutoff) continue;
-    const postUrl = String(item.postUrl || "");
+    const postUrl = commentCorroborationPostUrlKey(item.postUrl);
     if (!postUrl) continue;
     const succeeded = ["published", "published_with_warning"].includes(String(item.status || "")) && item.validation?.commentVerified !== false;
     if (succeeded) { successByPostUrl.add(postUrl); continue; }
     if ((item.validation?.errors || []).some((e) => String(e || "").toLowerCase() === "comment_profile_cannot_access_post_permalink")) {
-      if (!failuresByPostUrl.has(postUrl)) failuresByPostUrl.set(postUrl, new Set());
-      failuresByPostUrl.get(postUrl).add(pid);
+      if (!failuresByPostUrl.has(postUrl)) failuresByPostUrl.set(postUrl, new Map());
+      const m = failuresByPostUrl.get(postUrl);
+      if (!m.has(pid)) m.set(pid, at);
     }
   }
   return { failuresByPostUrl, successByPostUrl };
@@ -13712,16 +13765,26 @@ function commentCooldownBenchedSet(groupUrl, state = readState()) {
   // another probeMs cycle, still hard-capped at windowMs total from when the failure STREAK began (see
   // streakStartAt below) so a profile that keeps failing every 4h can never dodge the full-expiry cap forever.
   const probeMs = clampNumber(state.operator?.commentCooldownProbeHours, 1, 48, 4) * 60 * 60 * 1000;
-  const cutoff = Date.now() - windowMs;
-  const rowsByPid = new Map(); // pid -> [{at, item}] within window, this group, in read (chronological) order
-  // POST-LEVEL CORROBORATION (2026-07-05, task: 26-profile false-bench wave audit). A post still pending
+  const minCorroborationProfiles = clampNumber(state.operator?.commentCorroborationMinProfiles, 2, 20, 3);
+  const minCorroborationSpreadMs = clampNumber(state.operator?.commentCorroborationMinSpreadMinutes, 0, 720, 30) * 60 * 1000;
+  const cutoff = Date.now() - windowMs; // corroboration Maps stay scoped to this -- "recent" agreement only
+  // WIDER cutoff for the streak-walk only (2026-07-06 review fix): using the SAME cutoff as windowMs made
+  // `now - streakStartAt >= windowMs` self-referentially unreachable -- any row admitted into rowsByPid already
+  // satisfied at>=cutoff=(now-windowMs), so streakStartAt could never be more than windowMs old in the first
+  // place except by a sub-millisecond timing coincidence. 2x windowMs lets the backward walk actually see (and
+  // correctly hard-expire) a streak that began before the cooldown window.
+  const streakCutoff = Date.now() - (windowMs * 2);
+  const rowsByPid = new Map(); // pid -> [{at, item}] within the WIDER streak window, this group, chronological
+  // POST-LEVEL CORROBORATION (2026-07-05/06, task: 26-profile false-bench wave audit). A post still pending
   // moderator approval (or otherwise not yet publicly visible) fails comment_profile_cannot_access_post_permalink
   // IDENTICALLY for every different profile that tries it -- that's evidence against the POST, not any one
   // commenter. Built in the SAME pass as rowsByPid below (same rows, same window, same group filter -- no extra
   // ledger read). Confirmed live 2026-07-05/06 (runId 1783304427100): one postUrl alone failed identically for
-  // 8 distinct profiles across 3.5h with zero successes.
-  const cannotAccessProfilesByPostUrl = new Map(); // postUrl -> Set(profileId) that hit the exact token, within window
-  const anySuccessByPostUrl = new Set(); // postUrl that had >=1 verified comment within window
+  // 8 distinct profiles across 3.5h with zero successes -- the >=3-profiles/>=30min-spread bar below requires
+  // genuine slow-building agreement like that real case, not a same-sweep burst from 2 correlated-broken
+  // profiles (e.g. sharing a dead proxy), which could otherwise mutually exonerate each other.
+  const cannotAccessProfilesByPostUrl = new Map(); // postUrl -> Map(profileId -> firstFailAt), within the corroboration window
+  const anySuccessByPostUrl = new Set(); // postUrl (canonical) that had >=1 verified comment within window
   // SWARM FIX #5: cover the FULL bench window. The old 5000-line read spanned only ~1.1 days of the 34k-line
   // ledger, so a comment FAILURE inside the bench window had scrolled past line 5000 -> rowsByPid never saw it
   // -> a known-bad commenter was un-benched early. Built ONCE per pool-build, and cheap now that
@@ -13733,22 +13796,31 @@ function commentCooldownBenchedSet(groupUrl, state = readState()) {
     const k = normalizedFacebookGroupKey(item.actualGroupUrl || item.groupUrl || facebookGroupUrlFromPostUrl(item.postUrl));
     if (k !== groupKey) continue;
     const at = Date.parse(item.at || "");
-    if (!Number.isFinite(at) || at < cutoff) continue; // outside window -> cooled down already
+    if (!Number.isFinite(at) || at < streakCutoff) continue; // outside the WIDER window -> definitely cooled down already
     if (!rowsByPid.has(pid)) rowsByPid.set(pid, []);
     rowsByPid.get(pid).push({ at, item });
-    const postUrl = String(item.postUrl || "");
+    if (at < cutoff) continue; // outside the (narrower) corroboration window -> don't count toward the signal
+    const postUrl = commentCorroborationPostUrlKey(item.postUrl);
     if (postUrl) {
       const rowSucceeded = ["published", "published_with_warning"].includes(String(item.status || "")) && item.validation?.commentVerified !== false;
       if (rowSucceeded) {
         anySuccessByPostUrl.add(postUrl);
       } else if ((item.validation?.errors || []).some((e) => String(e || "").toLowerCase() === "comment_profile_cannot_access_post_permalink")) {
-        if (!cannotAccessProfilesByPostUrl.has(postUrl)) cannotAccessProfilesByPostUrl.set(postUrl, new Set());
-        cannotAccessProfilesByPostUrl.get(postUrl).add(pid);
+        if (!cannotAccessProfilesByPostUrl.has(postUrl)) cannotAccessProfilesByPostUrl.set(postUrl, new Map());
+        const m = cannotAccessProfilesByPostUrl.get(postUrl);
+        if (!m.has(pid)) m.set(pid, at); // first-fail time per profile only
       }
     }
   }
   const now = Date.now();
   const __isSucceeded = (r) => ["published", "published_with_warning"].includes(String(r.item.status || "")) && r.item.validation?.commentVerified !== false;
+  const __isCorroborated = (postUrl) => {
+    if (!postUrl || anySuccessByPostUrl.has(postUrl)) return false;
+    const m = cannotAccessProfilesByPostUrl.get(postUrl);
+    if (!m || m.size < minCorroborationProfiles) return false;
+    const times = [...m.values()];
+    return (Math.max(...times) - Math.min(...times)) >= minCorroborationSpreadMs;
+  };
   for (const [pid, rows] of rowsByPid.entries()) {
     rows.sort((a, b) => a.at - b.at); // chronological, oldest first
     const latest = rows[rows.length - 1];
@@ -13763,14 +13835,15 @@ function commentCooldownBenchedSet(groupUrl, state = readState()) {
       streakStartAt = rows[i].at;
     }
     if (now - streakStartAt >= windowMs) continue; // full cooldown elapsed since the streak began -> not benched
-    const postUrl = String(latest.item.postUrl || "");
-    // Require >=1 OTHER distinct profile (not just this one) to have hit the identical wall on the identical
-    // post, AND nobody to have ever gotten through on it. A profile that is the ONLY one who ever failed on a
-    // given post, or a post someone else later succeeded on, still benches exactly as before -- this does NOT
-    // weaken detection of a genuinely-restricted commenter (the operator's two prior mass-false-park incidents).
-    const corroborated = postUrl
-      && (cannotAccessProfilesByPostUrl.get(postUrl)?.size || 0) > 1
-      && !anySuccessByPostUrl.has(postUrl);
+    const postUrl = commentCorroborationPostUrlKey(latest.item.postUrl);
+    // Require >=minCorroborationProfiles DISTINCT profiles (default 3, not a bare 2) to have hit the identical
+    // wall on the identical post, spread across >=minCorroborationSpreadMinutes (default 30min) of real
+    // wall-clock time, AND nobody to have ever gotten through on it. A profile that is the ONLY one who ever
+    // failed on a given post, or a post someone else later succeeded on, or a same-sweep burst from just 2
+    // profiles, still benches exactly as before -- this does NOT weaken detection of a genuinely-restricted
+    // commenter (the operator's two prior mass-false-park incidents), nor does it let 2 correlated-broken
+    // profiles mutually exonerate each other in one pass.
+    const corroborated = __isCorroborated(postUrl);
     if (isTransientCommentProfileFailure(latest.item.validation || {}, { corroboratedPostStateIssue: corroborated })) continue; // transient, not an account issue
     benched.add(pid); // real comment failure within the cooldown window
   }
@@ -19531,7 +19604,12 @@ function currentlyBlockedProfilesSummary(state = readState()) {
 function commentCooldownProfilesSummary(state = readState()) {
   const windowMs = clampNumber(state.operator?.commentCooldownHours, 1, 720, 24) * 60 * 60 * 1000;
   const probeMs = clampNumber(state.operator?.commentCooldownProbeHours, 1, 48, 4) * 60 * 60 * 1000;
-  const cutoff = Date.now() - windowMs;
+  const minCorroborationProfiles = clampNumber(state.operator?.commentCorroborationMinProfiles, 2, 20, 3);
+  const minCorroborationSpreadMs = clampNumber(state.operator?.commentCorroborationMinSpreadMinutes, 0, 720, 30) * 60 * 1000;
+  const cutoff = Date.now() - windowMs; // corroboration Maps stay scoped to this
+  // WIDER cutoff for the streak-walk only (2026-07-06 review fix) -- see commentCooldownBenchedSet's matching
+  // comment: using the SAME cutoff as windowMs made the hard-expiry check self-referentially unreachable.
+  const streakCutoff = Date.now() - (windowMs * 2);
   const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 20000 }); // SWARM FIX #5: cover the full cooldown window (cheap with the ledger cache); 5000 lines spanned only ~1.1 days
   const rowsByPid = new Map();
   const cannotAccessProfilesByPostUrl = new Map();
@@ -19541,22 +19619,31 @@ function commentCooldownProfilesSummary(state = readState()) {
     const pid = Number(item.profileId || 0);
     if (!pid) continue;
     const at = Date.parse(item.at || "");
-    if (!Number.isFinite(at) || at < cutoff) continue;
+    if (!Number.isFinite(at) || at < streakCutoff) continue;
     if (!rowsByPid.has(pid)) rowsByPid.set(pid, []);
     rowsByPid.get(pid).push({ at, item });
-    const postUrl = String(item.postUrl || "");
+    if (at < cutoff) continue; // outside the (narrower) corroboration window
+    const postUrl = commentCorroborationPostUrlKey(item.postUrl);
     if (postUrl) {
       const rowSucceeded = ["published", "published_with_warning"].includes(String(item.status || "")) && item.validation?.commentVerified !== false;
       if (rowSucceeded) {
         anySuccessByPostUrl.add(postUrl);
       } else if ((item.validation?.errors || []).some((e) => String(e || "").toLowerCase() === "comment_profile_cannot_access_post_permalink")) {
-        if (!cannotAccessProfilesByPostUrl.has(postUrl)) cannotAccessProfilesByPostUrl.set(postUrl, new Set());
-        cannotAccessProfilesByPostUrl.get(postUrl).add(pid);
+        if (!cannotAccessProfilesByPostUrl.has(postUrl)) cannotAccessProfilesByPostUrl.set(postUrl, new Map());
+        const m = cannotAccessProfilesByPostUrl.get(postUrl);
+        if (!m.has(pid)) m.set(pid, at);
       }
     }
   }
   const now = Date.now();
   const __isSucceeded = (r) => ["published", "published_with_warning"].includes(String(r.item.status || "")) && r.item.validation?.commentVerified !== false;
+  const __isCorroborated = (postUrl) => {
+    if (!postUrl || anySuccessByPostUrl.has(postUrl)) return false;
+    const m = cannotAccessProfilesByPostUrl.get(postUrl);
+    if (!m || m.size < minCorroborationProfiles) return false;
+    const times = [...m.values()];
+    return (Math.max(...times) - Math.min(...times)) >= minCorroborationSpreadMs;
+  };
   const out = [];
   for (const [pid, entries] of rowsByPid.entries()) {
     entries.sort((a, b) => a.at - b.at);
@@ -19569,10 +19656,8 @@ function commentCooldownProfilesSummary(state = readState()) {
       streakStartAt = entries[i].at;
     }
     if (now - streakStartAt >= windowMs) continue; // full cooldown elapsed since the streak began
-    const postUrl = String(latest.item.postUrl || "");
-    const corroborated = postUrl
-      && (cannotAccessProfilesByPostUrl.get(postUrl)?.size || 0) > 1
-      && !anySuccessByPostUrl.has(postUrl);
+    const postUrl = commentCorroborationPostUrlKey(latest.item.postUrl);
+    const corroborated = __isCorroborated(postUrl);
     if (isTransientCommentProfileFailure(latest.item.validation || {}, { corroboratedPostStateIssue: corroborated })) continue;
     const item = latest.item;
     const at = latest.at;
