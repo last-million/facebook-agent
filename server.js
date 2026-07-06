@@ -64,6 +64,25 @@ const MAX_BG_COMMENT_IN_FLIGHT = 5; // past this, fall back to inline await so t
 // backgrounding was introduced. Keyed by ledgerKey (the plan row's own stable identity) and checked/set in the
 // single shared wrapper below, so EVERY call site is protected uniformly with no per-call-site change needed.
 const __approvalInFlightKeys = new Set();
+// FULL-LEG liveness tracker for the backgrounded pre-publish-approval task (2026-07-05 review fix): spans
+// from the moment the "post_captured_awaiting_admin_approval" ledger row is written until the backgrounded
+// IIFE's own finally, covering BOTH the admin-approval sub-call AND the subsequent comment stage -- unlike
+// __approvalInFlightKeys (only set around approvePendingFacebookPostWithAdminProfiles). The stale-approval
+// self-heal sweep (selfHealStaleBackgroundedApprovalsAsync) must consult this before declaring a row dead --
+// ledger-row AGE alone can't distinguish a crashed task from one that is merely slow (e.g. an IXBrowser
+// desktop-recovery wait, not charged against the approval's own wall-clock budget), and sweeping a merely-slow
+// (still-alive) task's row would free its claim while the real task can still independently succeed later --
+// a genuine duplicate live post.
+const __bgApprovalLegInFlightKeys = new Set();
+// RUN-LIMIT OVERSHOOT GUARD (2026-07-05 review fix): the durable autopilotPostsThisRun counter is only bumped
+// inside completeVerifiedFacebookPostWithComment, which for a backgrounded pre-publish approval doesn't run
+// until the approval leg resolves (minutes later). Without this, the run-limit gate would keep dispatching new
+// posts during that window since it only sees the durable (too-low) counter. This ephemeral, in-memory-only
+// counter tracks backgrounded run-posts that have been CAPTURED (a real FB submission exists) but not yet
+// durably counted, so the run-limit checks can treat them as already-spent budget. Reset to 0 on every process
+// restart, which is correct: any promise it was tracking died with the process, and the separate publish_intent
+// crash-reconcile mechanism (untouched by this) re-establishes truth for those specific posts after a restart.
+let __bgPreApprovalRunPostsPending = 0;
 // IN-MEMORY authoritative verified-comment index (DOUBLE-COMMENT GUARD, 2026-06-25): the single ledger append can be
 // EBUSY-dropped under parallel posting (forensic: a dropped comment_recovery_finished proof makes a COMMENTED post
 // LOOK uncommented -> the drain re-opens + re-comments it = a duplicate money-comment; the operator confirmed 25). This
@@ -10044,7 +10063,10 @@ function autopilotMayPostNow() {
   // probes) but make no new opens. This replaces the old behaviour of churning every profile against 1018 for hours.
   if (ixOpenQuotaLatchedUntil(s) > Date.now()) return { ok: false, reason: "ix_open_cap_reached" };
   const lim = autopilotRunLimit(s);
-  if (lim > 0 && autopilotPostsThisRunCount(s) >= lim) return { ok: false, reason: "run_limit_reached" };
+  // + __bgPreApprovalRunPostsPending (review fix): a backgrounded pre-publish-approval post has a REAL FB
+  // submission already captured but its durable counter bump is delayed until approval resolves (minutes) --
+  // count it as already-spent run budget now, so backgrounding can't let a count-limited run overshoot N.
+  if (lim > 0 && (autopilotPostsThisRunCount(s) + __bgPreApprovalRunPostsPending) >= lim) return { ok: false, reason: "run_limit_reached" };
   return { ok: true };
 }
 // One autopilot cycle. SAFE BY DEFAULT: with operator.autopilotDryRun !== false
@@ -10103,6 +10125,15 @@ async function autopilotTickAsync(options = {}) {
     if (!dryRun && state.operator?.armedForExternalActions
         && !__reconcileIntentsInFlight && (Date.now() - __lastIntentReconcileAt) > 300000) {
       reconcilePendingPublishIntentsAsync({ max: 3 }).catch(() => {});
+    }
+    // STALE BACKGROUNDED-APPROVAL SELF-HEAL (2026-07-05 review fix): a "post_captured_awaiting_admin_approval"
+    // row whose backgrounded task died (process crash/restart) would otherwise stay pending FOREVER — nothing
+    // else ever resolves it. Find rows older than a safe bound with no resolving row, mark them abandoned, and
+    // release their claim so the product+group can be retried. Fire-and-forget, single-flight, armed-gated,
+    // throttled to once / 5 min.
+    if (!dryRun && state.operator?.armedForExternalActions
+        && !__staleApprovalSelfHealInFlight && (Date.now() - __lastStaleApprovalSelfHealAt) > 300000) {
+      selfHealStaleBackgroundedApprovalsAsync({}).catch(() => {});
     }
     // PROACTIVE PROFILE CLEANUP: close profiles that finished their work so they can't pile up and choke the
     // ixBrowser desktop (the overnight freeze). Fire-and-forget, single-flight, throttled ~2 min. Closing only;
@@ -10312,7 +10343,8 @@ async function autopilotTickAsync(options = {}) {
     // to 2/0. Clamping to the remaining run allowance makes the balance correct BEFORE the trim (which then
     // no-ops). runLimit=0 (unlimited) keeps the old machine-cap behavior.
     const __runLimitForBatch = autopilotRunLimit(state);
-    const __runRemainingForBatch = __runLimitForBatch > 0 ? Math.max(0, __runLimitForBatch - autopilotPostsThisRunCount(readState())) : Infinity;
+    // + __bgPreApprovalRunPostsPending (review fix): see autopilotMayPostNow's matching comment.
+    const __runRemainingForBatch = __runLimitForBatch > 0 ? Math.max(0, __runLimitForBatch - autopilotPostsThisRunCount(readState()) - __bgPreApprovalRunPostsPending) : Infinity;
     const __batchCap = Math.max(1, Math.min(maxWorkers, __runRemainingForBatch));
     const __perGroupCap = Math.max(1, Math.ceil(__batchCap / Math.max(1, __readyGroupKeys.length)));
     const __pickedByGroup = new Map();
@@ -10366,7 +10398,11 @@ async function autopilotTickAsync(options = {}) {
     {
       const lim = autopilotRunLimit(state);
       if (lim > 0) {
-        const already = autopilotPostsThisRunCount(readState());
+        // + __bgPreApprovalRunPostsPending (review fix): see autopilotMayPostNow's matching comment. Trades a
+        // rare, narrow undershoot (if a pending post ultimately gives up) for never letting a count-limited run
+        // overshoot N -- the give-up path already releases its claim so a genuinely short run can still be
+        // topped up manually if the operator notices.
+        const already = autopilotPostsThisRunCount(readState()) + __bgPreApprovalRunPostsPending;
         const remaining = Math.max(0, lim - already);
         if (picked.length > remaining) {
           // CLUSTER-AWARE TRIM (operator 2026-06-30: never split a product across groups): if the cut would land in
@@ -11676,6 +11712,11 @@ function latestSubmittedUrlMissingFacebookLivePostForRow(row = {}, profileId = "
     }
     const event = String(item.event || "");
     const status = String(item.status || "");
+    // SUPERSEDED BY A NEWER PENDING-BACKGROUND-APPROVAL ROW (2026-07-05 review fix): a later attempt for this
+    // exact key already captured a real post and is mid-flight in backgrounded admin approval (see
+    // latestPendingAdminApprovalFacebookLivePostForRow below). Stop here so an OLDER submitted_url_missing row
+    // underneath it can never resurface and trigger a stale/wrong-state recovery attempt.
+    if (event === "post_captured_awaiting_admin_approval") return null;
     if (status === "submitted_url_missing" || /^submitted_url_missing/.test(event)) {
       return {
         ...item,
@@ -11699,7 +11740,8 @@ function latestPendingAdminApprovalFacebookLivePostForRow(row = {}, profileId = 
     const item = rows[index];
     if (!item || item.key !== key) continue;
     if (item.postUrl && ["published", "published_with_warning", "published_verification_failed"].includes(String(item.status || ""))) return null;
-    if (String(item.event || "") === "submitted_url_missing" || /^submitted_url_missing/.test(String(item.event || ""))) return null;
+    // true parity with the sibling function above: check status (exact) OR event (prefix), not event twice.
+    if (String(item.status || "") === "submitted_url_missing" || /^submitted_url_missing/.test(String(item.event || ""))) return null;
     const event = String(item.event || "");
     if (event === "post_captured_awaiting_admin_approval") {
       return { ...item, actualGroupUrl: item.actualGroupUrl || item.groupUrl || "" };
@@ -13032,6 +13074,8 @@ function reconcileScanWasInconclusive(rec) {
 let __reconcileIntentsInFlight = null;
 let __lastIntentReconcileAt = 0;
 const __intentScanAttempts = new Map(); // intentId -> consecutive not-found/inconclusive scans (in-memory; reset on restart = a few extra safe scans)
+let __staleApprovalSelfHealInFlight = null;
+let __lastStaleApprovalSelfHealAt = 0;
 async function reconcilePendingPublishIntentsAsync(options = {}) {
   if (__reconcileIntentsInFlight) return __reconcileIntentsInFlight;
   __reconcileIntentsInFlight = (async () => {
@@ -13158,6 +13202,64 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
     return summary;
   })();
   try { return await __reconcileIntentsInFlight; } finally { __reconcileIntentsInFlight = null; }
+}
+
+// STALE BACKGROUNDED-APPROVAL SELF-HEAL (2026-07-05, review fix for the pre-publish-approval-backgrounding
+// patch): a "post_captured_awaiting_admin_approval" ledger row is written right before the backgrounded task
+// starts (see runLiveFacebookPostFromPlan's __bgPreApprovalEligible branch). If the process crashes/restarts
+// (or the task throws before writing its own resolving row) while that task is mid-flight, nothing else in
+// this codebase ever resolves it -- resweepUncommentedFacebookPostsAsync only looks at published* rows, and
+// reconcilePendingPublishIntentsAsync tracks a completely separate publish_intent pair that already resolved
+// the instant runLiveFacebookPostFromPlan returned (before backgrounding even started). Left alone, the row
+// (and its file-based product+group claim) would be stranded FOREVER. This sweep finds rows stuck past a safe
+// bound with no later resolving event and writes a synthetic give-up + releases the claim, exactly like a
+// genuine give-up already does.
+async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
+  if (__staleApprovalSelfHealInFlight) return __staleApprovalSelfHealInFlight;
+  __staleApprovalSelfHealInFlight = (async () => {
+    const summary = { checked: 0, healed: 0, errors: 0 };
+    try {
+      const state = readState();
+      // 20min default: comfortably above the real observed max approval-session duration (~10.3min per the
+      // MAX_ADMIN_APPROVAL_WALL_CLOCK_MS budget comment) plus the comment-retry tail on top.
+      const staleMs = clampNumber(options.staleMinutes, 15, 180, 20) * 60 * 1000;
+      const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 8000 });
+      const latestByKey = new Map();
+      for (const r of rows) { if (r && r.key) latestByKey.set(String(r.key), r); } // append-only ledger -> last write per key wins
+      for (const [key, r] of latestByKey) {
+        if (String(r.event || "") !== "post_captured_awaiting_admin_approval") continue;
+        // Genuinely still running in THIS process (merely slow, e.g. an IXBrowser desktop-recovery wait) --
+        // NOT dead. Only a crashed/restarted process (this Set reset to empty) or an already-finished task
+        // reaches the age check below.
+        if (__bgApprovalLegInFlightKeys.has(key)) continue;
+        const at = Date.parse(r.at || "") || 0;
+        if (!at || (Date.now() - at) < staleMs) continue;
+        summary.checked += 1;
+        try {
+          appendFacebookLivePostLedger({
+            event: "admin_approval_background_gave_up",
+            key, planId: r.planId, sequence: r.sequence, profileId: r.profileId,
+            profile: r.profile || "", groupUrl: r.groupUrl || "", postUrl: r.postUrl || "",
+            status: "abandoned",
+            message: `Self-heal: no resolution ${Math.round((Date.now() - at) / 60000)}min after backgrounding (process restart or unhandled error presumed) -- releasing claim for retry.`,
+          });
+          releasePostProductForRun(state, String(r.productKey || "").toLowerCase(), r.groupUrl || "");
+          logEvent("admin_approval_stale_self_healed", { key, planId: r.planId, sequence: r.sequence, ageMin: Math.round((Date.now() - at) / 60000) });
+          summary.healed += 1;
+        } catch (err) {
+          logEvent("admin_approval_stale_self_heal_error", { key, error: oneLineField((err && err.message) || String(err), 200) });
+          summary.errors += 1;
+        }
+      }
+      if (summary.healed) logEvent("admin_approval_stale_self_heal_finished", summary);
+    } catch (err) {
+      logEvent("admin_approval_stale_self_heal_fatal", { error: oneLineField((err && err.message) || String(err), 200) });
+    } finally {
+      __lastStaleApprovalSelfHealAt = Date.now();
+    }
+    return summary;
+  })();
+  try { return await __staleApprovalSelfHealInFlight; } finally { __staleApprovalSelfHealInFlight = null; }
 }
 
 function livePostingBatchesByUniqueProfile(rows, maxConcurrentProfiles) {
@@ -17113,6 +17215,11 @@ async function runLiveFacebookPostFromPlan(body = {}) {
     // On REUSE the session already holds the per-profile lock; do NOT re-acquire (would 409 "profile busy").
     const releaseProfileUse = __reuse ? (() => {}) : acquireNormalIxProfileUse(ready.profileId, "facebook_live_post");
     let __keepProfileOpenAfter = false;
+    // KEEP-OPEN OWNERSHIP HANDOFF (2026-07-05 review fix): when the pre-publish approval backgrounds, this
+    // function returns (and the loop's finally below runs) long before the real approval+comment leg finishes.
+    // Set true so that finally SKIPS clearing inUse -- the backgrounded task's own finally clears it instead,
+    // once the leg genuinely completes, preserving the documented "inUse stays true for the whole leg" invariant.
+    let __bgHoldsKeepOpenSession = false;
     let scriptResult = null;
     try {
       let preOpenClose = null;
@@ -17259,17 +17366,35 @@ async function runLiveFacebookPostFromPlan(body = {}) {
               profile: row.profile || "",
               groupUrl,
               postUrl,
+              productKey: String(row.productKey || row.productUrl || row.link || ""),
               status: "pending",
               message: "Post click captured; moderator approval running in background so posting stays continuous.",
             });
             __bgCommentInFlight += 1;
+            __bgPreApprovalRunPostsPending += 1; // reserved run-limit budget until the durable counter bump lands (see completeVerifiedFacebookPostWithComment)
             const __bgClose = [];
             const __bgScriptResult = scriptResult;
             const __bgValidationStart = validation;
+            // KEEP-OPEN HANDOFF (review fix): this task, not the outer loop's finally, now owns clearing inUse
+            // once the real leg finishes -- keeps the 1s reaper + same-profile reuse from touching this session
+            // for the full approval+comment duration, matching the pre-backgrounding (inline) timing exactly.
+            if (__keepProfileOpenAfter) __bgHoldsKeepOpenSession = true;
+            const __bgKeptProfileId = ready.profileId;
+            const __bgKeptEndpoint = __keepProfileOpenAfter ? (__keepOpenSession.get(ready.profileId) || {}).endpoint || null : null;
             (async () => {
+              __bgApprovalLegInFlightKeys.add(ledgerKey);
               let __bgApprovalResult = null;
               let __bgFinalPostUrl = postUrl;
               let __bgValidation = __bgValidationStart;
+              let __bgOuterSlotReleased = false; // released as soon as the approval leg itself is done, before completeVerifiedFacebookPostWithComment does its OWN __bgCommentInFlight check -- holding it longer double-counts this one post across two slots
+              let __bgRunPendingReleased = false;
+              const __releaseBgOuterSlot = () => { if (!__bgOuterSlotReleased) { __bgOuterSlotReleased = true; __bgCommentInFlight = Math.max(0, __bgCommentInFlight - 1); } };
+              const __releaseBgRunPending = () => { if (!__bgRunPendingReleased) { __bgRunPendingReleased = true; __bgPreApprovalRunPostsPending = Math.max(0, __bgPreApprovalRunPostsPending - 1); } };
+              const __releaseBgKeepOpen = () => {
+                if (!__bgHoldsKeepOpenSession) return;
+                const __heldSessBg = __keepOpenSession.get(__bgKeptProfileId);
+                if (__heldSessBg && (!__bgKeptEndpoint || __heldSessBg.endpoint === __bgKeptEndpoint)) __heldSessBg.inUse = false;
+              };
               try {
                 __bgApprovalResult = await approvePendingFacebookPostWithAdminProfiles({
                   row,
@@ -17280,6 +17405,11 @@ async function runLiveFacebookPostFromPlan(body = {}) {
                   closeResults: __bgClose,
                   reason: "A permalink candidate exists but the post is not fully verified; checking whether admin approval is required.",
                 });
+                // The approval leg is genuinely finished here -- release this slot NOW instead of holding it
+                // through completeVerifiedFacebookPostWithComment, which does its OWN __bgCommentInFlight
+                // eligibility check/increment for the comment-stage task (review fix: was transiently
+                // double-counting this single post across 2 of the 5 shared slots).
+                __releaseBgOuterSlot();
                 if ((__bgApprovalResult?.ok || __bgApprovalResult?.approvalClicked) && __bgApprovalResult.postUrl) {
                   __bgFinalPostUrl = __bgApprovalResult.postUrl;
                   __bgValidation = __bgApprovalResult.validation;
@@ -17297,6 +17427,13 @@ async function runLiveFacebookPostFromPlan(body = {}) {
                     profile: row.profile || "", groupUrl, postUrl: __bgFinalPostUrl, status: "abandoned",
                     message: `Backgrounded pre-publish admin approval did not succeed: ${(__bgValidation.errors || []).join(", ") || "unknown_verification_error"}`,
                   });
+                  // FREE THE CLAIM (review fix): a give-up is a routine outcome (moderator budget exhausted /
+                  // no eligible admin profile), not a crash -- release this product+group so it can be picked
+                  // and retried within the same run, exactly like the pre-backgrounding inline path already did.
+                  try {
+                    releasePostProductForRun(readState(), String(row.productKey || row.productUrl || row.link || "").toLowerCase(), groupUrl);
+                  } catch (_) {}
+                  __releaseBgRunPending();
                   return;
                 }
                 await completeVerifiedFacebookPostWithComment({
@@ -17308,8 +17445,14 @@ async function runLiveFacebookPostFromPlan(body = {}) {
                 });
               } catch (e) {
                 try { logEvent("facebook_post_preapproval_backgrounded_error", { postUrl, groupUrl, error: oneLineField((e && e.message) || String(e), 200) }); } catch (_) {}
+                // Leave the claim HELD on a genuine exception (real FB state unknown) -- the periodic self-heal
+                // sweep (selfHealStaleBackgroundedApprovalsAsync) resolves + releases it after a bounded timeout
+                // regardless of cause, so this never strands the row/claim permanently.
               } finally {
-                __bgCommentInFlight = Math.max(0, __bgCommentInFlight - 1);
+                __releaseBgOuterSlot();
+                __releaseBgRunPending();
+                __releaseBgKeepOpen();
+                __bgApprovalLegInFlightKeys.delete(ledgerKey);
               }
             })();
             return {
@@ -17996,8 +18139,13 @@ async function runLiveFacebookPostFromPlan(body = {}) {
         // KEEP-OPEN: the session owns the window + the per-profile lock — do NOT close or release here. It is reaped
         // after KEEP_OPEN_MAX_POSTS / KEEP_OPEN_MAX_MS (closeStaleKeepOpenSessions) or on stop (closeAllKeepOpenSessions).
         // Clear inUse now that this post is done so the next reuse/reaper sees an idle (reapable) session.
-        const __heldSess = __keepOpenSession.get(ready.profileId);
-        if (__heldSess) __heldSess.inUse = false;
+        // EXCEPT when the pre-publish approval backgrounded (__bgHoldsKeepOpenSession) -- that task's own finally
+        // clears inUse once the real approval+comment leg genuinely completes (review fix: this synchronous
+        // return fires within seconds of capture, long before that leg is done).
+        if (!__bgHoldsKeepOpenSession) {
+          const __heldSess = __keepOpenSession.get(ready.profileId);
+          if (__heldSess) __heldSess.inUse = false;
+        }
         try { logEvent("ix_keepopen_session_held", { profileId: ready.profileId, postsUsed: (__keepOpenSession.get(ready.profileId) || {}).postsUsed || 0, groupUrl }); } catch (_) {}
       } else {
         const closeResult = await ixBrowserCloseAfterUse(ready.profileId, "facebook_live_post_attempt_finished");
