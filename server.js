@@ -10661,11 +10661,20 @@ function detectIncompleteRunAtBoot() {
       return;
     }
     if (__resumeSpiral) logEvent("autopilot_auto_resume_halted_crash_spiral", { resumes: __totalResumes, windowMin: Math.round((__nowMs - __streakStart) / 60000), posted, max, runId: String(__runId) }); // SWARM FIX #6
+    // DISTINCT REASON FOR THE TRUE CRASH-LOOP CAP (2026-07-06 stability-grace review fix): __noProgressNow>=3
+    // means 3 CONSECUTIVE crash-resumes posted literally nothing -- the strongest available signal of a
+    // genuinely broken run (dead selector/dependency) -- yet it was tagged with the SAME "run_active_at_restart"
+    // reason as a benign one-off decline (e.g. a watchdog wedge-restart cluster where each short segment just
+    // hadn't had time to post yet). The heartbeat's stability-grace auto-continue (search "AUTO-RESUME
+    // STABILITY GRACE") deliberately auto-re-arms only "run_active_at_restart" after a quiet period -- without
+    // this distinct tag it could not tell the two cases apart and would auto-continue a genuinely broken run
+    // after 20 quiet minutes, right when an operator investigating mid-incident least expects it.
+    const __trueCrashLoop = !__resumeSpiral && __noProgressNow >= 3;
     state.operator.lastIncompleteRun = {
       at: new Date().toISOString(),
       posted,
       max,
-      reason: __resumeSpiral ? "crash_resume_spiral_halted" : __reason,
+      reason: __resumeSpiral ? "crash_resume_spiral_halted" : (__trueCrashLoop ? "crash_loop_no_progress" : __reason),
       status: "pending",
     };
     state.operator.autopilotEnabled = false;
