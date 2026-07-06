@@ -21762,6 +21762,12 @@ function buildRunReports(force = false) {
     const gapStats = gaps.length
       ? { minSec: Math.min(...gaps), medianSec: __reportMedian(gaps), avgSec: Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length), maxSec: Math.max(...gaps) }
       : { minSec: 0, medianSec: 0, avgSec: 0, maxSec: 0 };
+    // AVERAGE POSTING TIME (operator: "show average posting time in minutes and seconds"): the average real
+    // wall-clock interval between one post landing and the next, within THIS run -- directly reflects pacing/
+    // throughput (e.g. whether the background-approval fix sped things up), not just a duration/count average.
+    const postIntervalsSec = [];
+    for (let i = 1; i < run.posts.length; i += 1) postIntervalsSec.push(Math.max(0, Math.round((run.posts[i]._t - run.posts[i - 1]._t) / 1000)));
+    const avgPostIntervalSec = postIntervalsSec.length ? Math.round(postIntervalsSec.reduce((a, b) => a + b, 0) / postIntervalsSec.length) : null;
     const pendingItems = run.pendingItems || [];
     return {
       index: idx,
@@ -21771,6 +21777,7 @@ function buildRunReports(force = false) {
       // dismiss can permanently exclude exactly these posts by __postKey, immune to future cluster merges.
       postKeys: run.posts.map(__postKey),
       durationMin: Math.round((run.lastT - run.startT) / 60000),
+      avgPostIntervalSec,
       posts: run.posts.length,
       commented,
       uncommented: run.posts.length - commented,

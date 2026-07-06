@@ -164,6 +164,8 @@ function fmtTime(iso){ if(!iso) return "—"; try{ var d=new Date(iso); return d
 function fmtDate(iso){ if(!iso) return "—"; try{ var d=new Date(iso); return d.toLocaleDateString([], {weekday:"short",day:"2-digit",month:"short"})+" "+d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}); }catch(e){ return "—"; } }
 function fmtGap(s){ if(s==null) return "—"; if(s<90) return s+"s"; return (s/60).toFixed(1)+"m"; }
 function gapClass(s){ if(s==null) return "no"; if(s>180) return "slow"; return "ok"; }
+// explicit "Xm Ys" format (operator: "show average posting time in minutes AND seconds")
+function fmtMinSec(s){ if(s==null) return "—"; s=Math.round(s); var m=Math.floor(s/60), sec=s%60; return m+"m "+(sec<10?"0":"")+sec+"s"; }
 function esc(x){ return String(x==null?"":x).replace(/[&<>"]/g,function(c){return({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[c];}); }
 // GENERIC, N-GROUP-SCALABLE (2026-07-04 review fix): __reportGroupName no longer emits fixed literal names
 // ("o-group"/"4854") for a hardcoded 2-group set, so a literal-string check here left every group looking
@@ -228,7 +230,7 @@ function runCard(r,i){
       + '<span class="rchev">▸</span>'
       + '<span class="rmain"><span class="rdate">'+esc(fmtDate(r.startedAt))+'</span>'
       + (r.live?'<span class="rlive">● EN COURS</span>':(i===0?'<span class="pill x">dernière</span>':''))+'</span>'
-      + '<span class="rposts">'+r.posts+' posts &middot; '+r.durationMin+'m</span>'
+      + '<span class="rposts">'+r.posts+' posts &middot; '+r.durationMin+'m'+(r.avgPostIntervalSec!=null?' &middot; ~'+fmtMinSec(r.avgPostIntervalSec)+'/post':'')+'</span>'
       + '<span class="rrate '+(rate>=90?"ok":rate>=70?"slow":"no")+'">'+rate+'%<small> comm.</small></span>'
       + (r.uncommented? '<span class="runc">'+r.uncommented+' sans</span>':'')
       + ((r.pendingApproval&&r.pendingApproval.count)? '<span class="runc pending">'+r.pendingApproval.count+' en attente</span>':'')
@@ -243,6 +245,7 @@ function runBody(r){
   var chrTxt = r.chromePeak==null ? "—" : r.chromePeak;
   var html = '<div class="stats">'
     + statCard("Posts publiés", r.posts, "sur "+r.durationMin+" min", "")
+    + statCard("Temps de post moyen", fmtMinSec(r.avgPostIntervalSec), "entre chaque post publié", "v")
     + statCard("Produits uniques", (r.uniqueProducts||0), (r.productsInBoth||0)+" dans les 2 groupes", (r.uniqueProducts? (r.productsInBoth>0?"g":"a") : ""))
     + statCard("Commentés", r.commentRate+'<small>%</small>', r.commented+"/"+r.posts+" • "+r.uncommented+" sans", r.commentRate>=90?"g":(r.commentRate>=70?"a":"r"))
     + statCard("Délai médian", fmtGap(r.gap.medianSec), "max "+fmtGap(r.gap.maxSec), "v")
