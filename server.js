@@ -9021,13 +9021,21 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
     // undiagnosable in prod. Stamp the key diag per round so the real cause is auditable.
     try {
       const __opened = objs.filter((o) => o && o.step === "harvest_theater_opened").pop();
-      const __end = objs.filter((o) => o && (o.step === "harvest_walk_end" || o.step === "harvest_walk_done")).pop();
+      // ENDREASON FIX (2026-07-06 harvest-supply audit): harvest_walk_done is logged UNCONDITIONALLY right after
+      // the walk loop, regardless of which real reason (loop_detected/age_cap/no_more_photos) fired -- so the old
+      // combined filter+.pop() always picked harvest_walk_done last, and every single harvest_walk_diag line in
+      // production showed the uninformative literal "harvest_walk_done" instead of the real stop reason. Read
+      // the two events SEPARATELY so the real reason (only present on harvest_walk_end) always wins.
+      const __endEvt = objs.filter((o) => o && o.step === "harvest_walk_end").pop();
+      const __doneEvt = objs.filter((o) => o && o.step === "harvest_walk_done").pop();
+      const __end = __endEvt || __doneEvt;
       const __grid = objs.filter((o) => o && o.step === "harvest_grid_fallback").pop();
       logEvent("harvest_walk_diag", {
         groupUrl, profileId: Number(profileId),
         got: (result && Array.isArray(result.items)) ? result.items.length : 0,
         navigable: __opened ? __opened.navigable : null, set: __opened ? __opened.set : null,
-        endReason: __end ? (__end.reason || __end.step) : null, collected: __end ? __end.collected : null, steps: __end ? __end.steps : null,
+        endReason: __endEvt ? __endEvt.reason : (__doneEvt && __doneEvt.timedOut ? "budget_timeout" : (__end ? __end.step : null)),
+        collected: __end ? __end.collected : null, steps: __end ? __end.steps : null,
         gridFallback: !!__grid,
       });
     } catch (_) {}
