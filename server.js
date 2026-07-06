@@ -9874,6 +9874,7 @@ let __autopilotTickStartedAt = 0; // when the in-flight tick started — drives 
 let __autopilotTickGen = 0; // tick generation: a wedged tick's finally must NOT clear a NEWER tick's flag after a watchdog reset
 let __lastPostProgressAt = 0; // when a post last LANDED — the watchdog only force-resets a tick that's stuck AND has made NO posting progress in the window (so a slow-but-working tick is never reset)
 const AUTOPILOT_TICK_MAX_MS = 3 * 60 * 1000; // a tick stuck > this WITH no post landed in the same window = a genuine FREEZE -> force-reset (operator wants the max freeze well under 5min; the no-progress guard makes 3min safe). Heartbeat-driven, race-safe via the gen guard.
+const AUTO_RESUME_STABILITY_GRACE_MS = 20 * 60 * 1000; // 2026-07-06: see the heartbeat's "AUTO-RESUME STABILITY GRACE" block -- 20min of proven continuous stability before auto-continuing a boot-time-declined pending banner.
 let __autopilotLastDecision = null;
 let __autopilotSchedulerTimer = null;
 let __autopilotDiscoveryInFlight = false;
@@ -21774,6 +21775,42 @@ setInterval(() => {
     setTimeout(() => { autopilotTickAsync().catch(() => {}); }, 0); // kick a fresh tick immediately so posting resumes
   }
   const state = readState();
+  // AUTO-RESUME STABILITY GRACE (2026-07-06 wedge-fix follow-up): detectIncompleteRunAtBoot's crash-loop cap
+  // (<=3 consecutive no-progress crash-resumes) is a legitimate circuit breaker, but its failure mode is worse
+  // than what it guards against -- once it declines, the pending banner sits silently disarmed until a HUMAN
+  // notices and clicks Continue. Confirmed live tonight, TWICE: the watchdog's wedge-restarts happened to
+  // cluster close enough together that each restart's own short segment showed "no progress" (purely a timing
+  // artifact of restarts landing minutes apart, not a genuine stuck loop), tripping the cap and leaving
+  // production disarmed -- zero posting -- for several HOURS each time before it was noticed. This closes that
+  // gap WITHOUT loosening the boot-time cap itself: if a "run_active_at_restart" pending banner has sat
+  // unresolved for AUTO_RESUME_STABILITY_GRACE_MS with NO further restart in between (proven by this SAME
+  // in-memory heartbeat still running continuously -- any restart would re-run detectIncompleteRunAtBoot and
+  // overwrite `at` with a fresh timestamp, resetting this grace timer), the process has clearly stopped
+  // crashing/looping, so auto-continue exactly like the operator's own dashboard Continue button would.
+  // Deliberately excludes crash_resume_spiral_halted (SWARM FIX #6's stronger >=3-resumes-in-30min signal) --
+  // that one stays a human decision. Gated on the same operator opt-in flag as the boot-time auto-resume.
+  try {
+    const __lir = state.operator?.lastIncompleteRun;
+    if (state.operator?.autopilotAutoResumeEnabled === true && __lir && __lir.status === "pending"
+        && __lir.reason === "run_active_at_restart" && Number(__lir.max) > 0
+        && Date.now() - (Date.parse(__lir.at || "") || 0) >= AUTO_RESUME_STABILITY_GRACE_MS) {
+      const sNow = readState();
+      const run2 = sNow.operator?.lastIncompleteRun;
+      if (run2 && run2.status === "pending" && run2.at === __lir.at) {
+        const origMax = Number(run2.max) || 0;
+        const newMax = Math.max(1, origMax - (Number(run2.posted) || 0));
+        sNow.operator.autopilotMaxPostsPerRun = newMax;
+        sNow.operator.autopilotPostsThisRun = 0;
+        sNow.operator.autopilotEnabled = true;
+        sNow.operator.armedForExternalActions = true;
+        sNow.operator.commentDrainPaused = false;
+        sNow.operator.autopilotDryRun = false;
+        sNow.operator.lastIncompleteRun = { ...run2, status: "continued", resolvedAt: new Date().toISOString(), via: "stability_grace_auto" };
+        writeState(sNow, { controlWrite: true, operatorControl: true });
+        logEvent("autopilot_auto_resumed_after_stability_grace", { posted: run2.posted, max: run2.max, newMax, graceMinutes: Math.round(AUTO_RESUME_STABILITY_GRACE_MS / 60000) });
+      }
+    }
+  } catch (_) {}
   // POSTING SLOT RESERVATION cache (2026-06-30 audit cause #2): refresh the cheap flags the hot acquireNormalIxProfileUse
   // gate reads, so it never has to readState() itself. Armed => reserve __postingReserveSlots open-slots for posting.
   try {
