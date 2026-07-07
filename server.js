@@ -11096,7 +11096,9 @@ function preparePostingPlan(options = {}) {
         if (__coverageIncomplete && __stampedAt) continue; // coverage-first: don't re-post an already-served group until EVERY configured group has this product once
         if (__stampedAt) { const __t = Date.parse(__stampedAt || ""); if (Number.isFinite(__t) && (Date.now() - __t) < __reuseMs) continue; } // 1x per group per reuse window
         if (normalizedFacebookGroupKey(__g) !== normalizedFacebookGroupKey(slot.groupUrl) && !__fanoutProfilesByGroupKey.has(__k)) continue; // no profile assigned to this group -> skip it (don't emit an unpostable row)
-        if (__recentPairFailureCounts && (__recentPairFailureCounts.get(postClaimBaseHash(state, product.key, __g)) || 0) >= 2) continue; // cooling down -- don't keep building a row for a (product, group) pair that's repeatedly failed recently; see recentProductGroupFailureCounts
+        const __pairFailN = __recentPairFailureCounts ? (__recentPairFailureCounts.get(postClaimBaseHash(state, product.key, __g)) || 0) : -1;
+        try { logEvent("__debug_cooldown_check", { productKey: product.key, groupUrl: __g, hash: postClaimBaseHash(state, product.key, __g), failCount: __pairFailN, mapSize: __recentPairFailureCounts ? __recentPairFailureCounts.size : -1 }); } catch (_) {}
+        if (__pairFailN >= 2) continue; // cooling down -- don't keep building a row for a (product, group) pair that's repeatedly failed recently; see recentProductGroupFailureCounts
         __targetGroups.push(__g);
       }
       if (!__targetGroups.length) continue; // already hit every group within its reuse window (or coverage pending on a temporarily-unservable group) -> skip
