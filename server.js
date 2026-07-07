@@ -11106,6 +11106,7 @@ function preparePostingPlan(options = {}) {
         if (__recentPairFailureCounts && (__recentPairFailureCounts.get(postClaimBaseHash(state, product.key, __g)) || 0) >= 2) continue; // cooling down -- don't keep building a row for a (product, group) pair that's repeatedly failed recently; see recentProductGroupFailureCounts
         __targetGroups.push(__g);
       }
+      if (index < 12) { try { logEvent("__debug_row_index", { index, productKey: product.key, hasHarvestedRec: !!harvestedRec, coverageIncomplete: __coverageIncomplete, slotGroupUrl: slot.groupUrl, slotProfile: slot.profile, targetGroupsLen: __targetGroups.length, missingAssets }); } catch (_) {} }
       if (!__targetGroups.length) continue; // already hit every group within its reuse window (or coverage pending on a temporarily-unservable group) -> skip
     }
     const __row = {
