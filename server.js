@@ -3714,6 +3714,7 @@ function collectProductUrlsForPosting(state, options = {}) {
       const partial = reeligibleRecs.filter(__isPartial).map((r) => r.productKey); // complete the duplication NOW
       const recycle = reeligibleRecs.filter((r) => !__isPartial(r)).map((r) => r.productKey); // stale-recycle, or owes only an unservable group -> behind fresh (don't starve the healthy group)
       harvestedKeys = [...partial, ...fresh, ...recycle];
+      try { logEvent("__debug_harvested_keys", { partialLen: partial.length, freshLen: fresh.length, recycleLen: recycle.length, recsLen: recs.length, onDiskLen: recs.filter(onDisk).length, first5: harvestedKeys.slice(0, 5) }); } catch (_) {}
     } else {
       harvestedKeys = [...fresh, ...reeligibleRecs.map((r) => r.productKey)];
     }
@@ -11106,7 +11107,7 @@ function preparePostingPlan(options = {}) {
         if (__recentPairFailureCounts && (__recentPairFailureCounts.get(postClaimBaseHash(state, product.key, __g)) || 0) >= 2) continue; // cooling down -- don't keep building a row for a (product, group) pair that's repeatedly failed recently; see recentProductGroupFailureCounts
         __targetGroups.push(__g);
       }
-      if (index < 12) { try { logEvent("__debug_row_index", { index, productKey: product.key, hasHarvestedRec: !!harvestedRec, coverageIncomplete: __coverageIncomplete, slotGroupUrl: slot.groupUrl, slotProfile: slot.profile, targetGroupsLen: __targetGroups.length, missingAssets }); } catch (_) {} }
+      try { logEvent("__debug_row_index", { index, productKey: product.key, hasHarvestedRec: !!harvestedRec, coverageIncomplete: __coverageIncomplete, slotGroupUrl: slot.groupUrl, slotProfile: slot.profile, targetGroupsLen: __targetGroups.length }); } catch (_) {}
       if (!__targetGroups.length) continue; // already hit every group within its reuse window (or coverage pending on a temporarily-unservable group) -> skip
     }
     const __row = {
