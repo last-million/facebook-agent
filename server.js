@@ -53,7 +53,39 @@ let __forcedCommentResweepActive = false;
 // across concurrent posts don't clear the exemption early.
 let __postCompletionExternalActionInFlight = 0;
 let __bgCommentInFlight = 0; // outstanding BACKGROUNDED comment+approval tasks (decouple backpressure 2026-06-30)
-const MAX_BG_COMMENT_IN_FLIGHT = 5; // past this, fall back to inline await so the tick slows + the backlog drains (the 14-slot open cap THROWS not blocks)
+// 2026-07-07 IN-RUN DEFER-LATENCY FIX ("he wants seconds, max 5-6min, never silently skipped during a live run"):
+// live audit confirmed 35/35 posts that hit the old DEFER-TO-DRAIN branch this run got ZERO comment/approval
+// attempt for the run's entire ~9h life -- the periodic resweep/drain they were betting on never advanced past
+// checked:0 while the run stayed busy. Raised 5->6 (not 8, per adversarial-verify Finding 1: the worst-case shared
+// drainCap -- harvest+health-sweep+persistent-drain+cold-backlog-heartbeat all draw from the SAME 14-open-profile
+// pool via __postingReserveSlots, server.js ~21953 -- floors at 14-6=8 when ixbrowser.maxConcurrentProfiles is
+// pushed toward 7-8; a bare 8 here would leave zero margin for those other consumers in that config, echoing the
+// 2026-07-03 121-chrome concurrency-raise incident). 6 still nearly doubles today's headroom while always leaving
+// >=2 slots free for the rest of the drainCap pool even at that worst case. Paired with the waiter queue below --
+// raising this alone is insurance, not the fix; the real fix is that a post can no longer be dropped with zero
+// attempt when the cap is full.
+const MAX_BG_COMMENT_IN_FLIGHT = 6;
+// FAST-FIRE WAITER QUEUE (2026-07-07): replaces "DEFER-TO-DRAIN = log it and hope the periodic resweep looks."
+// When the cap is full, a task is pushed here instead of dropped; the moment ANY backgrounded task's .finally
+// below runs, it hands the just-freed slot to the OLDEST queued waiter FIRST -- synchronously, in the same
+// microtask turn, so a queued post can never be leap-frogged by a brand-new post's own admission check. Same
+// grant/release/shift pattern already proven safe in this file for acquireCommentLock (server.js ~15637-15654).
+const __bgCommentWaiters = [];
+const MAX_BG_COMMENT_QUEUE = 15; // safety valve: beyond this (should never happen at cap=6), fall back to the OLD passive drain-dependent behavior rather than grow this array unbounded
+function __fireBackgroundedComment(task) {
+  __bgCommentInFlight += 1;
+  addRequiredFirstCommentWithDifferentProfile(task.args)
+    .then((r) => { try { logEvent("facebook_post_comment_backgrounded_done", { postUrl: task.args.postUrl, ok: Boolean(r && r.ok), fromQueue: !!task.fromQueue, queuedMs: task.fromQueue ? (Date.now() - task.queuedAt) : 0 }); } catch (_) {} })
+    .catch((e) => { try { logEvent("facebook_post_comment_backgrounded_error", { postUrl: task.args.postUrl, error: oneLineField((e && e.message) || String(e), 200), fromQueue: !!task.fromQueue }); } catch (_) {} })
+    .finally(() => {
+      __bgCommentInFlight = Math.max(0, __bgCommentInFlight - 1);
+      const next = __bgCommentWaiters.shift();
+      if (next) {
+        try { logEvent("facebook_post_comment_dequeued_for_slot", { postUrl: next.args.postUrl, queuedMs: Date.now() - next.queuedAt, queueDepthRemaining: __bgCommentWaiters.length }); } catch (_) {}
+        __fireBackgroundedComment({ args: next.args, fromQueue: true, queuedAt: next.queuedAt });
+      }
+    });
+}
 // PER-POST APPROVAL MUTEX (2026-07-05, "background the pre-publish approval for full high-scale prod"):
 // backgrounding the pre-publish admin-approval decision (see runLiveFacebookPostFromPlan) means an approval
 // attempt for a post can now be in flight at the SAME time other code (e.g. the comment-stage's own
@@ -6962,7 +6994,8 @@ function acquireNormalIxProfileUse(profileId, purpose) {
   // GLOBAL_MAX_OPEN_PROFILES and starve publisher opens (the audit's #2 cause; the post-restart "posting won't start"
   // symptom). Posting itself is NEVER capped here (only the global 14 bounds it). A blocked drain open gets the same
   // typed retryable 503 as the global cap, so it just defers + retries when a slot frees — comments still land via the
-  // next sweep (the drain keeps ~10 of 14 slots, ample for maxConcurrentComments=2 + bg comments + approvals).
+  // next sweep (the drain keeps 14-reserve slots -- shared by maxConcurrentComments, the MAX_BG_COMMENT_IN_FLIGHT=6
+  // bg-comment pool + its waiter queue (2026-07-07), harvest, and the persistent-drain/cold-backlog heartbeat).
   if (__armedForPostingReserve && !/facebook_live_post/i.test(String(purpose || ""))) {
     const __drainCap = GLOBAL_MAX_OPEN_PROFILES - __postingReserveSlots;
     if (normalIxProfileUseLocks.size >= __drainCap) {
@@ -17081,12 +17114,7 @@ async function completeVerifiedFacebookPostWithComment({
     && readState().operator?.commentDrainDisabled !== true;
   const __bgApprovalComment = __isRunApprovalPost && __bgCommentInFlight < MAX_BG_COMMENT_IN_FLIGHT;
   if (__bgApprovalComment) {
-    __bgCommentInFlight += 1;
-    const __bgClose = [];
-    addRequiredFirstCommentWithDifferentProfile({ row, ready, groupUrl: actualGroupUrl, postUrl, imagePath: ready.imagePath, postValidation: validation, ledgerKey, closeResults: __bgClose })
-      .then((r) => { try { logEvent("facebook_post_comment_backgrounded_done", { postUrl, ok: Boolean(r && r.ok) }); } catch (_) {} })
-      .catch((e) => { try { logEvent("facebook_post_comment_backgrounded_error", { postUrl, error: oneLineField((e && e.message) || String(e), 200) }); } catch (_) {} })
-      .finally(() => { __bgCommentInFlight = Math.max(0, __bgCommentInFlight - 1); });
+    __fireBackgroundedComment({ args: { row, ready, groupUrl: actualGroupUrl, postUrl, imagePath: ready.imagePath, postValidation: validation, ledgerKey, closeResults: [] } });
     try { logEvent("facebook_post_published_comment_backgrounded", { postUrl, groupUrl: actualGroupUrl, profileId: ready.profileId, bgInFlight: __bgCommentInFlight }); } catch (_) {}
     return {
       ok: true, // PUBLISHED ok — the post landed + is durably recorded; comment + admin approval run in the background
@@ -17113,20 +17141,26 @@ async function completeVerifiedFacebookPostWithComment({
       registers: readRegisters(),
     };
   }
-  // DEFER-TO-DRAIN (2026-06-30 prod-throughput-audit wf_442b9c45, root cause #1 — the bursty "post a burst then stall
-  // for minutes" the operator reported). When an approval-group RUN post is OVER the bg cap, do NOT fall through to the
-  // inline `await addRequiredFirstCommentWithDifferentProfile` below: that call carries the ~8-min moderator approval +
-  // ~4-min comment-retry tail, and because the scheduler does `await autopilotTickAsync()` (single-flight, next timer
-  // armed only in its finally) and the tick awaits EVERY worker, one ~14-min inline await FREEZES the whole tick =
-  // the multi-minute stall (CPU ~25% the whole time because it's await/lock contention, not compute). The post is
-  // already DURABLE here (published ledger row + full comment payload + per-run counter bump + publisher-lock release
-  // all happened above), and the always-on resweepUncommentedFacebookPostsAsync re-comments published rows AND re-fires
-  // approval (double-comment + in-flight guarded), so comment+approval still land async on a different profile.
-  // Returning published-ok keeps the tick continuous. Gated on __isRunApprovalPost (which already requires
-  // commentDrainDisabled!==true) so with the drain OFF the code KEEPS the inline await — correctness preserved exactly.
-  // Counter was bumped at RECORD time (before this point) so this does NOT double-count.
+  // FAST-FIRE QUEUE (2026-07-07, replaces DEFER-TO-DRAIN — operator: "during a run he must not skip comments, max
+  // 5-6min, ideally seconds like the ones I see land fast." Live audit confirmed 35/35 posts that hit the old
+  // DEFER-TO-DRAIN branch this run got ZERO comment/approval attempt for the run's entire ~9h life; the shared
+  // single-flight resweep lock this branch bet everything on never advanced past checked:0 all day while the run
+  // stayed busy). Queue it instead: __fireBackgroundedComment's own .finally() (declared near MAX_BG_COMMENT_IN_FLIGHT)
+  // hands this post the VERY NEXT freed slot, before any newer post's admission check can claim it — so discovery/
+  // attempt-start is no longer gated on the periodic resweep/drain at all. Post stays DURABLE exactly as before
+  // (ledger row + payload + counter bump + lock release already happened above); tick stays non-blocking (still zero
+  // await here). Persistent drain / cold-backlog heartbeat (2026-07-07) are UNCHANGED as the crash-safety backstop
+  // for the (should-never-happen) queue-saturated case below. Gated on __isRunApprovalPost (already requires
+  // commentDrainDisabled!==true) so with the drain OFF the code keeps the inline await — correctness preserved.
   if (__isRunApprovalPost) {
-    try { logEvent("facebook_post_published_comment_deferred_to_drain", { postUrl, groupUrl: actualGroupUrl, profileId: ready.profileId, bgInFlight: __bgCommentInFlight }); } catch (_) {}
+    const __bgTaskArgs = { row, ready, groupUrl: actualGroupUrl, postUrl, imagePath: ready.imagePath, postValidation: validation, ledgerKey, closeResults: [] };
+    const __queued = __bgCommentWaiters.length < MAX_BG_COMMENT_QUEUE;
+    if (__queued) {
+      __bgCommentWaiters.push({ args: __bgTaskArgs, queuedAt: Date.now() });
+      try { logEvent("facebook_post_published_comment_queued_for_slot", { postUrl, groupUrl: actualGroupUrl, profileId: ready.profileId, bgInFlight: __bgCommentInFlight, queueDepth: __bgCommentWaiters.length }); } catch (_) {}
+    } else {
+      try { logEvent("facebook_post_published_comment_deferred_to_drain_queue_saturated", { postUrl, groupUrl: actualGroupUrl, profileId: ready.profileId, bgInFlight: __bgCommentInFlight, queueDepth: __bgCommentWaiters.length }); } catch (_) {}
+    }
     return {
       ok: true,
       postUrl,
@@ -17145,9 +17179,12 @@ async function completeVerifiedFacebookPostWithComment({
       approvalResult: null,
       postValidation: validation,
       validation,
-      commentBackgrounded: false,
-      commentDeferred: true,
-      message: `Post published by ${row.profile || ready.profileId} (URL: ${postUrl}); comment + admin approval deferred to the durable drain (bg cap reached) so posting stays continuous.`,
+      commentBackgrounded: __queued, // true = a real attempt is now guaranteed the instant a slot frees
+      commentQueuedForSlot: __queued,
+      commentDeferred: !__queued, // only true in the (should-never-happen) safety-valve case
+      message: __queued
+        ? `Post published by ${row.profile || ready.profileId} (URL: ${postUrl}); comment + admin approval queued for the next free background slot (fires automatically) so posting stays continuous.`
+        : `Post published by ${row.profile || ready.profileId} (URL: ${postUrl}); comment queue saturated (>=${MAX_BG_COMMENT_QUEUE}) -- deferred to the durable drain so posting stays continuous.`,
       liveLog: compactLivePostLog(postLogObjects),
       state: readState(),
       registers: readRegisters(),
