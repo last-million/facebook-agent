@@ -16511,6 +16511,23 @@ const COMMENT_RECOVERY_BACKOFF_MS = 4 * 60 * 1000; // operator 2026-06-28: re-ch
 let __lastPersistentDrainAt = 0;
 const PERSISTENT_DRAIN_INTERVAL_MS = 3 * 60 * 1000;   // drain at most every 3 min while disarmed
 const PERSISTENT_DRAIN_WINDOW_MS = 60 * 60 * 1000;    // keep draining up to 60 min after the last published post (outlasts the 30-min FB queue)
+// COLD-BACKLOG HEARTBEAT (2026-07-07, "he should not skip any comment"): the warm drain above only stays alive
+// for PERSISTENT_DRAIN_WINDOW_MS (60min) after the LAST publish -- once a run auto-disarms and nothing new
+// publishes, that window closes and NOTHING ever retries an owed comment again, forever, until the operator
+// manually launches a new run or hits the manual resweep button. Confirmed live (2026-07-07 run
+// 1783382968189): 49 published posts (17.7% of the run) sat permanently uncommented for 8+ hours because
+// every recovery window (in-run sweep, this warm drain, the 5-pass finish-drain) had already expired by the
+// time anyone looked -- most of them (35/49) via the DEFER-TO-DRAIN branch (MAX_BG_COMMENT_IN_FLIGHT momentarily
+// full at publish time) which makes literally ZERO comment attempt at publish and bets entirely on a drain
+// window that then closes forever. This slow (15min), small-batch (15), maximal-reach-back (168h, the
+// function's own hard ceiling) fallback keeps the SAME guaranteed-recovery path alive indefinitely once the
+// warm window closes, so a durable published-but-uncommented row is retried until it succeeds -- never a
+// silent permanent give-up -- without hammering FB: it reuses resweepUncommentedFacebookPostsAsync's existing
+// dedup/single-flight/chronic-failure-reorder guards untouched, and the escalating per-post backoff added
+// alongside this (see __chronicFails in the resweep loop) keeps a genuinely-chronic post's retry cadence down
+// to roughly hourly instead of every 15min. When nothing is owed this is one cheap ledger read, no browsers opened.
+let __lastColdBacklogDrainAt = 0;
+const COLD_BACKLOG_DRAIN_INTERVAL_MS = 15 * 60 * 1000;
 async function resweepUncommentedFacebookPostsAsync(options = {}) {
   if (__commentResweepInFlight) return __commentResweepInFlight;
   __commentResweepInFlight = (async () => {
@@ -16555,7 +16572,14 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       // attribution / comment-lock / never-twice guards below — it can never loop on un-commentable old posts.
       if (__runStart > 0 && !options.force && !options.drain) cutoff = Math.max(cutoff, __runStart); // drain uses its own recency window (windowHours) so it reaches THIS run's just-published tail after disarm, bounded so it never chases old runs
       const maxToFix = clampNumber(options.max, 1, 50, 10);
-      const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 8000 });
+      // WINDOW-SCALED READ (2026-07-07 review fix): this flat 8000-line cap ignored windowMs/windowHours entirely
+      // -- at current ledger volume (~224 lines/hour) 8000 lines only reaches back ~36h, so the new cold-backlog
+      // heartbeat's windowHours:168 request was silently truncated to ~36h of real data despite the clamp
+      // accepting 168 unchanged. readJsonlAbsoluteFile's cache already reads+splits the WHOLE file regardless of
+      // limit (limit only slices the cached array), so widening this costs extra JSON.parse work only, no extra
+      // disk I/O -- cheap on the cold path's 15min cadence. Existing callers (windowHours<=24, e.g. the warm
+      // drain/in-run sweep) still get exactly 8000 (max(8000, 24*300)=8000) -- zero behavior change for them.
+      const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: Math.max(8000, Math.round(clampNumber(options.windowHours, 1, 168, 24) * 300)) });
       const publishedByPlan = new Map();
       const payloadByPlan = new Map(); // DURABLE COMMENT-RECOVERY: planId|sequence -> ledger row carrying the stored comment payload
       for (const r of rows) {
@@ -16671,7 +16695,20 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         const commentText = String(row?.commentTextPreview || row?.link || "").trim();
         if (!row || !commentText) { summary.stillMissing += 1; continue; } // cannot reconstruct the comment (no live plan row AND no durable payload)
         const __boAt = __commentRecoveryBackoff.get(postUrl) || 0;
-        const __backoffMs = clampNumber(state.operator?.commentRecoveryBackoffMinutes, 1, 60, 4) * 60 * 1000; // DYNAMIC (operator 2026-06-28): re-check interval -> post commented within ~5-6 min of going public; live-editable via operator.commentRecoveryBackoffMinutes (default 4)
+        const __baseBackoffMs = clampNumber(state.operator?.commentRecoveryBackoffMinutes, 1, 60, 4) * 60 * 1000; // DYNAMIC (operator 2026-06-28): re-check interval -> post commented within ~5-6 min of going public; live-editable via operator.commentRecoveryBackoffMinutes (default 4)
+        // ESCALATING BACKOFF (2026-07-07 review fix): a post with many prior last-resort failures (per
+        // __lastResortCountByUrl, the SAME count the 2026-07-06 reorder fix already tracks) now waits
+        // proportionally longer between attempts, capped at 6h -- a fresh/rarely-failing post still gets the
+        // normal ~4min recheck, but a genuinely chronic post (10+ documented failures) backs off to roughly
+        // hourly instead of being re-tried every single sweep pass forever. This exists specifically so the
+        // new cold-backlog heartbeat below (15min cadence, up to 7 days reach-back) can never turn into ~190
+        // repeated automated comment attempts against one stuck post over 2 days -- the exact kind of
+        // sustained automated repetition this codebase's own history (and its "server at rest opens ZERO
+        // browsers" philosophy) treats as an FB-detection risk. Does NOT skip or cap total attempts -- per the
+        // operator's explicit 2026-07-01 "don't skip comments" policy, a chronic post is still retried
+        // forever, just increasingly gently.
+        const __chronicFails = __failCountFor(postUrl);
+        const __backoffMs = Math.min(__baseBackoffMs * (1 + __chronicFails), 6 * 3600 * 1000);
         if (Date.now() - __boAt < __backoffMs) { summary.stillMissing += 1; continue; } // tried recently + still uncommented -> defer (don't re-cycle profiles on a stuck/pending post)
         // STARVATION FIX (operator 2026-06-20): the RECOVERY drains (persistent drain / stop-finish / run-end / forced)
         // must NOT yield-forever to an always-posting run — that left the drain checking only 1 post/cycle while 20 stayed
@@ -21947,6 +21984,13 @@ setInterval(() => {
       // floor keeps recovery alive there while still giving posting the lion's share of the slots.
       const __drainMax = isLivePostingInFlight() ? 8 : 50;
       resweepUncommentedFacebookPostsAsync({ drain: true, max: __drainMax, windowHours: 6 }).catch(() => {}); // operator 2026-06-20: windowHours 1->6 so the drain can SEE a long run's first-half posts (1h silently excluded posts published >60min ago -> never recovered); max 25->50 to clear a whole run's tail in one cycle (aligns with the stop/run-end drains' windowHours:24/max:50).
+    } else if (Date.now() - __lastColdBacklogDrainAt > COLD_BACKLOG_DRAIN_INTERVAL_MS) {
+      // See COLD-BACKLOG HEARTBEAT comment above (~line 16511) for the full rationale. Fires ONLY once the warm
+      // window above has closed (no publish in the last 60min) -- zero behavior change during/right after an
+      // active run. windowHours:168 is the function's own hard ceiling (clampNumber(...,1,168,24)), so this
+      // reaches back as far as the shared recovery mechanism allows anything to reach.
+      __lastColdBacklogDrainAt = Date.now();
+      resweepUncommentedFacebookPostsAsync({ drain: true, max: 15, windowHours: 168 }).catch(() => {});
     }
   }
   const intervalMs = clampNumber(state.triggers?.heartbeatSeconds, 3, 120, 3) * 1000;
