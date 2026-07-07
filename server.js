@@ -3660,7 +3660,12 @@ function recentProductGroupFailureCounts() {
     if (!r || r.event !== "publish_intent_resolved" || __PRODUCT_GROUP_SUCCESS_STATUSES.has(String(r.status || ""))) continue;
     const at = Date.parse(r.at || "");
     if (!Number.isFinite(at) || at < cutoff) continue;
-    const hash = String(r.message || "").split("|")[1] || "";
+    // DELIMITER FIX (2026-07-07): was split("|"), but oneLineField (the message sanitizer every ledger row's
+    // message passes through, server.js ~11396) strips "|" via /[\r\n|]+/g before the row ever reaches disk --
+    // so this always returned an empty hash, making this whole cooldown counter an unconditional empty Map for
+    // every group, all the time (confirmed live: 0/63 publish_intent_resolved rows since the run started
+    // contained a literal "|"). "::" survives oneLineField's strip regex; matches the writer at ~10599/10605.
+    const hash = String(r.message || "").split("::")[1] || "";
     if (!hash) continue;
     counts.set(hash, (counts.get(hash) || 0) + 1);
   }
@@ -10596,13 +10601,17 @@ async function autopilotTickAsync(options = {}) {
       const __claimHash = postClaimBaseHash(state, __prodKey, r.groupUrl); // SWARM FIX #4: group-aware so the kill-mid-post reconciler (releaseClaim) frees the SAME (product,group) claim that was set
       const __intentId = crypto.randomBytes(8).toString("hex");
       const __intentRunId = String(state.operator?.autopilotRunId || "");
-      appendFacebookLivePostLedger({ event: "publish_intent", key: __intentId, planId: r.planId, sequence: r.sequence, profileId: Number(r.profileId || 0), profile: r.profile || "", groupUrl: r.groupUrl || "", status: "in_flight", message: `${__intentRunId}|${__claimHash}` });
+      // DELIMITER FIX (2026-07-07): "|" -> "::" -- oneLineField (every ledger message passes through it) strips
+      // "|" via /[\r\n|]+/g before this reaches disk, so every reader that did message.split("|")[1] (the
+      // cooldown counter above AND reconcilePendingPublishIntentsAsync's releaseClaim below) always got an empty
+      // hash. "::" survives that strip regex.
+      appendFacebookLivePostLedger({ event: "publish_intent", key: __intentId, planId: r.planId, sequence: r.sequence, profileId: Number(r.profileId || 0), profile: r.profile || "", groupUrl: r.groupUrl || "", status: "in_flight", message: `${__intentRunId}::${__claimHash}` });
       let __intentResolved = false;
       let __intentOutcome = "interrupted";
       let __intentUrl = "";
       const __resolveIntent = () => {
         if (__intentResolved) return; __intentResolved = true;
-        try { appendFacebookLivePostLedger({ event: "publish_intent_resolved", key: __intentId, planId: r.planId, sequence: r.sequence, profileId: Number(r.profileId || 0), groupUrl: r.groupUrl || "", postUrl: __intentUrl, status: __intentOutcome, message: `${__intentRunId}|${__claimHash}` }); } catch (_) {}
+        try { appendFacebookLivePostLedger({ event: "publish_intent_resolved", key: __intentId, planId: r.planId, sequence: r.sequence, profileId: Number(r.profileId || 0), groupUrl: r.groupUrl || "", postUrl: __intentUrl, status: __intentOutcome, message: `${__intentRunId}::${__claimHash}` }); } catch (_) {}
       };
       try {
         const v = await runLiveFacebookPostFromPlan({ fullRun: true, autopilot: true, planId: r.planId, sequence: r.sequence, countTowardRun: true });
@@ -13284,7 +13293,11 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
         const sequence = Number(it.sequence || 0);
         const profileId = Number(it.profileId || 0);
         const groupUrl = String(it.groupUrl || "");
-        const parts = String(it.message || "").split("|");
+        // DELIMITER FIX (2026-07-07): was split("|") -- oneLineField strips "|" from every ledger message before
+        // it reaches disk, so runId/claimHash never actually parsed out and releaseClaim's fs.rmSync below never
+        // ran (a stray .claim file was left behind on every kill-mid-post recovery this affected). "::" survives
+        // oneLineField's strip regex; matches the writer at ~10599/10610.
+        const parts = String(it.message || "").split("::");
         const runId = parts[0] || "";
         const claimHash = parts[1] || "";
         const writeResolved = (status, postUrl) => { try { appendFacebookLivePostLedger({ event: "publish_intent_resolved", key: it.key, planId, sequence, profileId, groupUrl, postUrl: postUrl || "", status, message: String(it.message || "") }); } catch (_) {} __intentScanAttempts.delete(String(it.key)); };
