@@ -599,6 +599,12 @@ function defaultState() {
       autoRemoveGoneProfilesEnabled: false,   // HARD RULE: NEVER auto-remove a profile that vanished from
                                               // ixBrowser — the operator removes manually. true re-enables the
                                               // old GONE-removal (not advised).
+      autoRebalanceGroupsEnabled: true,       // 2026-07-07 (operator: "redispatch equally between groups" when
+                                              // accounts fall out of service): auto-redispatch healthy profiles
+                                              // across ALL currently-configured groups so each group's healthy
+                                              // headcount stays roughly equal, dynamically, for any number of
+                                              // groups/profiles. See reconcileGroupProfileBalance (PASS 4 of
+                                              // reconcileProfilesWithIxBrowser). false disables (manual-only).
     },
     rules: {
       minutesBetweenPosts: 12,
@@ -1795,6 +1801,7 @@ function normalizeWorkflowState(state) {
   state.posting.groupProfileAssignments = capRecordLogTail(state.posting.groupProfileAssignments, 200000); // 2026-07-04: was head-slice (dropped newest), see writeRegisters
   state.posting.equalSplitAssignments = state.posting.equalSplitAssignments === true; // Step-3 toggle: equal dispatch, each profile in exactly one group
   state.posting.groupPostFailCounts = String(state.posting.groupPostFailCounts || "{}").slice(0, 20000); // per-(group,profile) post-fail tally for auto-unassign
+  state.posting.groupRebalanceDeficiencyStreak = String(state.posting.groupRebalanceDeficiencyStreak || "{}").slice(0, 20000); // 2026-07-07: per-group consecutive-deficient-cycle counter for reconcileGroupProfileBalance's streak gate
   state.posting.postTextsList = String(state.posting.postTextsList || "").slice(0, 100000); // old-method (web-scraping) post captions, one per line
   state.posting.groupFallbackPolicy = String(state.posting.groupFallbackPolicy || defaultState().posting.groupFallbackPolicy).slice(0, 600);
   state.posting.profileGroupIssueLogEndpoint = "/api/posting/profile-group-issue";
@@ -19526,6 +19533,16 @@ const RECONCILE_MIN_PLAUSIBLE_PROFILE_COUNT = 3;
 const RECONCILE_RESERVED_PROFILE_IDS = new Set([40, 41, 42, 43]);
 const RECONCILE_MIN_INTERVAL_MS = 60 * 1000;
 const IXBROWSER_SYNC_INTERVAL_MS = 5 * 60 * 1000; // standalone "always" sync cadence (boot + heartbeat), independent of posting
+// GROUP-PROFILE REBALANCE (2026-07-07, operator: "redispatch equally between groups" when accounts fall out of
+// service, dynamic for any number of groups/accounts). See reconcileGroupProfileBalance below (PASS 4).
+const GROUP_REBALANCE_SLACK = 1; // tolerate off-by-<=1 forever; never chase perfect equality every cycle
+const GROUP_REBALANCE_MAX_MOVES_PER_CYCLE = 25; // circuit breaker, mirrors this file's other hard per-cycle caps
+// Adversarial-verify finding #1 (2026-07-07): a group must be deficient on >=2 CONSECUTIVE reconcile cycles
+// (~5-10min apart) before any move happens -- a second damper, on top of isDurablyHealthyPostingProfile's own
+// durable-only health gate, against a mass correlated flip (this system's documented "22/22 benched 03:00->17:54",
+// "18 profiles in one ~26min window" incident shape) triggering an immediate mass rebalance that then reverses
+// itself once a transient bench self-heals.
+const GROUP_REBALANCE_STREAK_REQUIRED = 2;
 let __reconcileInFlight = false;
 let __reconcileLastAt = 0;
 let __lastStandaloneReconcileAt = 0;
@@ -19626,6 +19643,209 @@ function reconcileClearGoneProfileBlacklist(state, profileId, label) {
       return !(lineId && lineId === Number(profileId));
     })
     .join("\n");
+}
+
+// GROUP-PROFILE HEALTH FOR REBALANCE PURPOSES (2026-07-07): deliberately NARROWER than postingSlots' own
+// eligibility gate / isProfileBlockedForPosting. Only DURABLE, no-auto-expiry exclusions count as "down" here --
+// the three JSON parked arrays (disconnected/errored/suspended, never cleared except by an admin Release) and a
+// genuine FB-account quarantine (isFacebookProfileQuarantinedForFacebook). Self-healing benches (comment-
+// verification 45min / repeated-transient 60min / generic-transient 6h -- all folded into the broader
+// isProfileBlockedForPosting) are deliberately EXCLUDED: counting them would let a mass transient bench (this
+// system's own documented incident shape -- "22/22 benched 03:00->17:54", "18 profiles in one ~26min window")
+// trigger an immediate mass rebalance that then reverses itself within the hour once the bench self-heals
+// (adversarial-verify finding #1, 2026-07-07). Reserved profiles (moderators/#40-43/ShopYourLikes/manual
+// blocklist) are excluded entirely, matching PASS 1-3's own isReservedReconcileProfile gate.
+function isDurablyHealthyPostingProfile(id, label, state, liveIds) {
+  if (!id) return false;
+  if (liveIds && !liveIds.has(id)) return false;
+  if (isReservedReconcileProfile(id, label, state)) return false;
+  if (disconnectedProfileIdSet(state).has(String(id))) return false;
+  if (erroredProfileIdSet(state).has(String(id))) return false;
+  if (suspendedProfileIdSet(state).has(String(id))) return false;
+  if (isFacebookProfileQuarantinedForFacebook(String(id), state, "")) return false;
+  return true;
+}
+
+// PASS 4: DYNAMIC GROUP-PROFILE REBALANCE (2026-07-07, operator: "redispatch equally between groups" whenever
+// accounts fall out of service -- must be dynamic for any future number of groups/accounts). Fully generic: never
+// assumes a fixed group count or per-group size, deriving everything from state.posting.groupAssignmentData's
+// actual current shape at call time (mirrors how the dashboard's own assignProfilesByPercent already works
+// generically, just re-derived every cycle from LIVE health instead of once from a static candidate list).
+//
+// Called from inside reconcileProfilesWithIxBrowser, after PASS 1-3 have already run on the SAME state object, so
+// any self-healing bench PASS 2 just cleared is already gone by the time this looks -- only genuinely durable
+// exclusions (see isDurablyHealthyPostingProfile above) can trigger a move. Idempotent: once every group is
+// within GROUP_REBALANCE_SLACK of its fair share, the deficient-group filter is empty on the very first loop
+// iteration and this is a no-op (no dirty, no extra log) -- re-running with unchanged health data always
+// produces the same empty result.
+function reconcileGroupProfileBalance(state, liveIds) {
+  const summary = { moved: [], shortfalls: [] };
+  if (state.operator?.autoRebalanceGroupsEnabled === false) return summary;
+  const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
+  const validGroups = groups.filter((g) => g && g.url);
+  if (validGroups.length < 2) return summary; // nothing to rebalance with 0-1 groups
+
+  const groupsInfo = validGroups.map((g) => {
+    const key = normalizedFacebookGroupKey(g.url);
+    const healthy = (Array.isArray(g.profiles) ? g.profiles : []).filter((label) => isDurablyHealthyPostingProfile(profileIdFromLabel(label), label, state, liveIds));
+    return { entry: g, url: g.url, key, healthy };
+  });
+
+  const n = groupsInfo.length;
+  const totalHealthy = groupsInfo.reduce((s, g) => s + g.healthy.length, 0);
+  const base = Math.floor(totalHealthy / n);
+  const rem = totalHealthy % n;
+  // deterministic +1 remainder assignment (stable sort key = normalized group url) so which group(s) get the
+  // "extra" profile never flip-flops tick-to-tick for the same input
+  [...groupsInfo].sort((a, b) => a.key.localeCompare(b.key)).forEach((g, i) => { g.target = base + (i < rem ? 1 : 0); });
+
+  // STREAK GATE (adversarial-verify finding #1, second layer on top of the durable-only health definition above):
+  // a group only becomes a rebalance CANDIDATE once it's been deficient on >=GROUP_REBALANCE_STREAK_REQUIRED
+  // CONSECUTIVE calls to this function (each call is itself already >=RECONCILE_MIN_INTERVAL_MS/IXBROWSER_SYNC_
+  // INTERVAL_MS apart) -- persisted the same way reconcileMissStreak is, so a single-cycle correlated flip in the
+  // durable categories still needs to persist across ~2 real-world cycles before any profile actually moves.
+  let streak = {};
+  try { streak = JSON.parse(String(state.posting?.groupRebalanceDeficiencyStreak || "{}")) || {}; } catch (_) { streak = {}; }
+  const nextStreak = {};
+  for (const g of groupsInfo) {
+    const isDeficient = g.healthy.length < g.target - GROUP_REBALANCE_SLACK;
+    nextStreak[g.key] = isDeficient ? ((Number(streak[g.key]) || 0) + 1) : 0;
+    g.deficiencyStreak = nextStreak[g.key];
+  }
+  state.posting.groupRebalanceDeficiencyStreak = JSON.stringify(nextStreak);
+
+  // ORPHAN POOL (adversarial-verify finding #4): live profiles belonging to NO group at all right now (e.g. left
+  // behind by recordGroupPostFailureAndMaybeUnassign, which unassigns but never reassigns) -- the cheapest
+  // possible donor since taking one costs no other group anything. Filtered through the SAME durable-health +
+  // reserved-profile gate as every group member, so a moderator/#40-43/ShopYourLikes/manually-blocked id (which
+  // correctly belongs to zero posting groups by design) can NEVER be mistaken for a free mover.
+  const groupedIds = new Set();
+  for (const g of groupsInfo) for (const label of (Array.isArray(g.entry.profiles) ? g.entry.profiles : [])) { const id = profileIdFromLabel(label); if (id) groupedIds.add(id); }
+  const orphanPool = [];
+  if (liveIds) {
+    for (const id of liveIds) {
+      if (groupedIds.has(id)) continue;
+      if (!isDurablyHealthyPostingProfile(id, String(id), state, liveIds)) continue;
+      orphanPool.push(String(id));
+    }
+  }
+
+  // Prefer moving the least-recently-active / lowest-lifetime-volume profile over yanking one mid-productive-
+  // streak -- the identical ascending ordering postingSlots' own orderFreshFirst uses for "who gets a slot
+  // first," re-purposed here for "who is safest to pull." Also hard-excludes a profile mid-open/mid-post right
+  // now (normalIxProfileUseLocks) or one whose most recent post (in ANY group) is still within
+  // operator.commentMaxAgeMinutes -- its own first comment may still be in flight.
+  const pickIdlestSafeCandidate = (labels) => {
+    const { byProfile: todayByPid, lastAtByProfile } = autopilotPublishedTodayByProfile(state);
+    const histByPid = autopilotPostHistoryByProfile();
+    const commentWindowMs = clampNumber(state.operator?.commentMaxAgeMinutes, 1, 240, 6) * 60000;
+    const safe = labels.filter((label) => {
+      const id = profileIdFromLabel(label);
+      if (!id) return false;
+      if (normalIxProfileUseLocks.has(String(id))) return false;
+      const lastAt = lastAtByProfile.get(id) || 0;
+      if (lastAt && (Date.now() - lastAt) < commentWindowMs) return false;
+      return true;
+    });
+    safe.sort((a, b) => {
+      const idA = profileIdFromLabel(a), idB = profileIdFromLabel(b);
+      const cnt = (m, id) => m.get(id) || m.get(String(id)) || 0;
+      const ta = cnt(todayByPid, idA), tb = cnt(todayByPid, idB);
+      if (ta !== tb) return ta - tb;
+      const la = lastAtByProfile.get(idA) || 0, lb = lastAtByProfile.get(idB) || 0;
+      if (la !== lb) return la - lb;
+      return cnt(histByPid, idA) - cnt(histByPid, idB);
+    });
+    return safe[0] || null;
+  };
+
+  for (let i = 0; i < GROUP_REBALANCE_MAX_MOVES_PER_CYCLE; i++) {
+    const deficient = groupsInfo
+      .filter((g) => g.healthy.length < g.target - GROUP_REBALANCE_SLACK && g.deficiencyStreak >= GROUP_REBALANCE_STREAK_REQUIRED)
+      .sort((a, b) => (a.healthy.length - a.target) - (b.healthy.length - b.target)); // worst-off first
+    if (!deficient.length) break; // within slack (or not yet streak-confirmed) everywhere -> STOP (idempotency guarantee)
+    const recipient = deficient[0];
+
+    let mover = null;
+    let fromGroup = null;
+    if (orphanPool.length) {
+      mover = pickIdlestSafeCandidate(orphanPool);
+      if (mover) orphanPool.splice(orphanPool.indexOf(mover), 1);
+    }
+    if (!mover) {
+      const surplus = groupsInfo.filter((g) => g !== recipient && g.healthy.length > g.target + GROUP_REBALANCE_SLACK)
+        .sort((a, b) => (b.healthy.length - b.target) - (a.healthy.length - a.target)); // most-surplus first
+      let donor = surplus[0];
+      if (!donor && recipient.healthy.length === 0) {
+        // emergency: recipient is at 0 and no orphan/surplus exists -> pull from whichever group has the MOST
+        // healthy profiles anyway, even if merely "at target" -- the next cycle's normal math smooths this back
+        // out once the true outage resolves elsewhere.
+        donor = groupsInfo.filter((g) => g !== recipient && g.healthy.length > 1).sort((a, b) => b.healthy.length - a.healthy.length)[0];
+      }
+      if (!donor) { summary.shortfalls.push({ group: recipient.key, healthy: recipient.healthy.length, target: recipient.target }); break; }
+      mover = pickIdlestSafeCandidate(donor.healthy);
+      if (!mover) break; // every candidate in the only available donor was unsafe to move right now -- stop rather than loop forever
+      fromGroup = donor;
+    }
+
+    const moverId = profileIdFromLabel(mover);
+    if (fromGroup) {
+      fromGroup.entry.profiles = (Array.isArray(fromGroup.entry.profiles) ? fromGroup.entry.profiles : []).filter((p) => profileIdFromLabel(p) !== moverId);
+      fromGroup.healthy = fromGroup.healthy.filter((p) => profileIdFromLabel(p) !== moverId);
+    }
+    if (!Array.isArray(recipient.entry.profiles)) recipient.entry.profiles = [];
+    if (!recipient.entry.profiles.some((p) => profileIdFromLabel(p) === moverId)) recipient.entry.profiles.push(mover);
+    recipient.healthy.push(mover);
+
+    // Hygiene (2026-07-07 review fix -- adversarial-verify on the FIRST implementation attempt caught this
+    // scoped to the WRONG group): a profile's stale per-group failure tally / text-bench block must be cleared
+    // for the RECIPIENT it's now entering, not the fromGroup it's leaving -- clearing fromGroup's bench is a
+    // no-op (the profile isn't posting there anymore regardless), while a STALE bench for the recipient (from
+    // some EARLIER stint in that same group, e.g. via recordGroupPostFailureAndMaybeUnassign/
+    // recordPostingProfileGroupIssue, which unassign-and-bench together) is exactly what could silently block
+    // this move from actually working -- postingSlots would keep rerouting the profile away from the recipient
+    // via isProfileGroupBlockedForPosting's stale line, while groupAssignmentData/the dashboard both say it
+    // belongs there. Runs UNCONDITIONALLY (not gated on `if (fromGroup)`) since even an orphan-sourced move needs
+    // the recipient-side stale bench checked.
+    try {
+      const counts = JSON.parse(state.posting.groupPostFailCounts || "{}");
+      delete counts[`${recipient.key}|${moverId}`];
+      state.posting.groupPostFailCounts = JSON.stringify(counts);
+    } catch (_) {}
+    // ANCHORED profile-id match (2026-07-07 review fix): the first implementation attempt used an unanchored
+    // `line.includes("profile_id=" + moverId)`, which would also match profile_id=10/12/19/100-199 etc. as a
+    // substring of profile_id=1 -- mirrors the anchoring stripPriorRepeatedBlacklistLines already uses
+    // (`profile_id=${pid}(?!\d)`, server.js ~8357) specifically to prevent this exact cross-profile leak.
+    const recipientAliases = groupKeyAliasSet(recipient.url);
+    const moverIdRe = new RegExp(`profile_id=${moverId}(?!\\d)`);
+    const stripGroupBench = (value) => String(value || "").split(/\r?\n/).filter((line) => {
+      if (!/status=cannot_post_in_group/i.test(line)) return true;
+      if (!moverIdRe.test(line)) return true;
+      const lineGroup = normalizedFacebookGroupKey((line.match(/group_url=([^|]+)/i) || [])[1] || "");
+      return !(lineGroup === recipient.key || recipientAliases.has(lineGroup));
+    }).join("\n");
+    state.posting.facebookProfileStatus = stripGroupBench(state.posting.facebookProfileStatus);
+    state.ixbrowser.failedProfiles = stripGroupBench(state.ixbrowser.failedProfiles);
+
+    const reason = !fromGroup ? "orphan_reassigned" : (fromGroup.healthy.length === 0 ? "emergency_donor" : "surplus_donor");
+    summary.moved.push({ profileId: moverId, profile: mover, fromGroup: fromGroup ? fromGroup.url : "(unassigned)", toGroup: recipient.url, reason });
+    try { logEvent("group_profile_rebalance_moved", { profileId: moverId, profile: oneLineField(mover, 120), fromGroup: fromGroup ? fromGroup.url : "(unassigned)", toGroup: recipient.url, reason }); } catch (_) {}
+  }
+
+  for (const s of summary.shortfalls) { try { logEvent("group_profile_rebalance_shortfall", s); } catch (_) {} }
+  if (summary.moved.length) {
+    try {
+      logEvent("group_profile_rebalance_applied", {
+        moves: summary.moved.length,
+        groupCounts: oneLineField(JSON.stringify(groupsInfo.map((g) => ({ group: g.key, healthy: g.healthy.length, target: g.target }))), 2000),
+      });
+    } catch (_) {}
+  }
+  // Telemetry only (never read by any decision path, fully recomputed every cycle so a stale overwrite is
+  // harmless) -- extends the existing groupsWithoutEligibleProfiles observability gap (that flag exists
+  // server-side but is never rendered in web/app.js/index.html today).
+  try { state.operator.groupHealthSummary = groupsInfo.map((g) => ({ group: g.url, healthy: g.healthy.length, total: (g.entry.profiles || []).length, target: g.target })); } catch (_) {}
+  return summary;
 }
 
 async function reconcileProfilesWithIxBrowser(options = {}) {
@@ -19743,6 +19963,20 @@ async function reconcileProfilesWithIxBrowser(options = {}) {
         }
         if (addedToAny) { rosterIds.set(id, label); dirty = true; summary.added.push({ profileId: id, label }); }
       }
+    }
+
+    // PASS 4: REBALANCE (2026-07-07) -- runs strictly AFTER PASS 1-3 above have already cleared any self-healing
+    // bench in THIS SAME cycle, so only durable/sticky exclusions are visible to it (see reconcileGroupProfileBalance
+    // and isDurablyHealthyPostingProfile for the full rationale). Same in-memory state object, same persistence
+    // call below -- no new write, no new race window. INDIVIDUALLY try/caught (2026-07-07 review fix) so an
+    // unexpected PASS4 throw can never discard PASS 1-3's already-computed dirty changes for this cycle (an
+    // uncaught throw here would otherwise propagate past the writeState(state) call below, silently losing
+    // PASS1-3's work too -- self-heals next cycle either way, but PASS4 must not be able to cause that).
+    try {
+      const rebalanceSummary = reconcileGroupProfileBalance(state, liveIds);
+      if (rebalanceSummary.moved.length) dirty = true;
+    } catch (err) {
+      logEvent("group_profile_rebalance_error", { error: oneLineField(err.message || String(err), 240) });
     }
 
     state.ixbrowser.reconcileMissStreak = JSON.stringify(nextMissStreak);
