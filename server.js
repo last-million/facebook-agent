@@ -10946,6 +10946,7 @@ function preparePostingPlan(options = {}) {
     ? clampNumber(options.limit, 1, 500, 1)
     : clampNumber(state.productDiscovery?.dailyPostTarget, 1, 500, slots.length);
   const limit = Math.min(slots.length, planProducts.length, requestedLimit);
+  if (!options.testPost) { try { logEvent("__debug_plan_sizes", { slotsLen: slots.length, planProductsLen: planProducts.length, requestedLimit, limit, usableProductsLen: usableProducts.length, productsLen: products.length }); } catch (_) {} }
   const runType = options.testPost ? "one_post_test" : "full_posting_plan";
   const planId = `plan_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`;
   const at = new Date().toISOString();
