@@ -3602,6 +3602,27 @@ function harvestedProductEverCoveredAllConfiguredGroups(rec, state) {
   } catch (_) { return true; } // fail-open: never block a sweep on an unexpected error
 }
 
+// PRODUCT+GROUP FAILURE COOLDOWN (2026-07-07 review fix): shared by collectProductUrlsForPosting's coverage-
+// priority ordering AND preparePostingPlan's per-row __targetGroups selection -- both must agree on which
+// (product, group) pairs are "cooling down", otherwise a pair demoted out of coverage-priority ordering can still
+// get a row built for its troubled group the moment it's considered at all (confirmed live: this exact gap let
+// one stuck pair keep being the ONLY row built every tick even after being pushed out of the front of the list,
+// since preparePostingPlan's own owed-group loop didn't know about the cooldown). Counts recent completed_error
+// publish_intent_resolved rows by their claim hash (product+group, stable across retries -- see
+// postClaimBaseHash/the runWorker publish_intent writer) within a 30-minute window.
+function recentProductGroupFailureCounts() {
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  const counts = new Map();
+  for (const r of readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 3000 })) {
+    if (!r || r.event !== "publish_intent_resolved" || r.status !== "completed_error") continue;
+    const at = Date.parse(r.at || "");
+    if (!Number.isFinite(at) || at < cutoff) continue;
+    const hash = String(r.message || "").split("|")[1] || "";
+    if (!hash) continue;
+    counts.set(hash, (counts.get(hash) || 0) + 1);
+  }
+  return counts;
+}
 function collectProductUrlsForPosting(state, options = {}) {
   const latestOnly = Boolean(options.latestDiscoveryOnly || options.latest_discovery_only);
   const candidateRows = latestOnly
@@ -3666,16 +3687,7 @@ function collectProductUrlsForPosting(state, options = {}) {
       // see postClaimBaseHash/the runWorker publish_intent writer) and treat a pair that's failed >=2 times in the
       // last 30min as temporarily unservable for coverage-priority purposes -- it falls to recycle (behind the fresh
       // queue) instead of monopolizing every tick, and naturally re-qualifies once 30min pass without a new failure.
-      const __recentPairFailureCutoff = Date.now() - 30 * 60 * 1000;
-      const __recentPairFailureCounts = new Map();
-      for (const r of readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 3000 })) {
-        if (!r || r.event !== "publish_intent_resolved" || r.status !== "completed_error") continue;
-        const at = Date.parse(r.at || "");
-        if (!Number.isFinite(at) || at < __recentPairFailureCutoff) continue;
-        const hash = String(r.message || "").split("|")[1] || "";
-        if (!hash) continue;
-        __recentPairFailureCounts.set(hash, (__recentPairFailureCounts.get(hash) || 0) + 1);
-      }
+      const __recentPairFailureCounts = recentProductGroupFailureCounts();
       const __owesServableGroup = (r) => {
         const bg = (r && r.lastPostedAtByGroup && typeof r.lastPostedAtByGroup === "object") ? r.lastPostedAtByGroup : {};
         for (const { url, key: g } of __cfgGroupPairs) {
@@ -10967,6 +10979,12 @@ function preparePostingPlan(options = {}) {
       }
     }
   } catch (_) { /* observability only — never break plan building */ }
+  // PRODUCT+GROUP FAILURE COOLDOWN (2026-07-07 review fix): see recentProductGroupFailureCounts and
+  // collectProductUrlsForPosting's matching comment. Computed ONCE per plan-build (not per row) and consulted
+  // below when building each row's __targetGroups, so a (product, group) pair pushed out of coverage-priority
+  // ordering can't still get a row built for its cooling-down group the moment it's considered at all -- confirmed
+  // live this exact gap let one stuck pair remain the ONLY row built every tick even after being demoted.
+  const __recentPairFailureCounts = state.operator?.postToAllGroups === true ? recentProductGroupFailureCounts() : null;
   const __fanoutCursorByGroupKey = new Map();
   const __pickFanoutProfileForGroup = (groupUrl, excludeProfileKey) => {
     const gk = normalizedFacebookGroupKey(groupUrl);
@@ -11073,6 +11091,7 @@ function preparePostingPlan(options = {}) {
         if (__coverageIncomplete && __stampedAt) continue; // coverage-first: don't re-post an already-served group until EVERY configured group has this product once
         if (__stampedAt) { const __t = Date.parse(__stampedAt || ""); if (Number.isFinite(__t) && (Date.now() - __t) < __reuseMs) continue; } // 1x per group per reuse window
         if (normalizedFacebookGroupKey(__g) !== normalizedFacebookGroupKey(slot.groupUrl) && !__fanoutProfilesByGroupKey.has(__k)) continue; // no profile assigned to this group -> skip it (don't emit an unpostable row)
+        if (__recentPairFailureCounts && (__recentPairFailureCounts.get(postClaimBaseHash(state, product.key, __g)) || 0) >= 2) continue; // cooling down -- don't keep building a row for a (product, group) pair that's repeatedly failed recently; see recentProductGroupFailureCounts
         __targetGroups.push(__g);
       }
       if (!__targetGroups.length) continue; // already hit every group within its reuse window (or coverage pending on a temporarily-unservable group) -> skip
