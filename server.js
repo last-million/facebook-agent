@@ -3652,14 +3652,32 @@ function collectProductUrlsForPosting(state, options = {}) {
     const recs = readHarvestedProducts(state);
     const rh = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 24);
     const onDisk = (r) => r && r.firstCommentUrl && r.imageLocalPath && !r.imageDeleted && imageFileLooksValid(safeProjectPath(r.imageLocalPath));
-    const lastMs = (r) => { const s = r.lastPostedAt || r.posted || ""; const t = s ? Date.parse(s) : 0; return Number.isFinite(t) ? t : 0; };
+    // GROUP-STAMP FALLBACK (2026-07-07 review fix): the postToAllGroups fan-out path stamps ONLY
+    // lastPostedAtByGroup (per-group) on a successful post -- it never writes the legacy singular
+    // lastPostedAt/posted fields this "has this product EVER been posted" check was written against. Confirmed
+    // live: a product posted to all 4 configured groups (lastPostedAtByGroup fully populated) still had
+    // lastPostedAt/posted BOTH empty, so it was misclassified as "fresh" (never posted) -- meaning EVERY
+    // harvested product that only ever went through the fan-out path looked fresh regardless of its real
+    // coverage state, front-loading a pool of already-fully-covered products ahead of (and burying) genuinely
+    // reuse-due partial products, and starving the plan-builder's per-index loop (which correctly reads
+    // lastPostedAtByGroup and skips a still-within-reuseHours group) down to just 1 valid row per pass. Anchor
+    // "has ever posted" on the MOST RECENT timestamp across either signal, whichever is newer.
+    const __maxGroupStampMs = (r) => {
+      const bg = (r && r.lastPostedAtByGroup && typeof r.lastPostedAtByGroup === "object") ? r.lastPostedAtByGroup : null;
+      if (!bg) return 0;
+      let m = 0;
+      for (const k of Object.keys(bg)) { const t = Date.parse(bg[k] || ""); if (Number.isFinite(t) && t > m) m = t; }
+      return m;
+    };
+    const lastMs = (r) => { const s = r.lastPostedAt || r.posted || ""; const t = s ? Date.parse(s) : 0; return Math.max(Number.isFinite(t) ? t : 0, __maxGroupStampMs(r)); };
+    const everPosted = (r) => Boolean(r.lastPostedAt || r.posted) || __maxGroupStampMs(r) > 0;
     const __reuseMs = rh * 3600 * 1000;
     const __fanout = state.operator?.postToAllGroups === true;
-    const fresh = recs.filter((r) => onDisk(r) && !(r.lastPostedAt || r.posted)).map((r) => r.productKey);
+    const fresh = recs.filter((r) => onDisk(r) && !everPosted(r)).map((r) => r.productKey);
     // RE-ELIGIBLE: product-level window when posting to a single group; GROUP-AWARE (still owes a configured group)
     // when postToAllGroups, so a product posted to ONE group stays eligible for the remaining group(s) instead of
     // being dropped from the pool for the whole window (the "same product not in all groups" bug).
-    const reeligibleRecs = recs.filter((r) => onDisk(r) && (r.lastPostedAt || r.posted) && (
+    const reeligibleRecs = recs.filter((r) => onDisk(r) && everPosted(r) && (
       __fanout
         ? harvestedProductOwesAnyConfiguredGroup(r, state, __reuseMs)
         : (lastMs(r) > 0 && (Date.now() - lastMs(r)) >= __reuseMs)
@@ -3714,7 +3732,6 @@ function collectProductUrlsForPosting(state, options = {}) {
       const partial = reeligibleRecs.filter(__isPartial).map((r) => r.productKey); // complete the duplication NOW
       const recycle = reeligibleRecs.filter((r) => !__isPartial(r)).map((r) => r.productKey); // stale-recycle, or owes only an unservable group -> behind fresh (don't starve the healthy group)
       harvestedKeys = [...partial, ...fresh, ...recycle];
-      try { logEvent("__debug_harvested_keys", { partialLen: partial.length, freshLen: fresh.length, recycleLen: recycle.length, recsLen: recs.length, onDiskLen: recs.filter(onDisk).length, first5: harvestedKeys.slice(0, 5) }); } catch (_) {}
     } else {
       harvestedKeys = [...fresh, ...reeligibleRecs.map((r) => r.productKey)];
     }
@@ -10947,7 +10964,6 @@ function preparePostingPlan(options = {}) {
     ? clampNumber(options.limit, 1, 500, 1)
     : clampNumber(state.productDiscovery?.dailyPostTarget, 1, 500, slots.length);
   const limit = Math.min(slots.length, planProducts.length, requestedLimit);
-  if (!options.testPost) { try { logEvent("__debug_plan_sizes", { slotsLen: slots.length, planProductsLen: planProducts.length, requestedLimit, limit, usableProductsLen: usableProducts.length, productsLen: products.length }); } catch (_) {} }
   const runType = options.testPost ? "one_post_test" : "full_posting_plan";
   const planId = `plan_${Date.now()}_${crypto.randomBytes(3).toString("hex")}`;
   const at = new Date().toISOString();
@@ -11107,7 +11123,6 @@ function preparePostingPlan(options = {}) {
         if (__recentPairFailureCounts && (__recentPairFailureCounts.get(postClaimBaseHash(state, product.key, __g)) || 0) >= 2) continue; // cooling down -- don't keep building a row for a (product, group) pair that's repeatedly failed recently; see recentProductGroupFailureCounts
         __targetGroups.push(__g);
       }
-      try { logEvent("__debug_row_index", { index, productKey: product.key, hasHarvestedRec: !!harvestedRec, coverageIncomplete: __coverageIncomplete, slotGroupUrl: slot.groupUrl, slotProfile: slot.profile, targetGroupsLen: __targetGroups.length }); } catch (_) {}
       if (!__targetGroups.length) continue; // already hit every group within its reuse window (or coverage pending on a temporarily-unservable group) -> skip
     }
     const __row = {
