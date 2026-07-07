@@ -3638,7 +3638,9 @@ function collectProductUrlsForPosting(state, options = {}) {
       // starting brand-new products. Without this, every fresh product is posted to its FIRST group first and the
       // 2nd-group copies wait behind the entire fresh queue (~30-78min observed), so "same product in ALL groups"
       // barely happens (~12%). Order: partial-coverage first -> fresh -> stale-recycle.
-      const __cfgGroupKeys = allConfiguredPostingGroupUrls(state).map(normalizedFacebookGroupKey).filter(Boolean);
+      const __cfgGroupUrls = allConfiguredPostingGroupUrls(state); // keep the real URLs too -- postClaimBaseHash below needs them, not just the normalized keys
+      const __cfgGroupPairs = __cfgGroupUrls.map((url) => ({ url, key: normalizedFacebookGroupKey(url) })).filter((p) => p.key);
+      const __cfgGroupKeys = __cfgGroupPairs.map((p) => p.key);
       const __coveredCount = (r) => { const bg = (r && r.lastPostedAtByGroup && typeof r.lastPostedAtByGroup === "object") ? r.lastPostedAtByGroup : {}; let n = 0; for (const g of __cfgGroupKeys) { const t = bg[g] ? Date.parse(bg[g]) : 0; if (t && Number.isFinite(t) && (Date.now() - t) < __reuseMs) n += 1; } return n; };
       // SERVABLE-AWARE (review-flagged regression guard): only FRONT-LOAD a partial that owes a group which currently
       // has >=1 eligible profile. A partial owing ONLY a benched/disconnected group emits no plan row but still burns a
@@ -3653,7 +3655,38 @@ function collectProductUrlsForPosting(state, options = {}) {
         const servable = (e.profiles || []).some((p) => { const id = String(profileIdFromLabel(String(p)) || ""); return id && !__disconnectedIds.has(id) && !isProfileBlockedForPosting(String(p), state, e.url); });
         if (servable) __servableGroupKeys.add(gk);
       }
-      const __owesServableGroup = (r) => { const bg = (r && r.lastPostedAtByGroup && typeof r.lastPostedAtByGroup === "object") ? r.lastPostedAtByGroup : {}; for (const g of __cfgGroupKeys) { const t = bg[g] ? Date.parse(bg[g]) : 0; const owed = !t || !Number.isFinite(t) || (Date.now() - t) >= __reuseMs; if (owed && __servableGroupKeys.has(g)) return true; } return false; };
+      // PRODUCT+GROUP FAILURE COOLDOWN (2026-07-07 review fix): "servable" above only checks PROFILE availability --
+      // it says nothing about whether POSTING to that group for THIS SPECIFIC product keeps actually failing (e.g. a
+      // post-click that never gets a confirmed permalink, triggering an admin-approval retry that can itself fail).
+      // Without this, a single (product, group) pair stuck in that failure mode gets front-loaded and re-retried on
+      // EVERY tick forever. Confirmed live: one pair retried nonstop for 25+ minutes while a 96-product ready buffer
+      // sat completely idle, because __autopilotTickInFlight serializes ticks and each retry cycle can burn up to
+      // ~8-16 minutes of admin-approval attempts before failing and being immediately re-picked. Track recent
+      // completed_error publish_intent_resolved rows by their claim hash (product+group, stable across retries --
+      // see postClaimBaseHash/the runWorker publish_intent writer) and treat a pair that's failed >=2 times in the
+      // last 30min as temporarily unservable for coverage-priority purposes -- it falls to recycle (behind the fresh
+      // queue) instead of monopolizing every tick, and naturally re-qualifies once 30min pass without a new failure.
+      const __recentPairFailureCutoff = Date.now() - 30 * 60 * 1000;
+      const __recentPairFailureCounts = new Map();
+      for (const r of readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 3000 })) {
+        if (!r || r.event !== "publish_intent_resolved" || r.status !== "completed_error") continue;
+        const at = Date.parse(r.at || "");
+        if (!Number.isFinite(at) || at < __recentPairFailureCutoff) continue;
+        const hash = String(r.message || "").split("|")[1] || "";
+        if (!hash) continue;
+        __recentPairFailureCounts.set(hash, (__recentPairFailureCounts.get(hash) || 0) + 1);
+      }
+      const __owesServableGroup = (r) => {
+        const bg = (r && r.lastPostedAtByGroup && typeof r.lastPostedAtByGroup === "object") ? r.lastPostedAtByGroup : {};
+        for (const { url, key: g } of __cfgGroupPairs) {
+          const t = bg[g] ? Date.parse(bg[g]) : 0;
+          const owed = !t || !Number.isFinite(t) || (Date.now() - t) >= __reuseMs;
+          if (!owed || !__servableGroupKeys.has(g)) continue;
+          if ((__recentPairFailureCounts.get(postClaimBaseHash(state, r.productKey, url)) || 0) >= 2) continue; // cooling down -- don't front-load THIS group for THIS product right now
+          return true;
+        }
+        return false;
+      };
       const __isPartial = (r) => __coveredCount(r) > 0 && __owesServableGroup(r); // mid-duplication AND the missing group can actually post now
       const partial = reeligibleRecs.filter(__isPartial).map((r) => r.productKey); // complete the duplication NOW
       const recycle = reeligibleRecs.filter((r) => !__isPartial(r)).map((r) => r.productKey); // stale-recycle, or owes only an unservable group -> behind fresh (don't starve the healthy group)
