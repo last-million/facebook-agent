@@ -3607,14 +3607,19 @@ function harvestedProductEverCoveredAllConfiguredGroups(rec, state) {
 // (product, group) pairs are "cooling down", otherwise a pair demoted out of coverage-priority ordering can still
 // get a row built for its troubled group the moment it's considered at all (confirmed live: this exact gap let
 // one stuck pair keep being the ONLY row built every tick even after being pushed out of the front of the list,
-// since preparePostingPlan's own owed-group loop didn't know about the cooldown). Counts recent completed_error
+// since preparePostingPlan's own owed-group loop didn't know about the cooldown). Counts recent NON-SUCCESS
 // publish_intent_resolved rows by their claim hash (product+group, stable across retries -- see
-// postClaimBaseHash/the runWorker publish_intent writer) within a 30-minute window.
+// postClaimBaseHash/the runWorker publish_intent writer) within a 30-minute window. Deliberately counts every
+// status EXCEPT the known-success ones (not just "completed_error"): a process restart that interrupts an
+// in-flight attempt makes reconcilePendingPublishIntentsAsync resolve it as "needs_manual_review" or
+// "released_not_landed" instead of "completed_error" -- confirmed live this exact gap let 2 restart-interrupted
+// attempts on the SAME stuck pair go uncounted, keeping the cooldown permanently below its own >=2 threshold.
+const __PRODUCT_GROUP_SUCCESS_STATUSES = new Set(["completed_published", "already_recorded", "recovered_landed"]);
 function recentProductGroupFailureCounts() {
   const cutoff = Date.now() - 30 * 60 * 1000;
   const counts = new Map();
   for (const r of readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 3000 })) {
-    if (!r || r.event !== "publish_intent_resolved" || r.status !== "completed_error") continue;
+    if (!r || r.event !== "publish_intent_resolved" || __PRODUCT_GROUP_SUCCESS_STATUSES.has(String(r.status || ""))) continue;
     const at = Date.parse(r.at || "");
     if (!Number.isFinite(at) || at < cutoff) continue;
     const hash = String(r.message || "").split("|")[1] || "";
