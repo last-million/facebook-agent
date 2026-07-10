@@ -16700,7 +16700,22 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         if (fa !== fb) return fa - fb;
         return (Date.parse(a.at || 0) || 0) - (Date.parse(b.at || 0) || 0);
       });
-      for (const ev of __orderedPending) {
+      // CHRONIC-STARVATION GUARD (2026-07-10, operator: "why do I still see many not commented" -- confirmed
+      // live: a post that already hit publisher_comment_last_resort_skipped (failCount>=1) is ALWAYS sorted
+      // behind every failCount=0 candidate above, with no floor. During a long, continuously-busy run that keeps
+      // generating fresh candidates, a chronic post can lose this race on every single pass, forever -- confirmed
+      // live on a post stuck 14+ hours with zero retries since its last-resort marker, even though the documented
+      // intent (task #222, 2026-07-06) was "reorder, never abandon; a chronic post still gets retried, just after
+      // the fresher ones." Reserve a small, fixed slice of THIS pass's budget for the globally OLDEST already-
+      // failed posts regardless of fail count, so a chronic post is guaranteed periodic attention no matter how
+      // much fresh volume exists. Bounded (maxToFix/4) so it can't crowd out fresh posts' own fast commenting.
+      const __chronicLaneSize = Math.max(1, Math.floor(maxToFix / 4));
+      const __chronicOldestFirst = __orderedPending.filter((ev) => __failCountFor(ev.postUrl) > 0)
+        .sort((a, b) => (Date.parse(a.at || 0) || 0) - (Date.parse(b.at || 0) || 0))
+        .slice(0, __chronicLaneSize);
+      const __chronicSet = new Set(__chronicOldestFirst);
+      const __orderedFinal = [...__chronicOldestFirst, ...__orderedPending.filter((ev) => !__chronicSet.has(ev))];
+      for (const ev of __orderedFinal) {
         if (!options.ignoreArmedGate && __externalStopRequested > resweepStartedAt) { logEvent("comment_resweep_aborted_by_stop", { checked: summary.checked }); break; } // operator hit STOP -> halt now. EXCEPTION (operator 2026-06-20): the ignoreArmedGate FINISH-drains (stop-drain 8270 / run-end 9075) run to COMPLETION — a 2nd/stale/double STOP must NOT bump __externalStopRequested past this drain's resweepStartedAt and abandon the comments the run already owes (that left 20 uncommented forever). Posting+harvest are already hard-killed before the finish-drain starts, so this only lets the cheap comment-finish complete.
         const postUrl = ev.postUrl;
         // Bound by ATTEMPTS, not just successes: a post that can never be commented (no eligible
