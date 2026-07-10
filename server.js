@@ -22282,7 +22282,14 @@ setInterval(() => {
       // inter-tick gap). A FULL skip risked bounded comment LOSS in a sustained gapless burst (verifier flag) — a light
       // floor keeps recovery alive there while still giving posting the lion's share of the slots.
       const __drainMax = isLivePostingInFlight() ? 8 : 50;
-      resweepUncommentedFacebookPostsAsync({ drain: true, max: __drainMax, windowHours: 6 }).catch(() => {}); // operator 2026-06-20: windowHours 1->6 so the drain can SEE a long run's first-half posts (1h silently excluded posts published >60min ago -> never recovered); max 25->50 to clear a whole run's tail in one cycle (aligns with the stop/run-end drains' windowHours:24/max:50).
+      // windowHours 6->24 (2026-07-10, same live incident as the chronic-starvation guard above): a run that
+      // stays continuously active for many hours (this one: 14+) never triggers the cold-backlog heartbeat below
+      // (it only fires once nothing has published in 60min), so THIS warm drain was the only thing that could
+      // still reach an aging stuck post -- but its own 6h reach-back window silently dropped it from
+      // publishedByPlan entirely once it aged past 6h, with no log line marking the loss. 24h comfortably covers
+      // a long single-day run while staying well short of "chasing across days" (the persistent-drain/run-only
+      // philosophy this constant originally protected, per the 2026-06-20 comment below).
+      resweepUncommentedFacebookPostsAsync({ drain: true, max: __drainMax, windowHours: 24 }).catch(() => {}); // operator 2026-06-20: windowHours 1->6 so the drain can SEE a long run's first-half posts (1h silently excluded posts published >60min ago -> never recovered); max 25->50 to clear a whole run's tail in one cycle (aligns with the stop/run-end drains' windowHours:24/max:50).
     } else if (Date.now() - __lastColdBacklogDrainAt > COLD_BACKLOG_DRAIN_INTERVAL_MS) {
       // See COLD-BACKLOG HEARTBEAT comment above (~line 16511) for the full rationale. Fires ONLY once the warm
       // window above has closed (no publish in the last 60min) -- zero behavior change during/right after an
