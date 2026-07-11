@@ -23123,6 +23123,18 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "GET" && url.pathname === "/api/profiles/issues") {
     return json(res, 200, { issues: (readState().posting?.issueProfiles || []) }); // profiles auto-benched after repeated failures; Release via /api/profiles/release-issue
   }
+  if (req.method === "GET" && url.pathname === "/api/profiles/not-group-member") {
+    // 2026-07-11: profiles confirmed not a member of ANY currently-configured Facebook group (they still work
+    // fine everywhere else -- a single-group membership exclusion never lands here, only exhausting every
+    // configured group does). Release via /api/profiles/release-not-group-member once the admin has actually
+    // fixed the account's group membership on Facebook.
+    return json(res, 200, { notGroupMember: (readState().posting?.notGroupMemberProfiles || []) });
+  }
+  if (req.method === "POST" && url.pathname === "/api/profiles/release-not-group-member") {
+    const id = url.searchParams.get("profileId") || "";
+    const ok = releaseNotGroupMemberProfile(id);
+    return json(res, 200, { ok, profileId: id, notGroupMember: (readState().posting?.notGroupMemberProfiles || []) });
+  }
   if (req.method === "POST" && url.pathname === "/api/profiles/comment-limit") {
     // manually sideline a broken COMMENTER (post-only) — excluded from the commenter pool, surfaced in the
     // Comment-limited section; Release via /api/profiles/release. (Auto-fires too, after 3 commenter-specific failures.)
