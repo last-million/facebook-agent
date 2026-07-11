@@ -16718,12 +16718,33 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         .slice(0, __chronicLaneSize);
       const __chronicSet = new Set(__chronicOldestFirst);
       const __orderedFinal = [...__chronicOldestFirst, ...__orderedPending.filter((ev) => !__chronicSet.has(ev))];
+      // PARALLEL DISPATCH (2026-07-10, operator: still seeing a growing backlog on a group whose recovery
+      // chain -- multiple comment-fallback profiles + 2 admin-approval attempts -- routinely takes 5-15 minutes
+      // PER POST). This loop used to be fully sequential (`for...await`), so a single pass could only ever fully
+      // resolve 1-2 candidates in the time between drain cycles no matter how the candidate list was sorted --
+      // confirmed live: the same 1-2 (planId,sequence) pairs cycling through many fallback profiles for 15+
+      // minutes each while the rest of a ~30-post backlog on one group sat completely untouched, and the
+      // chronic-priority-lane widening (same day) made no measurable difference because the bottleneck was
+      // never the SORT ORDER, it was sequential wall-clock time. Split into (1) a cheap, sequential SELECTION
+      // pass below -- dedup/payload-reconstruction/backoff checks only, no network/browser calls, safe to keep
+      // synchronous -- capped at maxToFix candidates, then (2) a CONCURRENT dispatch of the expensive
+      // addRequiredFirstCommentWithDifferentProfile calls via Promise.allSettled. This mirrors the exact pattern
+      // already proven safe in this file by the 2026-07-07 fast-fire comment queue (__fireBackgroundedComment):
+      // addRequiredFirstCommentWithDifferentProfile's own inner path acquires acquireCommentLock() (a proper
+      // async semaphore, operator.maxConcurrentComments, clamped 1-4) before doing any real browser work, so
+      // firing more candidates than that limit simply queues the rest -- REAL concurrency stays bounded by the
+      // SAME existing gate that already governs every other concurrent comment path in this codebase, not by
+      // however many this loop "starts." Counters (summary.checked/recommented/stillMissing) are plain object
+      // field increments; Node's single-threaded event loop makes each individual increment atomic between
+      // awaits, so no lock is needed for the shared summary object across the concurrent callbacks.
+      const __candidates = [];
       for (const ev of __orderedFinal) {
-        if (!options.ignoreArmedGate && __externalStopRequested > resweepStartedAt) { logEvent("comment_resweep_aborted_by_stop", { checked: summary.checked }); break; } // operator hit STOP -> halt now. EXCEPTION (operator 2026-06-20): the ignoreArmedGate FINISH-drains (stop-drain 8270 / run-end 9075) run to COMPLETION — a 2nd/stale/double STOP must NOT bump __externalStopRequested past this drain's resweepStartedAt and abandon the comments the run already owes (that left 20 uncommented forever). Posting+harvest are already hard-killed before the finish-drain starts, so this only lets the cheap comment-finish complete.
+        if (!options.ignoreArmedGate && __externalStopRequested > resweepStartedAt) { logEvent("comment_resweep_aborted_by_stop", { checked: summary.checked }); break; } // operator hit STOP -> halt now (before dispatching anything new). EXCEPTION (operator 2026-06-20): the ignoreArmedGate FINISH-drains (stop-drain 8270 / run-end 9075) run to COMPLETION — a 2nd/stale/double STOP must NOT bump __externalStopRequested past this drain's resweepStartedAt and abandon the comments the run already owes (that left 20 uncommented forever). Posting+harvest are already hard-killed before the finish-drain starts, so this only lets the cheap comment-finish complete.
         const postUrl = ev.postUrl;
-        // Bound by ATTEMPTS, not just successes: a post that can never be commented (no eligible
-        // commenter) must not make every 90s sweep do full-cost recovery work against it.
-        if (summary.recommented >= maxToFix || summary.checked >= maxToFix) break;
+        // Bound by CANDIDATES SELECTED, not (as before) attempts made mid-loop -- equivalent now that dispatch
+        // is concurrent: each selected candidate becomes exactly one real attempt below (barring the late
+        // re-check race, same as before), so capping selection at maxToFix preserves the same per-pass budget.
+        if (__candidates.length >= maxToFix) break;
         const publisherId = Number(ev.profileId || 0);
         if (__hasDifferentProfileComment(postUrl, publisherId)) continue; // already has a different-profile comment (SWARM FIX #2: build-once index over the full 8000 selection window, not a smaller 5000 re-read)
         // REMOVED 2026-07-01 (operator: "find way to not skip comments man!"): there used to be a hard COMMENT MAX-AGE
@@ -16781,45 +16802,43 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         const __chronicFails = __failCountFor(postUrl);
         const __backoffMs = Math.min(__baseBackoffMs * (1 + __chronicFails), 6 * 3600 * 1000);
         if (Date.now() - __boAt < __backoffMs) { summary.stillMissing += 1; continue; } // tried recently + still uncommented -> defer (don't re-cycle profiles on a stuck/pending post)
-        // STARVATION FIX (operator 2026-06-20): the RECOVERY drains (persistent drain / stop-finish / run-end / forced)
-        // must NOT yield-forever to an always-posting run — that left the drain checking only 1 post/cycle while 20 stayed
-        // uncommented (audit: waitedMs 76544 -> checked 1). Bound their courtesy yield to 15s so ONE cycle clears the whole
-        // owed backlog; the cheap normal armed heartbeat sweep keeps the full polite yield (no added load at rest).
+        const __forcedSweep = !!(options.drain || options.ignoreArmedGate || options.force);
+        if (!__forcedSweep) __commentRecoveryBackoff.set(postUrl, Date.now()); // record this attempt (set BEFORE attempting so a timeout/crash still backs off) -- unchanged: still stamped at SELECTION time for normal sweeps, same as before
+        if (__commentRecoveryBackoff.size > 3000) { const cut = Date.now() - 2 * COMMENT_RECOVERY_BACKOFF_MS; for (const [k, v] of __commentRecoveryBackoff) if (v < cut) __commentRecoveryBackoff.delete(k); } // bound memory
+        __candidates.push({ ev, row, postUrl, publisherId, __forcedSweep });
+      }
+      // STARVATION FIX (operator 2026-06-20): the RECOVERY drains (persistent drain / stop-finish / run-end / forced)
+      // must NOT yield-forever to an always-posting run — that left the drain checking only 1 post/cycle while 20 stayed
+      // uncommented (audit: waitedMs 76544 -> checked 1). Bound their courtesy yield to 15s so ONE cycle clears the whole
+      // owed backlog; the cheap normal armed heartbeat sweep keeps the full polite yield (no added load at rest). Each
+      // concurrent candidate below still waits/yields independently before its own attempt.
+      await Promise.allSettled(__candidates.map(async (c) => {
         if (!options.drain && !options.ignoreArmedGate && !options.force) await waitForPostingIdle({ label: "comment_resweep" });
         else await waitForPostingIdle({ label: "comment_resweep", maxWaitMs: 15000 });
-        if (latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) continue; // a concurrent post may have just commented it
-        // BACKOFF POISONING FIX (operator 2026-06-21): for the FORCED recovery sweeps (run-end final / stop-finish /
-        // persistent drain / manual force) DON'T stamp the backoff before the attempt. Those sweeps run right after a
-        // post lands and can collide with that post's still-in-flight inline comment lock; a pre-attempt stamp would
-        // back the post off 8-22 min and make every later pass SKIP it — so the tail post never got re-tried. We stamp
-        // these only AFTER a failed attempt (below). The NORMAL armed heartbeat sweep keeps the conservative
-        // set-before-attempt (it polite-yields forever so it never collides, and a timeout/crash must still back it off).
-        const __forcedSweep = !!(options.drain || options.ignoreArmedGate || options.force);
-        if (!__forcedSweep) __commentRecoveryBackoff.set(postUrl, Date.now()); // record this attempt (set BEFORE attempting so a timeout/crash still backs off)
-        if (__commentRecoveryBackoff.size > 3000) { const cut = Date.now() - 2 * COMMENT_RECOVERY_BACKOFF_MS; for (const [k, v] of __commentRecoveryBackoff) if (v < cut) __commentRecoveryBackoff.delete(k); } // bound memory
+        if (latestDifferentProfileVerifiedCommentForPost(c.postUrl, c.publisherId)) return; // a concurrent post may have just commented it
         summary.checked += 1;
-        const groupUrl = facebookGroupUrlFromPostUrl(postUrl) || ev.actualGroupUrl || ev.groupUrl || row.groupUrl;
-        const ready = { profileId: publisherId, imagePath: row.imagePath || ev.imagePath || "" };
+        const groupUrl = facebookGroupUrlFromPostUrl(c.postUrl) || c.ev.actualGroupUrl || c.ev.groupUrl || c.row.groupUrl;
+        const ready = { profileId: c.publisherId, imagePath: c.row.imagePath || c.ev.imagePath || "" };
         const closeResults = [];
         try {
           const res = await addRequiredFirstCommentWithDifferentProfile({
-            row,
+            row: c.row,
             ready,
             groupUrl,
-            postUrl,
+            postUrl: c.postUrl,
             imagePath: ready.imagePath,
             postValidation: { ok: true, errors: [], warnings: ["comment_resweep_recover"] },
-            ledgerKey: livePostLedgerKey(row, publisherId),
+            ledgerKey: livePostLedgerKey(c.row, c.publisherId),
             closeResults,
           });
           if (res?.skipped) { summary.skippedInFlight = (summary.skippedInFlight || 0) + 1; } // DOUBLE-COMMENT GUARD: the per-post in-flight lock skipped this — ANOTHER attempt is actively committing the comment. NOT a failure: do not count it stillMissing and do NOT stamp the backoff (that 8-min poison would delay re-checking a post that ends up genuinely uncommented if the in-flight attempt fails). Left un-backed-off, the next sweep re-checks it immediately.
-          else if (res?.ok || latestDifferentProfileVerifiedCommentForPost(postUrl, publisherId)) summary.recommented += 1;
-          else { summary.stillMissing += 1; if (__forcedSweep) __commentRecoveryBackoff.set(postUrl, Date.now()); } // forced sweep: stamp backoff only AFTER a real failure, so a clean attempt isn't poisoned by a race
+          else if (res?.ok || latestDifferentProfileVerifiedCommentForPost(c.postUrl, c.publisherId)) summary.recommented += 1;
+          else { summary.stillMissing += 1; if (c.__forcedSweep) __commentRecoveryBackoff.set(c.postUrl, Date.now()); } // forced sweep: stamp backoff only AFTER a real failure, so a clean attempt isn't poisoned by a race
         } catch (err) {
-          if (__forcedSweep) __commentRecoveryBackoff.set(postUrl, Date.now()); // forced sweep: a thrown attempt also backs off (parity with the set-before path)
+          if (c.__forcedSweep) __commentRecoveryBackoff.set(c.postUrl, Date.now()); // forced sweep: a thrown attempt also backs off (parity with the set-before path)
           summary.errors.push(oneLineField(err.message || String(err), 160));
         }
-      }
+      }));
     } catch (err) {
       summary.errors.push("fatal:" + oneLineField(err.message || String(err), 160));
     } finally {
