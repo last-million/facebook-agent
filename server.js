@@ -13600,7 +13600,19 @@ function livePostingBatchesByUniqueProfile(rows, maxConcurrentProfiles) {
 }
 
 function isFacebookGroupAccessPublishFailure(message = "") {
-  return /could not open composer|composer not found|not allowed to post|cannot post|permission|join group|not a member|content isn't available|page unavailable/i.test(String(message || ""));
+  // FIX (2026-07-11, operator: "i attributed more then 3 equal profiles dispatching" -- why does the same 1-2
+  // profiles keep failing forever instead of being unassigned so fresh ones get tried): this regex was missing
+  // the LITERAL underscored error code the connector actually throws
+  // (facebook_group_membership_required_not_a_member, tools/fb-post-test-capture-url.js:4891) -- its sibling
+  // classifier isFacebookGroupMembershipFailure (line ~13622) already includes it, but this one only had the
+  // natural-language phrase "not a member" (WITH SPACES), which never matches the underscored code. Result:
+  // !isFacebookGroupAccessPublishFailure(errorMessage) was TRUE for this exact error, so
+  // runLiveFacebookPostFromPlan's fallback-decision branch (~18627) took the "attempt_failed_no_fallback" early
+  // exit BEFORE ever reaching the groupErrors/allMembershipFailure aggregation (~18725-18749) that calls
+  // recordGroupPostFailureAndMaybeUnassign + recordGroupMembershipExclusion -- so a confirmed non-member profile
+  // was NEVER unassigned or excluded, and kept getting re-tried against the same broken group forever, wasting a
+  // real ~10-30s FB attempt every cycle while 20 other assigned profiles for this group never got a turn.
+  return /facebook_group_membership_required_not_a_member|could not open composer|composer not found|not allowed to post|cannot post|permission|join group|not a member|content isn't available|page unavailable/i.test(String(message || ""));
 }
 
 // A GROUP page that won't render (our bounded group-render recovery gave up, or FB
