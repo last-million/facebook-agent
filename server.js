@@ -16708,8 +16708,11 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       // intent (task #222, 2026-07-06) was "reorder, never abandon; a chronic post still gets retried, just after
       // the fresher ones." Reserve a small, fixed slice of THIS pass's budget for the globally OLDEST already-
       // failed posts regardless of fail count, so a chronic post is guaranteed periodic attention no matter how
-      // much fresh volume exists. Bounded (maxToFix/4) so it can't crowd out fresh posts' own fast commenting.
-      const __chronicLaneSize = Math.max(1, Math.floor(maxToFix / 4));
+      // much fresh volume exists. Bounded (maxToFix/2, widened from /4 on 2026-07-10: live monitoring showed
+      // /4 -- 2 slots out of an 8-budget warm-drain pass -- was too small against a ~30-item real backlog on one
+      // group; the single OLDEST item still hadn't been retried once after 40+ minutes) so it can't crowd out
+      // fresh posts' own fast commenting entirely, but chronic backlog now converges meaningfully faster.
+      const __chronicLaneSize = Math.max(1, Math.floor(maxToFix / 2));
       const __chronicOldestFirst = __orderedPending.filter((ev) => __failCountFor(ev.postUrl) > 0)
         .sort((a, b) => (Date.parse(a.at || 0) || 0) - (Date.parse(b.at || 0) || 0))
         .slice(0, __chronicLaneSize);
