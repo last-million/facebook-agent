@@ -8155,7 +8155,7 @@ function shuffledCopy(items = []) {
 
 function postingSlots(state) {
   const slots = [];
-  const __disconnectedIds = disconnectedProfileIdSet(state); const __erroredIds = erroredProfileIdSet(state); const __suspendedIds = suspendedProfileIdSet(state); // skip parked profiles (not-logged-in / account error / suspended)
+  const __disconnectedIds = disconnectedProfileIdSet(state); const __erroredIds = erroredProfileIdSet(state); const __suspendedIds = suspendedProfileIdSet(state); const __notGroupMemberIds = notGroupMemberProfileIdSet(state); // skip parked profiles (not-logged-in / account error / suspended / confirmed not a member of any configured group)
   const __liveIds = cachedLiveIxProfileIdSet(); // DYNAMIC: live ixBrowser ids (sync cache, kept warm by the reconcile); null => fail open
   const postsPerProfile = clampNumber(state.rules.postsPerProfilePerDay, 1, 20, 5);
   const maxProfilesPerRun = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 1000000, 100000);
@@ -8207,7 +8207,7 @@ function postingSlots(state) {
         if (!label) continue;
         const profileId = profileIdFromLabel(label);
         if (__liveIds && profileId && !__liveIds.has(profileId)) continue; // DYNAMIC: profile no longer exists in ixBrowser (operator deleted/renamed) -> auto-skip, no stale 2007 failure
-        if (__disconnectedIds.has(String(profileId)) || __erroredIds.has(String(profileId)) || __suspendedIds.has(String(profileId))) continue; // parked (not logged in / account error / suspended) -> skipped until released
+        if (__disconnectedIds.has(String(profileId)) || __erroredIds.has(String(profileId)) || __suspendedIds.has(String(profileId)) || __notGroupMemberIds.has(String(profileId))) continue; // parked (not logged in / account error / suspended / not a member of any configured group) -> skipped until released
         if (isDedicatedShopYourLikesProfileLabel(label, state)) continue;
         if (isBlockedIxBrowserProfileLabel(label, state)) continue;
         if (isFacebookProfileQuarantinedForFacebook(label, state, groupUrl)) continue;
@@ -18760,6 +18760,16 @@ async function runLiveFacebookPostFromPlan(body = {}) {
     });
     recordGroupPostFailureAndMaybeUnassign(ready.profileId, ready.groupUrl, true); // confirmed non-member -> unassign from this group now
     recordGroupMembershipExclusion(ready.profileId, ready.groupUrl); // 2026-07-11: persist so the dynamic rebalancer (PASS 4) never reassigns this exact (profile,group) pair right back -- see function comment
+    // 2026-07-11 (operator: "switch profiles between groupes that work for eachone... if a profile dont work
+    // with any groupe so exclude it in a section in prod tab"): this profile is still fine for every OTHER
+    // group -- only bench it globally once it's confirmed excluded from EVERY currently-configured group (no
+    // group left for the rebalancer to try it against).
+    {
+      const __freshState = readState();
+      if (isProfileExcludedFromAllConfiguredGroups(ready.profileId, __freshState)) {
+        markProfileNotMemberOfAnyGroup(ready.profileId, row.profile || "", "Confirmed not a member of any currently-configured Facebook group -- add this account to a group on Facebook, then Release.");
+      }
+    }
   } else if (allGroupRenderUnavailable) {
     logEvent("posting_group_render_unavailable_profile_not_benched", {
       profileId: ready.profileId,
@@ -19182,6 +19192,67 @@ function isGroupMembershipExcluded(profileId, groupUrl, state) {
     const excl = JSON.parse(String(state?.posting?.groupMembershipExcluded || "{}")) || {};
     return Boolean(excl[`${normalizedFacebookGroupKey(gu)}|${pid}`]);
   } catch (_) { return false; }
+}
+// NOT-A-MEMBER-OF-ANY-GROUP BENCH (2026-07-11, operator: "switch profiles between groupes that work for
+// eachone, and if a profile dont work with any groupe so exclude it in a section in prod tab... till user
+// admin fix it and release it"). A single (profile,group) membership exclusion should NOT bench the profile
+// globally -- it's still fully usable for every OTHER group, and the dynamic rebalancer (PASS 4) already tries
+// it there. But once a profile is confirmed excluded from EVERY currently-configured group (isProfileExcludedFromAllConfiguredGroups
+// below), it has nowhere left to go -- keeping it live just means the picker/rebalancer keep spending real FB
+// attempts confirming the same dead end. Bench it here (mirrors disconnectedProfiles/suspendedProfiles exactly:
+// posting-eligibility gate in postingSlots + isDurablyHealthyPostingProfile, own Prod-tab section, admin-only Release).
+function notGroupMemberProfileIdSet(state = readState()) {
+  return new Set((state.posting?.notGroupMemberProfiles || []).map((p) => String(p.profileId || "")));
+}
+function isProfileExcludedFromAllConfiguredGroups(profileId, state) {
+  const pid = Number(profileId) || 0;
+  if (!pid) return false;
+  const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
+  const validGroups = groups.filter((g) => g && g.url);
+  if (!validGroups.length) return false; // no configured groups at all -> nothing to exhaust
+  return validGroups.every((g) => isGroupMembershipExcluded(pid, g.url, state));
+}
+function markProfileNotMemberOfAnyGroup(profileId, label, reason) {
+  const id = String(profileId || "").replace(/\D+/g, "");
+  if (!id) return false;
+  const state = readState();
+  const list = Array.isArray(state.posting.notGroupMemberProfiles) ? state.posting.notGroupMemberProfiles : [];
+  if (list.some((p) => String(p.profileId) === id)) return false; // already benched
+  list.push({ profileId: id, label: String(label || ("Profile " + id)), at: new Date().toISOString(), reason: String(reason || "confirmed not a member of any configured group").slice(0, 200) });
+  state.posting.notGroupMemberProfiles = list;
+  writeState(state);
+  try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {}
+  try { __profilesBlockedCache = { at: 0, body: null }; } catch (_) {}
+  logEvent("profile_not_member_of_any_group_parked", { profileId: id, reason: String(reason || "").slice(0, 160) });
+  return true;
+}
+function releaseNotGroupMemberProfile(profileId) {
+  const id = String(profileId || "").replace(/\D+/g, "");
+  const pid = Number(id) || 0;
+  const state = readState();
+  const before = (state.posting.notGroupMemberProfiles || []).length;
+  state.posting.notGroupMemberProfiles = (state.posting.notGroupMemberProfiles || []).filter((p) => String(p.profileId) !== id);
+  // Give it a genuinely fresh start (operator intent always wins over the automated exclusion machinery): clear
+  // every per-group membership exclusion recorded for this profile too, so PASS 3/PASS 4 can freely re-place it
+  // anywhere once the admin has actually fixed the underlying membership (per the request: "fix it and release it").
+  let clearedExclusions = 0;
+  if (pid) {
+    try {
+      const excl = JSON.parse(String(state.posting.groupMembershipExcluded || "{}")) || {};
+      for (const key of Object.keys(excl)) {
+        if (key.endsWith(`|${pid}`)) { delete excl[key]; clearedExclusions += 1; }
+      }
+      state.posting.groupMembershipExcluded = JSON.stringify(excl);
+    } catch (_) {}
+  }
+  if (state.posting.notGroupMemberProfiles.length !== before || clearedExclusions) {
+    writeState(state);
+    try { __autopilotStatusCache = { at: 0, body: null }; } catch (_) {}
+    try { __profilesBlockedCache = { at: 0, body: null }; } catch (_) {}
+    logEvent("profile_not_member_of_any_group_released", { profileId: id, clearedExclusions });
+    return true;
+  }
+  return false;
 }
 
 function recordPostingProfileGroupIssue(body) {
@@ -19751,6 +19822,7 @@ function isDurablyHealthyPostingProfile(id, label, state, liveIds) {
   if (disconnectedProfileIdSet(state).has(String(id))) return false;
   if (erroredProfileIdSet(state).has(String(id))) return false;
   if (suspendedProfileIdSet(state).has(String(id))) return false;
+  if (notGroupMemberProfileIdSet(state).has(String(id))) return false; // 2026-07-11: confirmed not a member of ANY configured group -- no group left for the rebalancer to place it in
   if (isFacebookProfileQuarantinedForFacebook(String(id), state, "")) return false;
   return true;
 }
