@@ -1802,6 +1802,7 @@ function normalizeWorkflowState(state) {
   state.posting.equalSplitAssignments = state.posting.equalSplitAssignments === true; // Step-3 toggle: equal dispatch, each profile in exactly one group
   state.posting.groupPostFailCounts = String(state.posting.groupPostFailCounts || "{}").slice(0, 20000); // per-(group,profile) post-fail tally for auto-unassign
   state.posting.groupRebalanceDeficiencyStreak = String(state.posting.groupRebalanceDeficiencyStreak || "{}").slice(0, 20000); // 2026-07-07: per-group consecutive-deficient-cycle counter for reconcileGroupProfileBalance's streak gate
+  state.posting.groupMembershipExcluded = String(state.posting.groupMembershipExcluded || "{}").slice(0, 40000); // 2026-07-11: (group,profile) pairs confirmed NOT a member of that FB group -- the dynamic rebalancer must never reassign them back
   state.posting.postTextsList = String(state.posting.postTextsList || "").slice(0, 100000); // old-method (web-scraping) post captions, one per line
   state.posting.groupFallbackPolicy = String(state.posting.groupFallbackPolicy || defaultState().posting.groupFallbackPolicy).slice(0, 600);
   state.posting.profileGroupIssueLogEndpoint = "/api/posting/profile-group-issue";
@@ -18746,6 +18747,7 @@ async function runLiveFacebookPostFromPlan(body = {}) {
       message: "Account is NOT a member of this group — auto-removing it from THIS group's roster (kept for any group it belongs to). Profile NOT globally benched.",
     });
     recordGroupPostFailureAndMaybeUnassign(ready.profileId, ready.groupUrl, true); // confirmed non-member -> unassign from this group now
+    recordGroupMembershipExclusion(ready.profileId, ready.groupUrl); // 2026-07-11: persist so the dynamic rebalancer (PASS 4) never reassigns this exact (profile,group) pair right back -- see function comment
   } else if (allGroupRenderUnavailable) {
     logEvent("posting_group_render_unavailable_profile_not_benched", {
       profileId: ready.profileId,
@@ -19130,6 +19132,44 @@ function recordGroupPostFailureAndMaybeUnassign(profileId, groupUrl, definitive)
       writeState(state);
     }
   } catch (_) {}
+}
+// GROUP-MEMBERSHIP EXCLUSION LIST (2026-07-11, re-applied 2026-07-11 20:xx after this fix was found silently
+// lost from server.js -- see git history 'b05d553' for the original): confirmed live via the operator asking
+// "why does group o149639111290866 not share" -- every attempt for this group failed with
+// facebook_group_membership_required_not_a_member (the account was never actually joined to the FB group, a
+// genuine external/operator-side fact this code cannot fix). recordGroupPostFailureAndMaybeUnassign correctly
+// unassigns the profile from THIS group's roster on a confirmed non-member hit, but that leaves the profile an
+// ORPHAN (in no group's profiles[] at all) -- and the 2026-07-07 dynamic rebalancer (PASS 4,
+// reconcileGroupProfileBalance) treats every live, account-healthy orphan as a free donor for whichever group is
+// currently most deficient. Since a whole group of confirmed-non-members makes that SAME group perpetually
+// deficient, the rebalancer was reassigning each just-unassigned profile straight back into the group it was
+// JUST removed from -- a churn loop that wastes a real FB posting attempt (and the ~10-30s it takes to fail)
+// every cycle, for every profile, forever, without ever fixing anything (only the operator actually joining
+// these accounts to the group on Facebook can). This persists the (group,profile) pair so the rebalancer can
+// permanently exclude it from ever being assigned back to THIS SPECIFIC group -- the profile remains fully
+// usable for every OTHER group, and a manual re-add via the dashboard still overrides this (operator intent
+// always wins).
+function recordGroupMembershipExclusion(profileId, groupUrl) {
+  try {
+    const pid = Number(profileId) || 0; const gu = String(groupUrl || "").trim();
+    if (!pid || !gu) return;
+    const state = readState();
+    let excl = {}; try { excl = JSON.parse(String(state.posting.groupMembershipExcluded || "{}")) || {}; } catch (_) { excl = {}; }
+    excl[`${normalizedFacebookGroupKey(gu)}|${pid}`] = Date.now();
+    // bound growth: keep at most the most recent 2000 entries (this should never realistically approach that)
+    const keys = Object.keys(excl);
+    if (keys.length > 2000) { keys.sort((a, b) => (excl[a] || 0) - (excl[b] || 0)).slice(0, keys.length - 2000).forEach((k) => delete excl[k]); }
+    state.posting.groupMembershipExcluded = JSON.stringify(excl);
+    writeState(state);
+  } catch (_) {}
+}
+function isGroupMembershipExcluded(profileId, groupUrl, state) {
+  try {
+    const pid = Number(profileId) || 0; const gu = String(groupUrl || "").trim();
+    if (!pid || !gu) return false;
+    const excl = JSON.parse(String(state?.posting?.groupMembershipExcluded || "{}")) || {};
+    return Boolean(excl[`${normalizedFacebookGroupKey(gu)}|${pid}`]);
+  } catch (_) { return false; }
 }
 
 function recordPostingProfileGroupIssue(body) {
@@ -19772,7 +19812,7 @@ function reconcileGroupProfileBalance(state, liveIds) {
   // first," re-purposed here for "who is safest to pull." Also hard-excludes a profile mid-open/mid-post right
   // now (normalIxProfileUseLocks) or one whose most recent post (in ANY group) is still within
   // operator.commentMaxAgeMinutes -- its own first comment may still be in flight.
-  const pickIdlestSafeCandidate = (labels) => {
+  const pickIdlestSafeCandidate = (labels, forGroupUrl) => {
     const { byProfile: todayByPid, lastAtByProfile } = autopilotPublishedTodayByProfile(state);
     const histByPid = autopilotPostHistoryByProfile();
     const commentWindowMs = clampNumber(state.operator?.commentMaxAgeMinutes, 1, 240, 6) * 60000;
@@ -19780,6 +19820,10 @@ function reconcileGroupProfileBalance(state, liveIds) {
       const id = profileIdFromLabel(label);
       if (!id) return false;
       if (normalIxProfileUseLocks.has(String(id))) return false;
+      // MEMBERSHIP-EXCLUSION GUARD (2026-07-11, re-applied): never reassign a profile back into a group it was
+      // JUST confirmed-removed from for not being an actual member of the FB group -- see
+      // recordGroupMembershipExclusion's comment for the full churn-loop this closes.
+      if (forGroupUrl && isGroupMembershipExcluded(id, forGroupUrl, state)) return false;
       const lastAt = lastAtByProfile.get(id) || 0;
       if (lastAt && (Date.now() - lastAt) < commentWindowMs) return false;
       return true;
@@ -19806,7 +19850,7 @@ function reconcileGroupProfileBalance(state, liveIds) {
     let mover = null;
     let fromGroup = null;
     if (orphanPool.length) {
-      mover = pickIdlestSafeCandidate(orphanPool);
+      mover = pickIdlestSafeCandidate(orphanPool, recipient.url);
       if (mover) orphanPool.splice(orphanPool.indexOf(mover), 1);
     }
     if (!mover) {
@@ -19820,8 +19864,8 @@ function reconcileGroupProfileBalance(state, liveIds) {
         donor = groupsInfo.filter((g) => g !== recipient && g.healthy.length > 1).sort((a, b) => b.healthy.length - a.healthy.length)[0];
       }
       if (!donor) { summary.shortfalls.push({ group: recipient.key, healthy: recipient.healthy.length, target: recipient.target }); break; }
-      mover = pickIdlestSafeCandidate(donor.healthy);
-      if (!mover) break; // every candidate in the only available donor was unsafe to move right now -- stop rather than loop forever
+      mover = pickIdlestSafeCandidate(donor.healthy, recipient.url);
+      if (!mover) break; // every candidate in the only available donor was unsafe to move right now (incl. membership-excluded for this recipient) -- stop rather than loop forever
       fromGroup = donor;
     }
 
