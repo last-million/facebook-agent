@@ -20050,6 +20050,18 @@ async function reconcileProfilesWithIxBrowser(options = {}) {
           if (!Array.isArray(entry.profiles)) entry.profiles = [];
           if (isFacebookAdminApprovalProfileLabel(label, state, entry.url)) continue; // never a moderator/approval profile for this group
           if (entry.profiles.some((p) => profileIdFromLabel(p) === id)) continue; // already assigned to this group
+          // MEMBERSHIP-EXCLUSION GUARD (2026-07-11 review fix, operator: "auto switch profiles to respect equal
+          // quota with profiles that WORK"): a profile that was just confirmed-removed from THIS group for not
+          // being an actual FB member (recordGroupMembershipExclusion) becomes an orphan the instant it has no
+          // OTHER group -- and this auto-add pass (unlike the PASS 4 rebalancer) had no awareness of that
+          // exclusion, so it blindly re-added the profile straight back into the exact group it was just kicked
+          // from on the very next reconcile cycle, completely defeating the exclusion (confirmed live: profiles
+          // 67/77 reappeared in o149639111290866's roster within minutes of being removed, with zero rebalance-
+          // move log line, because THIS pass -- not PASS 4 -- put them back). Skip this specific group only; the
+          // profile is still eligible for every OTHER group (this is a per-(profile,group) exclusion, not a
+          // global bench) and the PASS 4 rebalancer remains the correct, exclusion-aware path to actually place
+          // this profile wherever it can genuinely help.
+          if (isGroupMembershipExcluded(id, entry.url, state)) continue;
           if (entry.profiles.length >= 500) continue; // per-group cap
           entry.profiles.push(label);
           addedToAny = true;
