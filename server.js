@@ -14145,11 +14145,22 @@ async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState
   // 24-min cooldown) so the rotation falls through to the next least-used moderator. After the cooldown the id
   // drops out of this set automatically -> the moderator is retried (auto-retest); a successful approval removes it.
   const __blockedModCooldown = blockedModeratorCooldownSet(state);
+  // SUSPENDED / DISCONNECTED accounts must NEVER moderate (operator 2026-07-11: "suspended accounts should not be
+  // used, of course"). The moderator pool was the ONE role missing this guard: the poster (postingSlots ~8223),
+  // the commenter execution gate (recoverFacebookCommentWithProfilesInner ~15850) and the rebalancer
+  // (isDurablyHealthyPostingProfile ~19888) all skip suspendedProfileIdSet, but this builder checked only the
+  // quarantine text-log -- so a profile hard-suspended via markProfileSuspended (health sweep / harvest / posting
+  // result / the /api/profiles/mark-suspended admin button) or logged-out via markProfileDisconnected stayed in the
+  // approval rotation and got opened anyway. Both sets are Release-gated (cleared when the admin releases the
+  // profile), and a suspended/logged-out FB account can never approve, so this only removes provably-dead work.
+  const __suspendedIds = suspendedProfileIdSet(state);
+  const __disconnectedIds = disconnectedProfileIdSet(state);
   const add = (profileId, profile, source) => {
     const numericProfileId = Number(profileId || profileIdFromLabel(profile) || 0);
     const label = oneLineField(profile || numericProfileId || "", 180);
     if (!numericProfileId || !label || excludedIds.has(numericProfileId) || seen.has(numericProfileId)) return;
     if (__blockedModCooldown.has(String(numericProfileId))) return; // temporarily blocked moderator -> skip during cooldown
+    if (__suspendedIds.has(String(numericProfileId)) || __disconnectedIds.has(String(numericProfileId))) return; // FB-suspended / logged-out account can never approve -> never rotate it into the moderator pool
     if (isDedicatedShopYourLikesIxProfile(numericProfileId, state) || isDedicatedShopYourLikesProfileLabel(label, state)) return;
     if (isFacebookProfileQuarantinedForFacebook(label, state, groupUrl)) return;
     const approvalOnlyProfile = isFacebookAdminApprovalProfileId(numericProfileId, state, groupUrl) || isFacebookAdminApprovalProfileLabel(label, state, groupUrl);
@@ -14428,6 +14439,20 @@ async function runFacebookAdminApprovalAttempt({ row, profileId, profileLabel, g
     const scriptResult = await runLiveFacebookPostScript(payload, { timeoutMs: clampNumber(__freshTimeoutMs, 30000, FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS, FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS) });
     const approvedUrl = firstFacebookPostUrlFromLog(scriptResult.objects) || postUrl;
     const validation = facebookAdminApprovalValidationFromLog(scriptResult.objects, approvedUrl);
+    // SUSPENDED-MODERATOR DETECTION (operator 2026-07-11: "even moderators can be suspended, like profile 89 -- why
+    // didn't he detect it?"). A moderator whose OWN FB account is checkpointed/suspended returns NORMALLY here (no
+    // throw): the connector's openGroupReviewSurface now emits a facebook_account_blocked step (accountBlockReason)
+    // when the pending queue redirects to /checkpoint/. The catch-path hard-block handling below never runs for a
+    // normal return, so without this the dead moderator got re-picked every cycle. Park it in the SUSPENDED array
+    // (excluded from EVERY role incl. the moderator pool via the new guard in facebookAdminApprovalProfilesForGroup)
+    // + the quarantine log + the moderator cooldown, and surface it in the Prod tab for the admin to fix + Release.
+    if (isFacebookAccountHardBlockedFailure("", validation, scriptResult.objects)) {
+      const __blkReason = "Facebook checkpoint/suspension detected on this moderator account during approval (fix the account on Facebook, then Release it).";
+      try { markProfileSuspended(numericProfileId, cleanProfile, __blkReason); } catch (_) {}
+      try { recordFacebookAccountHardBlock({ profile: cleanProfile, profileId: numericProfileId, groupUrl, reason: __blkReason, source: "facebook_admin_approval" }); } catch (_) {}
+      try { markModeratorBlocked(numericProfileId, cleanProfile, "suspended/checkpointed FB account (detected during approval) -- fix on Facebook then Release"); } catch (_) {}
+      try { logEvent("facebook_admin_approval_moderator_account_suspended", { profileId: numericProfileId, profile: cleanProfile, groupUrl }); } catch (_) {}
+    }
     appendFacebookLivePostLedger({
       event: "admin_approval_finished",
       key: ledgerKey,
@@ -14469,6 +14494,11 @@ async function runFacebookAdminApprovalAttempt({ row, profileId, profileLabel, g
         reason: err.message || "Facebook admin/moderator account is suspended, disabled, locked, or requires review.",
         source: "facebook_admin_approval",
       });
+      // Also park it in the SUSPENDED array (Prod-tab + excluded from every role incl. the moderator pool) so a
+      // suspended moderator is never rotated back in -- recordFacebookAccountHardBlock only writes the quarantine
+      // text-log, which the new moderator-pool guard does NOT read (it reads suspendedProfileIdSet).
+      try { markProfileSuspended(numericProfileId, cleanProfile, err.message || "Facebook suspended/disabled this moderator account."); } catch (_) {}
+      try { markModeratorBlocked(numericProfileId, cleanProfile, "suspended/checkpointed FB account (detected during approval) -- fix on Facebook then Release"); } catch (_) {}
     } else if (isFacebookNotLoggedInError(err.message || String(err))) {
       // MODERATOR LOGGED OUT / DISCONNECTED (operator 2026-06-30: "profile 42 is FB-disconnected but it never
       // classified it as disconnected to be skipped"). A logged-out moderator can NEVER approve, so don't keep

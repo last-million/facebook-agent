@@ -3145,12 +3145,19 @@ async function dismissForcedAccountSwitch(page) {
         //   (c) if still nothing clicked, press Enter (that card's default action is Continue).
         const inPage = await page.evaluate((src) => {
           const re = new RegExp(src, 'i');
-          const neg = /(not now|cancel|go back|annuler|cancelar|abbrechen|إلغاء|لاحقا|later|nicht jetzt|agora n[aã]o|annulla|anuluj)/i;
+          // NEGATIVE = never click. Extended (2026-07-11 adversarial verify) beyond the cancel-family to also exclude
+          // IDENTITY + DESTRUCTIVE controls (log out / delete / report / decline / block / settings / "see all
+          // profiles"): on a REAL multi-account picker those sit right next to the Continue button, and the old blind
+          // fallback below could click one -> switch to the WRONG identity or trigger a destructive action.
+          const neg = /(not now|cancel|go back|annuler|cancelar|abbrechen|إلغاء|لاحقا|later|nicht jetzt|agora n[aã]o|annulla|anuluj|log ?out|sign out|cerrar sesi|d[ée]connexion|abmelden|تسجيل الخروج|delete|remove|report|decline|reject|block|see all profiles|ver todos los perfiles|voir tous les profils|settings|configuraci|param[èe]tres)/i;
           const vis = (el) => { try { const r = el.getBoundingClientRect(); const st = getComputedStyle(el); return r.width > 2 && r.height > 2 && st.visibility !== 'hidden' && st.display !== 'none'; } catch { return false; } };
           const els = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"], a[role="link"]')).filter(vis);
           els.sort((a, b) => (a.tagName === 'A' ? 1 : 0) - (b.tagName === 'A' ? 1 : 0)); // real buttons before links
           for (const el of els) { const t = ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim(); if (t && re.test(t) && !neg.test(t)) { el.click(); return 'text-match'; } }
-          for (const el of els) { const t = ((el.innerText || el.value || '') + '').replace(/\s+/g, ' ').trim(); if (t && !neg.test(t)) { el.click(); return 'primary-button'; } } // require real text (skip icon-only buttons)
+          // REMOVED (2026-07-11 adversarial verify): the blind "click the first non-negative button" fallback. On a
+          // genuine account picker EVERY account row + Log out/Delete/Report is a non-negative button, so a blind
+          // click risked a WRONG-IDENTITY switch or a destructive action. ONLY the Continue-family text match above
+          // clicks now; if nothing matched we fall through to the card's safe default action (Enter, pressed at ~3157).
           return 'none';
         }, FORCED_SWITCH_CONTINUE_CONTAINS_RE.source).catch(() => 'none');
         console.log(JSON.stringify({ step: 'forced_account_switch_fallback_click', method: inPage, attempt }));
@@ -3558,6 +3565,34 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
     base,
   ];
   const visited = [];
+  const __surfaceStartedAt = Date.now();
+  // OBSERVABILITY (2026-07-11): between admin_identity and this function's return, the connector emitted NOTHING for
+  // 60s-13min, so when a moderator attempt was killed mid-poll (execFileAsync SIGKILL at the shrinking per-attempt
+  // budget) the log went black right after admin_identity and the server could not tell "moderator reached the queue
+  // but the post isn't in it yet" from "moderator redirected to the FEED = not an admin of this group". These probes
+  // emit the crucial reach-queue-vs-feed-redirect verdict per target/retry, flushed to the pipe as they happen, so a
+  // later kill still leaves the breadcrumb. Pure logging -- no control-flow change, cannot affect the approve gate.
+  const __isAdminSurfaceUrl = (u) => /\/(pending_posts|manage_post_queue|posts\/pending)/i.test(String(u || ''));
+  const __probe = (step, extra) => { try { console.log(JSON.stringify({ step, elapsedMs: Date.now() - __surfaceStartedAt, numericGid, landedUrl: String(page.url() || '').slice(0, 200), isAdminSurface: __isAdminSurfaceUrl(page.url()), ...extra })); } catch (_) {} };
+  // SUSPENDED-MODERATOR DETECTION (operator 2026-07-11: "even moderators can have a suspended account, like profile
+  // 89 -- why didn't he detect it?"). When a moderator's OWN FB account is checkpointed/suspended, navigating to the
+  // pending queue REDIRECTS to /checkpoint/... (proven live: cUser 61566285705555 -> /checkpoint/1501092823525282/).
+  // The old code read that only as "not an admin surface" and kept retrying the dead account for ~175s. Detect the
+  // checkpoint/login redirect, emit a step the SERVER classifies as a hard account block (accountBlockReason ->
+  // isFacebookAccountHardBlockedFailure), and BAIL immediately so the server can mark the moderator suspended and
+  // rotate to a healthy one instead of burning the session. facebookLoginSnapshot.accountBlocked gates it, so a mere
+  // transient login redirect (loginRequired only) does NOT trip it -- only a real checkpoint/suspension does.
+  const __checkModeratorBlocked = async () => {
+    const u = String(page.url() || '');
+    if (!/facebook\.com\/(?:login|checkpoint|recover|two_factor|confirmemail|disabled|help\/contact)/i.test(u)) return null;
+    const snap = await facebookLoginSnapshot(page).catch(() => null);
+    if (snap && snap.accountBlocked) {
+      const reason = snap.accountBlockReason || 'checkpoint_account_blocked';
+      try { console.log(JSON.stringify({ step: 'facebook_account_blocked', mode: 'admin_approval', accountBlocked: true, accountBlockReason: reason, url: snap.url || u, snippet: String(snap.snippet || '').slice(0, 200) })); } catch (_) {}
+      return { opened: false, moderatorAccountBlocked: true, accountBlockReason: reason, url: snap.url || u, visited, method: 'moderator_account_checkpoint_blocked', adminSurfaceReachable: null };
+    }
+    return null;
+  };
   // OPERATOR 2026-06-29: "focus only on NEW posts of this run, don't go FAR for old ones." The pending queue is
   // newest-first (proven live: our just-posted post was found on the FIRST screen, scrollsRequired:0), so our
   // run's post is at/near the TOP and old pending posts sit DEEP. Keep the search SHALLOW so the moderator stays
@@ -3618,6 +3653,10 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
       await humanPause(3000, 4500);
     }
     if (/\/(pending_posts|manage_post_queue|posts\/pending)/i.test(String(page.url() || ''))) workingTarget = target;
+    // EARLY per-target verdict: reached the admin queue, or bounced to the group feed (= this account is not a
+    // moderator of this group). Emitted before the scan so even a fast kill preserves the reach-queue signal.
+    __probe('admin_approval_surface_probe', { target, feedRedirect: !__isAdminSurfaceUrl(page.url()) });
+    { const __blk = await __checkModeratorBlocked(); if (__blk) return __blk; } // moderator's OWN account checkpointed/suspended -> bail, let the server mark it suspended + rotate
     let found = await scanLoadedSurface('direct_review_url');
     if (found) return found;
     const clicked = await clickFirst(page, [
@@ -3657,6 +3696,8 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
       await page.goto(workingTarget, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
       visited.push(page.url());
       await humanPause(3000, 4500);
+      __probe('admin_approval_retry', { attempt });
+      { const __blk = await __checkModeratorBlocked(); if (__blk) return __blk; } // account got checkpointed mid-poll -> stop wasting the session
       const found = await scanLoadedSurface(`retry${attempt}_review_url`);
       if (found) return { ...found, retried: attempt };
     }
@@ -3773,6 +3814,20 @@ async function approvePendingPost(page, context, payload, gid, marker) {
       method: reviewSurface.method,
       visited: (reviewSurface.visited || []).slice(-5),
     }));
+    if (reviewSurface.moderatorAccountBlocked) {
+      // This moderator's OWN FB account is checkpointed/suspended (facebook_account_blocked step already emitted so
+      // the server will mark it suspended + rotate). Nothing to approve on a checkpoint page -- emit a result and
+      // stop instead of wasting the session clicking Approve / verifying permalinks.
+      console.log(JSON.stringify({
+        step: 'result', mode: 'approve_only', marker, postUrl: '', postPageUrl: '',
+        moderatorAccountBlocked: true, accountBlockReason: reviewSurface.accountBlockReason || 'checkpoint_account_blocked',
+        bodyChecks: { markerVisible: false, ownControls: false }, imageVerified: false, postMediaVerified: false,
+        commentResult: { skipped: true, clicked: false, typed: false, submitted: false, verified: false },
+        commentPinResult: { requested: false, skipped: true, menuOpened: false, clicked: false, confirmed: false, verified: false, reason: '' },
+        candidateCount: 0, verified: [],
+      }, null, 2));
+      return;
+    }
     approvalResult = await clickApproveForVisibleMarker(page, marker, payload.publisherFacebookUserId || payload.facebookUserId, gid);
     // BATCH (speed): we're already on the queue as admin — approve ALL our OTHER pending posts in this same
     // session so they don't each wait for a fresh ~6-min session. Scoped to our publisher id only. Runs before
