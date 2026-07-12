@@ -1,10 +1,10 @@
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="color-scheme" content="dark" />
-<title>Rapport des runs — Facebook autopilot</title>
+<title>Runs report — Facebook autopilot</title>
 <style>
   :root{
     --bg:#0e1217; --bg2:#141a22; --card:#1a222c; --card2:#202a36; --line:#27323f;
@@ -130,14 +130,14 @@
 <div class="wrap">
   <div class="top">
     <div>
-      <h1><span class="dot"></span> Rapport des runs</h1>
-      <div class="sub">Facebook autopilot — généré depuis les logs (sans IA). Clique une carte pour la dérouler.</div>
+      <h1><span class="dot"></span> Runs report</h1>
+      <div class="sub">Facebook autopilot — generated from logs (no AI). Click a card to expand it.</div>
     </div>
     <div class="controls">
       <label class="toggle"><input type="checkbox" id="auto" checked> Auto 30s</label>
       <span class="upd" id="upd"></span>
-      <button class="btn" id="hideAll" title="Masquer toutes les runs actuellement affichées (non destructif — les posts restent sur Facebook)">🗑 Masquer tout</button>
-      <button class="btn" id="refresh">↻ Rafraîchir</button>
+      <button class="btn" id="hideAll" title="Hide all runs currently shown (non-destructive — the posts stay on Facebook)">🗑 Hide all</button>
+      <button class="btn" id="refresh">↻ Refresh</button>
     </div>
   </div>
 
@@ -146,13 +146,13 @@
   <div id="pendingunclustered"></div>
   <div id="openbudget"></div>
   <div id="live"></div>
-  <div id="runs"><div class="empty"><span class="spin"></span> Chargement du rapport…</div></div>
+  <div id="runs"><div class="empty"><span class="spin"></span> Loading the report…</div></div>
   <div id="probprof"></div>
 
   <div class="foot" id="foot"></div>
 </div>
 
-<button id="scrollTopBtn" class="scrollTopBtn" type="button" title="Remonter en haut" aria-label="Remonter en haut">&#8593;</button>
+<button id="scrollTopBtn" class="scrollTopBtn" type="button" title="Back to top" aria-label="Back to top">&#8593;</button>
 
 <script>
 "use strict";
@@ -188,13 +188,13 @@ function load(force){
   fetch(u, { headers: { "x-dashboard-token": TOKEN }, cache:"no-store" })
     .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
     .then(function(j){ DATA=j; document.getElementById("err").innerHTML=""; render(); })
-    .catch(function(e){ document.getElementById("err").innerHTML='<div class="err">⚠ Impossible de charger le rapport : '+esc(e.message)+' — ouvre cette page via <b>/report</b> (le serveur injecte le token).</div>'; })
-    .finally(function(){ document.getElementById("refresh").innerHTML="↻ Rafraîchir"; });
+    .catch(function(e){ document.getElementById("err").innerHTML='<div class="err">⚠ Unable to load the report: '+esc(e.message)+' — open this page via <b>/report</b> (the server injects the token).</div>'; })
+    .finally(function(){ document.getElementById("refresh").innerHTML="↻ Refresh"; });
 }
 
 function render(){
   if(!DATA) return;
-  document.getElementById("upd").textContent = "MAJ " + fmtTime(DATA.generatedAt);
+  document.getElementById("upd").textContent = "Updated " + fmtTime(DATA.generatedAt);
   document.getElementById("foot").textContent = (DATA.runCount||0)+" run(s) — source : facebook-live-posts.jsonl + events.log + watchdog";
 
   // global banners (reconcile / open-budget / problem accounts)
@@ -208,15 +208,15 @@ function render(){
     var done = lv.postedThisRun || 0;
     var pct = tgt ? Math.min(100, Math.round(done/tgt*100)) : null;
     liveEl.innerHTML = '<div class="livecard">'
-      + '<div class="lh"><span class="lblink"></span> Run en cours</div>'
-      + '<div class="lp"><b>'+done+'</b>'+(tgt? ' / <b>'+tgt+'</b>' : '')+' posts publiés'+(pct!=null? ' &middot; '+pct+'%':'')+'</div>'
+      + '<div class="lh"><span class="lblink"></span> Run in progress</div>'
+      + '<div class="lp"><b>'+done+'</b>'+(tgt? ' / <b>'+tgt+'</b>' : '')+' posts published'+(pct!=null? ' &middot; '+pct+'%':'')+'</div>'
       + (pct!=null? rateBar(pct) : '') + '</div>';
   } else liveEl.innerHTML = '';
 
   // RUNS accordion (collapsed by default)
   var runs = DATA.runs || [];
   var runsEl = document.getElementById("runs");
-  if(!runs.length){ runsEl.innerHTML = '<div class="tablecard"><div class="empty">Aucune run enregistrée pour le moment.<br>Le rapport se remplira dès le premier post.</div></div>'; return; }
+  if(!runs.length){ runsEl.innerHTML = '<div class="tablecard"><div class="empty">No run recorded yet.<br>The report fills in from the first post.</div></div>'; return; }
   runsEl.innerHTML = runs.map(function(r,i){ return runCard(r,i); }).join("");
 }
 
@@ -229,12 +229,12 @@ function runCard(r,i){
     + '<summary>'
       + '<span class="rchev">▸</span>'
       + '<span class="rmain"><span class="rdate">'+esc(fmtDate(r.startedAt))+'</span>'
-      + (r.live?'<span class="rlive">● EN COURS</span>':(i===0?'<span class="pill x">dernière</span>':''))+'</span>'
+      + (r.live?'<span class="rlive">● LIVE</span>':(i===0?'<span class="pill x">latest</span>':''))+'</span>'
       + '<span class="rposts">'+r.posts+' posts &middot; '+r.durationMin+'m'+(r.avgPostIntervalSec!=null?' &middot; ~'+fmtMinSec(r.avgPostIntervalSec)+'/post':'')+'</span>'
       + '<span class="rrate '+(rate>=90?"ok":rate>=70?"slow":"no")+'">'+rate+'%<small> comm.</small></span>'
-      + (r.uncommented? '<span class="runc">'+r.uncommented+' sans</span>':'')
-      + ((r.pendingApproval&&r.pendingApproval.count)? '<span class="runc pending">'+r.pendingApproval.count+' en attente</span>':'')
-      + '<button class="rdel" title="Supprimer cette run du rapport" onclick="dismiss(event,\''+sa+'\',\''+ea+'\')">✕</button>'
+      + (r.uncommented? '<span class="runc">'+r.uncommented+' without</span>':'')
+      + ((r.pendingApproval&&r.pendingApproval.count)? '<span class="runc pending">'+r.pendingApproval.count+' pending</span>':'')
+      + '<button class="rdel" title="Remove this run from the report" onclick="dismiss(event,\''+sa+'\',\''+ea+'\')">✕</button>'
     + '</summary>'
     + '<div class="rbody">'+runBody(r)+'</div>'
     + '</details>';
@@ -244,87 +244,87 @@ function runBody(r){
   var ramTxt = r.minRamPct==null ? "—" : (r.minRamPct+"%");
   var chrTxt = r.chromePeak==null ? "—" : r.chromePeak;
   var html = '<div class="stats">'
-    + statCard("Posts publiés", r.posts, "sur "+r.durationMin+" min", "")
-    + statCard("Temps de post moyen", fmtMinSec(r.avgPostIntervalSec), "entre chaque post publié", "v")
-    + statCard("Produits uniques", (r.uniqueProducts||0), (r.productsInBoth||0)+" dans les 2 groupes", (r.uniqueProducts? (r.productsInBoth>0?"g":"a") : ""))
-    + statCard("Commentés", r.commentRate+'<small>%</small>', r.commented+"/"+r.posts+" • "+r.uncommented+" sans", r.commentRate>=90?"g":(r.commentRate>=70?"a":"r"))
-    + statCard("Délai médian", fmtGap(r.gap.medianSec), "max "+fmtGap(r.gap.maxSec), "v")
-    + statCard("Pic Chrome", chrTxt, "RAM libre min "+ramTxt, (r.chromePeak&&r.chromePeak>120)?"r":"g")
-    + statCard("Redémarrages", r.restarts, r.restarts? "serveur relancé":"aucun — stable", r.restarts?"a":"g")
-    + ((r.pendingApproval&&r.pendingApproval.count)? statCard("En attente d'approbation", r.pendingApproval.count, "modérateur pas encore passé", "a") : "")
+    + statCard("Posts published", r.posts, "over "+r.durationMin+" min", "")
+    + statCard("Average post time", fmtMinSec(r.avgPostIntervalSec), "between each published post", "v")
+    + statCard("Unique products", (r.uniqueProducts||0), (r.productsInBoth||0)+" in both groups", (r.uniqueProducts? (r.productsInBoth>0?"g":"a") : ""))
+    + statCard("Commented", r.commentRate+'<small>%</small>', r.commented+"/"+r.posts+" • "+r.uncommented+" without", r.commentRate>=90?"g":(r.commentRate>=70?"a":"r"))
+    + statCard("Median delay", fmtGap(r.gap.medianSec), "max "+fmtGap(r.gap.maxSec), "v")
+    + statCard("Chrome peak", chrTxt, "min free RAM "+ramTxt, (r.chromePeak&&r.chromePeak>120)?"r":"g")
+    + statCard("Restarts", r.restarts, r.restarts? "server restarted":"none — stable", r.restarts?"a":"g")
+    + ((r.pendingApproval&&r.pendingApproval.count)? statCard("Awaiting approval", r.pendingApproval.count, "moderator hasn't passed yet", "a") : "")
     + '</div>';
   var gks = Object.keys(r.byGroup||{});
   if(gks.length){
-    html += '<h2>Par groupe <span class="ln"></span></h2><div class="cards2">';
+    html += '<h2>By group <span class="ln"></span></h2><div class="cards2">';
     html += gks.map(function(g){
       var v=r.byGroup[g];
       var stuck = !v.posts && v.held>0;
       return '<div class="grp"><div class="gh"><span>'+grpPill(g)+'</span><span class="tag">'+v.posts+' posts</span></div>'
-        + (v.posts ? '<div class="row"><span>Commentés</span><b>'+v.commented+'/'+v.posts+'</b></div>'
-          + '<div class="row"><span>Taux</span><b class="'+(v.commentRate>=90?"ok":v.commentRate>=70?"slow":"no")+'">'+v.commentRate+'%</b></div>'
-          + '<div class="row"><span>Délai médian</span><b>'+fmtGap(v.gapMedianSec)+'</b></div>'
-          + rateBar(v.commentRate) : (stuck ? '<div class="row"><span class="no">⚠ Aucun post — bloqué</span></div>' : '<div class="row"><span style="opacity:.6">Aucun post pour l\'instant</span></div>'))
-        + (v.held>0 ? '<div class="row"><span>Retenus (aucun commentateur libre)</span><b class="'+(stuck?"no":"slow")+'">'+v.held+'</b></div>' : '')
+        + (v.posts ? '<div class="row"><span>Commented</span><b>'+v.commented+'/'+v.posts+'</b></div>'
+          + '<div class="row"><span>Rate</span><b class="'+(v.commentRate>=90?"ok":v.commentRate>=70?"slow":"no")+'">'+v.commentRate+'%</b></div>'
+          + '<div class="row"><span>Median delay</span><b>'+fmtGap(v.gapMedianSec)+'</b></div>'
+          + rateBar(v.commentRate) : (stuck ? '<div class="row"><span class="no">⚠ No post — blocked</span></div>' : '<div class="row"><span style="opacity:.6">No post yet</span></div>'))
+        + (v.held>0 ? '<div class="row"><span>Held (no free commenter)</span><b class="'+(stuck?"no":"slow")+'">'+v.held+'</b></div>' : '')
         + '</div>';
     }).join("");
     html += '</div>';
   }
-  // PAR PRODUIT — chaque produit harvested, son numéro, combien de fois posté, dans quels groupes, par quels profils
+  // BY PRODUCT — each harvested product, its number, how many times posted, in which groups, by which profiles
   var prods = r.products || [];
   if (prods.length) {
-    html += '<h2>Par produit <span class="ln"></span> <span class="tag">'+(r.productsInBoth||0)+'/'+(r.uniqueProducts||prods.length)+' dans les 2 groupes</span></h2>';
+    html += '<h2>By product <span class="ln"></span> <span class="tag">'+(r.productsInBoth||0)+'/'+(r.uniqueProducts||prods.length)+' in both groups</span></h2>';
     html += '<div class="tablecard"><table class="detail"><thead><tr>'
-      + '<th>Produit</th><th>Titre</th><th>Posté</th><th>Groupes</th><th>Profils</th></tr></thead><tbody>';
+      + '<th>Product</th><th>Title</th><th>Posted</th><th>Groups</th><th>Profiles</th></tr></thead><tbody>';
     html += prods.map(function(p){
       var gl = Object.keys(p.groups||{}).map(function(g){ return grpPill(g)+' ×'+p.groups[g]; }).join(' ');
-      var multi = (p.groupCount>=2) ? '<span class="ok">✓ '+p.groupCount+' groupes</span>' : '<span class="slow">⚠ 1 seul</span>';
+      var multi = (p.groupCount>=2) ? '<span class="ok">✓ '+p.groupCount+' groups</span>' : '<span class="slow">⚠ only 1</span>';
       var prof = (p.profiles||[]).join(', ');
       var ttl = (p.title||p.shortKey||'').toString();
       return '<tr>'
-        + '<td data-l="Produit"><b>P'+p.num+'</b></td>'
-        + '<td data-l="Titre" title="'+esc(p.key)+'">'+esc(ttl.length>46?ttl.slice(0,46)+'…':ttl)+'</td>'
-        + '<td data-l="Posté"><b>'+p.total+'×</b> '+multi+'</td>'
-        + '<td data-l="Groupes">'+gl+'</td>'
-        + '<td data-l="Profils">'+esc(prof)+'</td></tr>';
+        + '<td data-l="Product"><b>P'+p.num+'</b></td>'
+        + '<td data-l="Title" title="'+esc(p.key)+'">'+esc(ttl.length>46?ttl.slice(0,46)+'…':ttl)+'</td>'
+        + '<td data-l="Posted"><b>'+p.total+'×</b> '+multi+'</td>'
+        + '<td data-l="Groups">'+gl+'</td>'
+        + '<td data-l="Profiles">'+esc(prof)+'</td></tr>';
     }).join("");
     html += '</tbody></table></div>';
   }
-  html += '<h2>Détail des posts <span class="ln"></span></h2><div class="tablecard"><table class="detail"><thead><tr>'
-    + '<th>#</th><th>Produit</th><th>Groupe</th><th>Publié</th><th>Commenté</th><th>Approbation</th><th>Délai</th><th>Profils</th></tr></thead><tbody>';
+  html += '<h2>Post detail <span class="ln"></span></h2><div class="tablecard"><table class="detail"><thead><tr>'
+    + '<th>#</th><th>Product</th><th>Group</th><th>Published</th><th>Commented</th><th>Approval</th><th>Delay</th><th>Profiles</th></tr></thead><tbody>';
   html += (r.detail||[]).map(function(d,i){
     var prof = d.profilePub ? (d.profilePub + (d.profileCom? " → "+d.profileCom : " → —")) : "—";
     var pnum = d.productNum ? ('<span class="pill x" title="'+esc(d.productKey||"")+'">P'+d.productNum+'</span>') : '—';
     // 2026-07-11 (operator): show WHICH moderator approved this post + how long the approval took.
     var appr = '—';
     if (d.approvedByModerator) {
-      appr = '<span class="pill x" title="Modérateur ayant approuvé ce post en attente">✔ '+esc(String(d.approvedByModerator))+'</span>'
+      appr = '<span class="pill x" title="Moderator who approved this pending post">✔ '+esc(String(d.approvedByModerator))+'</span>'
            + (d.approvalDurationMinutes!=null? ' <span class="'+(d.approvalDurationMinutes>=30?'no':'slow')+'">'+d.approvalDurationMinutes+'min</span>':'');
     } else if (d.wasPendingApproval) {
-      appr = '<span class="slow">en attente…</span>';
+      appr = '<span class="slow">pending…</span>';
     }
     return '<tr>'
       + '<td data-l="#">'+(i+1)+'</td>'
-      + '<td data-l="Produit">'+pnum+'</td>'
-      + '<td data-l="Groupe">'+grpPill(d.group)+'</td>'
-      + '<td data-l="Publié">'+fmtTime(d.publishedAt)+'</td>'
-      + '<td data-l="Commenté">'+(d.commentedAt?(fmtTime(d.commentedAt)+(d.wasPendingApproval?' <span class="pill x" title="Ce post a attendu l\'approbation d\'un modérateur avant de pouvoir être commenté.">⏳ attente '+(d.approvalWaitMinutes!=null?d.approvalWaitMinutes+'min':'?')+'</span>':'')):(d.approvalVerification==="soft_clicked"?'<span class="slow">approbation en cours…</span>':'<span class="no">non commenté</span>'))+'</td>'
-      + '<td data-l="Approbation">'+appr+'</td>'
-      + '<td data-l="Délai" class="'+gapClass(d.gapSec)+'">'+fmtGap(d.gapSec)+'</td>'
-      + '<td data-l="Profils">'+esc(prof)+'</td></tr>';
+      + '<td data-l="Product">'+pnum+'</td>'
+      + '<td data-l="Group">'+grpPill(d.group)+'</td>'
+      + '<td data-l="Published">'+fmtTime(d.publishedAt)+'</td>'
+      + '<td data-l="Commented">'+(d.commentedAt?(fmtTime(d.commentedAt)+(d.wasPendingApproval?' <span class="pill x" title="This post waited for a moderator\'s approval before it could be commented.">⏳ waiting '+(d.approvalWaitMinutes!=null?d.approvalWaitMinutes+'min':'?')+'</span>':'')):(d.approvalVerification==="soft_clicked"?'<span class="slow">approval in progress…</span>':'<span class="no">not commented</span>'))+'</td>'
+      + '<td data-l="Approval">'+appr+'</td>'
+      + '<td data-l="Delay" class="'+gapClass(d.gapSec)+'">'+fmtGap(d.gapSec)+'</td>'
+      + '<td data-l="Profiles">'+esc(prof)+'</td></tr>';
   }).join("");
   html += '</tbody></table></div>';
   var pend = (r.pendingApproval && r.pendingApproval.items) || [];
   if (pend.length) {
-    html += '<h2>En attente d\'approbation <span class="ln"></span> <span class="tag">'+pend.length+'</span></h2>';
+    html += '<h2>Awaiting approval <span class="ln"></span> <span class="tag">'+pend.length+'</span></h2>';
     html += '<div class="tablecard"><table class="detail"><thead><tr>'
-      + '<th>Groupe</th><th>Soumis</th><th>Attente</th><th>Profil</th></tr></thead><tbody>';
+      + '<th>Group</th><th>Submitted</th><th>Waiting</th><th>Profile</th></tr></thead><tbody>';
     html += pend.map(function(p){
       var old = p.ageMinutes>=60;
       return '<tr>'
-        + '<td data-l="Groupe">'+grpPill(p.group)+'</td>'
-        + '<td data-l="Soumis">'+fmtTime(p.startedAt)+'</td>'
-        + '<td data-l="Attente" class="'+(old?"no":"slow")+'">'+p.ageMinutes+' min'+(old?' ⚠':'')+'</td>'
-        + '<td data-l="Profil">'+(p.profileId||'—')+'</td></tr>';
+        + '<td data-l="Group">'+grpPill(p.group)+'</td>'
+        + '<td data-l="Submitted">'+fmtTime(p.startedAt)+'</td>'
+        + '<td data-l="Waiting" class="'+(old?"no":"slow")+'">'+p.ageMinutes+' min'+(old?' ⚠':'')+'</td>'
+        + '<td data-l="Profile">'+(p.profileId||'—')+'</td></tr>';
     }).join("");
     html += '</tbody></table></div>';
   }
@@ -335,12 +335,12 @@ function renderGlobals(){
   var rc = DATA.reconcile || {};
   var recoEl = document.getElementById("reco");
   var bits = [];
-  if (rc.pending) bits.push('<b>'+rc.pending+'</b> interrompu(s), reprise en cours');
-  if (rc.needsReview) bits.push('<b>'+rc.needsReview+'</b> à vérifier manuellement');
-  if (rc.recovered) bits.push('<b>'+rc.recovered+'</b> récupéré(s)');
-  if (rc.released) bits.push('<b>'+rc.released+'</b> relancé(s)');
-  if (rc.pending || rc.needsReview) recoEl.innerHTML = '<div class="reco warn">⚠ Reprise après interruption (kill mid-post) : ' + bits.join(' · ') + '</div>';
-  else if (rc.recovered || rc.released) recoEl.innerHTML = '<div class="reco ok">✓ Reprise auto après interruption : ' + bits.join(' · ') + ' — aucune perte silencieuse</div>';
+  if (rc.pending) bits.push('<b>'+rc.pending+'</b> interrupted, recovery in progress');
+  if (rc.needsReview) bits.push('<b>'+rc.needsReview+'</b> to review manually');
+  if (rc.recovered) bits.push('<b>'+rc.recovered+'</b> recovered');
+  if (rc.released) bits.push('<b>'+rc.released+'</b> restarted');
+  if (rc.pending || rc.needsReview) recoEl.innerHTML = '<div class="reco warn">⚠ Recovery after interruption (kill mid-post): ' + bits.join(' · ') + '</div>';
+  else if (rc.recovered || rc.released) recoEl.innerHTML = '<div class="reco ok">✓ Auto recovery after interruption: ' + bits.join(' · ') + ' — no silent loss</div>';
   else recoEl.innerHTML = '';
 
   // PENDING, NO RUN YET (2026-07-04): posts awaiting moderator approval whose run has zero landed posts so far --
@@ -352,22 +352,22 @@ function renderGlobals(){
     var byG = {};
     pu.forEach(function(p){ byG[p.group] = (byG[p.group]||0)+1; });
     var bits2 = Object.keys(byG).map(function(g){ return '<b>'+byG[g]+'</b> '+g; });
-    puEl.innerHTML = '<div class="reco warn">⏳ '+pu.length+' post(s) soumis, en attente d\'approbation modérateur (aucune run affichée pour l\'instant) : ' + bits2.join(' · ') + '</div>';
+    puEl.innerHTML = '<div class="reco warn">⏳ '+pu.length+' post(s) submitted, awaiting moderator approval (no run shown yet): ' + bits2.join(' · ') + '</div>';
   } else { puEl.innerHTML = ''; }
 
   var ob = DATA.openBudget || null;
   var obEl = document.getElementById("openbudget");
   if (ob && (ob.opensToday || ob.effectiveLimit)) {
     var used = ob.opensToday || 0, lim = ob.effectiveLimit;
-    var KOMODE = { force_on:'keep-open <b>forcé ON</b>', force_off:'keep-open <b>forcé OFF</b>', auto_on_tight_plan:'keep-open <b>auto ON</b> (plan serré)', auto_on_near_limit:'keep-open <b>auto ON</b> (proche limite)', auto_off_roomy_plan:'keep-open auto OFF (plan large)', auto_off_plan_unknown:'keep-open auto OFF (plan inconnu)' };
+    var KOMODE = { force_on:'keep-open <b>forced ON</b>', force_off:'keep-open <b>forced OFF</b>', auto_on_tight_plan:'keep-open <b>auto ON</b> (tight plan)', auto_on_near_limit:'keep-open <b>auto ON</b> (near limit)', auto_off_roomy_plan:'keep-open auto OFF (roomy plan)', auto_off_plan_unknown:'keep-open auto OFF (unknown plan)' };
     var ko = KOMODE[ob.mode] || (ob.keepOpenOn ? 'keep-open ON' : 'keep-open off');
-    var planSrc = ob.planLimit ? 'plan connu' : (ob.learnedLimit ? 'auto-appris' : '');
+    var planSrc = ob.planLimit ? 'known plan' : (ob.learnedLimit ? 'auto-learned' : '');
     var head, cls;
     if (lim) {
-      var line = '<b>' + used + '</b> / ~' + lim + ' ouvertures aujourd\'hui (' + planSrc + (ob.pct != null ? ', ' + ob.pct + '%' : '') + ', reste ~' + ob.remaining + ') — ' + ko;
+      var line = '<b>' + used + '</b> / ~' + lim + ' opens today (' + planSrc + (ob.pct != null ? ', ' + ob.pct + '%' : '') + ', remaining ~' + ob.remaining + ') — ' + ko;
       cls = ob.nearLimit ? 'warn' : 'ok';
-      head = (ob.nearLimit ? '⚠ Proche de la limite d\'ouvertures ixBrowser : ' : '✓ Budget d\'ouvertures ixBrowser : ') + line;
-    } else { cls = 'ok'; head = '✓ Ouvertures ixBrowser aujourd\'hui : <b>' + used + '</b> — plan inconnu (auto-appris au 1er 1018) — ' + ko; }
+      head = (ob.nearLimit ? '⚠ Near the ixBrowser opens limit: ' : '✓ ixBrowser opens budget: ') + line;
+    } else { cls = 'ok'; head = '✓ ixBrowser opens today: <b>' + used + '</b> — unknown plan (auto-learned at first 1018) — ' + ko; }
     obEl.innerHTML = '<div class="reco ' + cls + '">' + head + '</div>';
   } else { obEl.innerHTML = ''; }
 
@@ -375,9 +375,9 @@ function renderGlobals(){
   var ppEl = document.getElementById("probprof");
   if (pp.length) {
     var ppRows = pp.map(function (p) { return '<tr><td><b>p' + p.profileId + '</b></td><td class="no">' + p.realFails + '</td><td class="' + (p.unblocks ? 'slow' : '') + '">' + (p.unblocks || 0) + '</td><td>' + esc(p.lastReal || '—') + '</td></tr>'; }).join("");
-    ppEl.innerHTML = '<h2>⚠ Comptes à problème (font perdre du temps) <span class="ln"></span></h2>'
-      + '<div class="reco warn" style="margin:0 0 8px">Vrais échecs (accès groupe / blocage compte) sur 24h — <b>PAS</b> les victimes du quota ixBrowser (1018/1004).</div>'
-      + '<div class="tablecard"><table><thead><tr><th>Profil</th><th>Échecs réels</th><th>Déblocages</th><th>Dernière raison</th></tr></thead><tbody>' + ppRows + '</tbody></table></div>';
+    ppEl.innerHTML = '<h2>⚠ Problem accounts (waste time) <span class="ln"></span></h2>'
+      + '<div class="reco warn" style="margin:0 0 8px">Real failures (group access / account block) over 24h — <b>NOT</b> the ixBrowser quota victims (1018/1004).</div>'
+      + '<div class="tablecard"><table><thead><tr><th>Profile</th><th>Real failures</th><th>Unblocks</th><th>Last reason</th></tr></thead><tbody>' + ppRows + '</tbody></table></div>';
   } else { ppEl.innerHTML = ''; }
 }
 
@@ -385,21 +385,21 @@ function onToggle(el){ var sa=el.getAttribute("data-sa"); if(el.open) OPEN.add(s
 
 function dismiss(ev, sa, ea){
   ev.stopPropagation(); ev.preventDefault();
-  if(!confirm("Supprimer cette run du rapport ? (les posts ne sont pas supprimés de Facebook — c'est juste masqué ici)")) return;
+  if(!confirm("Remove this run from the report? (the posts are NOT deleted from Facebook — it's just hidden here)")) return;
   fetch("/api/reports/runs/dismiss", { method:"POST", headers:{ "x-dashboard-token":TOKEN, "Content-Type":"application/json" }, body:JSON.stringify({ endedAt: ea || sa, startedAt: sa }) })
     .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
     .then(function(){ OPEN.delete(sa); load(true); })
-    .catch(function(e){ alert("Erreur suppression : "+e.message); });
+    .catch(function(e){ alert("Delete error: "+e.message); });
 }
 
 function hideAll(){
   var n = (DATA && DATA.runs ? DATA.runs.length : 0);
-  if (!n) { alert("Aucune run affichée à masquer."); return; }
-  if(!confirm("Masquer les "+n+" run(s) actuellement affichées ? (les posts ne sont pas supprimés de Facebook — c'est juste masqué ici, tu peux annuler via l'API restore si besoin)")) return;
+  if (!n) { alert("No run shown to hide."); return; }
+  if(!confirm("Hide the "+n+" run(s) currently shown? (the posts are NOT deleted from Facebook — it's just hidden here, you can undo via the restore API if needed)")) return;
   fetch("/api/reports/runs/dismiss", { method:"POST", headers:{ "x-dashboard-token":TOKEN, "Content-Type":"application/json" }, body:JSON.stringify({ dismissAllVisible: true }) })
     .then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
     .then(function(){ OPEN.clear(); load(true); })
-    .catch(function(e){ alert("Erreur : "+e.message); });
+    .catch(function(e){ alert("Error: "+e.message); });
 }
 
 function arm(){ if(timer) clearInterval(timer); if(document.getElementById("auto").checked){ timer=setInterval(function(){ load(false); }, 30000); } }
