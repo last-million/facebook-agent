@@ -22633,6 +22633,21 @@ function buildRunReports(force = false) {
     const ex = pendingStartByKey.get(k);
     if (!ex || t < ex.t) pendingStartByKey.set(k, { t, at: r.at, groupUrl: r.groupUrl || "", profileId: Number(r.profileId || 0) });
   }
+  // APPROVAL RESOLUTION (2026-07-11, operator: report should show which MODERATOR approved each pending post and
+  // HOW LONG it took). Scan admin_approval_finished (the connector records the approving moderator's profileId +
+  // timestamp). Keyed the same planId:sequence:group way as pendingStartByKey, so duration = finished - earliest
+  // started. Keep the LAST successful finish per key (a post can accrue several failed moderator attempts before
+  // one lands). status "approved_and_verified" is the connector's own success marker (server.js:14409).
+  const approvalResolvedByKey = new Map();
+  for (const r of rows) {
+    if (!r || r.event !== "admin_approval_finished" || !r.at) continue;
+    if (String(r.status || "") !== "approved_and_verified") continue;
+    const t = Date.parse(r.at);
+    if (!Number.isFinite(t)) continue;
+    const k = (r.planId || "") + ":" + (r.sequence || 0) + ":" + normalizedFacebookGroupKey(r.groupUrl || r.actualGroupUrl || "");
+    const ex = approvalResolvedByKey.get(k);
+    if (!ex || t > ex.t) approvalResolvedByKey.set(k, { t, at: r.at, moderatorId: Number(r.profileId || 0), moderator: String(r.profile || "") });
+  }
   // MAX AGE (2026-07-04 review fix): a real moderator-approval wait resolves in minutes (10-30+ per the code's own
   // observed range), never hours. Without a cap, a post whose plan row retried a DIFFERENT group/profile after this
   // admin_approval_started fired (runLiveFacebookPostFromPlan's fallbackGroupUrls loop, or a hard admin_approval_error
@@ -22753,7 +22768,11 @@ function buildRunReports(force = false) {
       // one waited approvalWaitMinutes before it landed (and, if commented, before that comment could happen).
       const __pendingStart = pendingStartByKey.get(__postKey(p));
       const approvalWaitMinutes = __pendingStart ? Math.max(0, Math.round((p._t - __pendingStart.t) / 60000)) : null;
-      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profileCom: c ? c.profileId : null, productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable", wasPendingApproval: Boolean(__pendingStart), approvalWaitMinutes });
+      // 2026-07-11 (operator): surface WHICH moderator approved this post + how long the approval itself took.
+      const __appr = approvalResolvedByKey.get(__postKey(p));
+      const approvedByModerator = __appr ? (__appr.moderator || String(__appr.moderatorId || "")) : null;
+      const approvalDurationMinutes = (__appr && __pendingStart) ? Math.max(0, Math.round((__appr.t - __pendingStart.t) / 60000)) : null;
+      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profileCom: c ? c.profileId : null, productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable", wasPendingApproval: Boolean(__pendingStart), approvalWaitMinutes, approvedByModerator, approvalDurationMinutes });
       if (p.approvalVerification === "soft_clicked" && !c) softApproved += 1;
     }
     const products = productOrder.map((pm) => ({ num: pm.num, key: pm.key, shortKey: pm.key.replace(/^harvested:/, ""), title: pm.title, total: pm.total, groups: pm.groups, groupCount: Object.keys(pm.groups).length, profiles: Array.from(pm.profiles) }));

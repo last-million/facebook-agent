@@ -290,16 +290,25 @@ function runBody(r){
     html += '</tbody></table></div>';
   }
   html += '<h2>Détail des posts <span class="ln"></span></h2><div class="tablecard"><table class="detail"><thead><tr>'
-    + '<th>#</th><th>Produit</th><th>Groupe</th><th>Publié</th><th>Commenté</th><th>Délai</th><th>Profils</th></tr></thead><tbody>';
+    + '<th>#</th><th>Produit</th><th>Groupe</th><th>Publié</th><th>Commenté</th><th>Approbation</th><th>Délai</th><th>Profils</th></tr></thead><tbody>';
   html += (r.detail||[]).map(function(d,i){
     var prof = d.profilePub ? (d.profilePub + (d.profileCom? " → "+d.profileCom : " → —")) : "—";
     var pnum = d.productNum ? ('<span class="pill x" title="'+esc(d.productKey||"")+'">P'+d.productNum+'</span>') : '—';
+    // 2026-07-11 (operator): show WHICH moderator approved this post + how long the approval took.
+    var appr = '—';
+    if (d.approvedByModerator) {
+      appr = '<span class="pill x" title="Modérateur ayant approuvé ce post en attente">✔ '+esc(String(d.approvedByModerator))+'</span>'
+           + (d.approvalDurationMinutes!=null? ' <span class="'+(d.approvalDurationMinutes>=30?'no':'slow')+'">'+d.approvalDurationMinutes+'min</span>':'');
+    } else if (d.wasPendingApproval) {
+      appr = '<span class="slow">en attente…</span>';
+    }
     return '<tr>'
       + '<td data-l="#">'+(i+1)+'</td>'
       + '<td data-l="Produit">'+pnum+'</td>'
       + '<td data-l="Groupe">'+grpPill(d.group)+'</td>'
       + '<td data-l="Publié">'+fmtTime(d.publishedAt)+'</td>'
       + '<td data-l="Commenté">'+(d.commentedAt?(fmtTime(d.commentedAt)+(d.wasPendingApproval?' <span class="pill x" title="Ce post a attendu l\'approbation d\'un modérateur avant de pouvoir être commenté.">⏳ attente '+(d.approvalWaitMinutes!=null?d.approvalWaitMinutes+'min':'?')+'</span>':'')):(d.approvalVerification==="soft_clicked"?'<span class="slow">approbation en cours…</span>':'<span class="no">non commenté</span>'))+'</td>'
+      + '<td data-l="Approbation">'+appr+'</td>'
       + '<td data-l="Délai" class="'+gapClass(d.gapSec)+'">'+fmtGap(d.gapSec)+'</td>'
       + '<td data-l="Profils">'+esc(prof)+'</td></tr>';
   }).join("");
