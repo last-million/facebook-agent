@@ -3439,18 +3439,24 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
       if (!markerEl || markerEl.contains(el)) markerEl = el;
     }
     if (!markerEl) return { clicked: false, reason: 'marker_text_node_not_found' };
+    // CONTAINMENT CLIMB (2026-07-11, adversarially verified). Rise from OUR #fb marker element to the SMALLEST
+    // ancestor holding EXACTLY ONE per-post Approve = this post's own cell. Cap 30 (was 14 -> too shallow: FB's
+    // empty-[role=article] pending queue nests the caption deep and the Approve lives in a SIBLING branch, so the
+    // common ancestor is frequently >14 hops up -> approve_button_not_found even though the post is right there,
+    // which is exactly why approvals were not landing). CRITICAL SAFETY: if a level holds MORE THAN ONE Approve we
+    // BAIL (return not-found -> server retries) instead of geometry-guessing "nearest by top" -- that old pick was a
+    // wrong-post hazard (a neighbour post's Approve can be closer to our marker's top than our own). Anchored
+    // STRICTLY on our #fb fingerprint (markerEl) -- never author, never position. isPerPostApprove already excludes
+    // the bulk "Approve selected pending posts" button, so this can never mass-approve.
     let node = markerEl, found = [];
-    for (let i = 0; i < 14 && node; i += 1) {
+    for (let i = 0; i < 30 && node; i += 1) {
       const btns = [...node.querySelectorAll('div[role="button"],button,a[role="button"]')].filter(isPerPostApprove);
-      if (btns.length) { found = btns; break; }
+      if (btns.length === 1) { found = btns; break; } // smallest cell holding OUR single Approve -> unambiguous
+      if (btns.length > 1) return { clicked: false, reason: 'ambiguous_multi_approve_not_fingerprint_scoped' }; // never geometry-guess across posts
       node = node.parentElement;
     }
     if (!found.length) return { clicked: false, reason: 'no_perpost_approve_near_marker' };
-    let best = found[0];
-    if (found.length > 1) { // climbed into a container with multiple posts — take the Approve nearest the marker
-      const mr = markerEl.getBoundingClientRect(); let bestD = Infinity;
-      for (const b of found) { const br = b.getBoundingClientRect(); const d = Math.abs(br.top - mr.top); if (d < bestD) { bestD = d; best = b; } }
-    }
+    const best = found[0];
     best.scrollIntoView({ block: 'center' });
     best.click();
     return { clicked: true, label: norm(best.getAttribute('aria-label')) || norm(best.innerText) || 'Approve' };
@@ -3759,14 +3765,20 @@ async function approvePendingPost(page, context, payload, gid, marker) {
     await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => attempts.push({ target: postUrl, warning: e.message }));
     await humanPause(2000, 3500);
     attempts.push({ target: postUrl, url: page.url(), title: await page.title().catch(() => '') });
-    approvalResult = await clickApproveForVisibleMarker(page, marker, payload.publisherFacebookUserId || payload.facebookUserId, gid);
-    const directChecks = await bodyMarkerChecks(page, marker);
-    // A pending post's OWN permalink renders fine (marker + image visible) even though it is NOT approved
-    // yet — so "visible" must NOT be read as "approved" (that was the false-positive that left posts pending
-    // while the server logged them approved). Detect the pending banner; accept the visibility-only success
-    // ONLY when the post is genuinely LIVE (not pending). When pending, fall through to the moderation QUEUE
-    // below where the real Approve button is clicked.
+    // FIX 2 (2026-07-11, adversarially verified): detect PENDING *before* attempting to approve on the permalink.
+    // A pending post's own permalink is a modal with NO per-post Approve button (Approve exists ONLY in the
+    // /pending_posts/ queue), so clicking here is doomed AND a latent false-soft-success vector (the loose
+    // APPROVE_TEXT_RE fallback could click a stray control -> a bogus approvalClicked that fires a comment on a
+    // still-pending post). Only attempt the permalink approve when the post is genuinely LIVE (not pending); when
+    // pending, leave approvalResult.clicked=false so the flow falls through to the real moderation QUEUE below.
     const pendingDetected = await page.evaluate(() => /\b(pending|waiting for approval|awaiting approval|pendiente|en attente|en espera|in attesa)\b/i.test(document.body.innerText || '') || /قيد المراجعة|بانتظار الموافقة/.test(document.body.innerText || '')).catch(() => false);
+    if (!pendingDetected) {
+      approvalResult = await clickApproveForVisibleMarker(page, marker, payload.publisherFacebookUserId || payload.facebookUserId, gid);
+    }
+    const directChecks = await bodyMarkerChecks(page, marker);
+    // A pending post's OWN permalink renders fine (marker + image visible) even though it is NOT approved yet — so
+    // "visible" must NOT be read as "approved". Accept the visibility-only success ONLY when genuinely LIVE (not
+    // pending); when pending, fall through to the moderation QUEUE below where the real Approve button is clicked.
     if (!approvalResult.clicked && directChecks.markerVisible && directChecks.postMediaVerified && !pendingDetected) {
       console.log(JSON.stringify({
         step: 'approval_attempted',
