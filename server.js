@@ -16660,6 +16660,7 @@ const __reapprovalAttemptsByUrl = new Map(); // sanitized postUrl -> re-approval
 const SOFT_STUCK_MIN_AGE_MS = 35 * 60 * 1000;  // past FB's 10-30min approve->public window (never re-approve a still-propagating post)
 const MAX_SOFT_STUCK_REAPPROVALS = 2;          // then fall back to the normal comment path forever (NEVER abandon the owed comment)
 const MAX_REAPPROVALS_PER_PASS = 2;            // don't storm the thin moderator pool
+const PENDING_PUBLIC_BACKOFF_MS = 30 * 60 * 1000; // 2026-07-12 LOAD FIX: a PROVABLY-PENDING post (not public to a commenter) is re-checked at most every ~30min instead of every ~8-24min -> kills the doomed-comment browser-open spiral. NOT a skip (the 30min recheck IS the probe; it snaps back to the 4min path the instant the post goes public). Forced finish-drains bypass it.
 // PERSISTENT FIRST-COMMENT DRAIN (operator 2026-06-19): the armed-gated resweep + the run-end final passes all stop
 // within ~5 min of disarm, but FB's moderation queue makes a pending post public 10-30 min LATER — so a late-approved
 // post never got its money-comment (the 8.5% miss). This always-on, armed-INDEPENDENT drain keeps re-commenting any
@@ -16827,6 +16828,21 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         const m = __pendingFailByUrl.get(u); if (!m || m.size < clampNumber(state.operator?.commentCorroborationMinProfiles, 2, 20, 3)) return false;
         const t = [...m.values()]; return Math.max(...t) - Math.min(...t) >= clampNumber(state.operator?.commentCorroborationMinSpreadMinutes, 0, 720, 30) * 60000;
       };
+      // PROVABLY-PENDING (2026-07-12, adversarially verified) -- event/approvalVerification AGNOSTIC. The dominant load
+      // posts are recorded event:"published" / approvalVerification:"not_applicable" (the PUBLISHER's own self-view
+      // verified the marker at publish, so the inline approval was skipped) even though they are NOT public to a
+      // different commenter profile -> __isStuckSoft (which requires soft_clicked) never matched them, so they were
+      // re-commented every cycle forever = the load spiral. This predicate uses ONLY the ledger corroboration already
+      // built above (no browser): a post with a verified comment (__okUrls) is public -> NOT pending; otherwise it is
+      // PROVABLY pending iff >=commentCorroborationMinProfiles distinct commenter profiles hit cannot-access/pending
+      // across >=commentCorroborationMinSpreadMinutes. False-positive-safe: a genuinely-public post gets a comment
+      // success before it could accrue 3 blocked-pending failures over 30min.
+      const __isProvablyPending = (url) => {
+        let u = ""; try { u = sanitizeFacebookPostUrl(url); } catch { return false; }
+        if (__okUrls.has(u)) return false;
+        const m = __pendingFailByUrl.get(u); if (!m || m.size < clampNumber(state.operator?.commentCorroborationMinProfiles, 2, 20, 3)) return false;
+        const t = [...m.values()]; return Math.max(...t) - Math.min(...t) >= clampNumber(state.operator?.commentCorroborationMinSpreadMinutes, 0, 720, 30) * 60000;
+      };
       const __orderedPending = [...publishedByPlan.values()].sort((a, b) => {
         const fa = __failCountFor(a.postUrl), fb = __failCountFor(b.postUrl);
         if (fa !== fb) return fa - fb;
@@ -16950,15 +16966,29 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         // forever, just increasingly gently.
         const __chronicFails = __failCountFor(postUrl);
         const __backoffMs = Math.min(__baseBackoffMs * (1 + __chronicFails), 6 * 3600 * 1000);
-        if (Date.now() - __boAt < __backoffMs) { summary.stillMissing += 1; continue; } // tried recently + still uncommented -> defer (don't re-cycle profiles on a stuck/pending post)
         const __forcedSweep = !!(options.drain || options.ignoreArmedGate || options.force);
+        // LOAD KILL (2026-07-12): a PROVABLY-PENDING post isn't public to a commenter yet, so re-commenting it every
+        // ~8-24min just burns a browser each cycle. Widen its recheck floor to ~30min (only for NON-forced sweeps).
+        // NOT a skip: the 30min recheck IS the probe; the moment it goes public a probe succeeds -> __okUrls -> the
+        // next line's __isProvablyPending is false -> it snaps back to the normal ~4min path and comments. Forced
+        // finish-drains keep the base backoff so a run-end drain still tries everything it owes.
+        const __pending = __isProvablyPending(postUrl);
+        const __effBackoffMs = (__pending && !__forcedSweep) ? Math.max(__backoffMs, PENDING_PUBLIC_BACKOFF_MS) : __backoffMs;
+        if (Date.now() - __boAt < __effBackoffMs) { summary.stillMissing += 1; continue; } // tried recently + still uncommented -> defer (don't re-cycle profiles on a stuck/pending post)
         if (!__forcedSweep) __commentRecoveryBackoff.set(postUrl, Date.now()); // record this attempt (set BEFORE attempting so a timeout/crash still backs off) -- unchanged: still stamped at SELECTION time for normal sweeps, same as before
         if (__commentRecoveryBackoff.size > 3000) { const cut = Date.now() - 2 * COMMENT_RECOVERY_BACKOFF_MS; for (const [k, v] of __commentRecoveryBackoff) if (v < cut) __commentRecoveryBackoff.delete(k); } // bound memory
         // STUCK-SOFT ROUTING (2026-07-11): a post soft-approved but stuck pending (>=35min, >=3 profiles blocked, never
         // strong-verified) gets a bounded RE-APPROVAL instead of another doomed comment -> it goes public -> commented
         // next pass. Capped at MAX_SOFT_STUCK_REAPPROVALS per URL; after that it falls back to the normal comment path
         // forever (never abandoned). Everything else follows the unchanged comment path.
-        if (__isStuckSoft(ev, postUrl) && (__reapprovalAttemptsByUrl.get(sanitizeFacebookPostUrl(postUrl)) || 0) < MAX_SOFT_STUCK_REAPPROVALS)
+        // Route a stuck-pending post to bounded RE-APPROVAL (push it public) instead of another doomed comment --
+        // now covers BOTH the soft_clicked subset AND the event-agnostic provably-pending posts (published /
+        // not_applicable), gated to admin-approval groups. `!__forcedSweep` (2026-07-12 verify fix): on a run-end /
+        // stop-finish drain we NEVER re-approve -- we always COMMENT, so an ex-pending-now-public post the run owes
+        // is commented before disarm (re-approving a public post is a no-op that would defer its owed comment).
+        if (!__forcedSweep
+            && (__isStuckSoft(ev, postUrl) || (__pending && isAdminApprovalEnabledForGroup(ev.groupUrl || ev.actualGroupUrl, state)))
+            && (__reapprovalAttemptsByUrl.get(sanitizeFacebookPostUrl(postUrl)) || 0) < MAX_SOFT_STUCK_REAPPROVALS)
           __reapprovalCandidates.push({ ev, row, postUrl, publisherId });
         else
           __candidates.push({ ev, row, postUrl, publisherId, __forcedSweep });
