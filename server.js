@@ -17404,7 +17404,15 @@ async function completeVerifiedFacebookPostWithComment({
   const __isRunApprovalPost = ready.__autopilotRunPost === true
     && isAdminApprovalEnabledForGroup(actualGroupUrl, readState())
     && readState().operator?.commentDrainDisabled !== true;
-  const __bgApprovalComment = __isRunApprovalPost && __bgCommentInFlight < MAX_BG_COMMENT_IN_FLIGHT;
+  // INSTANT COMMENT for ALL run posts (2026-07-12, operator: "comments must go DIRECTLY after publishing, don't skip").
+  // Previously only approval-group posts reached the non-blocking fast-fire path; a NO-APPROVAL group's post (public the
+  // instant it lands, comment-able with NO moderator) fell to the inline await below, which blocks the posting worker
+  // and serializes it. Broaden the fast-fire gate to EVERY run post so a no-approval post is commented immediately in
+  // the background with a group-allocated profile. Same strictly group-attributed commenter pool + the 3 double-comment
+  // guards + the never-skip durable drain backstop apply; the inline await stays as the drain-disabled fallback.
+  const __isRunPost = ready.__autopilotRunPost === true
+    && readState().operator?.commentDrainDisabled !== true;
+  const __bgApprovalComment = __isRunPost && __bgCommentInFlight < MAX_BG_COMMENT_IN_FLIGHT;
   if (__bgApprovalComment) {
     __fireBackgroundedComment({ args: { row, ready, groupUrl: actualGroupUrl, postUrl, imagePath: ready.imagePath, postValidation: validation, ledgerKey, closeResults: [] } });
     try { logEvent("facebook_post_published_comment_backgrounded", { postUrl, groupUrl: actualGroupUrl, profileId: ready.profileId, bgInFlight: __bgCommentInFlight }); } catch (_) {}
@@ -17444,7 +17452,7 @@ async function completeVerifiedFacebookPostWithComment({
   // await here). Persistent drain / cold-backlog heartbeat (2026-07-07) are UNCHANGED as the crash-safety backstop
   // for the (should-never-happen) queue-saturated case below. Gated on __isRunApprovalPost (already requires
   // commentDrainDisabled!==true) so with the drain OFF the code keeps the inline await — correctness preserved.
-  if (__isRunApprovalPost) {
+  if (__isRunPost) {
     const __bgTaskArgs = { row, ready, groupUrl: actualGroupUrl, postUrl, imagePath: ready.imagePath, postValidation: validation, ledgerKey, closeResults: [] };
     const __queued = __bgCommentWaiters.length < MAX_BG_COMMENT_QUEUE;
     if (__queued) {
@@ -18152,6 +18160,26 @@ async function runLiveFacebookPostFromPlan(body = {}) {
               status: "pending",
               message: "Post click captured; moderator approval running in background so posting stays continuous.",
             });
+            // PROVISIONAL COVERAGE STAMP (2026-07-12, adversarially verified) -- fixes the 82-vs-7 group imbalance.
+            // Coverage-first "which group is behind" is measured by lastPostedAtByGroup, which is normally written ONLY
+            // on a confirmed public/approved permalink (recordPublishedFacebookPostUrl). An approval-gated group's post
+            // sits here PENDING and writes no stamp, so that group looks PERPETUALLY behind -> the plan-build pours the
+            // whole fleet into it and skips the already-stamped no-approval groups (which would post instantly), AND
+            // the give-up->release path re-posts the same product to it (duplicate risk). Stamp the group as served the
+            // moment the post is CAPTURED so coverage fans out to ALL groups. Same key form (row.groupUrl +
+            // normalizedFacebookGroupKey) the coverage readers use. If the post is ultimately rejected (never goes
+            // live), the 24h reuse window re-owes the group -- bounded + correct; do NOT revert this on give-up (that
+            // reopens the double-post window while the original pending post still sits in FB's queue).
+            try {
+              const __covPk = String(row.productKey || "");
+              const __covGk = normalizedFacebookGroupKey(row.groupUrl || "");
+              if (__covPk && __covGk) {
+                const __covRec = harvestedRecordForKey(__covPk, readState()) || {};
+                const __covMap = Object.assign({}, __covRec.lastPostedAtByGroup || {});
+                __covMap[__covGk] = new Date().toISOString();
+                updateHarvestedProductRecord(__covPk, { lastPostedAtByGroup: __covMap });
+              }
+            } catch (_) {}
             __bgCommentInFlight += 1;
             __bgPreApprovalRunPostsPending += 1; // reserved run-limit budget until the durable counter bump lands (see completeVerifiedFacebookPostWithComment)
             const __bgClose = [];
