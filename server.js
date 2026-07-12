@@ -65,6 +65,21 @@ let __bgCommentInFlight = 0; // outstanding BACKGROUNDED comment+approval tasks 
 // raising this alone is insurance, not the fix; the real fix is that a post can no longer be dropped with zero
 // attempt when the cap is full.
 const MAX_BG_COMMENT_IN_FLIGHT = 6;
+// RESERVE HEADROOM FOR THE PRE-PUBLISH APPROVAL LEG (2026-07-12 fairness fix): before 2026-07-12 this whole
+// __bgCommentInFlight pool was only ever drawn from by approval-gated-group traffic (both the pre-publish
+// approval decision below AND that group's own post-completion comment). The SAME-DAY "fast-fire for ALL run
+// posts" broadening (completeVerifiedFacebookPostWithComment's __isRunPost) now lets the 3 direct (no-approval)
+// groups' comment-only tasks -- far higher volume (14-17 profiles each vs ~4 moderators), each holding a slot
+// only seconds -- compete for the identical 6-slot budget that the approval-gated group's pre-publish approval
+// leg (__bgPreApprovalEligible below, holds a slot for the full moderator wait) depends on to stay backgrounded.
+// When that leg finds no free slot it falls back to the SYNCHRONOUS admin-approval path, which blocks the tick
+// and can return ok:false -- a failure the (otherwise group-symmetric) cooldown then counts, a channel only the
+// approval-gated group can hit. Reserve a couple of slots exclusively for the pre-publish approval leg (which is
+// unchanged below and still checks the FULL MAX_BG_COMMENT_IN_FLIGHT) by capping ONLY the comment-only fast-fire
+// admission at a lower ceiling; comment-only tasks that miss it still fall into the existing FIFO waiter queue
+// (no comment ever dropped), so this costs at most a short queue wait for a comment, never a skipped one.
+const BG_APPROVAL_RESERVED_SLOTS = 2;
+const MAX_BG_COMMENT_ONLY_IN_FLIGHT = Math.max(1, MAX_BG_COMMENT_IN_FLIGHT - BG_APPROVAL_RESERVED_SLOTS);
 // FAST-FIRE WAITER QUEUE (2026-07-07): replaces "DEFER-TO-DRAIN = log it and hope the periodic resweep looks."
 // When the cap is full, a task is pushed here instead of dropped; the moment ANY backgrounded task's .finally
 // below runs, it hands the just-freed slot to the OLDEST queued waiter FIRST -- synchronously, in the same
@@ -17439,7 +17454,7 @@ async function completeVerifiedFacebookPostWithComment({
   // guards + the never-skip durable drain backstop apply; the inline await stays as the drain-disabled fallback.
   const __isRunPost = ready.__autopilotRunPost === true
     && readState().operator?.commentDrainDisabled !== true;
-  const __bgApprovalComment = __isRunPost && __bgCommentInFlight < MAX_BG_COMMENT_IN_FLIGHT;
+  const __bgApprovalComment = __isRunPost && __bgCommentInFlight < MAX_BG_COMMENT_ONLY_IN_FLIGHT;
   if (__bgApprovalComment) {
     __fireBackgroundedComment({ args: { row, ready, groupUrl: actualGroupUrl, postUrl, imagePath: ready.imagePath, postValidation: validation, ledgerKey, closeResults: [] } });
     try { logEvent("facebook_post_published_comment_backgrounded", { postUrl, groupUrl: actualGroupUrl, profileId: ready.profileId, bgInFlight: __bgCommentInFlight }); } catch (_) {}
