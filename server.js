@@ -1714,6 +1714,19 @@ function persistLiveTestFailure(error = {}) {
 function isModeratorApprovalProfileLine(line = "") {
   return /\b(admin|administrator|moderator|mod|owner|approve|approval|admin_approval)\b/i.test(String(line || ""));
 }
+// KEYWORD-INDEPENDENT moderator test (2026-07-12, operator: "make it dynamic for ANY moderator label"): a profile is a
+// moderator if its ID is a member of the operator-curated state.ixbrowser.moderatorProfiles, REGARDLESS of label
+// spelling ("113 - moderqtor5" typo, "112 - moderator3" where the trailing digit kills the \b word boundary). Mirrors
+// the proven ID-membership loops at ~7885-7900 / ~19977-19981. This is the robust admit path; the keyword test above
+// stays as an additive safety net for a named-but-unlisted moderator.
+function isModeratorByIdMembership(line, state = readState()) {
+  const id = profileIdFromLabel(line);
+  if (!id) return false;
+  for (const modLine of recordLines(state?.ixbrowser?.moderatorProfiles)) {
+    if (profileIdFromLabel(modLine) === id) return true;
+  }
+  return false;
+}
 
 function normalizedProfileListLines(...sources) {
   const seen = new Set();
@@ -1780,9 +1793,14 @@ function normalizeWorkflowState(state) {
   state.operator.commentCooldownHours = clampNumber(state.operator.commentCooldownHours, 1, 720, 24);
   state.operator.commentCooldownProbeHours = clampNumber(state.operator.commentCooldownProbeHours, 1, 48, 4);
   const blockedProfileLines = normalizedProfileListLines(state.ixbrowser?.blockedProfiles);
-  const movedModeratorLines = blockedProfileLines.filter(isModeratorApprovalProfileLine);
+  // 2026-07-12: migrate a moderator out of blockedProfiles by keyword OR by ID-membership in moderatorProfiles, so a
+  // moderator whose label lacks a clean "moderator" word ("113 - moderqtor5", "112 - moderator3") is never left stuck
+  // blocked after an auto-blacklist. Only relocates a line already intended to relocate; suspend/disconnect/cooldown
+  // exclusion is re-applied dynamically at pool-build time, so a live-suspended moderator is never re-admitted.
+  const isModeratorMigratable = (line) => isModeratorApprovalProfileLine(line) || isModeratorByIdMembership(line, state);
+  const movedModeratorLines = blockedProfileLines.filter(isModeratorMigratable);
   state.ixbrowser.blockedProfiles = blockedProfileLines
-    .filter((line) => !isModeratorApprovalProfileLine(line))
+    .filter((line) => !isModeratorMigratable(line))
     .slice(0, 500)
     .join("\n");
   state.ixbrowser.moderatorProfiles = normalizedProfileListLines(
