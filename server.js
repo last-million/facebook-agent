@@ -16828,6 +16828,19 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         let m = __pendingFailByUrl.get(u); if (!m) { m = new Map(); __pendingFailByUrl.set(u, m); }
         const pid = Number(r.profileId || 0); if (!m.has(pid)) m.set(pid, Date.parse(r.at || "") || 0);
       }
+      // CONFIRMED-PUBLIC (2026-07-12, operator: "the comment clock must start when the post goes APPROVED+PUBLISHED,
+      // not when it was first posted pending"). A post with an admin_approval_finished/approved_and_verified row (or a
+      // strong_verified published row) is genuinely LIVE now, so it must NOT be treated as provably-pending -- otherwise
+      // the ~30min pending backoff would delay its comment even though it just became public. It should comment on the
+      // normal fast (~4min) path the moment it's public, timed from the approval, not from the original pending post.
+      const __confirmedPublicUrls = new Set();
+      for (const r of rows) {
+        if (!r || !r.postUrl) continue;
+        const isStrongApproval = (r.event === "admin_approval_finished" && String(r.status || "") === "approved_and_verified")
+          || (r.event === "published_after_admin_approval" && r.approvalVerification === "strong_verified");
+        if (!isStrongApproval) continue;
+        let u = ""; try { u = sanitizeFacebookPostUrl(String(r.postUrl)); } catch { u = String(r.postUrl); } if (u) __confirmedPublicUrls.add(u);
+      }
       // A post is STUCK-SOFT (re-approve, don't re-comment) ONLY if: it was soft_clicked (never strong-verified) AND is
       // >=35min old (past FB's propagation window) AND has NO verified comment AND >=commentCorroborationMinProfiles
       // distinct profiles saw it blocked-pending across >=commentCorroborationMinSpreadMinutes. A healthy/propagating
@@ -16851,6 +16864,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       const __isProvablyPending = (url) => {
         let u = ""; try { u = sanitizeFacebookPostUrl(url); } catch { return false; }
         if (__okUrls.has(u)) return false;
+        if (__confirmedPublicUrls.has(u)) return false; // approved+public now -> comment on the fast path (timed from approval), never the 30min pending defer
         const m = __pendingFailByUrl.get(u); if (!m || m.size < clampNumber(state.operator?.commentCorroborationMinProfiles, 2, 20, 3)) return false;
         const t = [...m.values()]; return Math.max(...t) - Math.min(...t) >= clampNumber(state.operator?.commentCorroborationMinSpreadMinutes, 0, 720, 30) * 60000;
       };
