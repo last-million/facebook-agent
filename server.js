@@ -15792,6 +15792,16 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
   const totalProfiles = profileList.length;
   let noAccessCount = 0;
   let postNotReadyCount = 0; // POST-LEVEL dead-end: the post itself is unavailable/pending (NOT yet live after approval) — fails the SAME for every profile, so don't burn all 40; stop after a few and let the resweep retry once it propagates.
+  // 2026-07-11 (operator: "publication directe, pre-approved always -- it should work with any group any
+  // profiles"): the post-not-ready EARLY BREAK below (stop after the FIRST "target unavailable/pending" error)
+  // was written for APPROVAL-required groups, where a pending post genuinely fails identically for every profile
+  // until a moderator approves it. On a PRE-APPROVED group (requiresAdminApproval=false, which is the operator's
+  // entire setup) that error means propagation delay or a non-member commenter -- a DIFFERENT attributed
+  // commenter (or the same one moments later) can still succeed -- so breaking after 1 wrongly gives up on the
+  // whole group's commenter pool. Compute the group's approval status ONCE and only apply the early break when
+  // approval is genuinely required; pre-approved groups fan out to every attributed commenter (bounded by the
+  // MAX_COMMENT_FALLBACK_PROFILES=8 per-pass cap + the maxNoAccess cap, so it can't run unbounded).
+  const __groupRequiresApproval = isAdminApprovalEnabledForGroup(groupUrl);
   const __cState = readState();
   const maxNoAccess = clampNumber(__cState.operator?.maxCommentNoAccessAttempts, 1, 60, 25); // allow many no-access dead-ends before giving up — exhaust the group's allocated profiles (members come first, probes after) so a few non-member probes can't cut the list short.
   // ANTI-BURN (operator): per-profile comment cooldown + comment-limited(post-only) skip. Built fresh per
@@ -15933,7 +15943,9 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
     // profile, so cycling more profiles is pure waste. STOP ON THE FIRST detection (operator 2026-06-16: stop
     // burning profiles on a pending post) — the ~22-min comment-recovery backoff then re-checks it later, by which
     // time FB has had time to approve it -> it gets approved + commented on a LATER pass instead of hammered now.
-    if (isPendingPostCommentError(failStr)) {
+    // GATED (2026-07-11) on __groupRequiresApproval: only genuine approval groups get the early break; a
+    // pre-approved group keeps trying every attributed commenter (see the __groupRequiresApproval comment above).
+    if (__groupRequiresApproval && isPendingPostCommentError(failStr)) {
       postNotReadyCount += 1;
       if (postNotReadyCount >= 1) {
         logEvent("comment_recovery_post_not_ready_break", { postNotReadyCount, tried: attempts.length, postUrl, reason: "post_pending_break_on_first_detection_recheck_after_backoff" });
