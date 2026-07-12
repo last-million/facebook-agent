@@ -2817,6 +2817,7 @@ function blockedModeratorCooldownSet(state = readState()) {
   return ids;
 }
 const MODERATOR_FORCED_SWITCH_PARK_THRESHOLD = 3; // repeated forced_account_switch stuck = the moderator profile is genuinely broken (needs re-login), NOT a transient FB wall
+let __approvalModeratorRotationCursor = 0; // 2026-07-12: rotates the START moderator across approval sessions so concurrent background legs (which all rebuild the same least-used list from the pre-write ledger) don't funnel onto ONE account (the suspension risk that checkpointed profile 89). Single moderator -> no-op.
 function markModeratorBlocked(profileId, label, reason) {
   const id = String(profileId || "").replace(/\D+/g, "");
   if (!id) return false;
@@ -14768,7 +14769,17 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
   // Try pending queue search by author ID FIRST (empty postUrl) — fastest reliable
   // approach. Fall back to specific candidate permalinks only if that fails.
   const targetUrls = urls.length ? ["", ...urls.slice(0, 8)] : [""];
-  const adminProfiles = await facebookAdminApprovalProfilesForGroup(groupUrl, state, { excludeProfileId: ready.profileId });
+  const __rawAdminProfiles = await facebookAdminApprovalProfilesForGroup(groupUrl, state, { excludeProfileId: ready.profileId });
+  // EQUAL MODERATOR ROTATION across concurrent legs (2026-07-12, operator: "if there are more moderators, use them
+  // all equally"). Up to MAX_BG_COMMENT_IN_FLIGHT background approval legs fire near-simultaneously; each rebuilds
+  // this least-used list against the SAME pre-write ledger, so all get the identical order and all start at index 0
+  // -> they funnel onto ONE moderator (the account-suspension risk that checkpointed profile 89). Rotate the START
+  // index by an atomic per-session cursor so concurrent legs spread across the (least-used-sorted) healthy moderators.
+  // Preserves the full retry-on-failure loop + budget accounting (still iterates ALL N moderators, just from a rotated
+  // offset). With a single healthy moderator this is a no-op (off=0).
+  const adminProfiles = (__rawAdminProfiles.length > 1)
+    ? (() => { const off = (__approvalModeratorRotationCursor++) % __rawAdminProfiles.length; return [...__rawAdminProfiles.slice(off), ...__rawAdminProfiles.slice(0, off)]; })()
+    : __rawAdminProfiles;
   appendFacebookLivePostLedger({
     event: "admin_approval_planned",
     key: ledgerKey,
