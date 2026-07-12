@@ -13667,7 +13667,7 @@ function isFacebookAccountHardBlockedFailure(message = "", validation = null, ob
       item?.message,
     ].filter(Boolean).join(" ")).join(" ") : "",
   ].join(" ").toLowerCase();
-  return /facebook_account_suspended_or_disabled|facebook_account_status_blocked|account_suspended|account_disabled|account_deactivated|account_locked|identity_review_required|account_restricted|checkpoint_account_blocked|your account (?:has been )?(?:suspended|disabled|locked|deactivated)|we suspended your account|we disabled your account|you can't use facebook right now|you cannot use facebook right now|request a review|disagree with decision/i.test(text);
+  return /facebook_account_suspended_or_disabled|facebook_account_status_blocked|account_suspended|account_disabled|account_deactivated|account_locked|account_blocked_intl|identity_review_required|publish_identity_required|account_restricted|checkpoint_account_blocked|your account (?:has been )?(?:suspended|disabled|locked|deactivated)|we suspended your account|we disabled your account|you can't use facebook right now|you cannot use facebook right now|request a review|disagree with decision|votre compte a été (?:suspendu|désactivé)|compte (?:suspendu|désactivé|bloqué)|تم (?:تعطيل|إيقاف|حظر|تعليق) حسابك/i.test(text);
 }
 
 function isNonFallbackFacebookPublishFailure(message = "") {
