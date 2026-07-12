@@ -32,6 +32,7 @@
         </div>
         <nav class="topNav" aria-label="Workflow menu">
           <button class="topNavItem active" data-view-target="overview" type="button">Overview</button>
+          <button class="topNavItem" data-view-target="guide" type="button">Guide</button>
           <button class="topNavItem" data-view-target="monitor" type="button">Tasks</button>
           <button class="topNavItem" data-view-target="approvals" type="button">Approvals</button>
           <button class="topNavItem" data-view-target="credentials" type="button">Credentials</button>
@@ -56,6 +57,69 @@
 
       <section class="layout">
         <section class="mainGrid">
+          <section class="panel wide" data-view="guide">
+            <div class="panelHead">
+              <div>
+                <span class="stepBadge">Guide</span>
+                <h2>Setup checklist — how to make any group work</h2>
+                <p>Read this before launching a run, and whenever you add a new group or new profiles. The software side is fully generic — it works for any number of groups and accounts automatically. What it <b>cannot</b> do for you is the Facebook-side setup below. Get these right and any group will post + comment reliably.</p>
+              </div>
+            </div>
+
+            <div style="display:grid;gap:14px">
+
+              <div style="background:rgba(78,161,255,.07);border:1px solid rgba(78,161,255,.3);border-radius:12px;padding:14px 16px">
+                <h3 style="margin:0 0 8px;font-size:.95rem">1 · Profiles must be real members of each group</h3>
+                <p style="margin:0 0 6px;opacity:.85">This is the #1 cause of a group posting 0. A profile assigned to a group but <b>not actually joined</b> to it on Facebook can never post or comment there — no code can fix that.</p>
+                <ul style="margin:6px 0 0;padding-left:20px;line-height:1.7">
+                  <li>Open each posting profile and <b>Join</b> the groups it is assigned to (accept any join question / wait for admin approval of the join).</li>
+                  <li>If a group has "admin approval to join" on, an admin must accept the account first — a pending <i>join</i> request looks the same as "not a member" to the agent.</li>
+                  <li>The agent auto-detects a non-member, removes it from that group, and lists it under <b>Prod → "Profiles not member of any group"</b> once it can't work in any group. Fix membership on Facebook, then click <b>Release</b> there.</li>
+                </ul>
+              </div>
+
+              <div style="background:rgba(63,185,80,.07);border:1px solid rgba(63,185,80,.3);border-radius:12px;padding:14px 16px">
+                <h3 style="margin:0 0 8px;font-size:.95rem">2 · Assign profiles to groups + pick the default posting page</h3>
+                <ul style="margin:6px 0 0;padding-left:20px;line-height:1.7">
+                  <li>In <b>Prod → group assignment</b>, give every group its profiles. Use <b>Equal split</b> to dispatch them evenly across groups.</li>
+                  <li>Select the profile/page that should be the default publisher for each group.</li>
+                  <li>Don't worry about balancing manually over time — if accounts drop offline, the agent <b>auto-rebalances</b> healthy profiles across groups to keep each group's headcount even.</li>
+                </ul>
+              </div>
+
+              <div style="background:rgba(167,121,233,.07);border:1px solid rgba(167,121,233,.3);border-radius:12px;padding:14px 16px">
+                <h3 style="margin:0 0 8px;font-size:.95rem">3 · Define moderators (with admin rights)</h3>
+                <ul style="margin:6px 0 0;padding-left:20px;line-height:1.7">
+                  <li>Add your moderator accounts to the <b>moderator list</b>. These are approve-only — they approve pending posts, they don't post/comment.</li>
+                  <li>Each moderator must have a real <b>admin/moderator role</b> on every group it will approve for, or approval silently fails.</li>
+                  <li>The agent <b>rotates</b> moderators (spreads approvals evenly) so no single moderator gets suspended from too many approvals.</li>
+                  <li>A moderator that keeps failing is parked under <b>Prod</b> for you to fix + Release.</li>
+                </ul>
+              </div>
+
+              <div style="background:rgba(214,165,49,.07);border:1px solid rgba(214,165,49,.3);border-radius:12px;padding:14px 16px">
+                <h3 style="margin:0 0 8px;font-size:.95rem">4 · Set the approval mode correctly per group</h3>
+                <ul style="margin:6px 0 0;padding-left:20px;line-height:1.7">
+                  <li><b>Pre-approved group</b> (posts go live instantly): leave <b>Requires admin approval = OFF</b>. Comments fan out to every attributed profile.</li>
+                  <li><b>Approval-required group</b> (posts land in a pending queue): turn <b>Requires admin approval = ON</b> for that group, or posts stay pending forever and never get commented.</li>
+                  <li>You can check who approved each pending post and how long it took on the <b>Report</b> page (top-right link).</li>
+                </ul>
+              </div>
+
+              <div style="background:rgba(139,152,168,.06);border:1px solid var(--line, #27323f);border-radius:12px;padding:14px 16px">
+                <h3 style="margin:0 0 8px;font-size:.95rem">5 · Before you press launch</h3>
+                <ul style="margin:6px 0 0;padding-left:20px;line-height:1.7">
+                  <li>Confirm posting config: <b>post to all groups</b>, reuse hours, and concurrency are set the way you want.</li>
+                  <li>Make sure there's product supply (Content tab) so the run has something to post.</li>
+                  <li>Launch from <b>Prod</b>. Watch the first few minutes: each group should start producing posts, and comments should land within seconds to a few minutes.</li>
+                  <li>If a group posts 0, it's almost always item 1 (membership) — check the "not member of any group" list.</li>
+                </ul>
+              </div>
+
+              <p style="opacity:.6;font-size:.8rem;margin:2px 0 0">Rule of thumb: the agent handles everything technical (rebalancing, retries, comment fan-out, moderator rotation, crash recovery). You handle the Facebook-side setup above — memberships, roles, and the per-group approval switch.</p>
+            </div>
+          </section>
+
           <section class="panel command wide" data-view="_off">
             <div class="panelHead">
               <h2>Command Center</h2>

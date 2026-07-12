@@ -28,6 +28,7 @@ const PREPARE_ASSETS_TIMEOUT_MS = 1800000;
 const IXBROWSER_DASHBOARD_WAIT_MS = 420000;
 const VIEW_SUBTITLES = {
   overview: "Production readiness, safety switches, analytics, and comment-limit review.",
+  guide: "Setup checklist — what to prepare on Facebook and here before running each group. Read it anytime.",
   monitor: "Live Hermes queue, active run progress, and event timeline.",
   approvals: "Human validation for plans and queued tasks before anything is accepted.",
   credentials: "All saved service keys, local API URLs, and fixed proxy credentials in one place.",
