@@ -2334,10 +2334,18 @@ async function commentTargetPreflight(page, postUrl, marker) {
     // PENDING/UNAVAILABLE detection — multilingual (these profiles run FB in ES/AR; EN-only let a localized pending
     // post pass preflight and try to comment on a not-yet-approved post). Covers EN/FR/ES/PT/DE + Arabic.
     const unavailable = /content isn't available|content is not available|post unavailable|this post isn't available|post is pending|pending approval|awaiting approval|en attente d.approbation|en cours d.examen|publication est en attente|contenu non disponible|cette publication n.est pas disponible|pendiente de aprobaci[oó]n|publicaci[oó]n est[aá] pendiente|en espera de aprobaci[oó]n|contenido no (?:est[aá] )?disponible|esta publicaci[oó]n no est[aá] disponible|aguardando aprova[cç][aã]o|pendente de aprova[cç][aã]o|conte[uú]do (?:n[aã]o dispon[ií]vel|indispon[ií]vel)|ausstehende genehmigung|wartet auf genehmigung|inhalt nicht verf[uü]gbar|في انتظار الموافقة|بانتظار الموافقة|قيد المراجعة|بانتظار المراجعة|غير متاح|غير متوفر|هذا المحتوى غير متاح/i.test(text);
+    // FOLDED-MARKER FIX (2026-07-12): our unique #fb<6hex> marker is the LAST tag in a long caption that FB folds
+    // behind "See more"/"Voir plus". innerText OMITS folded text, so on these French-UI permalinks markerVisible was
+    // false even though we are on the EXACT correct post (urlMatches:true, exact postId, a comment box present) ->
+    // every comment blocked with target_marker_article_not_visible_before_comment. textContent INCLUDES the folded
+    // caption. Matching there is SAFE: the #fb marker is seeded UNIQUE per post, so it can only ever appear in OUR
+    // post's DOM subtree -- a related/suggested post on the same permalink page cannot contain it. This mirrors what
+    // submitCommentOnVisiblePost already does downstream; the preflight was the only gate still innerText-only.
+    const fullText = document.body.textContent || '';
     const markerArticles = [...document.querySelectorAll('[role="article"]')]
-      .filter((el) => visible(el) && matches(el.innerText || ''));
+      .filter((el) => visible(el) && (matches(el.innerText || '') || matches(el.textContent || '')));
     const markerRoots = [...document.querySelectorAll('[role="article"], div')]
-      .filter((el) => visible(el) && matches(el.innerText || ''));
+      .filter((el) => visible(el) && (matches(el.innerText || '') || matches(el.textContent || '')));
     const exactPermalinkCommentBoxes = [...document.querySelectorAll('[contenteditable="true"], [role="textbox"], textarea, [aria-label*="Comment as" i], [aria-label*="Write a comment" i], [aria-label*="commenter" i]')]
       .filter((el) => {
         if (!visible(el)) return false;
@@ -2348,7 +2356,7 @@ async function commentTargetPreflight(page, postUrl, marker) {
     return {
       url: location.href,
       title,
-      markerVisible: matches(text),
+      markerVisible: matches(text) || matches(fullText), // fullText = body.textContent (includes the "See more"-folded caption); #fb marker is unique so this can only match OUR post
       titleHasMarker: matches(title),
       visibleMarkerArticleCount: markerArticles.length,
       markerRootCount: markerRoots.length,
