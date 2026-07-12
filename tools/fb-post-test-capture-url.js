@@ -3620,7 +3620,19 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
   // then drains every other pending post) instead of many short sessions finding nothing.
   if (workingTarget) {
     for (let attempt = 2; attempt <= 14; attempt += 1) {
-      await humanPause(55000, 75000); // let the pending post propagate into the queue
+      // 2026-07-11 (operator): the pending post takes 10-30 min to appear in the queue. This poll used to call
+      // humanPause(55000,75000) but humanPause is HARD-clamped to 3000ms (see top of file), so the "patient
+      // ~14-min poll" silently collapsed to ~3s/pass. Use a RAW ~60s sleep here (this single call site only --
+      // global humanPause and its other 80 call sites are untouched). It is hard-bounded by the server's
+      // MAX_ADMIN_APPROVAL_ATTEMPT_MS=4min per-attempt kill, so it can never hang; the server re-fires the
+      // attempt across sessions to cover the full propagation window.
+      await new Promise((r) => setTimeout(r, 60000)); // let the pending post propagate into the queue
+      // CACHE CLEAR, LOGIN PRESERVED (2026-07-11, operator: "if moderator doesn't find the pending, clear cache
+      // and cookies but do NOT disconnect the account, then try again"): clear only the HTTP RESOURCE CACHE via
+      // CDP -- this does NOT touch cookies, so c_user/xs/datr survive and the FB account stays logged in. We
+      // deliberately do NOT call context.clearCookies() (that WOULD log the account out, which the operator
+      // explicitly forbade). Guarded so a detached/closed page can't break the approval flow.
+      try { const __cdp = await page.context().newCDPSession(page); await __cdp.send('Network.clearBrowserCache'); } catch (_) {}
       await page.goto(workingTarget, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
       visited.push(page.url());
       await humanPause(3000, 4500);

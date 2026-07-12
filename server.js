@@ -203,10 +203,23 @@ const MAX_CONCURRENT_NORMAL_IX_PROFILES = Math.max(3, Math.min(6, Math.floor(((o
 // 2026-06-16 alongside cap 3->5 (CORES_PER_PROFILE 1.5->1.0) so 5 concurrent posters don't starve their commenters on the
 // 8th lock. 9-core/32GB box: 14 profiles ~ <=112 chrome ~ <=18GB, leaving the OS + Pinterest ample headroom. (operator 2026-06-16)
 const GLOBAL_MAX_OPEN_PROFILES = 14;
-const MAX_COMMENT_FALLBACK_PROFILES = 8; // CEILING of profiles tried for the first comment. Was 40 -> on a STUCK post
-// (e.g. pending approval / not yet visible) it opened 40 browsers in a row, the #1 driver of the overnight memory crash
-// (201 chrome procs, freeRam 1%). A good post succeeds on the first profile, so 8 doesn't hurt normal posts; a post that
-// 8 distinct profiles can't comment is genuinely stuck (re-tried later by the resweep once it goes live). (operator 2026-06-15)
+// CEILING of profiles tried for the first comment. Was 40 -> on a STUCK post it opened 40 browsers IN A ROW,
+// blamed for the 2026-06-15 overnight memory crash (201 chrome procs, freeRam 1%) and cut to 8. But the REAL
+// crash driver was the ABSENCE of a total open-profile ceiling (GLOBAL_MAX_OPEN_PROFILES didn't exist yet -- it
+// was added 2026-06-16, line 205) plus unreaped orphan chrome (the OS reaper came later) -- NOT the per-post
+// list length: the comment loop is strictly SEQUENTIAL (recoverFacebookCommentWithProfilesInner opens ONE
+// profile, comments, closes, next), so a single stuck post holds exactly 1 browser at a time no matter the cap,
+// and real concurrency is hard-capped independently by acquireCommentLock (<=4) + GLOBAL_MAX_OPEN_PROFILES=14
+// (throws 503, never blocks). So raising this back up CANNOT reproduce that crash. Raised 8->50 on 2026-07-11
+// (operator: "must try EVERY attributed commenter for the group until one works, not just 8") -- the per-group
+// attribution gate means only the group's ~real members (~18-19) are ever actually opened; 50 is just a safe
+// ceiling well above any real roster. maxNoAccess (default 25) still bounds a truly-dead post's tail.
+const MAX_COMMENT_FALLBACK_PROFILES = 50;
+// SEPARATE, SMALL cap for the ADMIN-APPROVAL MODERATOR pool (2026-07-11 split): the moderator-candidate list at
+// facebookAdminApprovalProfilesForGroup used to share MAX_COMMENT_FALLBACK_PROFILES. Raising the comment cap to
+// 50 must NOT inflate how many MODERATOR accounts get touched per pending post -- that is exactly the
+// suspension exposure the operator fears. Kept explicit and small (only a handful of moderators exist anyway).
+const MAX_APPROVAL_MODERATOR_POOL = 8;
 const FACEBOOK_LIVE_POST_TIMEOUT_MS = 600000;
 // 18 min: the pending-queue propagation is 10-30 min (measured live 2026-06-12), and the connector now POLLS
 // the queue in ONE patient session (~14 min max) instead of burning a fresh ~3-min session per retry across
@@ -14102,14 +14115,24 @@ function facebookAdminProfileLabelsFromConfiguredText(text = "", groupUrl = "", 
 // ledger). Lets the approver order moderators least-used-first so they share the load evenly instead of
 // always hammering the first-listed one. Single 5000-row scan -> Map(profileId -> approval attempts).
 function facebookApprovalCountByProfile() {
+  // Returns { counts, lastApprovedAt } per moderator profileId. counts = lifetime admin_approval_finished rows
+  // (any status) -- the primary least-used sort key. lastApprovedAt = the most recent SUCCESSFUL approval time
+  // (status approved_and_verified only) -- the 2026-07-11 rotation secondary key: after a moderator succeeds it
+  // sinks to the back of the NEXT pending post's list, so approvals round-robin across moderators and no single
+  // one gets hammered into an FB suspension (operator: "rotate moderators to avoid getting one suspended").
   const counts = new Map();
+  const lastApprovedAt = new Map();
   for (const item of readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 })) {
     if (!item || item.event !== "admin_approval_finished") continue;
     const pid = Number(item.profileId || 0);
     if (!pid) continue;
     counts.set(pid, (counts.get(pid) || 0) + 1);
+    if (String(item.status || "") === "approved_and_verified") {
+      const t = Date.parse(item.at || "") || 0;
+      if (t > (lastApprovedAt.get(pid) || 0)) lastApprovedAt.set(pid, t);
+    }
   }
-  return counts;
+  return { counts, lastApprovedAt };
 }
 
 async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState(), options = {}) {
@@ -14167,9 +14190,17 @@ async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState
   }
   // EQUAL ROTATION: order moderators least-used-first so approvals spread evenly across all of them instead
   // of always hitting the first-listed one. Stable sort keeps configured order for ties.
-  const __apprUsage = facebookApprovalCountByProfile();
-  candidates.sort((a, b) => (__apprUsage.get(a.profileId) || 0) - (__apprUsage.get(b.profileId) || 0));
-  const __out = candidates.slice(0, MAX_COMMENT_FALLBACK_PROFILES);
+  const { counts: __apprUsage, lastApprovedAt: __apprLastAt } = facebookApprovalCountByProfile();
+  // MODERATOR ROTATION (2026-07-11): least-used FIRST (primary), then oldest-successful-approval FIRST (secondary)
+  // so the moderator that just approved sinks to the back -> approvals spread evenly across moderators, reducing
+  // per-account suspension risk. A never-yet-successful moderator (lastAt 0) sorts to the very front, which is
+  // correct (give it work). Ties fall through to configured order (stable sort).
+  candidates.sort((a, b) => {
+    const ca = __apprUsage.get(a.profileId) || 0, cb = __apprUsage.get(b.profileId) || 0;
+    if (ca !== cb) return ca - cb;
+    return (__apprLastAt.get(a.profileId) || 0) - (__apprLastAt.get(b.profileId) || 0);
+  });
+  const __out = candidates.slice(0, MAX_APPROVAL_MODERATOR_POOL);
   if (!__out.length && (state.posting?.blockedModerators || []).length) {
     // every moderator is in its forced_account_switch cooldown -> posts stay pending until one's 24-min cooldown
     // elapses (correct: don't hammer FB-blocked accounts). Surface it so the admin knows why approvals paused.
@@ -15800,7 +15831,7 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
   // commenter (or the same one moments later) can still succeed -- so breaking after 1 wrongly gives up on the
   // whole group's commenter pool. Compute the group's approval status ONCE and only apply the early break when
   // approval is genuinely required; pre-approved groups fan out to every attributed commenter (bounded by the
-  // MAX_COMMENT_FALLBACK_PROFILES=8 per-pass cap + the maxNoAccess cap, so it can't run unbounded).
+  // MAX_COMMENT_FALLBACK_PROFILES=50 per-pass cap + the maxNoAccess cap, so it can't run unbounded).
   const __groupRequiresApproval = isAdminApprovalEnabledForGroup(groupUrl);
   const __cState = readState();
   const maxNoAccess = clampNumber(__cState.operator?.maxCommentNoAccessAttempts, 1, 60, 25); // allow many no-access dead-ends before giving up — exhaust the group's allocated profiles (members come first, probes after) so a few non-member probes can't cut the list short.
