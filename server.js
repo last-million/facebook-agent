@@ -9239,7 +9239,10 @@ async function stopAllExternalWork(reason) {
   // args array avoids shell-quoting issues. Pinterest uses a different script + msedge, so it's untouched.
   try {
     const psKill = "Get-CimInstance Win32_Process -Filter \"name='node.exe'\" | Where-Object { $_.CommandLine -match 'fb-post-test-capture-url' } | ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force } catch {} }";
-    require("child_process").execFile("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psKill], () => {});
+    // 2026-07-12: AWAIT the kill (was fire-and-forget) so every in-flight FB connector child is actually dead before
+    // this returns -- otherwise "Stop" returned while connectors were still opening profiles (operator: "I see
+    // profiles opening after Stop"). Pinterest uses a different script + msedge, so it's untouched.
+    await execFileAsync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", psKill], { windowsHide: true, timeout: 15000 });
   } catch (_) {}
   try { await closeAllOpenIxProfiles(); } catch (_) {}
   logEvent("external_work_stop_all", { reason: reason || "operator_stop" });
@@ -9249,7 +9252,13 @@ async function stopAllExternalWork(reason) {
   // re-open a commenter; ignoreArmedGate (NOT force) bypasses the disarm yet KEEPS the run-cutoff clamp, so it only
   // finishes THIS run's comments and NEVER back-fills old posts; a SECOND stop (newer __externalStopRequested)
   // aborts it (the L13837 guard). If nothing is owed, the drain finds 0 posts and opens no browser — a quiet stop.
-  if (reason === "operator_stop_all" || reason === "dashboard_disarm") {
+  // IMMEDIATE SILENT STOP (2026-07-12, operator: "Stop must STOP -- I see profiles opening after Stop, and each Stop
+  // relaunches a drain, fuck"): this auto finish-drain re-opens commenter profiles for owed comments, so a Stop was
+  // NOT immediate/silent and every repeated Stop re-fired a fresh 5-pass drain (whack-a-mole -- killing connectors
+  // just respawned them). Gate it OFF by default so Stop is a hard, silent stop. The owed comments are NOT lost --
+  // the next armed run's comment-recovery re-sweeps them. Set operator.stopFinishDrainEnabled=true to restore the old
+  // "finish owed comments on Stop" behavior.
+  if ((reason === "operator_stop_all" || reason === "dashboard_disarm") && readState().operator?.stopFinishDrainEnabled === true) {
     setTimeout(() => {
       (async () => {
         // DISARM-RACE FIX (2026-06-25 forensics): the connector-kill above FAILS any tail post whose first-comment was
