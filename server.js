@@ -2824,6 +2824,11 @@ function markModeratorBlocked(profileId, label, reason) {
   const list = Array.isArray(state.posting.blockedModerators) ? state.posting.blockedModerators : [];
   const __stuck = /forced_account_switch|stuck/i.test(String(reason || ""));
   const __disconnected = /disconnected|not logged in|logged out|login required|session expired|facebook_login_required/i.test(String(reason || "")); // a logged-out moderator never self-heals -> park-until-release immediately (no 2min retry loop)
+  // SUSPENDED / CHECKPOINTED moderator (operator 2026-07-12: "if 89 is suspended you MUST block it until admin
+  // releases it"). A checkpointed/disabled FB account never self-heals -> park-until-release IMMEDIATELY (no cooldown,
+  // no retry), same as disconnected. It is also in suspendedProfiles (excluded from every role), but park it in the
+  // moderator list too so it can never be rotated back in and the Prod tab shows it as a hard park, not a cooldown.
+  const __suspended = /suspend|checkpoint|disabled|banned|deactivat|account (?:restricted|locked|review)/i.test(String(reason || ""));
   let entry = list.find((p) => String(p.profileId) === id);
   if (entry) {
     entry.at = new Date().toISOString();
@@ -2837,12 +2842,14 @@ function markModeratorBlocked(profileId, label, reason) {
   // genuinely broken (needs a fresh re-login) — retrying it every 2min just wastes approval sessions. Park it
   // PERSISTENTLY: it stays out of the moderator rotation until the admin re-logs it and Releases it from the Prod
   // tab. A successful approval still auto-clears it (the orchestrator removes the whole entry).
-  if (((__stuck && (Number(entry.stuckCount) || 0) >= MODERATOR_FORCED_SWITCH_PARK_THRESHOLD) || __disconnected) && !entry.parkedUntilRelease) {
+  if (((__stuck && (Number(entry.stuckCount) || 0) >= MODERATOR_FORCED_SWITCH_PARK_THRESHOLD) || __disconnected || __suspended) && !entry.parkedUntilRelease) {
     entry.parkedUntilRelease = true;
-    entry.reason = __disconnected
-      ? `Moderator DISCONNECTED (not logged into Facebook) — re-login this profile then Release it here`
-      : `Moderator stuck on forced_account_switch ${entry.stuckCount}x — re-login this profile then Release it here`;
-    try { logEvent("moderator_parked_until_release", { profileId: id, reason: __disconnected ? "disconnected" : "forced_account_switch", stuckCount: entry.stuckCount }); } catch (_) {}
+    entry.reason = __suspended
+      ? `Moderator account SUSPENDED / in Facebook checkpoint — fix this account on Facebook then Release it here`
+      : __disconnected
+        ? `Moderator DISCONNECTED (not logged into Facebook) — re-login this profile then Release it here`
+        : `Moderator stuck on forced_account_switch ${entry.stuckCount}x — re-login this profile then Release it here`;
+    try { logEvent("moderator_parked_until_release", { profileId: id, reason: __suspended ? "suspended_checkpoint" : __disconnected ? "disconnected" : "forced_account_switch", stuckCount: entry.stuckCount }); } catch (_) {}
   }
   state.posting.blockedModerators = list;
   writeState(state);
