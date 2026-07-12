@@ -2289,6 +2289,27 @@ function sameFacebookGroupPostUrl(left, right) {
 
 async function commentTargetPreflight(page, postUrl, marker) {
   const expected = facebookGroupPostParts(postUrl);
+  // 2026-07-12 ROOT-CAUSE FIX (operator: "0 comments this run"): the unique #fb<hex> marker is the LAST hashtag in
+  // a long caption that Facebook FOLDS behind "Voir plus"/"See more" -- it lives in the DOM textContent but NOT in
+  // document.body.innerText, which is what the snapshot below matches against (markerVisible = matches(innerText)).
+  // Result: a genuinely-correct post (right permalink, right postId, composer present, unavailable:false) blocked
+  // with markerVisible:false -> comment_profile_cannot_access_post_permalink -> every profile failed on the same
+  // ~6 posts. This is NOT a profile/config problem. Expand every "See more" toggle FIRST (same anchored regex the
+  // proven expanders at ~2478 / ~3552 use, capped at 40 clicks for politeness) so the folded end-of-caption marker
+  // enters innerText and matches. This does NOT weaken the gate -- it still hard-requires strict postId match AND
+  // our unique marker; it only REVEALS a marker that was always there. Verified adversarially: no path to comment
+  // on a wrong post (a rogue click can't mint a different postId, and the marker can't appear on a page lacking
+  // our post). The expansion persists in the DOM, so it also fixes captureTargetState downstream and re-runs each
+  // retry pass.
+  await page.evaluate(() => {
+    const re = /^(see more|ver m[aá]s|voir plus|mehr anzeigen|عرض المزيد|اقرأ المزيد|leia mais|altro)$/i;
+    let clicked = 0;
+    for (const el of document.querySelectorAll('div[role="button"], span[role="button"], [role="button"]')) {
+      if (clicked >= 40) break;
+      if (re.test((el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim())) { try { el.click(); clicked += 1; } catch (_) {} }
+    }
+  }).catch(() => {});
+  await page.waitForTimeout(700);
   const snapshot = await page.evaluate(({ marker }) => {
     const text = document.body.innerText || '';
     const title = document.title || '';
