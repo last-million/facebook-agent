@@ -16673,13 +16673,18 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       // so only posts published since the run started are re-commented. (Old posts that missed their comment stay
       // as-is — the operator wants the agent commenting what it posts NOW, not back-filling history.)
       const __runStart = Number(state.operator?.autopilotRunId) || 0;
-      // FORCED sweeps (auto-disarm drain / manual button / boot recovery) SKIP this clamp so they can reach back the
-      // full windowHours to back-fill a post left PENDING when a PRIOR run ended (STOP / crash / window-close / late
-      // approval) — today the clamp silently overrode their windowHours, so those posts went live with NO comment and
-      // were never recovered (the stale-pending hole). NORMAL tick-driven sweeps keep the run-only focus (operator:
-      // don't chase history every 90s during a run). Forced reach-back stays bounded by windowMs + maxToFix + the
-      // attribution / comment-lock / never-twice guards below — it can never loop on un-commentable old posts.
-      if (__runStart > 0 && !options.force && !options.drain) cutoff = Math.max(cutoff, __runStart); // drain uses its own recency window (windowHours) so it reaches THIS run's just-published tail after disarm, bounded so it never chases old runs
+      // RUN-ONLY CLAMP (2026-07-12, operator: "when I launch a new prod, NO need to comment old posts, fix it
+      // robustly in ALL the system"): clamp EVERY automatic sweep -- normal tick AND the persistent/cold-backlog
+      // DRAIN AND the auto-disarm finish-drain -- to the CURRENT run's start (autopilotRunId). So the instant a
+      // fresh run is launched, autopilotRunId advances and every automatic comment sweep stops touching the
+      // PREVIOUS run's posts entirely -- no more browsers opening 6h+ old posts from earlier runs / removed groups.
+      // The drain still catches THIS run's own late-approved pending tail (those posts are published AFTER __runStart
+      // so they stay inside the clamp) -- it just never reaches BEFORE the current run. Only the EXPLICIT manual
+      // "Resweep comments" button (options.force) still bypasses this, so the operator can deliberately back-fill an
+      // old run on demand. Previously `!options.drain` let the drain reach the full windowHours back, which is
+      // exactly what made a new run keep hammering the old run's/removed-group posts. (Defense-in-depth pairs with
+      // the deleted-group skip in the candidate loop below.)
+      if (__runStart > 0 && !options.force) cutoff = Math.max(cutoff, __runStart);
       const maxToFix = clampNumber(options.max, 1, 50, 10);
       // WINDOW-SCALED READ (2026-07-07 review fix): this flat 8000-line cap ignored windowMs/windowHours entirely
       // -- at current ledger volume (~224 lines/hour) 8000 lines only reaches back ~36h, so the new cold-backlog
@@ -16793,10 +16798,26 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       // however many this loop "starts." Counters (summary.checked/recommented/stillMissing) are plain object
       // field increments; Node's single-threaded event loop makes each individual increment atomic between
       // awaits, so no lock is needed for the shared summary object across the concurrent callbacks.
+      // SKIP DELETED-GROUP GHOST POSTS (2026-07-12, operator: "why are different profiles opening 6h+ old posts
+      // from groups I removed?"): when the operator removes a group from the config, its already-published posts
+      // stay in the durable uncommented backlog, and the drain/resweep keeps opening real browsers to retry-comment
+      // them forever (confirmed live: many distinct profiles hammering ~6 old posts on 2 REMOVED groups
+      // (1567661940074941, 1098414320641851) while the fresh run's own posts waited). A post whose group is no
+      // longer configured can never be part of the operator's plan again -> stop wasting FB opens on it. Alias-aware
+      // (vanity<->numeric) so a STILL-configured group recorded under its numeric id is never wrongly skipped; and
+      // fail-open (don't skip) when nothing is configured or the row has no group, so this can only ever REMOVE
+      // clearly-orphaned work, never suppress a legit comment.
+      const __configuredGroupUrls = (Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [])
+        .map((g) => g && g.url).filter(Boolean);
+      const __isConfiguredGroup = (gu) => {
+        if (!gu || !__configuredGroupUrls.length) return true;
+        return __configuredGroupUrls.some((cu) => { try { return groupsMatchByAlias(gu, cu); } catch { return normalizedFacebookGroupKey(gu) === normalizedFacebookGroupKey(cu); } });
+      };
       const __candidates = [];
       for (const ev of __orderedFinal) {
         if (!options.ignoreArmedGate && __externalStopRequested > resweepStartedAt) { logEvent("comment_resweep_aborted_by_stop", { checked: summary.checked }); break; } // operator hit STOP -> halt now (before dispatching anything new). EXCEPTION (operator 2026-06-20): the ignoreArmedGate FINISH-drains (stop-drain 8270 / run-end 9075) run to COMPLETION — a 2nd/stale/double STOP must NOT bump __externalStopRequested past this drain's resweepStartedAt and abandon the comments the run already owes (that left 20 uncommented forever). Posting+harvest are already hard-killed before the finish-drain starts, so this only lets the cheap comment-finish complete.
         const postUrl = ev.postUrl;
+        if (!__isConfiguredGroup(ev.groupUrl || ev.actualGroupUrl)) { summary.skippedDeletedGroup = (summary.skippedDeletedGroup || 0) + 1; continue; } // 2026-07-12: post's group was removed from config -> never comment it again
         // Bound by CANDIDATES SELECTED, not (as before) attempts made mid-loop -- equivalent now that dispatch
         // is concurrent: each selected candidate becomes exactly one real attempt below (barring the late
         // re-check race, same as before), so capping selection at maxToFix preserves the same per-pass budget.
