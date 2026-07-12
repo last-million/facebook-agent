@@ -16643,6 +16643,16 @@ let __lastCommentResweepAt = 0;
 // churn (a stuck post burning profiles repeatedly). Skip it for ~20min, then retry (in case it went live/approved).
 const __commentRecoveryBackoff = new Map(); // postUrl -> last-attempt ms
 const COMMENT_RECOVERY_BACKOFF_MS = 4 * 60 * 1000; // operator 2026-06-28: re-check every ~4 min so EVERY post is commented within ~5-6 min of going PUBLIC (was 22 min). TRADE-OFF: a still-pending post is re-tried (and re-fires moderator approval) every ~4 min instead of ~22 min — more approval attempts on the thin 2-moderator pool. Accepted for fast commenting.
+// STUCK-SOFT-APPROVED RE-APPROVAL (2026-07-11, adversarially verified). A post SOFT-approved (approvalClicked but never
+// strong-verified) by the OLD miss-prone Approve code never actually became public, so re-commenting it forever is
+// hopeless (a non-moderator commenter can't see a pending post) AND it drove the load spiral (each cycle reopens a
+// commenter+moderator browser). Instead, RE-FIRE the now-reliable (commit 5f4a45d) Approve on it -- bounded -- so it
+// goes public and the existing comment path lands the comment on the NEXT pass. Module-level so the per-URL cap holds
+// across passes (resets on restart, which is fine: each re-approval is idempotent + #fb-fingerprint-gated).
+const __reapprovalAttemptsByUrl = new Map(); // sanitized postUrl -> re-approvals fired
+const SOFT_STUCK_MIN_AGE_MS = 35 * 60 * 1000;  // past FB's 10-30min approve->public window (never re-approve a still-propagating post)
+const MAX_SOFT_STUCK_REAPPROVALS = 2;          // then fall back to the normal comment path forever (NEVER abandon the owed comment)
+const MAX_REAPPROVALS_PER_PASS = 2;            // don't storm the thin moderator pool
 // PERSISTENT FIRST-COMMENT DRAIN (operator 2026-06-19): the armed-gated resweep + the run-end final passes all stop
 // within ~5 min of disarm, but FB's moderation queue makes a pending post public 10-30 min LATER — so a late-approved
 // post never got its money-comment (the 8.5% miss). This always-on, armed-INDEPENDENT drain keeps re-commenting any
@@ -16786,6 +16796,30 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         __lastResortCountByUrl.set(u, (__lastResortCountByUrl.get(u) || 0) + 1);
       }
       const __failCountFor = (pUrl) => { let u = ""; try { u = sanitizeFacebookPostUrl(pUrl || ""); } catch { return 0; } return __lastResortCountByUrl.get(u) || 0; };
+      // STUCK-SOFT detection index (2026-07-11): per-post PENDING/no-access comment failures keyed by DISTINCT profile
+      // + timestamp, plus a set of URLs that already have a verified comment. Reuses the already-loaded `rows`. Lets
+      // __isStuckSoft tell a genuinely-stuck soft-approved post (re-approve it) from a normally-propagating one (wait).
+      const __pendingFailByUrl = new Map(); const __okUrls = new Set();
+      for (const r of rows) {
+        if (!r || r.event !== "comment_recovery_finished" || !r.postUrl) continue;
+        let u = ""; try { u = sanitizeFacebookPostUrl(String(r.postUrl)); } catch { u = String(r.postUrl); } if (!u) continue;
+        if (["published", "published_with_warning"].includes(String(r.status || "")) && r.validation?.commentVerified !== false) { __okUrls.add(u); continue; }
+        const errs = (r.validation?.errors || []).map((e) => String(e || "").toLowerCase());
+        if (!errs.some((e) => e === "comment_profile_cannot_access_post_permalink" || isPendingPostCommentError(e))) continue;
+        let m = __pendingFailByUrl.get(u); if (!m) { m = new Map(); __pendingFailByUrl.set(u, m); }
+        const pid = Number(r.profileId || 0); if (!m.has(pid)) m.set(pid, Date.parse(r.at || "") || 0);
+      }
+      // A post is STUCK-SOFT (re-approve, don't re-comment) ONLY if: it was soft_clicked (never strong-verified) AND is
+      // >=35min old (past FB's propagation window) AND has NO verified comment AND >=commentCorroborationMinProfiles
+      // distinct profiles saw it blocked-pending across >=commentCorroborationMinSpreadMinutes. A healthy/propagating
+      // post can never accrue that corroboration (it'd get a success first) -> false-positive-safe.
+      const __isStuckSoft = (ev, url) => {
+        if (ev.event !== "published_after_admin_approval" || ev.approvalVerification !== "soft_clicked") return false;
+        if (Date.now() - (Date.parse(ev.at || "") || 0) < SOFT_STUCK_MIN_AGE_MS) return false;
+        let u = ""; try { u = sanitizeFacebookPostUrl(url); } catch { return false; } if (__okUrls.has(u)) return false;
+        const m = __pendingFailByUrl.get(u); if (!m || m.size < clampNumber(state.operator?.commentCorroborationMinProfiles, 2, 20, 3)) return false;
+        const t = [...m.values()]; return Math.max(...t) - Math.min(...t) >= clampNumber(state.operator?.commentCorroborationMinSpreadMinutes, 0, 720, 30) * 60000;
+      };
       const __orderedPending = [...publishedByPlan.values()].sort((a, b) => {
         const fa = __failCountFor(a.postUrl), fb = __failCountFor(b.postUrl);
         if (fa !== fb) return fa - fb;
@@ -16844,6 +16878,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         return __configuredGroupUrls.some((cu) => { try { return groupsMatchByAlias(gu, cu); } catch { return normalizedFacebookGroupKey(gu) === normalizedFacebookGroupKey(cu); } });
       };
       const __candidates = [];
+      const __reapprovalCandidates = []; // stuck-soft posts to RE-APPROVE this pass instead of re-commenting (2026-07-11)
       for (const ev of __orderedFinal) {
         if (!options.ignoreArmedGate && __externalStopRequested > resweepStartedAt) { logEvent("comment_resweep_aborted_by_stop", { checked: summary.checked }); break; } // operator hit STOP -> halt now (before dispatching anything new). EXCEPTION (operator 2026-06-20): the ignoreArmedGate FINISH-drains (stop-drain 8270 / run-end 9075) run to COMPLETION — a 2nd/stale/double STOP must NOT bump __externalStopRequested past this drain's resweepStartedAt and abandon the comments the run already owes (that left 20 uncommented forever). Posting+harvest are already hard-killed before the finish-drain starts, so this only lets the cheap comment-finish complete.
         const postUrl = ev.postUrl;
@@ -16912,13 +16947,44 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         const __forcedSweep = !!(options.drain || options.ignoreArmedGate || options.force);
         if (!__forcedSweep) __commentRecoveryBackoff.set(postUrl, Date.now()); // record this attempt (set BEFORE attempting so a timeout/crash still backs off) -- unchanged: still stamped at SELECTION time for normal sweeps, same as before
         if (__commentRecoveryBackoff.size > 3000) { const cut = Date.now() - 2 * COMMENT_RECOVERY_BACKOFF_MS; for (const [k, v] of __commentRecoveryBackoff) if (v < cut) __commentRecoveryBackoff.delete(k); } // bound memory
-        __candidates.push({ ev, row, postUrl, publisherId, __forcedSweep });
+        // STUCK-SOFT ROUTING (2026-07-11): a post soft-approved but stuck pending (>=35min, >=3 profiles blocked, never
+        // strong-verified) gets a bounded RE-APPROVAL instead of another doomed comment -> it goes public -> commented
+        // next pass. Capped at MAX_SOFT_STUCK_REAPPROVALS per URL; after that it falls back to the normal comment path
+        // forever (never abandoned). Everything else follows the unchanged comment path.
+        if (__isStuckSoft(ev, postUrl) && (__reapprovalAttemptsByUrl.get(sanitizeFacebookPostUrl(postUrl)) || 0) < MAX_SOFT_STUCK_REAPPROVALS)
+          __reapprovalCandidates.push({ ev, row, postUrl, publisherId });
+        else
+          __candidates.push({ ev, row, postUrl, publisherId, __forcedSweep });
       }
       // STARVATION FIX (operator 2026-06-20): the RECOVERY drains (persistent drain / stop-finish / run-end / forced)
       // must NOT yield-forever to an always-posting run — that left the drain checking only 1 post/cycle while 20 stayed
       // uncommented (audit: waitedMs 76544 -> checked 1). Bound their courtesy yield to 15s so ONE cycle clears the whole
       // owed backlog; the cheap normal armed heartbeat sweep keeps the full polite yield (no added load at rest). Each
       // concurrent candidate below still waits/yields independently before its own attempt.
+      // STUCK-SOFT RE-APPROVAL DISPATCH (2026-07-11, adversarially verified): re-fire the now-reliable Approve on posts
+      // stuck pending, INSTEAD of another doomed comment. Bounded + sequential: <=MAX_REAPPROVALS_PER_PASS this pass,
+      // <=MAX_SOFT_STUCK_REAPPROVALS per URL total. Routes through the SAME #fb-fingerprint-gated approval entry point
+      // (no wrong-post surface); never clears the owed comment (post stays in publishedByPlan -> commented once public).
+      // Stamps backoff so no doomed comment fires alongside -> net LOAD REDUCTION vs the old commenter+retry storm.
+      for (const c of __reapprovalCandidates.slice(0, MAX_REAPPROVALS_PER_PASS)) {
+        if (!options.ignoreArmedGate && __externalStopRequested > resweepStartedAt) break; // honor operator STOP mid-loop
+        const __u = sanitizeFacebookPostUrl(c.postUrl);
+        __reapprovalAttemptsByUrl.set(__u, (__reapprovalAttemptsByUrl.get(__u) || 0) + 1);
+        __commentRecoveryBackoff.set(c.postUrl, Date.now()); // suppress a doomed comment this pass + throttle re-approval cadence
+        const __reGroupUrl = facebookGroupUrlFromPostUrl(c.postUrl) || c.ev.actualGroupUrl || c.ev.groupUrl || c.row.groupUrl;
+        try {
+          await approvePendingFacebookPostWithAdminProfiles({
+            row: c.row,
+            ready: { profileId: c.publisherId },
+            groupUrl: __reGroupUrl,
+            candidateUrls: [c.postUrl],
+            ledgerKey: livePostLedgerKey(c.row, c.publisherId),
+            closeResults: [],
+            reason: "Stuck soft-approved (>=35min, never strong-verified, >=3 profiles blocked pending); re-firing approval before any comment.",
+          });
+        } catch (e) { summary.errors.push("reapprove:" + oneLineField(e.message || String(e), 120)); }
+        summary.reapproved = (summary.reapproved || 0) + 1;
+      }
       await Promise.allSettled(__candidates.map(async (c) => {
         if (!options.drain && !options.ignoreArmedGate && !options.force) await waitForPostingIdle({ label: "comment_resweep" });
         else await waitForPostingIdle({ label: "comment_resweep", maxWaitMs: 15000 });
@@ -16953,7 +17019,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       __lastCommentResweepAt = Date.now();
       __commentResweepInFlight = null;
     }
-    if (summary.checked || summary.recommented || summary.errors.length) {
+    if (summary.checked || summary.recommented || summary.reapproved || summary.errors.length) {
       logEvent("facebook_comment_resweep_complete", summary);
     }
     return summary;
