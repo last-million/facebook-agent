@@ -23075,7 +23075,9 @@ function buildRunReports(force = false) {
     if (!Number.isFinite(t)) continue;
     const k = (r.planId || "") + ":" + (r.sequence || 0) + ":" + normalizedFacebookGroupKey(r.groupUrl || r.actualGroupUrl || "");
     const ex = approvalResolvedByKey.get(k);
-    if (!ex || t > ex.t) approvalResolvedByKey.set(k, { t, at: r.at, moderatorId: Number(r.profileId || 0), moderator: String(r.profile || "") });
+    // FIRST success (2026-07-13, was last): re-approval rescue cycles create multiple successes per post;
+    // the first one is when the post actually went public, so duration = first success - first start.
+    if (!ex || t < ex.t) approvalResolvedByKey.set(k, { t, at: r.at, moderatorId: Number(r.profileId || 0), moderator: String(r.profile || "") });
   }
   // MAX AGE (2026-07-04 review fix): a real moderator-approval wait resolves in minutes (10-30+ per the code's own
   // observed range), never hours. Without a cap, a post whose plan row retried a DIFFERENT group/profile after this
@@ -23100,7 +23102,10 @@ function buildRunReports(force = false) {
     if (!Number.isFinite(t)) continue;
     const k = (r.planId || "") + ":" + (r.sequence || 0);
     const ex = approvalResolvedByPlanSeq.get(k);
-    if (!ex || t > ex.t) approvalResolvedByPlanSeq.set(k, { t, at: r.at, moderatorId: Number(r.profileId || 0), moderator: String(r.profile || "") });
+    // FIRST success, not last (2026-07-13): a post whose comment keeps hitting FB's propagation lag gets
+    // RE-approved every rescue cycle, so last-success minus first-start showed 68-120min "approval time" for
+    // approvals that actually landed in ~1min. The FIRST success is the one that made the post public.
+    if (!ex || t < ex.t) approvalResolvedByPlanSeq.set(k, { t, at: r.at, moderatorId: Number(r.profileId || 0), moderator: String(r.profile || "") });
   }
   // Group-agnostic earliest-start twin of pendingStartByKey (same vanity/numeric rationale): used as the
   // FALLBACK for the per-post approval-history decoration below, so an approved-after-pending post still shows
