@@ -142,6 +142,7 @@
   </div>
 
   <div id="err"></div>
+  <div id="pendingtop"></div>
   <div id="reco"></div>
   <div id="pendingunclustered"></div>
   <div id="openbudget"></div>
@@ -196,6 +197,13 @@ function render(){
   if(!DATA) return;
   document.getElementById("upd").textContent = "Updated " + fmtTime(DATA.generatedAt);
   document.getElementById("foot").textContent = (DATA.runCount||0)+" run(s) — source : facebook-live-posts.jsonl + events.log + watchdog";
+
+  // AWAITING APPROVAL — always visible, top of page (operator 2026-07-13: "why don't I see a section for posts
+  // still pending" — the per-run version lives inside a COLLAPSED <details> card, invisible until clicked).
+  // Aggregates every genuinely-pending post across ALL runs plus the unclustered bucket, so it's the very first
+  // thing on the page with zero clicks, exactly like the per-run table it doesn't replace (that one stays too,
+  // for when a specific run is expanded — this is the always-visible summary of the SAME underlying data).
+  renderPendingTop();
 
   // global banners (reconcile / open-budget / problem accounts)
   renderGlobals();
@@ -253,26 +261,9 @@ function runBody(r){
     + statCard("Restarts", r.restarts, r.restarts? "server restarted":"none — stable", r.restarts?"a":"g")
     + ((r.pendingApproval&&r.pendingApproval.count)? statCard("Awaiting approval", r.pendingApproval.count, "moderator hasn't passed yet", "a") : "")
     + '</div>';
-  // AWAITING APPROVAL (operator 2026-07-12: "he should not show posts that are pending mixed in — show them in the
-  // FIRST section of the report till they're approved"). These are posts genuinely submitted to Facebook and still
-  // waiting on a moderator, so they don't belong next to already-CONFIRMED posts in "Post detail" below — moved to
-  // the very first content section (right after the run's stat cards) so it's the first thing the operator sees,
-  // instead of being buried after every other table.
-  var pend = (r.pendingApproval && r.pendingApproval.items) || [];
-  if (pend.length) {
-    html += '<h2>Awaiting approval <span class="ln"></span> <span class="tag">'+pend.length+'</span></h2>';
-    html += '<div class="tablecard"><table class="detail"><thead><tr>'
-      + '<th>Group</th><th>Submitted</th><th>Waiting</th><th>Profile</th></tr></thead><tbody>';
-    html += pend.map(function(p){
-      var old = p.ageMinutes>=60;
-      return '<tr>'
-        + '<td data-l="Group">'+grpPill(p.group)+'</td>'
-        + '<td data-l="Submitted">'+fmtTime(p.startedAt)+'</td>'
-        + '<td data-l="Waiting" class="'+(old?"no":"slow")+'">'+p.ageMinutes+' min'+(old?' ⚠':'')+'</td>'
-        + '<td data-l="Profile">'+(p.profileId||'—')+'</td></tr>';
-    }).join("");
-    html += '</tbody></table></div>';
-  }
+  // AWAITING APPROVAL now lives ONLY in the always-visible top-of-page section (renderPendingTop, operator
+  // 2026-07-13: "should be only in one section report Awaiting approval") -- no per-run listing here anymore,
+  // just the count in the stat card above (a number, not a duplicate listing of the same rows).
   var gks = Object.keys(r.byGroup||{});
   if(gks.length){
     html += '<h2>By group <span class="ln"></span></h2><div class="cards2">';
@@ -336,6 +327,41 @@ function runBody(r){
   return html;
 }
 
+// AWAITING APPROVAL — always-visible, top-of-page aggregate (operator 2026-07-13). Combines every run's own
+// pendingApproval.items with the unclustered bucket (posts whose run hasn't landed anything yet, so buildRunReports'
+// clustering can't attach them to any run card) into ONE list, deduped by key, sorted oldest-waiting-first. This is
+// the SOLE place pending posts are listed as rows anywhere on the page (per-run cards only show a plain count).
+function renderPendingTop(){
+  var el = document.getElementById("pendingtop");
+  var items = [];
+  var seen = {};
+  (DATA.runs || []).forEach(function(r){
+    ((r.pendingApproval && r.pendingApproval.items) || []).forEach(function(p){
+      var k = p.key || (p.group + "|" + p.startedAt + "|" + p.profileId);
+      if (seen[k]) return; seen[k] = true; items.push(p);
+    });
+  });
+  (DATA.pendingUnclustered || []).forEach(function(p){
+    var k = p.key || (p.group + "|" + p.startedAt + "|" + p.profileId);
+    if (seen[k]) return; seen[k] = true; items.push(p);
+  });
+  if (!items.length) { el.innerHTML = ""; return; }
+  items.sort(function(a,b){ return (b.ageMinutes||0) - (a.ageMinutes||0); });
+  var html = '<div class="tablecard pendingtopcard">'
+    + '<h2 style="margin-top:0">⏳ Awaiting approval <span class="ln"></span> <span class="tag">'+items.length+'</span></h2>'
+    + '<table class="detail"><thead><tr><th>Group</th><th>Submitted</th><th>Waiting</th><th>Profile</th></tr></thead><tbody>';
+  html += items.map(function(p){
+    var old = p.ageMinutes>=60;
+    return '<tr>'
+      + '<td data-l="Group">'+grpPill(p.group)+'</td>'
+      + '<td data-l="Submitted">'+fmtTime(p.startedAt)+'</td>'
+      + '<td data-l="Waiting" class="'+(old?"no":"slow")+'">'+p.ageMinutes+' min'+(old?' ⚠':'')+'</td>'
+      + '<td data-l="Profile">'+(p.profileId||'—')+'</td></tr>';
+  }).join("");
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
+
 function renderGlobals(){
   var rc = DATA.reconcile || {};
   var recoEl = document.getElementById("reco");
@@ -348,17 +374,11 @@ function renderGlobals(){
   else if (rc.recovered || rc.released) recoEl.innerHTML = '<div class="reco ok">✓ Auto recovery after interruption: ' + bits.join(' · ') + ' — no silent loss</div>';
   else recoEl.innerHTML = '';
 
-  // PENDING, NO RUN YET (2026-07-04): posts awaiting moderator approval whose run has zero landed posts so far --
-  // clustering (buildRunReports) only sees LANDED posts, so without this banner a run that's 100% pending right
-  // now would be entirely invisible on the page.
-  var pu = DATA.pendingUnclustered || [];
+  // PENDING, NO RUN YET (2026-07-04): posts whose run has zero landed posts so far are now folded into
+  // renderPendingTop()'s single aggregate table instead of a separate one-line banner here (operator 2026-07-13:
+  // "should be only in one section report Awaiting approval") -- this element is left empty on purpose.
   var puEl = document.getElementById("pendingunclustered");
-  if (pu.length) {
-    var byG = {};
-    pu.forEach(function(p){ byG[p.group] = (byG[p.group]||0)+1; });
-    var bits2 = Object.keys(byG).map(function(g){ return '<b>'+byG[g]+'</b> '+g; });
-    puEl.innerHTML = '<div class="reco warn">⏳ '+pu.length+' post(s) submitted, awaiting moderator approval (no run shown yet): ' + bits2.join(' · ') + '</div>';
-  } else { puEl.innerHTML = ''; }
+  puEl.innerHTML = "";
 
   var ob = DATA.openBudget || null;
   var obEl = document.getElementById("openbudget");
