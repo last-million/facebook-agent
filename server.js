@@ -23084,10 +23084,38 @@ function buildRunReports(force = false) {
   // "pending" ghost. Past this bound it's overwhelmingly more likely to be an orphaned key than a genuine wait, so it
   // is dropped from the view entirely (the underlying ledger/posting logic is untouched -- this only affects display).
   const PENDING_GHOST_CUTOFF_MIN = 240;
+  // APPROVED = RESOLVED, GROUP-AGNOSTIC (2026-07-13, operator: "why are those not approved?" -- they WERE, each
+  // in 17-38s, but the report kept listing them for hours): the resolvedPostKeys filter below compares
+  // group-INCLUSIVE keys, and a comment-rescue approval cycle records its rows under the VANITY group form
+  // (o38679876833911) while the published post's row carries the NUMERIC form (1076334503593333) --
+  // normalizedFacebookGroupKey cannot unify the two (that alias resolution lives in groupsMatchByAlias), so the
+  // keys never matched and an already-approved post sat in "Awaiting approval" until the 240-min ghost cutoff.
+  // Same failure mode already fixed for publisherByKey above; same cure: a planId:sequence-only index (globally
+  // unique per row within a run) of successful approvals. Any approved_and_verified at/after the pending start
+  // clears the item. Display-only -- the ledger and approval logic are untouched.
+  const approvalResolvedByPlanSeq = new Map();
+  for (const r of rows) {
+    if (!r || r.event !== "admin_approval_finished" || String(r.status || "") !== "approved_and_verified" || !r.at) continue;
+    const t = Date.parse(r.at);
+    if (!Number.isFinite(t)) continue;
+    const k = (r.planId || "") + ":" + (r.sequence || 0);
+    if (!approvalResolvedByPlanSeq.has(k) || t > approvalResolvedByPlanSeq.get(k)) approvalResolvedByPlanSeq.set(k, t);
+  }
+  // Publisher fallback for items with no capture-time row (comment-rescue cycles on a normally-published post
+  // never emit post_captured_awaiting_admin_approval): the published post itself knows who posted it.
+  const publishedProfileByPlanSeq = new Map();
+  for (const p of posts) {
+    const k = (p.planId || "") + ":" + (p.sequence || 0);
+    if (!publishedProfileByPlanSeq.has(k)) publishedProfileByPlanSeq.set(k, { profileId: Number(p.profileId || 0), profile: String(p.profile || "") });
+  }
   const pendingApproval = [...pendingStartByKey.entries()]
     .filter(([k]) => !resolvedPostKeys.has(k))
+    .filter(([, v]) => {
+      const rt = approvalResolvedByPlanSeq.get(v.planId + ":" + v.sequence);
+      return !(rt && rt >= v.t); // a successful approval at/after the wait started -> not awaiting anymore
+    })
     .map(([k, v]) => {
-      const pub = publisherByKey.get(v.planId + ":" + v.sequence);
+      const pub = publisherByKey.get(v.planId + ":" + v.sequence) || publishedProfileByPlanSeq.get(v.planId + ":" + v.sequence);
       return {
         key: k, groupUrl: v.groupUrl, group: __reportGroupName(v.groupUrl),
         // moderator currently/first attempting to approve this pending post
