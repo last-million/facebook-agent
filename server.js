@@ -10316,7 +10316,7 @@ async function autopilotTickAsync(options = {}) {
     // catches any post whose inline comment attempt failed under 3-by-3). Fire-and-forget,
     // single-flight, armed-gated, throttled to once / 90s, yields to active posting.
     if (!dryRun && state.operator?.autopilotEnabled && state.operator?.armedForExternalActions
-        && !__commentResweepInFlight && (Date.now() - __lastCommentResweepAt) > 90000) {
+        && !__commentResweepInFlight && !__forceResweepPending && (Date.now() - __lastCommentResweepAt) > 90000) {
       resweepUncommentedFacebookPostsAsync({ max: 5 }).catch(() => {});
     }
     // KILL-MID-POST RECONCILE: recover any post interrupted by a watchdog kill (a publish_intent with no
@@ -16760,6 +16760,13 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
 // per-run 20-count is untouched). Reconstructs the full row from posting-plan.jsonl by planId+seq.
 // Single-flight, armed-gated, throttled, yields to active posting, budget-bounded.
 let __commentResweepInFlight = null;
+// Set while an explicit force resweep (operator's manual "Resweep comments" catch-up) is waiting for the mutex.
+// The periodic heartbeat drain (server.js ~22800) checks this and stands down instead of re-acquiring the mutex
+// the instant it frees up -- on a continuously-busy run the heartbeat re-arms so quickly that a force call kept
+// losing that race forever even after awaiting the prior pass and reclaiming the mutex on the very next line
+// (2026-07-13 live incident: two old-run leftover posts never got a single force-resweep attempt across several
+// tries). This flag gives the explicit operator action priority for exactly one pass, not indefinitely.
+let __forceResweepPending = false;
 let __lastCommentResweepAt = 0;
 // Per-post comment-recovery BACKOFF (operator 2026-06-15): a post that just failed its recovery (e.g. pending
 // approval / not yet visible) must NOT be re-cycled through profiles every 90s sweep — that was the overnight profile
@@ -16815,8 +16822,13 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
     // the `await` resumes, nothing else can run before this function synchronously reassigns
     // __commentResweepInFlight itself.
     if (!options.force) return __commentResweepInFlight;
+    // Flag stays true across the await AND the mutex reassignment right below -- clearing it any earlier (e.g. in
+    // a finally attached to just this await) reopens the exact gap this exists to close, since the heartbeat's
+    // own check-then-call happens at its OWN call site, not here.
+    __forceResweepPending = true;
     try { await __commentResweepInFlight; } catch (_) {}
   }
+  __forceResweepPending = false; // cleared the instant we're about to reclaim the mutex ourselves, synchronously, no await in between
   __commentResweepInFlight = (async () => {
     const summary = { checked: 0, recommented: 0, stillMissing: 0, errors: [] };
     try {
@@ -22812,6 +22824,9 @@ setInterval(() => {
   // yields to active posting. ZERO browsers at rest: the latestPublishedFacebookPostAtMs gate is a no-op once no
   // post was published in the last 60 min.
   if (!__commentResweepInFlight
+      && !__forceResweepPending // stand down for one tick so a waiting explicit force resweep (operator's manual
+                                 // catch-up) actually gets the mutex instead of losing the race to this heartbeat
+                                 // forever on a continuously-busy run (2026-07-13 live incident)
       && state.operator?.autopilotDryRun !== true
       && Date.now() - __lastPersistentDrainAt > PERSISTENT_DRAIN_INTERVAL_MS) {
     const __lastPub = latestPublishedFacebookPostAtMs();
