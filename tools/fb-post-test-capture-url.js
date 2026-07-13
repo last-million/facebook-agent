@@ -1369,6 +1369,16 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
   const initialCommentPath = await page.evaluate(() => location.pathname).catch(() => '');
   const captureTargetState = async () => page.evaluate((marker) => {
     const text = document.body.innerText || '';
+    // FOLDED-MARKER FIX (2026-07-13, applied here too): this preflight gate was still innerText-only while the
+    // sibling marker check further down this file (search "FOLDED-MARKER FIX (2026-07-12)") was already patched.
+    // Our #fb<6hex> marker is the LAST tag in a long product caption, which Facebook visually folds behind "See
+    // more" for long captions -- innerText OMITS folded text (it respects the collapsed CSS state), so this gate
+    // reported markerVisible:false / 0 marker articles forever on any long-caption post, even though we were
+    // genuinely on the correct permalink -- blocking the comment in an unbreakable retry loop (confirmed live,
+    // 2026-07-13: 27 retries over 122s, never resolving). textContent INCLUDES the folded caption. Matching there
+    // is SAFE: the #fb marker is seeded unique per post, so it can only ever appear in OUR post's DOM subtree --
+    // a related/suggested post sharing the same permalink page cannot contain it.
+    const fullText = document.body.textContent || '';
     const title = document.title || '';
     const exactGroupPostPath = /\/groups\/[0-9]+\/(?:permalink|posts)\/[0-9]+/i.test(location.pathname || '');
     const visible = (el) => {
@@ -1390,9 +1400,9 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
       return cleanMarker.length >= 12 && normalize(value).includes(cleanMarker);
     };
     const markerArticles = [...document.querySelectorAll('[role="article"]')]
-      .filter((el) => visible(el) && marker && matches(el.innerText || ''));
+      .filter((el) => visible(el) && marker && (matches(el.innerText || '') || matches(el.textContent || '')));
     const markerRoots = [...document.querySelectorAll('[role="article"], div')]
-      .filter((el) => visible(el) && marker && matches(el.innerText || ''));
+      .filter((el) => visible(el) && marker && (matches(el.innerText || '') || matches(el.textContent || '')));
     const exactPermalinkCommentBoxes = [...document.querySelectorAll('[contenteditable="true"], [role="textbox"], textarea, [aria-label*="Comment as" i], [aria-label*="Write a comment" i], [aria-label*="commenter" i]')]
       .filter((el) => {
         if (!visible(el)) return false;
@@ -1401,7 +1411,7 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
         return /comment as|write a comment|commenter|\bcomment\b/.test(label);
       });
     return {
-      markerVisible: matches(text),
+      markerVisible: matches(text) || matches(fullText),
       titleHasMarker: matches(title),
       exactGroupPostPath,
       visibleMarkerArticleCount: markerArticles.length,

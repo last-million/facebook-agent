@@ -11868,6 +11868,12 @@ function appendFacebookLivePostLedger(event = {}) {
     title: oneLineField(event.title || "", 200),
     ogDescription: oneLineField(event.ogDescription || "", 500),
     productKey: oneLineField(event.productKey || "", 200),
+    // FIX (2026-07-13): this fixed whitelist silently dropped productId even though
+    // completeVerifiedFacebookPostWithComment and the durable-recovery row rebuild both already read/write it --
+    // it never reached disk (confirmed live: 0 of 5173 "published" rows had it). Restoring it makes the
+    // trackingSeed's productId component actually persist, so a reconstructed #fb<hex> marker matches the one
+    // really embedded in the live post instead of silently drifting to a marker nothing was ever posted with.
+    productId: oneLineField(event.productId || "", 200),
     validation: event.validation && typeof event.validation === "object" ? {
       ok: Boolean(event.validation.ok),
       errors: Array.isArray(event.validation.errors) ? event.validation.errors.map(String).slice(0, 20) : [],
@@ -13109,13 +13115,27 @@ async function runLiveFacebookPostScript(payload, options = {}) {
   };
 }
 
+// PRODUCT-ID FALLBACK (2026-07-13 root-cause fix): canonicalProduct() always keys a product as "<store>:<id>" or
+// "harvested:<id>", so productId is always recoverable from productKey. This matters because
+// appendFacebookLivePostLedger's fixed whitelist has never persisted productId (see the fix there), so any row
+// rebuilt from the durable ledger payload for comment-recovery/resweep silently got productId="" -- a DIFFERENT
+// #fb<hex> fingerprint than the one actually embedded in the live post, making every later different-profile
+// comment search Facebook for text that was NEVER posted (confirmed live via sha1 reproduction against 2
+// currently-stuck posts: the marker computed WITH productId matched the live-embedded marker exactly; WITHOUT it
+// matched the wrong marker every comment-recovery attempt was fruitlessly searching for). This is a pure `||`
+// safety net -- it never overrides an already-correct value, and it retroactively heals posts already stuck.
+function productIdFromProductKey(productKey) {
+  const s = String(productKey || "");
+  const i = s.indexOf(":");
+  return i >= 0 ? s.slice(i + 1) : "";
+}
 function livePostPayloadForRow(row, groupUrl, imagePath, profileId, options = {}) {
   const basePostText = String(row.postText || "").trim();
   const includeComment = options.includeComment !== false;
   const trackingSeed = [
     row.planId || "",
     row.productKey || "",
-    row.productId || "",
+    row.productId || productIdFromProductKey(row.productKey) || "",
     row.sequence || "",
     row.link || "",
   ].filter(Boolean).join("|") || crypto.randomBytes(4).toString("hex");
