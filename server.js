@@ -11878,6 +11878,12 @@ function appendFacebookLivePostLedger(event = {}) {
     // trackingSeed's productId component actually persist, so a reconstructed #fb<hex> marker matches the one
     // really embedded in the live post instead of silently drifting to a marker nothing was ever posted with.
     productId: oneLineField(event.productId || "", 200),
+    // AWAIT-PROPAGATION RE-DRIVE (2026-07-13): bounded-retry bookkeeping for a fresh approval-group post that gave
+    // up before FB surfaced it in the moderator queue. Persisted (the whitelist would otherwise drop them) so the
+    // attempt cap + age cap survive a restart and a rejected/never-surfaced post is released after the cap instead
+    // of being re-driven forever. Harmlessly 0/"" on every other event.
+    attempt: Number.isFinite(Number(event.attempt)) ? Number(event.attempt) : 0,
+    firstAwaitAt: oneLineField(event.firstAwaitAt || "", 40),
     validation: event.validation && typeof event.validation === "object" ? {
       ok: Boolean(event.validation.ok),
       errors: Array.isArray(event.validation.errors) ? event.validation.errors.map(String).slice(0, 20) : [],
@@ -13565,6 +13571,43 @@ function __allEverPublishedKeysFullScan() {
   }
   return set;
 }
+// AWAIT-PROPAGATION RE-DRIVE bounds (2026-07-13, fixes the fresh-pending-post drop introduced by ba8d187):
+// when a fresh approval-group post's 8-min background approval gives up because FB has NOT yet surfaced it in the
+// moderator queue (10-30min propagation), we DON'T terminally abandon it -- selfHeal re-drives the SAME post
+// (armed-only, since selfHeal is armed-gated) until a real Approve click lands, then comments it. These caps stop
+// a genuinely REJECTED/removed post (same clean error codes) from being re-driven forever (adversarial DEFECT A):
+// after MAX attempts OR MAX age it is released for a fresh re-post, not hammered.
+const APPROVAL_REDRIVE_MAX_ATTEMPTS = 12;              // ~12 moderator-queue re-checks, bounded; covers FB's 10-30min window with margin
+const APPROVAL_REDRIVE_MAX_AGE_MS = 150 * 60 * 1000;  // 2.5h hard ceiling from first capture (was the implicit 24h reuse window -> too long)
+const APPROVAL_REDRIVE_MIN_INTERVAL_MS = 4 * 60 * 1000; // don't re-drive the same key more than ~every 4 min (throttles moderator load)
+// The durable comment payload + marker inputs to stamp on a pending/await marker so a later re-drive can rebuild
+// the row and reproduce the EXACT #fb<hex> fingerprint (trackingSeed uses planId+productKey+productId+sequence+link)
+// AND deliver the different-profile comment. Mirrors what completeVerifiedFacebookPostWithComment stamps (~17297).
+function __pendingApprovalPayloadFields(row) {
+  return {
+    commentTextPreview: row.commentTextPreview || "",
+    commentPostText: row.postText || "",
+    commentLink: row.link || "",
+    pinFirstComment: row.pinFirstComment !== false,
+    harvested: Boolean(row.harvested),
+    commentImagePath: row.image || row.imagePath || "",
+    title: row.title || "",
+    ogDescription: row.ogDescription || "",
+    productId: row.productId || "",
+  };
+}
+// Rebuild a minimal posting-plan row from a stamped await/pending ledger row so the re-drive reproduces the same
+// marker and comment. Carries all 5 trackingSeed inputs (planId, productKey, productId, sequence, link).
+function __rebuildRowFromPendingLedger(r) {
+  return {
+    planId: r.planId, sequence: r.sequence, profile: r.profile || "", groupUrl: r.groupUrl || "",
+    productKey: r.productKey || "", productId: r.productId || "",
+    commentTextPreview: r.commentTextPreview || "", postText: r.commentPostText || "",
+    link: r.commentLink || "", pinFirstComment: r.pinFirstComment !== false,
+    harvested: Boolean(r.harvested), image: r.commentImagePath || "", imagePath: r.commentImagePath || "",
+    title: r.title || "", ogDescription: r.ogDescription || "",
+  };
+}
 async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
   if (__staleApprovalSelfHealInFlight) return __staleApprovalSelfHealInFlight;
   __staleApprovalSelfHealInFlight = (async () => {
@@ -13590,14 +13633,22 @@ async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
         if (!__fullPublishedKeysThisPass) __fullPublishedKeysThisPass = __allEverPublishedKeysFullScan();
         return __fullPublishedKeysThisPass.has(key);
       };
+      let __redrivesThisPass = 0; // per-pass browser-open budget for re-drives (each opens moderator + commenter browsers)
       for (const [key, r] of latestByKey) {
-        if (String(r.event || "") !== "post_captured_awaiting_admin_approval") continue;
+        // 2026-07-13: also process admin_approval_await_propagation -- a fresh approval-group post that gave up
+        // before FB surfaced it in the moderator queue. Both events mean "submitted, still pending, no published row".
+        const __ev = String(r.event || "");
+        if (__ev !== "post_captured_awaiting_admin_approval" && __ev !== "admin_approval_await_propagation") continue;
         // Genuinely still running in THIS process (merely slow, e.g. an IXBrowser desktop-recovery wait) --
         // NOT dead. Only a crashed/restarted process (this Set reset to empty) or an already-finished task
         // reaches the age check below.
         if (__bgApprovalLegInFlightKeys.has(key)) continue;
         const at = Date.parse(r.at || "") || 0;
-        if (!at || (Date.now() - at) < staleMs) continue;
+        // await_propagation rows re-drive on a short interval (retry the queue as soon as FB may have surfaced it);
+        // a stale post_captured (a crashed/restarted process's captured-but-never-resolved row) waits the full
+        // staleMs before we touch it, so we never yank a possibly-still-running fresh capture.
+        const __gateMs = __ev === "admin_approval_await_propagation" ? APPROVAL_REDRIVE_MIN_INTERVAL_MS : staleMs;
+        if (!at || (Date.now() - at) < __gateMs) continue;
         summary.checked += 1;
         try {
           // SAME wrong-key blind spot this loop's sibling below closes (2026-07-06 review fix): a comment-stage
@@ -13615,16 +13666,72 @@ async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
             logEvent("admin_approval_started_stale_ignored_published", { key, planId: r.planId, sequence: r.sequence, ageMin: Math.round((Date.now() - at) / 60000) });
             summary.ignoredPublished += 1;
           } else {
-            appendFacebookLivePostLedger({
-              event: "admin_approval_background_gave_up",
-              key, planId: r.planId, sequence: r.sequence, profileId: r.profileId,
-              profile: r.profile || "", groupUrl: r.groupUrl || "", postUrl: r.postUrl || "",
-              status: "abandoned",
-              message: `Self-heal: no resolution ${Math.round((Date.now() - at) / 60000)}min after backgrounding (process restart or unhandled error presumed) -- releasing claim for retry.`,
-            });
-            releasePostProductForRun(state, String(r.productKey || "").toLowerCase(), r.groupUrl || "");
-            logEvent("admin_approval_stale_self_healed", { key, planId: r.planId, sequence: r.sequence, ageMin: Math.round((Date.now() - at) / 60000) });
-            summary.healed += 1;
+            // RE-DRIVE the ORIGINAL still-pending post (2026-07-13, fixes the fresh-pending drop): re-fire the SAME
+            // #fb-fingerprint-gated, moderator-rotating approval now that FB has had time to surface it in the queue.
+            // A real Approve click -> completeVerified writes the real published_after_admin_approval row + drives
+            // the different-profile comment -> the normal resweep owns it thereafter. Bounded by attempt + age caps
+            // so a genuinely REJECTED/never-surfaced post is released for a fresh re-post, not hammered forever.
+            // selfHeal is armed-gated (the only caller checks armedForExternalActions), and approvePending hard-
+            // blocks on a real operator STOP, so this never opens a browser after Stop.
+            const __firstAt = Date.parse(r.firstAwaitAt || r.at || "") || at;
+            const __attempt = Number(r.attempt || 0);
+            const __ageMs = Date.now() - __firstAt;
+            const __capped = __attempt >= APPROVAL_REDRIVE_MAX_ATTEMPTS || __ageMs >= APPROVAL_REDRIVE_MAX_AGE_MS;
+            if (__capped) {
+              appendFacebookLivePostLedger({
+                event: "admin_approval_background_gave_up",
+                key, planId: r.planId, sequence: r.sequence, profileId: r.profileId,
+                profile: r.profile || "", groupUrl: r.groupUrl || "", postUrl: r.postUrl || "", status: "abandoned",
+                message: `Self-heal: still pending after ${__attempt} re-drive attempt(s) / ${Math.round(__ageMs / 60000)}min -- FB never surfaced it in the moderator queue; releasing claim for a fresh re-post.`,
+              });
+              releasePostProductForRun(state, String(r.productKey || "").toLowerCase(), r.groupUrl || "");
+              logEvent("admin_approval_redrive_capped_released", { key, planId: r.planId, sequence: r.sequence, attempt: __attempt, ageMin: Math.round(__ageMs / 60000) });
+              summary.healed += 1;
+            } else if (__redrivesThisPass >= 3 || __approvalInFlightKeys.has(key)) {
+              // per-pass browser budget reached, or an approval for this key is already running elsewhere:
+              // leave the durable await marker as-is so the NEXT pass retries it. No state change.
+            } else {
+              __redrivesThisPass += 1;
+              const __rebuilt = __rebuildRowFromPendingLedger(r);
+              let __redriveOk = false;
+              try {
+                const __ap = await approvePendingFacebookPostWithAdminProfiles({
+                  row: __rebuilt, ready: { profileId: r.profileId, imagePath: r.commentImagePath || "" },
+                  groupUrl: r.groupUrl || "", candidateUrls: [r.postUrl].filter(Boolean), ledgerKey: key,
+                  closeResults: [], reason: "Self-heal re-drive: re-firing admin approval on a still-pending post FB has now had time to surface in the moderator queue.",
+                });
+                if (__ap?.ok || __ap?.approvalClicked) {
+                  __redriveOk = true;
+                  await completeVerifiedFacebookPostWithComment({
+                    row: __rebuilt, ready: { profileId: r.profileId, imagePath: r.commentImagePath || "" },
+                    groupUrl: r.groupUrl || "", postUrl: (__ap.postUrl || r.postUrl),
+                    validation: __ap.validation || { ok: Boolean(__ap.ok), errors: [], warnings: ["self_heal_redrive"] },
+                    ledgerKey: key, attemptedGroups: [], closeResults: [], approvalResult: __ap,
+                  });
+                  logEvent("admin_approval_redrive_approved", { key, planId: r.planId, sequence: r.sequence, attempt: __attempt + 1, ageMin: Math.round(__ageMs / 60000) });
+                  summary.healed += 1;
+                }
+              } catch (e2) {
+                logEvent("admin_approval_redrive_error", { key, error: oneLineField((e2 && e2.message) || String(e2), 200) });
+                summary.errors += 1;
+              }
+              if (!__redriveOk && !__everPublished(key)) {
+                // still not surfaced -> re-arm the durable await marker (bump attempt, keep firstAwaitAt) so the
+                // NEXT pass retries it until it propagates or hits the caps above.
+                appendFacebookLivePostLedger({
+                  event: "admin_approval_await_propagation",
+                  key, planId: r.planId, sequence: r.sequence, profileId: r.profileId,
+                  profile: r.profile || "", groupUrl: r.groupUrl || "", postUrl: r.postUrl || "",
+                  productKey: String(r.productKey || ""),
+                  commentTextPreview: r.commentTextPreview || "", commentPostText: r.commentPostText || "",
+                  commentLink: r.commentLink || "", pinFirstComment: r.pinFirstComment !== false,
+                  harvested: Boolean(r.harvested), commentImagePath: r.commentImagePath || "",
+                  title: r.title || "", ogDescription: r.ogDescription || "", productId: r.productId || "",
+                  status: "pending", attempt: __attempt + 1, firstAwaitAt: r.firstAwaitAt || r.at || new Date().toISOString(),
+                  message: `Self-heal re-drive attempt ${__attempt + 1}: post still pending / not yet in moderator queue.`,
+                });
+              }
+            }
           }
         } catch (err) {
           logEvent("admin_approval_stale_self_heal_error", { key, error: oneLineField((err && err.message) || String(err), 200) });
@@ -18303,7 +18410,12 @@ async function runLiveFacebookPostFromPlan(body = {}) {
               groupUrl,
               postUrl,
               productKey: String(row.productKey || row.productUrl || row.link || ""),
+              // DURABLE COMMENT-RECOVERY on the PENDING marker (2026-07-13): if the 8-min background approval gives
+              // up before FB surfaces this post in the moderator queue, this row is the only record the selfHeal
+              // re-drive can rebuild the row + reproduce the #fb marker + deliver the comment from. (Whitelisted.)
+              ...__pendingApprovalPayloadFields(row),
               status: "pending",
+              firstAwaitAt: new Date().toISOString(),
               message: "Post click captured; moderator approval running in background so posting stays continuous.",
             });
             // PROVISIONAL COVERAGE STAMP (2026-07-12, adversarially verified) -- fixes the 82-vs-7 group imbalance.
@@ -18377,13 +18489,37 @@ async function runLiveFacebookPostFromPlan(body = {}) {
                       postUrl: __bgFinalPostUrl, errors: __bgValidation.errors, backgrounded: true,
                     });
                   } catch (_) {}
+                  // NOT-YET-PROPAGATED vs HARD FAILURE (2026-07-13): a FRESH pending post is not in FB's moderator
+                  // queue within the 8-min background budget (queue propagation is 10-30min), so the clean "no real
+                  // Approve click yet" codes are NOT abandonment. Do NOT write the terminal gave_up and do NOT
+                  // release the claim -- leave a durable await-propagation marker (latest event for this key,
+                  // carrying the comment payload) so the ARMED selfHeal re-drives the SAME post once FB surfaces it,
+                  // clicks the real Approve, then comments it. Only a genuine hard failure (any other error) abandons
+                  // + releases as before. The attempt/age caps in selfHeal bound a genuinely-rejected post.
+                  const __bgErrs = (__bgValidation.errors || []).map(String);
+                  const __notPropagatedYet = __bgErrs.length > 0 && __bgErrs.every((e) =>
+                    e === "admin_approval_button_not_clicked_post_still_pending"
+                    || e === "admin_approval_post_marker_not_verified");
+                  if (__notPropagatedYet) {
+                    appendFacebookLivePostLedger({
+                      event: "admin_approval_await_propagation",
+                      key: ledgerKey, planId: row.planId, sequence: row.sequence, profileId: ready.profileId,
+                      profile: row.profile || "", groupUrl, postUrl: __bgFinalPostUrl,
+                      productKey: String(row.productKey || row.productUrl || row.link || ""),
+                      ...__pendingApprovalPayloadFields(row),
+                      status: "pending", attempt: 1, firstAwaitAt: new Date().toISOString(),
+                      message: `Post submitted and pending; FB has not surfaced it in the moderator queue yet (${__bgErrs.join(", ")}). Self-heal will re-drive approval+comment until it propagates.`,
+                    });
+                    __releaseBgRunPending();
+                    return;
+                  }
                   appendFacebookLivePostLedger({
                     event: "admin_approval_background_gave_up",
                     key: ledgerKey, planId: row.planId, sequence: row.sequence, profileId: ready.profileId,
                     profile: row.profile || "", groupUrl, postUrl: __bgFinalPostUrl, status: "abandoned",
-                    message: `Backgrounded pre-publish admin approval did not succeed: ${(__bgValidation.errors || []).join(", ") || "unknown_verification_error"}`,
+                    message: `Backgrounded pre-publish admin approval did not succeed: ${__bgErrs.join(", ") || "unknown_verification_error"}`,
                   });
-                  // FREE THE CLAIM (review fix): a give-up is a routine outcome (moderator budget exhausted /
+                  // FREE THE CLAIM (review fix): a HARD give-up is a routine outcome (moderator budget exhausted /
                   // no eligible admin profile), not a crash -- release this product+group so it can be picked
                   // and retried within the same run, exactly like the pre-backgrounding inline path already did.
                   try {
