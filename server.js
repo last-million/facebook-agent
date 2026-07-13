@@ -23093,13 +23093,23 @@ function buildRunReports(force = false) {
   // Same failure mode already fixed for publisherByKey above; same cure: a planId:sequence-only index (globally
   // unique per row within a run) of successful approvals. Any approved_and_verified at/after the pending start
   // clears the item. Display-only -- the ledger and approval logic are untouched.
-  const approvalResolvedByPlanSeq = new Map();
+  const approvalResolvedByPlanSeq = new Map(); // planId:sequence -> { t, at, moderatorId, moderator } (latest success)
   for (const r of rows) {
     if (!r || r.event !== "admin_approval_finished" || String(r.status || "") !== "approved_and_verified" || !r.at) continue;
     const t = Date.parse(r.at);
     if (!Number.isFinite(t)) continue;
     const k = (r.planId || "") + ":" + (r.sequence || 0);
-    if (!approvalResolvedByPlanSeq.has(k) || t > approvalResolvedByPlanSeq.get(k)) approvalResolvedByPlanSeq.set(k, t);
+    const ex = approvalResolvedByPlanSeq.get(k);
+    if (!ex || t > ex.t) approvalResolvedByPlanSeq.set(k, { t, at: r.at, moderatorId: Number(r.profileId || 0), moderator: String(r.profile || "") });
+  }
+  // Group-agnostic earliest-start twin of pendingStartByKey (same vanity/numeric rationale): used as the
+  // FALLBACK for the per-post approval-history decoration below, so an approved-after-pending post still shows
+  // its wait/moderator even when its approval rows were recorded under the other group-url form.
+  const pendingStartByPlanSeq = new Map();
+  for (const [, v] of pendingStartByKey) {
+    const k = v.planId + ":" + v.sequence;
+    const ex = pendingStartByPlanSeq.get(k);
+    if (!ex || v.t < ex.t) pendingStartByPlanSeq.set(k, v);
   }
   // Publisher fallback for items with no capture-time row (comment-rescue cycles on a normally-published post
   // never emit post_captured_awaiting_admin_approval): the published post itself knows who posted it.
@@ -23112,7 +23122,7 @@ function buildRunReports(force = false) {
     .filter(([k]) => !resolvedPostKeys.has(k))
     .filter(([, v]) => {
       const rt = approvalResolvedByPlanSeq.get(v.planId + ":" + v.sequence);
-      return !(rt && rt >= v.t); // a successful approval at/after the wait started -> not awaiting anymore
+      return !(rt && rt.t >= v.t); // a successful approval at/after the wait started -> not awaiting anymore
     })
     .map(([k, v]) => {
       const pub = publisherByKey.get(v.planId + ":" + v.sequence) || publishedProfileByPlanSeq.get(v.planId + ":" + v.sequence);
@@ -23234,10 +23244,15 @@ function buildRunReports(force = false) {
       // commented posts that went through that wait): look up this post's own admin_approval_started entry
       // (if any) by the SAME stable key the pending-approval bucket above uses -- a resolved post that had
       // one waited approvalWaitMinutes before it landed (and, if commented, before that comment could happen).
-      const __pendingStart = pendingStartByKey.get(__postKey(p));
+      // GROUP-AGNOSTIC FALLBACK (2026-07-13): a comment-rescue approval cycle records its rows under the
+      // vanity group form while the post row carries the numeric form, so the group-inclusive __postKey lookup
+      // misses and the approval history (wait/moderator/duration) silently vanished for exactly the posts the
+      // operator most wants to see it on. planId:sequence twin maps close the gap (same fix as pendingApproval).
+      const __psKey = (p.planId || "") + ":" + (p.sequence || 0);
+      const __pendingStart = pendingStartByKey.get(__postKey(p)) || pendingStartByPlanSeq.get(__psKey);
       const approvalWaitMinutes = __pendingStart ? Math.max(0, Math.round((p._t - __pendingStart.t) / 60000)) : null;
       // 2026-07-11 (operator): surface WHICH moderator approved this post + how long the approval itself took.
-      const __appr = approvalResolvedByKey.get(__postKey(p));
+      const __appr = approvalResolvedByKey.get(__postKey(p)) || approvalResolvedByPlanSeq.get(__psKey);
       const approvedByModerator = __appr ? (__appr.moderator || String(__appr.moderatorId || "")) : null;
       const approvalDurationMinutes = (__appr && __pendingStart) ? Math.max(0, Math.round((__appr.t - __pendingStart.t) / 60000)) : null;
       detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profilePubLabel: String(p.profile || ""), profileCom: c ? c.profileId : null, profileComLabel: c ? String(c.profile || "") : "", productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable", wasPendingApproval: Boolean(__pendingStart), approvalWaitMinutes, approvedByModerator, approvalDurationMinutes });
