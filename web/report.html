@@ -253,6 +253,26 @@ function runBody(r){
     + statCard("Restarts", r.restarts, r.restarts? "server restarted":"none — stable", r.restarts?"a":"g")
     + ((r.pendingApproval&&r.pendingApproval.count)? statCard("Awaiting approval", r.pendingApproval.count, "moderator hasn't passed yet", "a") : "")
     + '</div>';
+  // AWAITING APPROVAL (operator 2026-07-12: "he should not show posts that are pending mixed in — show them in the
+  // FIRST section of the report till they're approved"). These are posts genuinely submitted to Facebook and still
+  // waiting on a moderator, so they don't belong next to already-CONFIRMED posts in "Post detail" below — moved to
+  // the very first content section (right after the run's stat cards) so it's the first thing the operator sees,
+  // instead of being buried after every other table.
+  var pend = (r.pendingApproval && r.pendingApproval.items) || [];
+  if (pend.length) {
+    html += '<h2>Awaiting approval <span class="ln"></span> <span class="tag">'+pend.length+'</span></h2>';
+    html += '<div class="tablecard"><table class="detail"><thead><tr>'
+      + '<th>Group</th><th>Submitted</th><th>Waiting</th><th>Profile</th></tr></thead><tbody>';
+    html += pend.map(function(p){
+      var old = p.ageMinutes>=60;
+      return '<tr>'
+        + '<td data-l="Group">'+grpPill(p.group)+'</td>'
+        + '<td data-l="Submitted">'+fmtTime(p.startedAt)+'</td>'
+        + '<td data-l="Waiting" class="'+(old?"no":"slow")+'">'+p.ageMinutes+' min'+(old?' ⚠':'')+'</td>'
+        + '<td data-l="Profile">'+(p.profileId||'—')+'</td></tr>';
+    }).join("");
+    html += '</tbody></table></div>';
+  }
   var gks = Object.keys(r.byGroup||{});
   if(gks.length){
     html += '<h2>By group <span class="ln"></span></h2><div class="cards2">';
@@ -313,21 +333,6 @@ function runBody(r){
       + '<td data-l="Profiles">'+esc(prof)+'</td></tr>';
   }).join("");
   html += '</tbody></table></div>';
-  var pend = (r.pendingApproval && r.pendingApproval.items) || [];
-  if (pend.length) {
-    html += '<h2>Awaiting approval <span class="ln"></span> <span class="tag">'+pend.length+'</span></h2>';
-    html += '<div class="tablecard"><table class="detail"><thead><tr>'
-      + '<th>Group</th><th>Submitted</th><th>Waiting</th><th>Profile</th></tr></thead><tbody>';
-    html += pend.map(function(p){
-      var old = p.ageMinutes>=60;
-      return '<tr>'
-        + '<td data-l="Group">'+grpPill(p.group)+'</td>'
-        + '<td data-l="Submitted">'+fmtTime(p.startedAt)+'</td>'
-        + '<td data-l="Waiting" class="'+(old?"no":"slow")+'">'+p.ageMinutes+' min'+(old?' ⚠':'')+'</td>'
-        + '<td data-l="Profile">'+(p.profileId||'—')+'</td></tr>';
-    }).join("");
-    html += '</tbody></table></div>';
-  }
   return html;
 }
 
