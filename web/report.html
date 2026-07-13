@@ -313,7 +313,9 @@ function runBody(r){
   html += '<h2>Post detail <span class="ln"></span></h2><div class="tablecard"><table class="detail"><thead><tr>'
     + '<th>#</th><th>Product</th><th>Group</th><th>Published</th><th>Commented</th><th>Approval</th><th>Delay</th><th>Profiles</th></tr></thead><tbody>';
   html += (r.detail||[]).map(function(d,i){
-    var prof = d.profilePub ? (d.profilePub + (d.profileCom? " → "+d.profileCom : " → —")) : "—";
+    var pubTxt = d.profilePub ? (d.profilePub + (d.profilePubLabel? " - "+esc(d.profilePubLabel) : "")) : "—";
+    var comTxt = d.profileCom ? (d.profileCom + (d.profileComLabel? " - "+esc(d.profileComLabel) : "")) : "—";
+    var prof = d.profilePub ? (pubTxt + " → " + comTxt) : "—";
     var pnum = d.productNum ? ('<span class="pill x" title="'+esc(d.productKey||"")+'">P'+d.productNum+'</span>') : '—';
     // 2026-07-11 (operator): show WHICH moderator approved this post + how long the approval took.
     var appr = '—';

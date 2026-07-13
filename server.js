@@ -22928,7 +22928,7 @@ function buildRunReports(force = false) {
       const t = Date.parse(r.at);
       if (!Number.isFinite(t)) continue;
       const ex = commentByUrl.get(r.postUrl);
-      if (!ex || t < ex.t) commentByUrl.set(r.postUrl, { t, at: r.at, profileId: Number(r.profileId || 0) });
+      if (!ex || t < ex.t) commentByUrl.set(r.postUrl, { t, at: r.at, profileId: Number(r.profileId || 0), profile: String(r.profile || "") });
     }
   }
   // drop self-comments (publisher == commenter): not a valid different-profile comment
@@ -23144,7 +23144,7 @@ function buildRunReports(force = false) {
       const __appr = approvalResolvedByKey.get(__postKey(p));
       const approvedByModerator = __appr ? (__appr.moderator || String(__appr.moderatorId || "")) : null;
       const approvalDurationMinutes = (__appr && __pendingStart) ? Math.max(0, Math.round((__appr.t - __pendingStart.t) / 60000)) : null;
-      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profileCom: c ? c.profileId : null, productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable", wasPendingApproval: Boolean(__pendingStart), approvalWaitMinutes, approvedByModerator, approvalDurationMinutes });
+      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profilePubLabel: String(p.profile || ""), profileCom: c ? c.profileId : null, profileComLabel: c ? String(c.profile || "") : "", productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable", wasPendingApproval: Boolean(__pendingStart), approvalWaitMinutes, approvedByModerator, approvalDurationMinutes });
       if (p.approvalVerification === "soft_clicked" && !c) softApproved += 1;
     }
     const products = productOrder.map((pm) => ({ num: pm.num, key: pm.key, shortKey: pm.key.replace(/^harvested:/, ""), title: pm.title, total: pm.total, groups: pm.groups, groupCount: Object.keys(pm.groups).length, profiles: Array.from(pm.profiles) }));
