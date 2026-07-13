@@ -236,10 +236,14 @@ const MAX_COMMENT_FALLBACK_PROFILES = 50;
 // suspension exposure the operator fears. Kept explicit and small (only a handful of moderators exist anyway).
 const MAX_APPROVAL_MODERATOR_POOL = 8;
 const FACEBOOK_LIVE_POST_TIMEOUT_MS = 600000;
-// 18 min: the pending-queue propagation is 10-30 min (measured live 2026-06-12), and the connector now POLLS
-// the queue in ONE patient session (~14 min max) instead of burning a fresh ~3-min session per retry across
-// moderators. The timeout must outlast that poll or the patient session gets killed mid-wait (the old 6 min
-// guaranteed every first-attempt approval died before the post even appeared).
+// 18 min CEILING, not the effective per-attempt time (comment corrected 2026-07-13 -- the old text described
+// a "~14-min patient session" that has NOT existed since 2026-06-29): every real attempt is capped at
+// MAX_ADMIN_APPROVAL_ATTEMPT_MS (240s, ~line 14930) inside an 8-min session wall clock, so the connector's
+// queue poll gets ~3.5 min per attempt, and the server re-fires attempts across sessions (~4-min comment-cycle
+// cadence) to cover FB's 10-30-min pending-queue propagation. The connector self-bounds via
+// payload.approveAttemptBudgetMs (budget handshake at runFacebookAdminApprovalAttempt) so it returns clean
+// verdicts instead of being SIGKILLed mid-poll. This constant remains only as the hard execFile ceiling
+// (also clamped to 900000ms inside runLiveFacebookPostScript, ~line 13036).
 const FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS = 1080000;
 const FACEBOOK_COMMENT_RECOVERY_TIMEOUT_MS = 240000;
 // A post FB has NOT yet made public (pending admin approval / not-ready): the first comment fails IDENTICALLY for every
@@ -14521,6 +14525,12 @@ async function runFacebookAdminApprovalAttempt({ row, profileId, profileLabel, g
       }
       __freshTimeoutMs = Math.min(timeoutMs, freshRemainingMs);
     }
+    // BUDGET HANDSHAKE (2026-07-13, queue-scan-failure fix): tell the connector its REAL kill budget so its
+    // self-deadline (payload.__approveDeadlineAt, derived in the approveOnly dispatch) stops the queue scan
+    // ~30s BEFORE the execFile SIGKILL below -- the clean marker_not_found / surface verdicts then always
+    // flush instead of dying as an opaque "timed out after N seconds". Mirrors the exact clamp used for the
+    // execFile timeout at the runLiveFacebookPostScript call so the two can never drift.
+    payload.approveAttemptBudgetMs = clampNumber(__freshTimeoutMs, 30000, FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS, FACEBOOK_ADMIN_APPROVAL_TIMEOUT_MS);
     appendFacebookLivePostLedger({
       event: "admin_approval_started",
       key: ledgerKey,

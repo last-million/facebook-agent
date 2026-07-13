@@ -1,6 +1,13 @@
 const { chromium } = require('playwright-core');
 const fs = require('fs');
 
+// Anchor for the approve-attempt deadline budget (2026-07-13): the server SIGKILLs each admin-approval
+// attempt at its per-attempt budget (MAX_ADMIN_APPROVAL_ATTEMPT_MS, default 240s). Killed mid-poll, the
+// connector could never return its clean marker_not_found / surface verdicts -- every queue-scan miss died
+// as an opaque "timed out after 240 seconds". The approveOnly path derives a self-deadline from this anchor
+// and stops scanning ~30s BEFORE the kill so results always flush.
+const __SCRIPT_STARTED_AT = Date.now();
+
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 function jitter(min, max) { return Math.floor(min + Math.random() * (max - min + 1)); }
 async function humanPause(min=500, max=1600) {
@@ -3039,9 +3046,14 @@ async function captureApprovalDiagnostic(page, marker) {
         textStart: (a.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200),
         textLen: (a.innerText || '').length,
         containsMarker: m ? (a.innerText || '').includes(m) : null,
+        // DIAGNOSTIC ONLY (2026-07-13): raw textContent view so a folded-marker miss (innerText empty/short
+        // while textContent holds the marker) is visible in the log. Never used as an approval gate.
+        textContentLen: (a.textContent || '').length,
+        containsMarkerTextContent: m ? (a.textContent || '').includes(m) : null,
         buttonCount: a.querySelectorAll('button, [role="button"]').length,
       }));
       const bodyContainsMarker = m ? (document.body.innerText || '').includes(m) : null;
+      const bodyContainsMarkerTextContent = m ? (document.body.textContent || '').includes(m) : null; // diagnostic only
       const allButtons = [...document.querySelectorAll('button, [role="button"], a[role="button"]')]
         .filter(visible)
         .slice(0, 40)
@@ -3058,6 +3070,7 @@ async function captureApprovalDiagnostic(page, marker) {
         title: document.title,
         articleCount: articles.length,
         bodyContainsMarker,
+        bodyContainsMarkerTextContent,
         articleSamples,
         buttons: allButtons,
       };
@@ -3406,9 +3419,30 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
   const fingerprint = (String(marker || '').match(/#fb[0-9a-f]{6}/gi) || []).pop() || '';
   const matchKey = fingerprint || marker;
   const markerVisible = await page.evaluate((matchKey) => {
-    const text = document.body.innerText || '';
     if (!matchKey) return false;
+    const text = document.body.innerText || '';
     if (text.includes(matchKey)) return true;
+    // FOLDED-MARKER FIX (2026-07-13, same fold bug fixed in captureTargetState ~1370 / commentTargetPreflight
+    // ~2354, root cause of the 100% queue-scan approval failure on group o38679876833911): FB folds long
+    // captions behind "See more"; innerText OMITS the folded tail where the trailing #fb<hex> lives, so the
+    // gate could never see a rendered-but-folded marker. Folded text is REAL text nodes (merely CSS-hidden),
+    // so walk TEXT NODES -- but NEVER raw document.body.textContent: that would also include <script>/<style>
+    // JSON blobs where FB embeds caption data for posts NOT rendered here, a wrong-post-approval vector
+    // (adversarial-verify amendment A1). SCRIPT/STYLE/NOSCRIPT/TEMPLATE subtrees are REJECTED wholesale.
+    const renderedText = (() => {
+      let out = '';
+      try {
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+          acceptNode(n) {
+            if (n.nodeType === 1) return /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(n.tagName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
+            return NodeFilter.FILTER_ACCEPT;
+          },
+        });
+        let n; while ((n = walker.nextNode())) out += n.nodeValue;
+      } catch (_) {}
+      return out;
+    })();
+    if (renderedText.includes(matchKey)) return true;
     const normalize = (input) => String(input || '')
       .normalize('NFD')
       .replace(/[̀-ͯ︀-️]/g, '')
@@ -3417,7 +3451,7 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
       .trim()
       .toLowerCase();
     const cleanMarker = normalize(matchKey);
-    return cleanMarker.length >= 8 && normalize(text).includes(cleanMarker);
+    return cleanMarker.length >= 8 && (normalize(text).includes(cleanMarker) || normalize(renderedText).includes(cleanMarker));
   }, matchKey).catch(() => false);
   const cleanPublisherId = String(publisherUserId || '').replace(/\D+/g, '');
   if (!markerVisible) {
@@ -3450,12 +3484,26 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
       const bareApprove = /^(approve|aprobar|approuver|aprovar|genehmigen|approva|موافقة|قبول)$/i;
       return ariaPerPost.test(al) || bareApprove.test(tx);
     };
-    // deepest element containing the exact fingerprint/marker text
+    // Deepest RENDERED text node containing the exact fingerprint/marker (2026-07-13, adversarial-verify
+    // amendment A1). The old querySelectorAll('*') walk matched el.textContent, which INCLUDES <script> JSON
+    // blobs -- FB embeds captions of NOT-rendered posts there, so the chain-lock could anchor on a script tag,
+    // climb to a body-level container, and with exactly ONE visible per-post Approve on screen click a WRONG
+    // (even a member's) post. A TreeWalker over TEXT nodes that REJECTS SCRIPT/STYLE/NOSCRIPT/TEMPLATE subtrees
+    // anchors only on real rendered caption text (folded "See more" tails included -- they are CSS-hidden real
+    // text nodes). No match -> fail CLOSED (no click, server retries), exactly like before.
     let markerEl = null;
-    for (const el of document.querySelectorAll('*')) {
-      if (!(el.textContent || '').includes(key)) continue;
-      if (!markerEl || markerEl.contains(el)) markerEl = el;
-    }
+    try {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+        acceptNode(n) {
+          if (n.nodeType === 1) return /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(n.tagName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
+          return NodeFilter.FILTER_ACCEPT;
+        },
+      });
+      let n;
+      while ((n = walker.nextNode())) {
+        if ((n.nodeValue || '').includes(key)) { markerEl = n.parentElement; break; } // parentElement of the marker text node = deepest anchor by construction
+      }
+    } catch (_) {}
     if (!markerEl) return { clicked: false, reason: 'marker_text_node_not_found' };
     // CONTAINMENT CLIMB (2026-07-11, adversarially verified). Rise from OUR #fb marker element to the SMALLEST
     // ancestor holding EXACTLY ONE per-post Approve = this post's own cell. Cap 30 (was 14 -> too shallow: FB's
@@ -3524,7 +3572,22 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
           // EXACT-MATCH ONLY: locate the article by our unique fingerprint/marker — NEVER by author (all our
           // posts share the same Page author; an author match could approve the wrong post or a member's).
           let target = null;
-          if (key) for (const a of articles) { if ((a.innerText || '').includes(key)) { target = a; break; } }
+          // FOLDED-MARKER FIX (2026-07-13): innerText misses "See more"-folded caption tails. Per-article
+          // rendered-text walk (REJECTS script/style/noscript/template so an embedded JSON blob inside the
+          // article can never fake a match -- amendment A1) as the fallback when innerText misses.
+          const articleRenderedIncludes = (root, k) => {
+            try {
+              const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+                acceptNode(n) {
+                  if (n.nodeType === 1) return /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(n.tagName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
+                  return NodeFilter.FILTER_ACCEPT;
+                },
+              });
+              let n; while ((n = walker.nextNode())) { if ((n.nodeValue || '').includes(k)) return true; }
+            } catch (_) {}
+            return false;
+          };
+          if (key) for (const a of articles) { if ((a.innerText || '').includes(key) || articleRenderedIncludes(a, key)) { target = a; break; } }
           if (!target) return { clicked: false, reason: 'no_target_article' };
           const tr = target.getBoundingClientRect();
           const btns = [...document.querySelectorAll('div[role="button"],button,a[role="button"]')].filter(vis)
@@ -3574,7 +3637,11 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
   return result;
 }
 
-async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = '', groupId = '') {
+async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = '', groupId = '', deadlineAt = 0) {
+  // deadlineAt (2026-07-13): epoch-ms self-deadline derived from the server's per-attempt kill budget. Stop
+  // scanning/polling BEFORE the SIGKILL so this function's clean verdicts (marker_not_found / surface
+  // reachability) always make it back to the server instead of dying as an opaque "timed out after 240s".
+  let budgetStopped = false;
   const rawBase = String(groupUrl || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
   const numericGid = String(groupId || '').replace(/\D+/g, '');
   // Admin surfaces only resolve with the NUMERIC group id; a vanity slug
@@ -3630,7 +3697,7 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
   const expandSeeMore = async () => {
     try {
       await page.evaluate(() => {
-        const re = /^(see more|ver m[aá]s|voir plus|mehr anzeigen|عرض المزيد|اقرأ المزيد)$/i;
+        const re = /^(see more|ver m[aá]s|voir plus|mehr anzeigen|leia mais|altro|عرض المزيد|اقرأ المزيد)$/i; // 2026-07-13: +pt/it, parity with the fixed expander at ~2315
         const btns = [...document.querySelectorAll('div[role="button"], span[role="button"], [role="button"]')]
           .filter((el) => re.test((el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()));
         for (const b of btns.slice(0, 40)) { try { b.click(); } catch (_) {} }
@@ -3643,8 +3710,25 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
   // Last match, not first — see clickApproveForVisibleMarker: the real fingerprint is always the trailing tag.
   const reviewFingerprint = (String(marker || '').match(/#fb[0-9a-f]{6}/gi) || []).pop() || '';
   const reviewMatchKey = reviewFingerprint || marker;
+  // FOLDED-MARKER FIX (2026-07-13, root cause of the 100% queue-scan approval failure): innerText OMITS
+  // "See more"-folded caption tails where the trailing #fb<hex> fingerprint lives -- in the pending queue the
+  // article's innerText is often EMPTY (see clickApproveForVisibleMarker's own comment) so this gate could
+  // never match a rendered-but-folded post, and the scan polled forever until the 240s kill. Walk rendered
+  // TEXT NODES instead; REJECT script/style/noscript/template subtrees so FB's embedded JSON blobs (captions
+  // of posts NOT rendered here) can never fake a match (adversarial-verify amendment A1).
   const markerCheck = async () => page.evaluate((key) => {
-    try { const bodyText = document.body.innerText || ''; return Boolean(key && bodyText.includes(key)); } catch { return false; }
+    try {
+      if (!key) return false;
+      if ((document.body.innerText || '').includes(key)) return true;
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+        acceptNode(n) {
+          if (n.nodeType === 1) return /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(n.tagName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
+          return NodeFilter.FILTER_ACCEPT;
+        },
+      });
+      let n; while ((n = walker.nextNode())) { if ((n.nodeValue || '').includes(key)) return true; }
+      return false;
+    } catch { return false; }
   }, reviewMatchKey).catch(() => false);
   // Scan ONE loaded surface (expand -> first screen -> scroll, expanding each step). Returns a found-result or null.
   const scanLoadedSurface = async (methodPrefix) => {
@@ -3661,11 +3745,22 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
       if (newHeight <= lastHeight + 20) { stagnantScrolls += 1; if (stagnantScrolls >= 2) break; }
       else { stagnantScrolls = 0; lastHeight = newHeight; }
     }
+    // SCAN OBSERVABILITY (2026-07-13): the incident logs had ZERO queue-content visibility on a failed scan.
+    // inner:false + textc:true on a pending_posts URL is the direct fingerprint of the fold bug. Log only.
+    try {
+      const d = await page.evaluate((key) => ({
+        inner: Boolean(key && (document.body.innerText || '').includes(key)),
+        textc: Boolean(key && (document.body.textContent || '').includes(key)),
+        articles: document.querySelectorAll('[role="article"]').length,
+      }), reviewMatchKey);
+      console.log(JSON.stringify({ step: 'admin_approval_scan_result', methodPrefix, found: false, ...d }));
+    } catch (_) {}
     return null;
   };
   // FIRST PASS: find the working admin surface (numeric-gid pending queue) and scan it.
   let workingTarget = null;
   for (const target of targets) {
+    if (deadlineAt && Date.now() + 35000 > deadlineAt) { budgetStopped = true; __probe('admin_approval_budget_stop', { phase: 'first_pass' }); break; }
     await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
     visited.push(page.url());
     await humanPause(3500, 5000);
@@ -3704,6 +3799,10 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
   // then drains every other pending post) instead of many short sessions finding nothing.
   if (workingTarget) {
     for (let attempt = 2; attempt <= 14; attempt += 1) {
+      // DEADLINE GUARD (2026-07-13): 140s margin = 60s sleep + 45s goto + ~25s scan + flush headroom (the
+      // 75s first draft under-counted the post-sleep goto+scan tail, verifier note 4). Falls through to the
+      // clean return below so the server gets a real verdict instead of a SIGKILL.
+      if (deadlineAt && Date.now() + 140000 > deadlineAt) { budgetStopped = true; __probe('admin_approval_budget_stop', { phase: 'poll', attempt }); break; }
       // 2026-07-11 (operator): the pending post takes 10-30 min to appear in the queue. This poll used to call
       // humanPause(55000,75000) but humanPause is HARD-clamped to 3000ms (see top of file), so the "patient
       // ~14-min poll" silently collapsed to ~3s/pass. Use a RAW ~60s sleep here (this single call site only --
@@ -3738,10 +3837,16 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
     // null = INCONCLUSIVE: without a numeric gid we cannot build a valid admin URL, so a feed
     // landing is NOT proof the approver lacks rights — never let a flaky gid-resolve MASK a real
     // moderator grant by reporting false here.
-    adminSurfaceReachable: numericGid ? reachedAdminSurface : null,
+    // BUDGET-STOP INCONCLUSIVE (2026-07-13, adversarial-verify amendment A2): a deadline stop that fired
+    // before ANY admin-path URL was reached proves NOTHING about this moderator's rights — reporting false
+    // here would cascade into approverLacksAdminRole / profile_not_admin_of_group / the loud no-admin-rights
+    // operator alarm, all fabricated. Only a full un-stopped pass that never kept an admin URL may say false.
+    adminSurfaceReachable: !numericGid ? null : (reachedAdminSurface ? true : (budgetStopped ? null : false)),
     method: !numericGid
       ? 'admin_surface_inconclusive_no_numeric_gid'
-      : (reachedAdminSurface ? 'marker_not_found_after_full_scroll' : 'pending_queue_redirected_to_feed_no_admin_surface'),
+      : (reachedAdminSurface
+        ? 'marker_not_found_after_full_scroll'
+        : (budgetStopped ? 'admin_approval_attempt_budget_stop_inconclusive' : 'pending_queue_redirected_to_feed_no_admin_surface')),
   };
 }
 
@@ -3833,7 +3938,7 @@ async function approvePendingPost(page, context, payload, gid, marker) {
     }
   }
   if (!approvalResult.clicked) {
-    const reviewSurface = await openGroupReviewSurface(page, groupUrl, marker, payload.publisherFacebookUserId || payload.facebookUserId, gid);
+    const reviewSurface = await openGroupReviewSurface(page, groupUrl, marker, payload.publisherFacebookUserId || payload.facebookUserId, gid, Number(payload.__approveDeadlineAt) || 0);
     attempts.push({ target: groupUrl, ...reviewSurface });
     // Emit an explicit surface-reachability signal the server keys off of (separate from the
     // overloaded "no pending article" reason): false => approver is not a moderator of this group.
@@ -4657,6 +4762,13 @@ async function main() {
   }
 
   if (payload.approveOnly) {
+    // SELF-DEADLINE (2026-07-13): the server kills this attempt at its per-attempt budget (default
+    // MAX_ADMIN_APPROVAL_ATTEMPT_MS=240s; passed explicitly via payload.approveAttemptBudgetMs once the
+    // server-side fix is deployed). Stop the queue scan ~30s before that kill so the clean verdicts always
+    // flush. Floor 90s (below that the guard cannot help anyway), ceiling 900s (matches the server's own
+    // hidden execFile clamp).
+    const __budgetMs = Math.max(90000, Math.min(Number(payload.approveAttemptBudgetMs) || 240000, 900000));
+    payload.__approveDeadlineAt = __SCRIPT_STARTED_AT + __budgetMs - 30000;
     // The admin pending-queue surface (pending_posts / manage_post_queue) only resolves with the
     // NUMERIC group id. When the group is addressed by a VANITY slug (e.g. /groups/o1498765421290862)
     // gid is empty here, so FB redirects pending_posts to the group FEED and the author-link match is
