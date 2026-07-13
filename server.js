@@ -14391,10 +14391,15 @@ function facebookAdminApprovalValidationFromLog(objects = [], postUrl = "") {
   // they sat pending forever (never commented, never retried). Accept a not-clicked approval ONLY when the
   // connector proved the post is already live & not pending (notPending === true).
   const approvalButtonClicked = Boolean(approvalStep?.clicked);
-  const provenAlreadyLive = resultStep?.notPending === true;
+  // 2026-07-13 (live-proven): notPending came from the MODERATOR's OWN permalink view, but Facebook renders a
+  // pending post LIVE-looking to an admin (no banner, no Approve button -- log fb-live-post-log-1783970053505),
+  // so it can NEVER prove the post is public to a member. The connector no longer emits that false notPending
+  // (ADMIN-VIEW TRAP fix), and this is the defense-in-depth backstop: a no-click approval is NEVER
+  // approved_and_verified. A genuinely-already-live post exits the loop via the member comment succeeding, not
+  // via this status -- so requiring a real Approve click here cannot strand a real post.
   if (!approvalButtonClicked && markerVisible && postMediaVerified) {
-    if (provenAlreadyLive) warnings.push("admin_approval_button_not_needed_post_already_live");
-    else errors.push("admin_approval_button_not_clicked_post_still_pending");
+    errors.push("admin_approval_button_not_clicked_post_still_pending");
+    if (resultStep?.notPending === true) warnings.push("admin_permalink_rendered_live_admin_view_inconclusive");
   }
   return {
     noPendingPostForPublisher,

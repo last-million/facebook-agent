@@ -2350,7 +2350,14 @@ async function commentTargetPreflight(page, postUrl, marker) {
     };
     // PENDING/UNAVAILABLE detection — multilingual (these profiles run FB in ES/AR; EN-only let a localized pending
     // post pass preflight and try to comment on a not-yet-approved post). Covers EN/FR/ES/PT/DE + Arabic.
-    const unavailable = /content isn't available|content is not available|post unavailable|this post isn't available|post is pending|pending approval|awaiting approval|en attente d.approbation|en cours d.examen|publication est en attente|contenu non disponible|cette publication n.est pas disponible|pendiente de aprobaci[oó]n|publicaci[oó]n est[aá] pendiente|en espera de aprobaci[oó]n|contenido no (?:est[aá] )?disponible|esta publicaci[oó]n no est[aá] disponible|aguardando aprova[cç][aã]o|pendente de aprova[cç][aã]o|conte[uú]do (?:n[aã]o dispon[ií]vel|indispon[ií]vel)|ausstehende genehmigung|wartet auf genehmigung|inhalt nicht verf[uü]gbar|في انتظار الموافقة|بانتظار الموافقة|قيد المراجعة|بانتظار المراجعة|غير متاح|غير متوفر|هذا المحتوى غير متاح/i.test(text);
+    // Split into the two distinct causes (2026-07-13, observability only -- the emitted reason string
+    // comment_target_unavailable_or_pending is UNCHANGED, since server.js matches it literally). pendingBanner =
+    // the post is held for admin approval (the dominant cause: approval never truly landed). unavailableBanner =
+    // the post/content is not visible to THIS profile (membership/identity/deleted). unavailableKind (added to
+    // the snapshot below) tells the two apart in the logs at a glance.
+    const pendingBanner = /post is pending|pending approval|awaiting approval|en attente d.approbation|en cours d.examen|publication est en attente|pendiente de aprobaci[oó]n|publicaci[oó]n est[aá] pendiente|en espera de aprobaci[oó]n|aguardando aprova[cç][aã]o|pendente de aprova[cç][aã]o|ausstehende genehmigung|wartet auf genehmigung|في انتظار الموافقة|بانتظار الموافقة|قيد المراجعة|بانتظار المراجعة/i.test(text);
+    const unavailableBanner = /content isn't available|content is not available|post unavailable|this post isn't available|contenu non disponible|cette publication n.est pas disponible|contenido no (?:est[aá] )?disponible|esta publicaci[oó]n no est[aá] disponible|conte[uú]do (?:n[aã]o dispon[ií]vel|indispon[ií]vel)|inhalt nicht verf[uü]gbar|غير متاح|غير متوفر|هذا المحتوى غير متاح/i.test(text);
+    const unavailable = pendingBanner || unavailableBanner;
     // FOLDED-MARKER FIX (2026-07-12): our unique #fb<6hex> marker is the LAST tag in a long caption that FB folds
     // behind "See more"/"Voir plus". innerText OMITS folded text, so on these French-UI permalinks markerVisible was
     // false even though we are on the EXACT correct post (urlMatches:true, exact postId, a comment box present) ->
@@ -2379,6 +2386,7 @@ async function commentTargetPreflight(page, postUrl, marker) {
       markerRootCount: markerRoots.length,
       exactPermalinkCommentBoxCount: exactPermalinkCommentBoxes.length,
       unavailable,
+      unavailableKind: pendingBanner ? 'pending_approval' : (unavailableBanner ? 'not_visible_to_profile' : ''), // observability only (2026-07-13)
       snippet: text.split('\n').filter((line) => line.includes(marker) || /content isn't available|pending|approval|comment/i.test(line)).slice(0, 12),
     };
   }, { marker }).catch((err) => ({
@@ -3903,38 +3911,18 @@ async function approvePendingPost(page, context, payload, gid, marker) {
     // "visible" must NOT be read as "approved". Accept the visibility-only success ONLY when genuinely LIVE (not
     // pending); when pending, fall through to the moderation QUEUE below where the real Approve button is clicked.
     if (!approvalResult.clicked && directChecks.markerVisible && directChecks.postMediaVerified && !pendingDetected) {
-      console.log(JSON.stringify({
-        step: 'approval_attempted',
-        mode: 'approve_only',
-        postUrl,
-        groupUrl,
-        marker,
-        ...approvalResult,
-        reason: approvalResult.reason || 'post_visible_no_approval_button_needed',
-        attempts,
-        bodyChecks: directChecks,
-      }, null, 2));
-      console.log(JSON.stringify({
-        step: 'result',
-        mode: 'approve_only',
-        marker,
-        postUrl,
-        postPageUrl: postUrl,
-        // notPending: the server REQUIRES this to accept a clicked:false approval (proof the post is already
-        // live, not merely that its permalink rendered). Set only on this genuinely-live, non-pending branch.
-        notPending: true,
-        bodyChecks: {
-          markerVisible: true,
-          ownControls: directChecks.ownControls,
-        },
-        imageVerified: true,
-        postMediaVerified: true,
-        commentResult: { skipped: true, clicked: false, typed: false, submitted: false, verified: false },
-        commentPinResult: { requested: false, skipped: true, menuOpened: false, clicked: false, confirmed: false, verified: false, reason: '' },
-        candidateCount: 1,
-        verified: [{ candidate: postUrl, url: postUrl, hasMarker: true, hasPostMedia: true, source: 'direct_post_visible' }],
-      }, null, 2));
-      return;
+      // ADMIN-VIEW TRAP (2026-07-13, live-proven: log fb-live-post-log-1783970053505-a0c84b.json, post
+      // 1695817788311665). This early-return used to declare success here -- but it is a FALSE POSITIVE that
+      // left every member comment blocked with comment_target_unavailable_or_pending for hours: Facebook renders
+      // a STILL-PENDING post's permalink to a MODERATOR (personal-admin identity) as fully LIVE -- likes, a
+      // comment box, NO pending banner, and NO per-post Approve button. So pendingDetected is STRUCTURALLY always
+      // false for a pending post viewed by an admin, clickApproveForVisibleMarker finds no button
+      // (approve_button_not_found_for_marker), and markerVisible+postMediaVerified are trivially true even though
+      // the post is NOT public to members. The only surface with a real per-post Approve is the /pending_posts/
+      // QUEUE. Never conclude success on the permalink: fall through to the queue branch below (the proven
+      // marker_container_perpost_approve click). Publicness is proven ONLY when a member's comment preflight
+      // stops seeing the "pending/awaiting approval" banner -- which only a real queue Approve produces.
+      console.log(JSON.stringify({ step: 'admin_permalink_renders_live_to_admin_inconclusive', postUrl, marker, bodyChecks: directChecks }));
     }
   }
   if (!approvalResult.clicked) {
