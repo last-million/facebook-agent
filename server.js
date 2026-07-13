@@ -22978,19 +22978,28 @@ function buildRunReports(force = false) {
     if (!Number.isFinite(t)) continue;
     const k = (r.planId || "") + ":" + (r.sequence || 0) + ":" + normalizedFacebookGroupKey(r.groupUrl || r.actualGroupUrl || "");
     const ex = pendingStartByKey.get(k);
-    if (!ex || t < ex.t) pendingStartByKey.set(k, { t, at: r.at, groupUrl: r.groupUrl || "", profileId: Number(r.profileId || 0), profile: String(r.profile || "") });
+    if (!ex || t < ex.t) pendingStartByKey.set(k, { t, at: r.at, groupUrl: r.groupUrl || "", profileId: Number(r.profileId || 0), profile: String(r.profile || ""), planId: String(r.planId || ""), sequence: Number(r.sequence || 0) });
   }
   // PUBLISHER LOOKUP (2026-07-13, operator: "in awaiting approval he should show the profile that posted and the
   // moderator"): post_captured_awaiting_admin_approval is written by the PUBLISHING profile right before the
-  // backgrounded approval leg starts, same planId:sequence:group key as pendingStartByKey above -- the one ledger
-  // row that reliably identifies who actually submitted a still-pending post (admin_approval_started's profileId
-  // is the MODERATOR attempting approval, a completely different identity).
+  // backgrounded approval leg starts -- the one ledger row that reliably identifies who actually submitted a
+  // still-pending post (admin_approval_started's profileId is the MODERATOR attempting approval, a completely
+  // different identity). Keyed by planId+sequence ONLY (no group) -- live case caught 2026-07-13: a post that
+  // fails comment-recovery and re-enters a SECOND admin-approval cycle can have its ledger rows' groupUrl switch
+  // from the vanity form (o149639111290866/) to the numeric form (the group's real internal ID) between the
+  // capture event and the later approval_started event for the exact same logical post; normalizedFacebookGroupKey
+  // applied independently to each string does not always resolve both forms to the identical key (that alias
+  // resolution is what groupsMatchByAlias exists for elsewhere), so a planId:sequence:group key silently failed to
+  // match and the publisher came back blank. planId+sequence is already a globally unique row identity within a
+  // run on its own (postingSlots/the fan-out assign a strictly incrementing sequence per product+group row), so
+  // dropping the group from this specific key removes the whole failure mode instead of trying to fix the alias
+  // matching here.
   const publisherByKey = new Map();
   for (const r of rows) {
     if (!r || r.event !== "post_captured_awaiting_admin_approval" || !r.at) continue;
     const t = Date.parse(r.at);
     if (!Number.isFinite(t)) continue;
-    const k = (r.planId || "") + ":" + (r.sequence || 0) + ":" + normalizedFacebookGroupKey(r.groupUrl || r.actualGroupUrl || "");
+    const k = (r.planId || "") + ":" + (r.sequence || 0);
     const ex = publisherByKey.get(k);
     if (!ex || t < ex.t) publisherByKey.set(k, { t, profileId: Number(r.profileId || 0), profile: String(r.profile || "") });
   }
@@ -23019,7 +23028,7 @@ function buildRunReports(force = false) {
   const pendingApproval = [...pendingStartByKey.entries()]
     .filter(([k]) => !resolvedPostKeys.has(k))
     .map(([k, v]) => {
-      const pub = publisherByKey.get(k);
+      const pub = publisherByKey.get(v.planId + ":" + v.sequence);
       return {
         key: k, groupUrl: v.groupUrl, group: __reportGroupName(v.groupUrl),
         // moderator currently/first attempting to approve this pending post
