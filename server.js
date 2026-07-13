@@ -16802,7 +16802,21 @@ const PERSISTENT_DRAIN_WINDOW_MS = 60 * 60 * 1000;    // keep draining up to 60 
 let __lastColdBacklogDrainAt = 0;
 const COLD_BACKLOG_DRAIN_INTERVAL_MS = 15 * 60 * 1000;
 async function resweepUncommentedFacebookPostsAsync(options = {}) {
-  if (__commentResweepInFlight) return __commentResweepInFlight;
+  if (__commentResweepInFlight) {
+    // FORCE MUST NEVER BE SILENTLY SWALLOWED (2026-07-13, live incident): a force call (the operator's explicit
+    // manual "Resweep comments" catch-up, options.force) landing while a periodic non-force drain was already
+    // in-flight used to just return that OTHER call's promise -- discarding force's own windowHours/run-clamp-bypass
+    // entirely. On a continuously-busy run the mutex is rarely free, so the operator's explicit catch-up could go
+    // an entire run without ever actually executing, with no error and no log line (checked stayed 0).
+    // NOT a recursive re-call after `await`ing the prior promise -- on a busy box the periodic heartbeat (every
+    // few seconds, server.js ~22800) can re-acquire the now-null mutex in the gap before a recursive call's own
+    // `await` resumes and re-checks it, so a force call could keep losing that race indefinitely. Awaiting here
+    // and falling through to claim the mutex on the very next (synchronous, non-async) line closes that gap: once
+    // the `await` resumes, nothing else can run before this function synchronously reassigns
+    // __commentResweepInFlight itself.
+    if (!options.force) return __commentResweepInFlight;
+    try { await __commentResweepInFlight; } catch (_) {}
+  }
   __commentResweepInFlight = (async () => {
     const summary = { checked: 0, recommented: 0, stillMissing: 0, errors: [] };
     try {
