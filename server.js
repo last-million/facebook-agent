@@ -10840,19 +10840,51 @@ function detectIncompleteRunAtBoot() {
     const __canAutoResume = op.autopilotAutoResumeEnabled === true && __reason === "run_active_at_restart"
       && max > 0 && posted < max && __runRecent && __noProgressNow < 3 && __totalResumes < 40 && !__resumeSpiral;
     if (__canAutoResume) {
+      // DYNAMIC IN-FLIGHT RECONCILIATION (2026-07-12, operator: "why does it keep going past 30, fix it, no
+      // hardcoding, all dynamic" -- observed live overshoot 30->32 across a mid-run restart). `posted` above is
+      // the DURABLE counter, which only increments once a post is CONFIRMED public (autopilot_post_counted, at
+      // the recordPublishedFacebookPostUrl moment) -- a post already submitted to Facebook and awaiting moderator
+      // approval at restart time is NOT yet reflected in it (that's exactly what the in-memory-only
+      // __bgPreApprovalRunPostsPending tracks during normal operation, and it is correctly wiped on restart since
+      // its promise died with the process). Without accounting for those, the recalculated remaining budget below
+      // would treat them as unspent; when they land moments later they consume budget ON TOP of whatever new posts
+      // the resumed run dispatches in the meantime, overshooting the original target by however many were in flight.
+      // Reuse the EXISTING canonical pending-approval classifier the /report page already computes (admin_approval_
+      // started with no subsequent published/published_after_admin_approval resolution, same ghost-age bound) --
+      // never a hardcoded number, always however many are ACTUALLY still in flight right now, for any run size.
+      let __inFlightUnresolved = 0;
+      try { __inFlightUnresolved = Number(buildRunReports()?.pendingApprovalTotal) || 0; } catch (_) {}
+      const __remaining = Math.max(0, max - posted - __inFlightUnresolved);
+      if (__remaining <= 0) {
+        // Every post in the original target is either durably confirmed OR already in flight awaiting approval --
+        // the run is effectively DONE. Do NOT arm for "at least 1 more" here (that would reproduce a smaller version
+        // of the exact overshoot this fix removes). MUST explicitly disarm (adversarial-verify catch, 2026-07-12):
+        // __canAutoResume only ever fires when `wasActive` was true, i.e. the persisted autopilotEnabled/
+        // armedForExternalActions were ALREADY true from before the crash -- every branch inside this `if` ends in
+        // `return`, so nothing else in this function will disarm them if this branch doesn't do it itself (unlike
+        // the function's own no-resume fallback tail, which does set both false). Skipping this would leave the
+        // server silently ARMED with the stale pre-crash posted/max numbers while the banner claims "resolved" --
+        // reproducing the exact overshoot this fix exists to remove, invisibly.
+        state.operator.autopilotEnabled = false;
+        state.operator.armedForExternalActions = false;
+        state.operator.lastIncompleteRun = { at: new Date().toISOString(), posted, max, inFlightUnresolved: __inFlightUnresolved, reason: __reason, status: "auto_resolved_in_flight_covers_target", resolvedAt: new Date().toISOString() };
+        writeState(state, { controlWrite: true, operatorControl: true });
+        logEvent("autopilot_auto_resume_skipped_target_covered_by_inflight", { posted, max, inFlightUnresolved: __inFlightUnresolved, runId: String(__runId) });
+        return;
+      }
       state.operator.lastIncompleteRun = { at: new Date().toISOString(), posted, max, reason: __reason, status: "auto_resumed", resolvedAt: new Date().toISOString() };
       state.operator.autopilotCrashResumeRunId = String(__runId);
       state.operator.autopilotCrashResumeAttempts = __totalResumes + 1;
       state.operator.autopilotCrashResumeNoProgress = __noProgressNow;
       state.operator.autopilotCrashResumeFirstAt = __streakStart; // SWARM FIX #6: anchor the rate-window start (persists across the restarts it counts)
-      state.operator.autopilotMaxPostsPerRun = Math.max(1, max - posted); // continue toward the same N total
+      state.operator.autopilotMaxPostsPerRun = __remaining; // continue toward the same N total, minus posts already committed but not yet durably counted
       state.operator.autopilotPostsThisRun = 0;
       state.operator.autopilotEnabled = true;
       state.operator.armedForExternalActions = true;
       state.operator.commentDrainPaused = false; // a (re)armed run re-enables the comment drain a prior operator STOP had paused
       state.operator.autopilotDryRun = false;
       writeState(state, { controlWrite: true, operatorControl: true });
-      logEvent("autopilot_auto_resumed_after_crash", { posted, max, remaining: Math.max(1, max - posted), totalResumes: __totalResumes + 1, consecutiveNoProgress: __noProgressNow, madeProgress: __madeProgress, runId: String(__runId) });
+      logEvent("autopilot_auto_resumed_after_crash", { posted, max, inFlightUnresolved: __inFlightUnresolved, remaining: __remaining, totalResumes: __totalResumes + 1, consecutiveNoProgress: __noProgressNow, madeProgress: __madeProgress, runId: String(__runId) });
       return;
     }
     if (__resumeSpiral) logEvent("autopilot_auto_resume_halted_crash_spiral", { resumes: __totalResumes, windowMin: Math.round((__nowMs - __streakStart) / 60000), posted, max, runId: String(__runId) }); // SWARM FIX #6
@@ -22686,16 +22718,28 @@ setInterval(() => {
       const run2 = sNow.operator?.lastIncompleteRun;
       if (run2 && run2.status === "pending" && run2.at === __lir.at) {
         const origMax = Number(run2.max) || 0;
-        const newMax = Math.max(1, origMax - (Number(run2.posted) || 0));
-        sNow.operator.autopilotMaxPostsPerRun = newMax;
-        sNow.operator.autopilotPostsThisRun = 0;
-        sNow.operator.autopilotEnabled = true;
-        sNow.operator.armedForExternalActions = true;
-        sNow.operator.commentDrainPaused = false;
-        sNow.operator.autopilotDryRun = false;
-        sNow.operator.lastIncompleteRun = { ...run2, status: "continued", resolvedAt: new Date().toISOString(), via: "stability_grace_auto" };
-        writeState(sNow, { controlWrite: true, operatorControl: true });
-        logEvent("autopilot_auto_resumed_after_stability_grace", { posted: run2.posted, max: run2.max, newMax, graceMinutes: Math.round(AUTO_RESUME_STABILITY_GRACE_MS / 60000) });
+        // DYNAMIC IN-FLIGHT RECONCILIATION (2026-07-12) -- same fix as detectIncompleteRunAtBoot's boot-time
+        // auto-resume: `run2.posted` only reflects DURABLY-confirmed posts, not ones already submitted to
+        // Facebook and awaiting moderator approval. Subtract those (reused canonical /report classifier, never
+        // a hardcoded count) so this second resume path can't reproduce the same overshoot-past-target bug.
+        let __inFlightUnresolved2 = 0;
+        try { __inFlightUnresolved2 = Number(buildRunReports()?.pendingApprovalTotal) || 0; } catch (_) {}
+        const newMax = Math.max(0, origMax - (Number(run2.posted) || 0) - __inFlightUnresolved2);
+        if (newMax <= 0) {
+          sNow.operator.lastIncompleteRun = { ...run2, status: "auto_resolved_in_flight_covers_target", resolvedAt: new Date().toISOString(), via: "stability_grace_auto", inFlightUnresolved: __inFlightUnresolved2 };
+          writeState(sNow, { controlWrite: true, operatorControl: true });
+          logEvent("autopilot_auto_resume_skipped_target_covered_by_inflight", { posted: run2.posted, max: run2.max, inFlightUnresolved: __inFlightUnresolved2, via: "stability_grace_auto" });
+        } else {
+          sNow.operator.autopilotMaxPostsPerRun = newMax;
+          sNow.operator.autopilotPostsThisRun = 0;
+          sNow.operator.autopilotEnabled = true;
+          sNow.operator.armedForExternalActions = true;
+          sNow.operator.commentDrainPaused = false;
+          sNow.operator.autopilotDryRun = false;
+          sNow.operator.lastIncompleteRun = { ...run2, status: "continued", resolvedAt: new Date().toISOString(), via: "stability_grace_auto" };
+          writeState(sNow, { controlWrite: true, operatorControl: true });
+          logEvent("autopilot_auto_resumed_after_stability_grace", { posted: run2.posted, max: run2.max, inFlightUnresolved: __inFlightUnresolved2, newMax, graceMinutes: Math.round(AUTO_RESUME_STABILITY_GRACE_MS / 60000) });
+        }
       }
     }
   } catch (_) {}
@@ -23182,7 +23226,15 @@ function buildRunReports(force = false) {
       if (Number.isFinite(__lastT) && Date.now() - __lastT < RUN_SPLIT_GAP_MS) outVisible[0].live = true;
     }
   } catch (_) {}
-  const body = { generatedAt: new Date().toISOString(), runCount: outVisible.length, latest: outVisible[0] || null, runs: outVisible.slice(0, 30), live, reconcile, problemProfiles, openBudget, pendingUnclustered };
+  // GLOBAL pre-clustering total (2026-07-12, run-limit overshoot fix): the run-clustering split above attaches
+  // each pending item to whichever run's [startT-60s, lastT+30min] window contains it, or drops it into
+  // pendingUnclustered when none does (e.g. a run with zero landed posts so far, or an approval wait that outlives
+  // the 30min post-cluster window -- plausible, since approval itself can take longer than that). Anything reading
+  // "how many posts are genuinely in flight right now" (not scoped to one run's display cluster) needs the total
+  // BEFORE that split, not latest.pendingApproval.count alone, or it silently under-counts. Exposed once here so
+  // every caller (detectIncompleteRunAtBoot's boot/stability-grace/manual-continue resume math) reads one number.
+  const pendingApprovalTotal = pendingApproval.length;
+  const body = { generatedAt: new Date().toISOString(), runCount: outVisible.length, latest: outVisible[0] || null, runs: outVisible.slice(0, 30), live, reconcile, problemProfiles, openBudget, pendingUnclustered, pendingApprovalTotal };
   __runReportCache.at = Date.now();
   __runReportCache.body = body;
   return body;
@@ -23992,8 +24044,16 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, action, state: next });
     }
     const origMax = Number(run.max) || 0;
+    // DYNAMIC IN-FLIGHT RECONCILIATION (2026-07-12) -- same fix as detectIncompleteRunAtBoot's boot-time
+    // auto-resume: `run.posted` only reflects DURABLY-confirmed posts, not ones already submitted to Facebook
+    // and awaiting moderator approval. An operator clicking Continue (possibly right after a restart) can
+    // otherwise arm for MORE than truly remains toward the original target, once those in-flight posts land on
+    // top of newly-dispatched ones. Reused canonical /report classifier, never a hardcoded count. Only applies
+    // to "continue" -- "relaunch" is an intentional fresh full-count run, not a continuation toward the same total.
+    let __inFlightUnresolved3 = 0;
+    if (action === "continue" && origMax > 0) { try { __inFlightUnresolved3 = Number(buildRunReports()?.pendingApprovalTotal) || 0; } catch (_) {} }
     const newMax = action === "continue" && origMax > 0
-      ? Math.max(1, origMax - (Number(run.posted) || 0))
+      ? Math.max(1, origMax - (Number(run.posted) || 0) - __inFlightUnresolved3)
       : origMax; // relaunch keeps the original count; max=0 stays unlimited either way
     state.operator.autopilotMaxPostsPerRun = newMax;
     state.operator.autopilotPostsThisRun = 0;
