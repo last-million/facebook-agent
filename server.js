@@ -14840,9 +14840,20 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
   const urls = [...new Set((candidateUrls || []).map((url) => {
     try { return sanitizeFacebookPostUrl(url); } catch { return ""; }
   }).filter(Boolean))];
-  // Try pending queue search by author ID FIRST (empty postUrl) — fastest reliable
-  // approach. Fall back to specific candidate permalinks only if that fails.
-  const targetUrls = urls.length ? ["", ...urls.slice(0, 8)] : [""];
+  // ORDER FIX (2026-07-12, live-trace-verified on plan_1783898169053_281a1d:62 and
+  // plan_1783900780693_77111e:3): a KNOWN candidate permalink resolves in ~15-20s via the
+  // connector's direct-postUrl branch (fb-post-test-capture-url.js ~3772-3823: goes straight to the
+  // permalink, returns immediately when the post is already live/not-pending). The empty-postUrl
+  // target skips that fast check entirely and goes straight into the slow /pending_posts/ queue-scan
+  // (openGroupReviewSurface), which the connector's own comment says needs 10-30min to reliably
+  // resolve and which redirects off the admin surface back to the feed on most retries. With
+  // MAX_ADMIN_APPROVAL_ATTEMPT_MS=4min/attempt and an 8min session budget, the empty-postUrl target
+  // going FIRST let it alone consume the ENTIRE session (2 moderator attempts, ~216-240s each) before
+  // a known-good permalink was EVER tried -- both real traces above logged "Trying N admin/moderator
+  // profile(s) against 1 candidate permalink(s)" then timed out twice without ever attempting it. This
+  // hits EVERY moderator profile, not just 112/113. Try known permalinks first; keep the queue-scan as
+  // the fallback for when no candidate permalink exists yet or none of them verify.
+  const targetUrls = urls.length ? [...urls.slice(0, 8), ""] : [""];
   const __rawAdminProfiles = await facebookAdminApprovalProfilesForGroup(groupUrl, state, { excludeProfileId: ready.profileId });
   // EQUAL MODERATOR ROTATION across concurrent legs (2026-07-12, operator: "if there are more moderators, use them
   // all equally"). Up to MAX_BG_COMMENT_IN_FLIGHT background approval legs fire near-simultaneously; each rebuilds
