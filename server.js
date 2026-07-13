@@ -22967,7 +22967,21 @@ function buildRunReports(force = false) {
     if (!Number.isFinite(t)) continue;
     const k = (r.planId || "") + ":" + (r.sequence || 0) + ":" + normalizedFacebookGroupKey(r.groupUrl || r.actualGroupUrl || "");
     const ex = pendingStartByKey.get(k);
-    if (!ex || t < ex.t) pendingStartByKey.set(k, { t, at: r.at, groupUrl: r.groupUrl || "", profileId: Number(r.profileId || 0) });
+    if (!ex || t < ex.t) pendingStartByKey.set(k, { t, at: r.at, groupUrl: r.groupUrl || "", profileId: Number(r.profileId || 0), profile: String(r.profile || "") });
+  }
+  // PUBLISHER LOOKUP (2026-07-13, operator: "in awaiting approval he should show the profile that posted and the
+  // moderator"): post_captured_awaiting_admin_approval is written by the PUBLISHING profile right before the
+  // backgrounded approval leg starts, same planId:sequence:group key as pendingStartByKey above -- the one ledger
+  // row that reliably identifies who actually submitted a still-pending post (admin_approval_started's profileId
+  // is the MODERATOR attempting approval, a completely different identity).
+  const publisherByKey = new Map();
+  for (const r of rows) {
+    if (!r || r.event !== "post_captured_awaiting_admin_approval" || !r.at) continue;
+    const t = Date.parse(r.at);
+    if (!Number.isFinite(t)) continue;
+    const k = (r.planId || "") + ":" + (r.sequence || 0) + ":" + normalizedFacebookGroupKey(r.groupUrl || r.actualGroupUrl || "");
+    const ex = publisherByKey.get(k);
+    if (!ex || t < ex.t) publisherByKey.set(k, { t, profileId: Number(r.profileId || 0), profile: String(r.profile || "") });
   }
   // APPROVAL RESOLUTION (2026-07-11, operator: report should show which MODERATOR approved each pending post and
   // HOW LONG it took). Scan admin_approval_finished (the connector records the approving moderator's profileId +
@@ -22993,7 +23007,18 @@ function buildRunReports(force = false) {
   const PENDING_GHOST_CUTOFF_MIN = 240;
   const pendingApproval = [...pendingStartByKey.entries()]
     .filter(([k]) => !resolvedPostKeys.has(k))
-    .map(([k, v]) => ({ key: k, groupUrl: v.groupUrl, group: __reportGroupName(v.groupUrl), profileId: v.profileId, startedAt: v.at, _t: v.t, ageMinutes: Math.round((Date.now() - v.t) / 60000) }))
+    .map(([k, v]) => {
+      const pub = publisherByKey.get(k);
+      return {
+        key: k, groupUrl: v.groupUrl, group: __reportGroupName(v.groupUrl),
+        // moderator currently/first attempting to approve this pending post
+        profileId: v.profileId, moderatorProfileId: v.profileId, moderatorProfile: v.profile || "",
+        // profile that actually made the original post (2026-07-13 operator ask) -- absent only if the
+        // capture-time ledger row itself is missing (pre-fix legacy rows), never for anything posted since
+        publisherProfileId: pub ? pub.profileId : 0, publisherProfile: pub ? pub.profile : "",
+        startedAt: v.at, _t: v.t, ageMinutes: Math.round((Date.now() - v.t) / 60000),
+      };
+    })
     .filter((item) => item.ageMinutes < PENDING_GHOST_CUTOFF_MIN)
     .sort((a, b) => a.ageMinutes < b.ageMinutes ? 1 : -1);
   // cluster into runs (>2h gap = new run)

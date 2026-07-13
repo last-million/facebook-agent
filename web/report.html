@@ -260,14 +260,17 @@ function runBody(r){
   if (pend.length) {
     html += '<h2>Awaiting approval <span class="ln"></span> <span class="tag">'+pend.length+'</span></h2>';
     html += '<div class="tablecard"><table class="detail"><thead><tr>'
-      + '<th>Group</th><th>Submitted</th><th>Waiting</th><th>Profile</th></tr></thead><tbody>';
+      + '<th>Group</th><th>Submitted</th><th>Waiting</th><th>Posted by</th><th>Moderator</th></tr></thead><tbody>';
     html += pend.map(function(p){
       var old = p.ageMinutes>=60;
+      var poster = p.publisherProfileId ? (p.publisherProfileId + (p.publisherProfile? ' — '+esc(p.publisherProfile) : '')) : '—';
+      var mod = p.moderatorProfileId ? (p.moderatorProfileId + (p.moderatorProfile? ' — '+esc(p.moderatorProfile) : '')) : (p.profileId||'—');
       return '<tr>'
         + '<td data-l="Group">'+grpPill(p.group)+'</td>'
         + '<td data-l="Submitted">'+fmtTime(p.startedAt)+'</td>'
         + '<td data-l="Waiting" class="'+(old?"no":"slow")+'">'+p.ageMinutes+' min'+(old?' ⚠':'')+'</td>'
-        + '<td data-l="Profile">'+(p.profileId||'—')+'</td></tr>';
+        + '<td data-l="Posted by">'+poster+'</td>'
+        + '<td data-l="Moderator">'+mod+'</td></tr>';
     }).join("");
     html += '</tbody></table></div>';
   }
