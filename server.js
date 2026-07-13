@@ -13600,7 +13600,12 @@ function __pendingApprovalPayloadFields(row) {
 // marker and comment. Carries all 5 trackingSeed inputs (planId, productKey, productId, sequence, link).
 function __rebuildRowFromPendingLedger(r) {
   return {
-    planId: r.planId, sequence: r.sequence, profile: r.profile || "", groupUrl: r.groupUrl || "",
+    // profileId is LOAD-BEARING for approval (2026-07-13 verify catch): runFacebookAdminApprovalAttempt derives
+    // publisherUserId via facebookUserIdByProfile(row.profileId) -> the moderator scopes the /user/{id}/ review
+    // surface + batchApprove to OUR pending post. Dropping it here empties publisherUserId ("was empty -> 0
+    // approved"), so the re-drive would burn every attempt, cap-release, and re-post a DUPLICATE. r.profileId is
+    // the publisher on every await/pending write and is whitelisted, so it round-trips cleanly.
+    planId: r.planId, sequence: r.sequence, profile: r.profile || "", profileId: r.profileId, groupUrl: r.groupUrl || "",
     productKey: r.productKey || "", productId: r.productId || "",
     commentTextPreview: r.commentTextPreview || "", postText: r.commentPostText || "",
     link: r.commentLink || "", pinFirstComment: r.pinFirstComment !== false,
