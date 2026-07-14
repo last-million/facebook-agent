@@ -23139,16 +23139,22 @@ setInterval(() => {
       && !__harvestSourcesInFlight && Date.now() >= __harvestNextAt) {
     harvestContentSourcesAsync({}).catch(() => {});
   }
-  // PERSISTENT FIRST-COMMENT DRAIN (operator 2026-06-19, the 10-30min-approval hole): FB makes a pending post public
-  // 10-30 min AFTER we record it published, but the armed-gated resweep + the run-end final passes all stop within
-  // ~5 min of disarm — so a late-approved post never got its money-comment (the 8.5% miss). This ALWAYS-ON drain
-  // re-comments any RECENTLY-published post still missing its different-profile first comment, for up to
-  // PERSISTENT_DRAIN_WINDOW_MS after the last published post. Bounded window => never chases old history. Single-
-  // flight, never reposts, never double-comments (the latestDifferentProfileVerifiedCommentForPost guard inside),
-  // yields to active posting. ZERO browsers at rest: the latestPublishedFacebookPostAtMs gate is a no-op once no
-  // post was published in the last 60 min.
-  if ((!__commentResweepInFlight || isCommentResweepPassHung()) // 2026-07-14: a HUNG pass (no time bound previously
-                                 // existed) must not permanently block the always-on drain -- treat it as free so
+  // SAME-SESSION FIRST-COMMENT DRAIN (operator 2026-07-14: "draining should happen only in the same session while
+  // posting/approving/commenting, not after the run ends" -- SUPERSEDES the prior 2026-06-19 ALWAYS-ON design,
+  // which deliberately kept this firing for hours/days after disarm to catch a post FB makes public 10-30 min
+  // late. The operator has now explicitly traded that safety net away: once a run disarms, this drain must stop
+  // completely and NOT resume until a new run is armed -- no independent background chasing of old backlog.
+  // Gated on `armed` (autopilotEnabled && armedForExternalActions), the SAME canonical check
+  // resweepUncommentedFacebookPostsAsync's own internal armed-gate uses for a non-drain/non-force call. Residual
+  // effect (communicated to the operator): a post whose FIRST comment attempt fails because FB hasn't made it
+  // public yet, and which is still stuck at the moment a run disarms, will NOT be auto-recovered -- only the
+  // operator's manual "Resweep comments" button (options.force, bypasses this gate) can rescue it after that.
+  // Still single-flight, never reposts, never double-comments (the latestDifferentProfileVerifiedCommentForPost
+  // guard inside), yields to active posting.
+  const __drainSessionArmed = state.operator?.autopilotEnabled === true && state.operator?.armedForExternalActions === true;
+  if (__drainSessionArmed
+      && (!__commentResweepInFlight || isCommentResweepPassHung()) // 2026-07-14: a HUNG pass (no time bound previously
+                                 // existed) must not permanently block the drain -- treat it as free so
                                  // the call below reaches resweepUncommentedFacebookPostsAsync's own safety valve,
                                  // which force-clears it (loudly logged) and starts a fresh pass.
       && !__forceResweepPending // stand down for one tick so a waiting explicit force resweep (operator's manual
