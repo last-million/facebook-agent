@@ -274,6 +274,33 @@ function runBody(r){
     }).join("");
     html += '</tbody></table></div>';
   }
+  // ALREADY APPROVED, AFTER WAITING (operator 2026-07-14: "I don't see history of the ones pending that are
+  // already approved after waiting and how much time it took, in same section"). The per-post Approval column
+  // further down (Post detail) already carries this (approvedByModerator + approvalDurationMinutes,
+  // 2026-07-11), but it's buried far below this section on a long page. Surface the same data here too, right
+  // next to the still-pending list, so both halves of the approval story (waiting now / waited-and-resolved)
+  // read together without scrolling. Pure client-side re-render of r.detail already sent by the server --
+  // no server change, takes effect on next page load.
+  var resolvedApprovals = (r.detail||[]).filter(function(d){ return d.wasPendingApproval && d.approvedByModerator; });
+  if (resolvedApprovals.length) {
+    html += '<h2>Approved after waiting <span class="ln"></span> <span class="tag">'+resolvedApprovals.length+'</span></h2>';
+    html += '<div class="tablecard"><table class="detail"><thead><tr>'
+      + '<th>Group</th><th>Posted by</th><th>Approved by</th><th>Waited</th><th>Commented</th><th>Commented by</th></tr></thead><tbody>';
+    html += resolvedApprovals.map(function(d){
+      var poster = d.profilePub ? (d.profilePub + (d.profilePubLabel? ' — '+esc(d.profilePubLabel) : '')) : '—';
+      var commenter = d.profileCom ? (d.profileCom + (d.profileComLabel? ' — '+esc(d.profileComLabel) : '')) : '—';
+      var waitedMin = d.approvalDurationMinutes!=null ? d.approvalDurationMinutes : d.approvalWaitMinutes;
+      var waitedTxt = waitedMin!=null ? waitedMin+' min' : '?';
+      return '<tr>'
+        + '<td data-l="Group">'+grpPill(d.group)+'</td>'
+        + '<td data-l="Posted by">'+poster+'</td>'
+        + '<td data-l="Approved by">'+esc(String(d.approvedByModerator))+'</td>'
+        + '<td data-l="Waited" class="'+(waitedMin!=null && waitedMin>=30?'no':'slow')+'">'+waitedTxt+'</td>'
+        + '<td data-l="Commented">'+(d.commentedAt?fmtTime(d.commentedAt):'<span class="no">not yet</span>')+'</td>'
+        + '<td data-l="Commented by">'+(d.commentedAt?commenter:'<span class="no">—</span>')+'</td></tr>';
+    }).join("");
+    html += '</tbody></table></div>';
+  }
   var gks = Object.keys(r.byGroup||{});
   if(gks.length){
     html += '<h2>By group <span class="ln"></span></h2><div class="cards2">';
