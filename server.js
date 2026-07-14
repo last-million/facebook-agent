@@ -14307,7 +14307,10 @@ function fastCommentCooldownActiveSet() {
 // below), plus the clean err.publicError/err.ixBrowserCode enums set at the connector throw site before they
 // collapse into free text.
 const FAST_COMMENT_COOLDOWN_TRIGGER_RE = /\b1004\b|\b1008\b|\b1009\b|\bserver busy\b|profile[ _-]?open[ _-]?failed|could not open (?:the )?profile|profile[ _-]?busy|profile[ _-]?in[ _-]?use|comment_recovery_profile_busy|ixbrowser_profile_busy|connectovercdp|connect over cdp|cdp (?:timeout|timed out|refused|closed|error)|websocket|reading ['"]ws['"]|target (?:page )?closed|browser has been closed|connection (?:closed|refused)|ECONNREFUSED|ECONNRESET|socket hang|connector timed out/i;
-const FAST_COMMENT_COOLDOWN_TRIGGER_PUBLIC_ERRORS = new Set(["facebook_live_post_connector_timeout", "ixbrowser_profile_open_failed", "ixbrowser_error"]);
+// "ixbrowser_error" deliberately EXCLUDED (adversarial-verify catch): ixBrowserError()'s generic fallback for ANY
+// unrecognized IXBrowser API code, including shared-resource/system-wide hiccups -- not specific enough to blame
+// a single profile's health, and would contradict this set's own "strict subset, profile-specific only" scope.
+const FAST_COMMENT_COOLDOWN_TRIGGER_PUBLIC_ERRORS = new Set(["facebook_live_post_connector_timeout", "ixbrowser_profile_open_failed"]);
 const FAST_COMMENT_COOLDOWN_TRIGGER_IX_CODES = new Set([500, 1004, 1008, 1009]);
 
 function isFastCommentCooldownTrigger(err, validation = {}) {
@@ -15510,7 +15513,14 @@ async function runFacebookCommentRecoveryAttempt({ row, profileId, profileLabel,
     releaseProfileUse = acquireNormalIxProfileUse(numericProfileId, "facebook_comment_recovery");
   } catch (err) {
     const validation = { ok: false, errors: ["comment_recovery_profile_busy"], warnings: [], commentRequired: true, commentSubmitted: false, commentVerified: false };
-    armFastCommentCooldown(numericProfileId, state); // literally busy RIGHT NOW -- always technical, always arm (fast comment-ONLY cooldown, operator 2026-07-14)
+    // FIX (adversarial-verify catch, 3/3 independent reviewers): acquireNormalIxProfileUse throws for 3 DISTINCT
+    // reasons, only one of which is actually THIS profile's fault -- ixbrowser_profile_busy (this exact profile
+    // locked elsewhere). The other two (ixbrowser_profile_budget_exceeded = global 14-open cap;
+    // ixbrowser_posting_reserved = drain-cap backpressure while a run is armed for posting) are pure system-
+    // capacity signals that fire on whichever profile loses a race for a shared slot -- unconditionally arming on
+    // all three would bench healthy profiles during ordinary busy load, exactly the false-bench-wave shape this
+    // codebase has been bitten by before. Gate on the actual per-profile cause.
+    if (err?.publicError === "ixbrowser_profile_busy") armFastCommentCooldown(numericProfileId, state);
     appendFacebookLivePostLedger({
       event: "comment_recovery_skipped",
       key: ledgerKey,
