@@ -10695,14 +10695,20 @@ async function autopilotTickAsync(options = {}) {
       };
       try {
         const v = await runLiveFacebookPostFromPlan({ fullRun: true, autopilot: true, planId: r.planId, sequence: r.sequence, countTowardRun: true });
-        if (!(v && v.ok)) releasePostProductForRun(state, __prodKey, r.groupUrl); // post did not land -> free the product (for THIS group when postToAllGroups) for retry
+        // AWAITING-PROPAGATION EXEMPTION (2026-07-14): a "not yet propagated" outcome (server.js ~13592) returns
+        // {ok:false, awaitingPropagation:true} instead of throwing -- it means the post is genuinely still pending
+        // in FB's moderator queue, NOT abandoned. Releasing the claim here would let a later tick re-pick the SAME
+        // product+group and submit a genuine duplicate post while the original is still sitting in review. The
+        // durable admin_approval_await_propagation ledger row already written holds the claim's place; selfHeal
+        // re-drives it until it lands or the bounded attempt/age caps give up (which DOES release it, elsewhere).
+        if (!(v && (v.ok || v.awaitingPropagation))) releasePostProductForRun(state, __prodKey, r.groupUrl); // post did not land -> free the product (for THIS group when postToAllGroups) for retry
         autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", errorText: (v && (v.error || v.reason)) || "", validation: v && v.validation, source: "autopilot" });
-        __intentOutcome = (v && v.ok) ? "completed_published" : "completed_not_landed"; __intentUrl = (v && v.postUrl) || "";
+        __intentOutcome = (v && v.ok) ? "completed_published" : (v && v.awaitingPropagation) ? "completed_awaiting_propagation" : "completed_not_landed"; __intentUrl = (v && v.postUrl) || "";
         // The per-run counter is now bumped at the RECORD moment inside completeVerifiedFacebookPostWithComment
         // (gated by ready.__autopilotRunPost = body.countTowardRun), so a post that LANDS but whose comment/
         // cleanup errors afterward is STILL counted exactly once — fixing the rare under-count where
         // "stop at N" could overshoot by 1 (e.g. p48: posted, but its worker threw right after landing).
-        return { profileId: Number(r.profileId || 0), ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", error: "" };
+        return { profileId: Number(r.profileId || 0), ok: Boolean(v && v.ok), postUrl: (v && v.postUrl) || "", error: (v && v.awaitingPropagation) ? "admin_approval_await_propagation" : "" };
       } catch (err) {
         releasePostProductForRun(state, __prodKey, r.groupUrl); // post threw -> free the product (for THIS group when postToAllGroups) so the run can retry it
         autoBlacklistProfileIfNeeded({ profileId: Number(r.profileId || 0), profile: r.profile, ok: false, postUrl: "", errorText: oneLineField((err && (err.profileFailureReason || err.message)) || String(err), 240), profileRetryable: !!(err && err.profileRetryable), validation: err && err.livePostValidation, source: "autopilot" });
@@ -12014,6 +12020,11 @@ function latestSubmittedUrlMissingFacebookLivePostForRow(row = {}, profileId = "
     // latestPendingAdminApprovalFacebookLivePostForRow below). Stop here so an OLDER submitted_url_missing row
     // underneath it can never resurface and trigger a stale/wrong-state recovery attempt.
     if (event === "post_captured_awaiting_admin_approval") return null;
+    // FIX (2026-07-14, adversarial-verify finding): a newer admin_approval_await_propagation row (the not-yet-
+    // propagated self-heal marker, written by the same give-up sites this function's caller is trying to protect
+    // against re-triggering) means a real submission for this key is genuinely still pending -- an older
+    // submitted_url_missing row underneath it must not resurface either, same rationale as the line above.
+    if (event === "admin_approval_await_propagation") return null;
     if (status === "submitted_url_missing" || /^submitted_url_missing/.test(event)) {
       return {
         ...item,
@@ -12041,6 +12052,15 @@ function latestPendingAdminApprovalFacebookLivePostForRow(row = {}, profileId = 
     if (String(item.status || "") === "submitted_url_missing" || /^submitted_url_missing/.test(String(item.event || ""))) return null;
     const event = String(item.event || "");
     if (event === "post_captured_awaiting_admin_approval") {
+      return { ...item, actualGroupUrl: item.actualGroupUrl || item.groupUrl || "" };
+    }
+    // FIX (2026-07-14, adversarial-verify finding): admin_approval_await_propagation means the SAME thing as
+    // post_captured_awaiting_admin_approval for this lookup's purpose -- a real FB submission for this exact key
+    // exists and is still genuinely pending (FB just hasn't surfaced it in the moderator queue yet). Written by 5
+    // call sites now (the backgrounded path plus 4 others), not only the original backgrounding path, so this
+    // must be recognized here too or a caller could treat a mid-propagation-wait row as "nothing pending" and
+    // submit a genuine duplicate post for the same planId+sequence+profileId.
+    if (event === "admin_approval_await_propagation") {
       return { ...item, actualGroupUrl: item.actualGroupUrl || item.groupUrl || "" };
     }
     if (event === "admin_approval_background_gave_up") return null; // background task already gave up -> safe to retry fresh
@@ -13617,6 +13637,38 @@ function __rebuildRowFromPendingLedger(r) {
     harvested: Boolean(r.harvested), image: r.commentImagePath || "", imagePath: r.commentImagePath || "",
     title: r.title || "", ogDescription: r.ogDescription || "",
   };
+}
+// ADMIN-APPROVAL "NOT YET PROPAGATED" CLASSIFIER (2026-07-14, generalized from the 2026-07-13 backgrounded-path
+// fix after a live incident + adversarial review found that fix's OWN classifier was dead code -- see the fix
+// comment at the __bgValidation reassignment inside runLiveFacebookPostFromPlan's backgrounded branch). A fresh
+// pending post is not in FB's moderator queue within a single approval attempt's budget (queue propagation is
+// 10-30min per FB, documented elsewhere in this file), so these specific error codes mean "FB hasn't surfaced it
+// yet," NOT "this post was rejected." Shared by every "give up to avoid a duplicate post" site in
+// runLiveFacebookPostFromPlan so they all agree on one definition instead of each re-implementing it (or, as
+// found live, not implementing it at all).
+function isAdminApprovalNotYetPropagated(errs) {
+  const list = (errs || []).map(String);
+  return list.length > 0 && list.every((e) =>
+    e === "admin_approval_button_not_clicked_post_still_pending"
+    || e === "admin_approval_post_marker_not_verified");
+}
+// Writes the durable await-propagation marker and returns the standard non-throwing "still pending, do not
+// abandon" result every give-up site should return instead of throwing when isAdminApprovalNotYetPropagated is
+// true. One writer keeps the ledger row shape identical across every call site so
+// selfHealStaleBackgroundedApprovalsAsync (which matches purely on event name, not on which site wrote it)
+// re-drives all of them the same way. Caller must NOT release the product+group claim on this outcome (see the
+// runWorker call site: `!(v && (v.ok || v.awaitingPropagation))`).
+function admApprovalAwaitPropagationResult({ ledgerKey, row, ready, groupUrl, postUrl, errs }) {
+  appendFacebookLivePostLedger({
+    event: "admin_approval_await_propagation",
+    key: ledgerKey, planId: row.planId, sequence: row.sequence, profileId: ready.profileId,
+    profile: row.profile || "", groupUrl, postUrl: postUrl || "",
+    productKey: String(row.productKey || row.productUrl || row.link || ""),
+    ...__pendingApprovalPayloadFields(row),
+    status: "pending", attempt: 1, firstAwaitAt: new Date().toISOString(),
+    message: `Post submitted and pending; FB has not surfaced it in the moderator queue yet (${errs.join(", ")}). Self-heal will re-drive approval+comment until it propagates.`,
+  });
+  return { ok: false, awaitingPropagation: true, postUrl: postUrl || "", reason: "admin_approval_await_propagation" };
 }
 async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
   if (__staleApprovalSelfHealInFlight) return __staleApprovalSelfHealInFlight;
@@ -18360,6 +18412,18 @@ async function runLiveFacebookPostFromPlan(body = {}) {
         approvalResult,
       });
     }
+    // NOT-YET-PROPAGATED (2026-07-14, generalized from the backgrounded-path fix): don't abandon + release the
+    // claim if the only reason approval didn't verify is that FB hasn't surfaced the post in the moderator queue
+    // yet -- that's a routine 10-30min propagation lag, not a rejection. Let selfHeal re-drive it instead.
+    {
+      const __recoveryErrs = (approvalResult?.validation?.errors || []).map(String);
+      if (isAdminApprovalNotYetPropagated(__recoveryErrs)) {
+        return admApprovalAwaitPropagationResult({
+          ledgerKey, row, ready, groupUrl: recoveryGroupUrl,
+          postUrl: approvalResult?.postUrl || recovered?.postUrl || "", errs: __recoveryErrs,
+        });
+      }
+    }
     throw unverifiedFacebookPublishError(
       "Previous Facebook post was not found by marker in feed/search/admin review; no permalink was captured, so the test will retry another eligible profile.",
       recovered?.validation || approvalResult?.validation || { ok: false, errors: ["submitted_url_recovery_failed"], warnings: [] },
@@ -18662,17 +18726,27 @@ async function runLiveFacebookPostFromPlan(body = {}) {
                       postUrl: __bgFinalPostUrl, errors: __bgValidation.errors, backgrounded: true,
                     });
                   } catch (_) {}
-                  // NOT-YET-PROPAGATED vs HARD FAILURE (2026-07-13): a FRESH pending post is not in FB's moderator
-                  // queue within the 8-min background budget (queue propagation is 10-30min), so the clean "no real
-                  // Approve click yet" codes are NOT abandonment. Do NOT write the terminal gave_up and do NOT
-                  // release the claim -- leave a durable await-propagation marker (latest event for this key,
-                  // carrying the comment payload) so the ARMED selfHeal re-drives the SAME post once FB surfaces it,
-                  // clicks the real Approve, then comments it. Only a genuine hard failure (any other error) abandons
-                  // + releases as before. The attempt/age caps in selfHeal bound a genuinely-rejected post.
-                  const __bgErrs = (__bgValidation.errors || []).map(String);
-                  const __notPropagatedYet = __bgErrs.length > 0 && __bgErrs.every((e) =>
-                    e === "admin_approval_button_not_clicked_post_still_pending"
-                    || e === "admin_approval_post_marker_not_verified");
+                  // NOT-YET-PROPAGATED vs HARD FAILURE (2026-07-13; classifier fixed 2026-07-14): a FRESH pending
+                  // post is not in FB's moderator queue within the 8-min background budget (queue propagation is
+                  // 10-30min), so the clean "no real Approve click yet" codes are NOT abandonment. Do NOT write the
+                  // terminal gave_up and do NOT release the claim -- leave a durable await-propagation marker so the
+                  // ARMED selfHeal re-drives the SAME post once FB surfaces it. Only a genuine hard failure (any
+                  // other error) abandons + releases as before. FIX (2026-07-14 adversarial-verify finding): this
+                  // used to read __bgValidation.errors, but __bgValidation only ever gets reassigned to
+                  // __bgApprovalResult.validation when approvalClicked is true (line 18686) -- yet this whole block
+                  // only runs when approvalClicked is FALSE (line 18690) -- so the reassignment and this block are
+                  // mutually exclusive and __bgValidation was ALWAYS still __bgValidationStart here: the PRE-approval
+                  // validator's error vocabulary, which never contains either admin_approval_* string. The classifier
+                  // below could therefore never be true, silently making this entire protection dead code since the
+                  // day it shipped (confirmed live: 132,950+ ledger lines, zero admin_approval_await_propagation /
+                  // admin_approval_background_gave_up events ever). Read the approval-specific validation directly
+                  // off __bgApprovalResult instead, with a safe fallback to __bgValidation for the (rare) case
+                  // approvePendingFacebookPostWithAdminProfiles itself returned null (e.g. no admin profiles
+                  // configured) -- that fallback still can't match this classifier's vocabulary, so it correctly
+                  // falls through to the hard-give-up path exactly as before.
+                  const __bgApprovalErrs = (__bgApprovalResult?.validation?.errors || []).map(String);
+                  const __bgErrs = __bgApprovalErrs.length ? __bgApprovalErrs : (__bgValidation.errors || []).map(String);
+                  const __notPropagatedYet = isAdminApprovalNotYetPropagated(__bgErrs);
                   if (__notPropagatedYet) {
                     appendFacebookLivePostLedger({
                       event: "admin_approval_await_propagation",
@@ -18763,6 +18837,19 @@ async function runLiveFacebookPostFromPlan(body = {}) {
           }
         }
         if (!validation.ok && !liveEnoughToComment && !approvalResult?.approvalClicked) {
+          // NOT-YET-PROPAGATED (2026-07-14): see the classifier comment near the shared helpers. `validation` here
+          // suffers the SAME reassignment-gating issue the backgrounded path had (2nd adversarial-verify round,
+          // Gap A): it only ever becomes approvalResult.validation when approvalClicked is true, but this branch
+          // only runs when approvalClicked is false -- so validation.errors never carries the admin_approval_*
+          // vocabulary. Read approvalResult?.validation?.errors directly instead.
+          {
+            const __syncErrs = (approvalResult?.validation?.errors || []).map(String);
+            if (isAdminApprovalNotYetPropagated(__syncErrs)) {
+              return admApprovalAwaitPropagationResult({
+                ledgerKey, row, ready, groupUrl, postUrl: approvalResult?.postUrl || finalPostUrl || "", errs: __syncErrs,
+              });
+            }
+          }
           const message = `Facebook post URL was captured, but publish verification failed: ${validation.errors.join(", ") || "unknown_verification_error"}.`;
           logEvent("facebook_live_post_verification_failed", {
             planId: row.planId,
@@ -18897,6 +18984,15 @@ async function runLiveFacebookPostFromPlan(body = {}) {
             liveLogFile: scriptResult.liveLogFile || "",
             payloadFile: scriptResult.payloadFile || "",
           });
+          // NOT-YET-PROPAGATED (2026-07-14): see the classifier comment at the first give-up site above.
+          {
+            const __uncertainErrs = (approvalResult?.validation?.errors || []).map(String);
+            if (isAdminApprovalNotYetPropagated(__uncertainErrs)) {
+              return admApprovalAwaitPropagationResult({
+                ledgerKey, row, ready, groupUrl, postUrl: approvalResult?.postUrl || "", errs: __uncertainErrs,
+              });
+            }
+          }
           throw unverifiedFacebookPublishError(
             "Facebook publish is uncertain after clicking Post; stopped before retrying another profile to prevent duplicate posts.",
             missingUrlValidation,
@@ -18993,6 +19089,15 @@ async function runLiveFacebookPostFromPlan(body = {}) {
           approvalResult,
         });
       }
+      // NOT-YET-PROPAGATED (2026-07-14): see the classifier comment at the first give-up site above.
+      {
+        const __submittedMissingErrs = (approvalResult?.validation?.errors || []).map(String);
+        if (isAdminApprovalNotYetPropagated(__submittedMissingErrs)) {
+          return admApprovalAwaitPropagationResult({
+            ledgerKey, row, ready, groupUrl, postUrl: approvalResult?.postUrl || "", errs: __submittedMissingErrs,
+          });
+        }
+      }
       appendFacebookLivePostLedger({
         event: "submitted_url_missing",
         key: ledgerKey,
@@ -19086,6 +19191,17 @@ async function runLiveFacebookPostFromPlan(body = {}) {
             }
           }
           if (!finalValidation.ok && !approvalResult?.approvalClicked) {
+            // NOT-YET-PROPAGATED (2026-07-14): see the classifier comment near the shared helpers (same
+            // reassignment-gating defect as Gap A above -- finalValidation never carries the admin_approval_*
+            // vocabulary in this branch; read approvalResult?.validation?.errors directly).
+            {
+              const __connectorSyncErrs = (approvalResult?.validation?.errors || []).map(String);
+              if (isAdminApprovalNotYetPropagated(__connectorSyncErrs)) {
+                return admApprovalAwaitPropagationResult({
+                  ledgerKey, row, ready, groupUrl, postUrl: approvalResult?.postUrl || finalPostUrl || "", errs: __connectorSyncErrs,
+                });
+              }
+            }
             const message = `Facebook post URL was captured after a connector error, but publish verification failed: ${finalValidation.errors.join(", ") || "unknown_verification_error"}.`;
             logEvent("facebook_live_post_verification_failed_after_connector_error", {
               planId: row.planId,
@@ -19229,6 +19345,18 @@ async function runLiveFacebookPostFromPlan(body = {}) {
           });
         }
         logEvent("facebook_live_post_partial_no_fallback", { planId: row.planId, sequence: row.sequence, profileId: ready.profileId, groupUrl, error: oneLineField(err.message || String(err), 300) });
+        // NOT-YET-PROPAGATED (2026-07-14): see the classifier comment at the first give-up site above. This is the
+        // dominant real-world path (connector error after post-click -> marker scan -> admin review) -- confirmed
+        // live to be the exact site that produced a 2026-07-14 incident where the same product+group+profile
+        // re-submitted 3 times in under an hour after each attempt gave up here with zero not-yet-propagated check.
+        {
+          const __connectorErrErrs = (markerApprovalResult?.validation?.errors || []).map(String);
+          if (isAdminApprovalNotYetPropagated(__connectorErrErrs)) {
+            return admApprovalAwaitPropagationResult({
+              ledgerKey, row, ready, groupUrl, postUrl: markerApprovalResult?.postUrl || "", errs: __connectorErrErrs,
+            });
+          }
+        }
         appendFacebookLivePostLedger({
           event: "submitted_url_missing_after_connector_error",
           key: ledgerKey,
