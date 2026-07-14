@@ -13605,6 +13605,27 @@ function __allEverPublishedKeysFullScan() {
 const APPROVAL_REDRIVE_MAX_ATTEMPTS = 12;              // ~12 moderator-queue re-checks, bounded; covers FB's 10-30min window with margin
 const APPROVAL_REDRIVE_MAX_AGE_MS = 150 * 60 * 1000;  // 2.5h hard ceiling from first capture (was the implicit 24h reuse window -> too long)
 const APPROVAL_REDRIVE_MIN_INTERVAL_MS = 4 * 60 * 1000; // don't re-drive the same key more than ~every 4 min (throttles moderator load)
+// REAL ROOT CAUSE (2026-07-14, found via diagnostic instrumentation): every one of the 6 admin-approval-not-yet-
+// -propagated give-up sites shares its ledgerKey with the per-attempt "close the browser now" cleanup that runs
+// in the enclosing try/finally -- that finally ALWAYS fires after a `return`, so within ~100ms of writing
+// admin_approval_await_propagation, a browser_closed_after_attempt (or browser_closed_after_admin_approval, or
+// one of the sibling per-attempt breadcrumb events below) lands on the EXACT SAME key and becomes "latest" in
+// the naive last-write-wins Map this self-heal builds -- silently erasing the only signal that told this
+// function the post still needs healing. Confirmed live: the stuck sequence-7 post's latest ledger row for its
+// key was browser_closed_after_attempt, not admin_approval_await_propagation, even though the propagation marker
+// was written and never resolved. These are pure per-attempt bookkeeping/diagnostic events -- none of them is a
+// claim about the post's approval STATE -- so they must never be allowed to overwrite a real state event in
+// latestByKey. (published/published_after_admin_approval survive this class of clobber already, via the
+// separate always-full-history __everPublished() check below; no equivalent existed for the pending states.)
+const SELF_HEAL_LEDGER_NOISE_EVENTS = new Set([
+  "attempt_started", "attempt_uncertain_after_click_stop", "attempt_unverified_no_url_try_next",
+  "attempt_uncertain_after_click_no_extra_recovery", "attempt_failed_no_fallback",
+  "submitted_url_missing", "submitted_url_missing_after_connector_error",
+  "submitted_url_recovery_started", "submitted_url_recovery_finished", "submitted_url_recovery_error",
+  "profile_account_blocked_try_next_profile", "profile_attempt_failed_try_next_profile",
+  "group_attempt_failed", "all_groups_failed",
+  "browser_closed_after_attempt", "browser_closed_after_admin_approval", "browser_closed_after_submitted_url_recovery",
+]);
 // HUNG-REDRIVE SAFETY VALVE (2026-07-14 finding): selfHealStaleBackgroundedApprovalsAsync's own redrive call had
 // no time bound -- a single wedged connector/CDP session (the same class of hang already fixed for the
 // comment-drain today) permanently blocks the ENTIRE self-heal for the rest of the process's life, silently
@@ -13679,9 +13700,18 @@ function admApprovalAwaitPropagationResult({ ledgerKey, row, ready, groupUrl, po
   return { ok: false, awaitingPropagation: true, postUrl: postUrl || "", reason: "admin_approval_await_propagation" };
 }
 async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
-  if (__staleApprovalSelfHealInFlight) return __staleApprovalSelfHealInFlight;
+  if (__staleApprovalSelfHealInFlight) {
+    // DIAGNOSTIC (2026-07-14): zero admin_approval_redrive_*/admin_approval_started_stale_* events have
+    // appeared anywhere in a full process lifetime despite genuinely stale rows existing -- this logs the
+    // ONE observable symptom of the mechanism being permanently wedged in-flight since some earlier pass
+    // (a hang this fix's own Promise.race doesn't cover, since it only bounds the redrive calls, not
+    // whatever else in this function might block forever). Cheap: fires at most once per 5min scheduler tick.
+    try { logEvent("self_heal_reused_stuck_inflight_promise", {}); } catch (_) {}
+    return __staleApprovalSelfHealInFlight;
+  }
   __staleApprovalSelfHealInFlight = (async () => {
     const summary = { checked: 0, healed: 0, errors: 0, ignoredPublished: 0 };
+    try { logEvent("self_heal_pass_started", {}); } catch (_) {}
     try {
       const state = readState();
       // 20min default: comfortably above the real observed max approval-session duration (~10.3min per the
@@ -13692,7 +13722,10 @@ async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
       const publishedKeys = new Set();
       for (const r of rows) {
         if (!r || !r.key) continue;
-        latestByKey.set(String(r.key), r); // append-only ledger -> last write per key wins
+        // Skip pure per-attempt bookkeeping/diagnostic events -- they share the SAME key as the real approval-
+        // state events (moderator rotation + post-attempt cleanup both key off row.planId:sequence:profileId:
+        // groupUrl) and would otherwise clobber a genuine pending state (see SELF_HEAL_LEDGER_NOISE_EVENTS above).
+        if (!SELF_HEAL_LEDGER_NOISE_EVENTS.has(String(r.event || ""))) latestByKey.set(String(r.key), r); // append-only ledger -> last STATE write per key wins
         if (r.event === "published" || r.event === "published_after_admin_approval") publishedKeys.add(String(r.key));
       }
       // Lazy, pass-scoped cache: the full unbounded scan runs at most once total for this whole sweep pass,
@@ -13712,7 +13745,10 @@ async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
         // Genuinely still running in THIS process (merely slow, e.g. an IXBrowser desktop-recovery wait) --
         // NOT dead. Only a crashed/restarted process (this Set reset to empty) or an already-finished task
         // reaches the age check below.
-        if (__bgApprovalLegInFlightKeys.has(key)) continue;
+        if (__bgApprovalLegInFlightKeys.has(key)) {
+          try { logEvent("self_heal_skip_bg_leg_in_flight", { key, planId: r.planId, sequence: r.sequence }); } catch (_) {}
+          continue;
+        }
         const at = Date.parse(r.at || "") || 0;
         // await_propagation rows re-drive on a short interval (retry the queue as soon as FB may have surfaced it);
         // a stale post_captured (a crashed/restarted process's captured-but-never-resolved row) waits the full
@@ -13760,7 +13796,15 @@ async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
             } else if (__redrivesThisPass >= 3 || __approvalInFlightKeys.has(key)) {
               // per-pass browser budget reached, or an approval for this key is already running elsewhere:
               // leave the durable await marker as-is so the NEXT pass retries it. No state change.
+              try {
+                logEvent("self_heal_redrive_skipped", {
+                  key, planId: r.planId, sequence: r.sequence,
+                  reason: __redrivesThisPass >= 3 ? "per_pass_budget_reached" : "already_in_flight_elsewhere",
+                  redrivesThisPass: __redrivesThisPass,
+                });
+              } catch (_) {}
             } else {
+              try { logEvent("self_heal_redrive_attempt_starting", { key, planId: r.planId, sequence: r.sequence, attempt: __attempt + 1 }); } catch (_) {}
               __redrivesThisPass += 1;
               const __rebuilt = __rebuildRowFromPendingLedger(r);
               let __redriveOk = false;
@@ -13882,6 +13926,7 @@ async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
         }
       }
       if (summary.healed || summary.ignoredPublished) logEvent("admin_approval_stale_self_heal_finished", summary);
+      try { logEvent("self_heal_pass_finished", summary); } catch (_) {}
     } catch (err) {
       logEvent("admin_approval_stale_self_heal_fatal", { error: oneLineField((err && err.message) || String(err), 200) });
     } finally {
