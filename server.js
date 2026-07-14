@@ -13605,6 +13605,14 @@ function __allEverPublishedKeysFullScan() {
 const APPROVAL_REDRIVE_MAX_ATTEMPTS = 12;              // ~12 moderator-queue re-checks, bounded; covers FB's 10-30min window with margin
 const APPROVAL_REDRIVE_MAX_AGE_MS = 150 * 60 * 1000;  // 2.5h hard ceiling from first capture (was the implicit 24h reuse window -> too long)
 const APPROVAL_REDRIVE_MIN_INTERVAL_MS = 4 * 60 * 1000; // don't re-drive the same key more than ~every 4 min (throttles moderator load)
+// HUNG-REDRIVE SAFETY VALVE (2026-07-14 finding): selfHealStaleBackgroundedApprovalsAsync's own redrive call had
+// no time bound -- a single wedged connector/CDP session (the same class of hang already fixed for the
+// comment-drain today) permanently blocks the ENTIRE self-heal for the rest of the process's life, silently
+// (nothing throws, so no error is ever logged). Confirmed live: zero admin_approval_redrive_*/
+// admin_approval_started_stale_* events anywhere in a full day's audit log, while several admin_approval_started
+// rows sat unresolved 60-134+ minutes past every other gate in this function. 10min is comfortably above the
+// documented ~8min MAX_ADMIN_APPROVAL_WALL_CLOCK_MS budget plus margin for the follow-on comment step.
+const APPROVAL_REDRIVE_HUNG_TIMEOUT_MS = 10 * 60 * 1000;
 // The durable comment payload + marker inputs to stamp on a pending/await marker so a later re-drive can rebuild
 // the row and reproduce the EXACT #fb<hex> fingerprint (trackingSeed uses planId+productKey+productId+sequence+link)
 // AND deliver the different-profile comment. Mirrors what completeVerifiedFacebookPostWithComment stamps (~17297).
@@ -13757,19 +13765,39 @@ async function selfHealStaleBackgroundedApprovalsAsync(options = {}) {
               const __rebuilt = __rebuildRowFromPendingLedger(r);
               let __redriveOk = false;
               try {
-                const __ap = await approvePendingFacebookPostWithAdminProfiles({
-                  row: __rebuilt, ready: { profileId: r.profileId, imagePath: r.commentImagePath || "" },
-                  groupUrl: r.groupUrl || "", candidateUrls: [r.postUrl].filter(Boolean), ledgerKey: key,
-                  closeResults: [], reason: "Self-heal re-drive: re-firing admin approval on a still-pending post FB has now had time to surface in the moderator queue.",
-                });
+                // HUNG-REDRIVE TIMEOUT (2026-07-14 finding): this self-heal has NO bound on how long a single
+                // redrive's real browser/moderator operations can take. If either await below wedges (the same
+                // root-cause class already fixed for the comment-drain today -- a connector/CDP session that
+                // outlives its nominal timeout without the OS-level process actually tearing down), this entire
+                // function never resolves: __staleApprovalSelfHealInFlight stays truthy forever, so line ~13674's
+                // guard silently short-circuits EVERY future scheduled call for the rest of this process's life --
+                // with zero error ever logged, since nothing throws, it just never returns. Confirmed live: zero
+                // admin_approval_redrive_*/admin_approval_started_stale_* events anywhere in a full day's audit
+                // log, while several admin_approval_started rows sat unresolved 60-134+ minutes, well past every
+                // gate in this function that should have caught and healed them. Race each real operation against
+                // a generous timeout so a wedge can only cost one redrive slot, never the whole mechanism -- the
+                // original call keeps running in the background (JS can't cancel it) and its own finally still
+                // cleans up __approvalInFlightKeys whenever/if it eventually settles; __approvalInFlightKeys.has(key)
+                // above already stops a future pass from redriving the same key while that's still possible.
+                const __ap = await Promise.race([
+                  approvePendingFacebookPostWithAdminProfiles({
+                    row: __rebuilt, ready: { profileId: r.profileId, imagePath: r.commentImagePath || "" },
+                    groupUrl: r.groupUrl || "", candidateUrls: [r.postUrl].filter(Boolean), ledgerKey: key,
+                    closeResults: [], reason: "Self-heal re-drive: re-firing admin approval on a still-pending post FB has now had time to surface in the moderator queue.",
+                  }),
+                  new Promise((_, reject) => setTimeout(() => reject(new Error("self_heal_redrive_timeout:approve")), APPROVAL_REDRIVE_HUNG_TIMEOUT_MS)),
+                ]);
                 if (__ap?.ok || __ap?.approvalClicked) {
                   __redriveOk = true;
-                  await completeVerifiedFacebookPostWithComment({
-                    row: __rebuilt, ready: { profileId: r.profileId, imagePath: r.commentImagePath || "" },
-                    groupUrl: r.groupUrl || "", postUrl: (__ap.postUrl || r.postUrl),
-                    validation: __ap.validation || { ok: Boolean(__ap.ok), errors: [], warnings: ["self_heal_redrive"] },
-                    ledgerKey: key, attemptedGroups: [], closeResults: [], approvalResult: __ap,
-                  });
+                  await Promise.race([
+                    completeVerifiedFacebookPostWithComment({
+                      row: __rebuilt, ready: { profileId: r.profileId, imagePath: r.commentImagePath || "" },
+                      groupUrl: r.groupUrl || "", postUrl: (__ap.postUrl || r.postUrl),
+                      validation: __ap.validation || { ok: Boolean(__ap.ok), errors: [], warnings: ["self_heal_redrive"] },
+                      ledgerKey: key, attemptedGroups: [], closeResults: [], approvalResult: __ap,
+                    }),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error("self_heal_redrive_timeout:comment")), APPROVAL_REDRIVE_HUNG_TIMEOUT_MS)),
+                  ]);
                   logEvent("admin_approval_redrive_approved", { key, planId: r.planId, sequence: r.sequence, attempt: __attempt + 1, ageMin: Math.round(__ageMs / 60000) });
                   summary.healed += 1;
                 }
