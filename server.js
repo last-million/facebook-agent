@@ -603,6 +603,8 @@ function defaultState() {
       commentCooldownProbeHours: 4, // operator 2026-07-06: re-test a benched profile every N hours instead of waiting the full commentCooldownHours -- a real recovery re-enters rotation sooner
       commentCorroborationMinProfiles: 3, // 2026-07-06 review fix: minimum distinct profiles that must hit the identical comment_profile_cannot_access_post_permalink wall on the same post before treating it as a post-state (not profile-state) issue -- raised from a bare 2 so 2 correlated-broken profiles (shared dead proxy/restriction) can't mutually exonerate each other in one sweep
       commentCorroborationMinSpreadMinutes: 30, // 2026-07-06 review fix: those distinct-profile failures must also span at least this many minutes -- a same-sweep burst from correlated-broken profiles can't pass, while genuine slow-building corroboration (the calibration incident: 8 profiles/3.5h) still can
+      commentFastCooldownMinutes: 5, // operator 2026-07-14: fast comment-ONLY circuit-breaker for a clearly technical/profile-session failure (IXBrowser busy/open-fail/connector crash); never affects posting
+      commentFastCooldownFloor: 3,   // operator 2026-07-14: never let the fast cooldown drop a group's eligible-commenter pool below this many profiles
       autopilotMaxPostsPerRun: 0, // HARD per-run cap: 0 = unlimited; >0 = auto-disarm after exactly N confirmed posts
       autopilotPostsThisRun: 0, // counter of confirmed posts since the run was armed (reset on each fresh arm)
       autopilotWorkerStaggerSeconds: 25,
@@ -1811,6 +1813,8 @@ function normalizeWorkflowState(state) {
   state.operator.autopilotRunId = String(state.operator.autopilotRunId || "").slice(0, 40); // per-run product-claim namespace
   state.operator.commentCooldownHours = clampNumber(state.operator.commentCooldownHours, 1, 720, 24);
   state.operator.commentCooldownProbeHours = clampNumber(state.operator.commentCooldownProbeHours, 1, 48, 4);
+  state.operator.commentFastCooldownMinutes = clampNumber(state.operator.commentFastCooldownMinutes, 1, 60, 5);
+  state.operator.commentFastCooldownFloor = clampNumber(state.operator.commentFastCooldownFloor, 1, 20, 3);
   const blockedProfileLines = normalizedProfileListLines(state.ixbrowser?.blockedProfiles);
   // 2026-07-12: migrate a moderator out of blockedProfiles by keyword OR by ID-membership in moderatorProfiles, so a
   // moderator whose label lacks a clean "moderator" word ("113 - moderqtor5", "112 - moderator3") is never left stuck
@@ -12826,7 +12830,7 @@ function commentRecoveryFallbackProfilesForGroup(row, groupUrl, state = readStat
       if (candidates.length >= MAX_COMMENT_FALLBACK_PROFILES) break;
     }
   }
-  return candidates.slice(0, MAX_COMMENT_FALLBACK_PROFILES);
+  return applyFastCommentCooldownFloor(candidates, state).slice(0, MAX_COMMENT_FALLBACK_PROFILES);
 }
 
 async function ixBrowserCommentFallbackProfilesForGroup(row, groupUrl, state = readState(), options = {}) {
@@ -12876,7 +12880,7 @@ async function ixBrowserCommentFallbackProfilesForGroup(row, groupUrl, state = r
       total: rows.total || rows.profiles?.length || 0,
       candidates: candidates.length,
     });
-    return candidates;
+    return applyFastCommentCooldownFloor(candidates, state);
   } catch (err) {
     logEvent("comment_fallback_ixbrowser_profile_pool_failed", {
       groupUrl,
@@ -14273,6 +14277,73 @@ function commentCooldownBenchedSet(groupUrl, state = readState()) {
   return benched;
 }
 
+// FAST COMMENT-ONLY COOLDOWN (operator 2026-07-14): a SHORT (default 5min), profile-keyed, comment-ONLY
+// circuit-breaker for a clearly technical/session failure (IXBrowser profile-open/busy, connector
+// crash/timeout) -- NOT the slow 24h/4h commentCooldownBenchedSet bench (above), which is ledger-driven
+// and rebuilt from a full scan. This is a cheap in-memory Map, mirroring the existing
+// __commentRecoveryBackoff (server.js:16901-ish) style: module scope, resets on restart, no persistence,
+// no ledger read to check. ONLY ever consulted by the two comment-candidate-pool builders
+// (commentRecoveryFallbackProfilesForGroup / ixBrowserCommentFallbackProfilesForGroup, above) -- NEVER by
+// postingSlots or any posting path -- and NEVER allowed to shrink a group's eligible-commenter pool below
+// commentFastCooldownFloor (default 3; fail-open on the floor).
+const __fastCommentCooldown = new Map(); // profileId -> cooldownUntilMs
+
+function fastCommentCooldownActiveSet() {
+  const now = Date.now();
+  const active = new Set();
+  for (const [pid, until] of __fastCommentCooldown.entries()) {
+    if (until > now) active.add(pid);
+    else __fastCommentCooldown.delete(pid); // lazy sweep on read -- no timer needed
+  }
+  return active;
+}
+
+// STRICT SUBSET of isTransientCommentProfileFailure's whitelist (above), restricted to ONLY the
+// profile/session-technical corner (IXBrowser open/busy/connector-crash) -- deliberately EXCLUDES the
+// selector-miss tokens (comment_box_not_found etc.) and ALL post-state/pending reasons even though
+// isTransientCommentProfileFailure ALSO treats those as "not this profile's fault": evidence shows those
+// cluster on STUCK POSTS, not stuck profiles, so they must never drive a per-PROFILE cooldown. Matches the
+// raw err.message text with the PROVEN posting-side isOpenInfraFailure signature (autoBlacklistProfileIfNeeded,
+// below), plus the clean err.publicError/err.ixBrowserCode enums set at the connector throw site before they
+// collapse into free text.
+const FAST_COMMENT_COOLDOWN_TRIGGER_RE = /\b1004\b|\b1008\b|\b1009\b|\bserver busy\b|profile[ _-]?open[ _-]?failed|could not open (?:the )?profile|profile[ _-]?busy|profile[ _-]?in[ _-]?use|comment_recovery_profile_busy|ixbrowser_profile_busy|connectovercdp|connect over cdp|cdp (?:timeout|timed out|refused|closed|error)|websocket|reading ['"]ws['"]|target (?:page )?closed|browser has been closed|connection (?:closed|refused)|ECONNREFUSED|ECONNRESET|socket hang|connector timed out/i;
+const FAST_COMMENT_COOLDOWN_TRIGGER_PUBLIC_ERRORS = new Set(["facebook_live_post_connector_timeout", "ixbrowser_profile_open_failed", "ixbrowser_error"]);
+const FAST_COMMENT_COOLDOWN_TRIGGER_IX_CODES = new Set([500, 1004, 1008, 1009]);
+
+function isFastCommentCooldownTrigger(err, validation = {}) {
+  const errors = Array.isArray(validation?.errors) ? validation.errors.map((e) => String(e || "").toLowerCase()) : [];
+  if (errors.includes("comment_recovery_profile_busy")) return true;
+  if (err) {
+    if (FAST_COMMENT_COOLDOWN_TRIGGER_IX_CODES.has(Number(err.ixBrowserCode || 0))) return true;
+    if (FAST_COMMENT_COOLDOWN_TRIGGER_PUBLIC_ERRORS.has(String(err.publicError || ""))) return true;
+    if (FAST_COMMENT_COOLDOWN_TRIGGER_RE.test(String(err.message || ""))) return true;
+  }
+  return errors.some((e) => FAST_COMMENT_COOLDOWN_TRIGGER_RE.test(e));
+}
+
+function armFastCommentCooldown(profileId, state = readState()) {
+  const pid = Number(profileId) || 0;
+  if (!pid) return;
+  const minutes = clampNumber(state.operator?.commentFastCooldownMinutes, 1, 60, 5);
+  __fastCommentCooldown.set(pid, Date.now() + minutes * 60 * 1000);
+  try { logEvent("comment_fast_cooldown_armed", { profileId: pid, minutes }); } catch (_) {}
+}
+
+// HARD FLOOR (operator correction 2026-07-14): never let this cooldown drop a group's eligible-candidate
+// count below commentFastCooldownFloor (default 3) -- fail-open, let a cooling profile stay eligible
+// rather than starve the picker onto 1-2 repeats. Post-processes the SAME `candidates` array each builder
+// already produced (after every OTHER exclusion, including the existing 24h commentCooldownBenchedSet),
+// so the floor can never disagree with what the picker actually sees.
+function applyFastCommentCooldownFloor(candidates, state = readState()) {
+  const cooled = fastCommentCooldownActiveSet();
+  if (!cooled.size) return candidates;
+  const notCooling = candidates.filter((c) => !cooled.has(c.profileId));
+  const floor = clampNumber(state.operator?.commentFastCooldownFloor, 1, 20, 3);
+  if (notCooling.length >= floor) return notCooling;
+  const stillCooling = candidates.filter((c) => cooled.has(c.profileId));
+  return [...notCooling, ...stillCooling.slice(0, floor - notCooling.length)];
+}
+
 function successfulFacebookCommentProfilesForGroup(groupUrl, options = {}) {
   const groupKey = normalizedFacebookGroupKey(groupUrl);
   if (!groupKey) return [];
@@ -15439,6 +15510,7 @@ async function runFacebookCommentRecoveryAttempt({ row, profileId, profileLabel,
     releaseProfileUse = acquireNormalIxProfileUse(numericProfileId, "facebook_comment_recovery");
   } catch (err) {
     const validation = { ok: false, errors: ["comment_recovery_profile_busy"], warnings: [], commentRequired: true, commentSubmitted: false, commentVerified: false };
+    armFastCommentCooldown(numericProfileId, state); // literally busy RIGHT NOW -- always technical, always arm (fast comment-ONLY cooldown, operator 2026-07-14)
     appendFacebookLivePostLedger({
       event: "comment_recovery_skipped",
       key: ledgerKey,
@@ -15572,6 +15644,11 @@ async function runFacebookCommentRecoveryAttempt({ row, profileId, profileLabel,
       // ignores post-caused reasons by design, so a pending post can never strike a healthy commenter). NOT passing
       // postUrl (the classifier reads postUrl as proof-of-success). The hard-block case above keeps its dedicated
       // recorder — this else prevents double-recording it.
+      // FAST COMMENT-ONLY COOLDOWN (operator 2026-07-14): a strict subset of clearly technical/session failures
+      // (IXBrowser open/busy, connector crash/timeout) arms a SHORT (default 5min) comment-only bench for this
+      // profile -- never posting. isFastCommentCooldownTrigger deliberately excludes post-state/pending reasons,
+      // so this can never fire for a stuck-post failure (those stay excluded exactly as before).
+      if (isFastCommentCooldownTrigger(err, validation)) armFastCommentCooldown(numericProfileId, state);
       try { autoBlacklistProfileIfNeeded({ profileId: numericProfileId, profile: cleanProfile, ok: false, errorText: err.message || String(err), source: "comment_recovery" }); } catch (_) {}
     }
     appendFacebookLivePostLedger({
