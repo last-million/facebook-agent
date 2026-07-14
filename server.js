@@ -10324,7 +10324,8 @@ async function autopilotTickAsync(options = {}) {
     // catches any post whose inline comment attempt failed under 3-by-3). Fire-and-forget,
     // single-flight, armed-gated, throttled to once / 90s, yields to active posting.
     if (!dryRun && state.operator?.autopilotEnabled && state.operator?.armedForExternalActions
-        && !__commentResweepInFlight && !__forceResweepPending && (Date.now() - __lastCommentResweepAt) > 90000) {
+        && (!__commentResweepInFlight || isCommentResweepPassHung()) // 2026-07-14 hung-pass safety valve (see declaration)
+        && !__forceResweepPending && (Date.now() - __lastCommentResweepAt) > 90000) {
       resweepUncommentedFacebookPostsAsync({ max: 5 }).catch(() => {});
     }
     // KILL-MID-POST RECONCILE: recover any post interrupted by a watchdog kill (a publish_intent with no
@@ -16981,6 +16982,27 @@ let __commentResweepInFlight = null;
 // (2026-07-13 live incident: two old-run leftover posts never got a single force-resweep attempt across several
 // tries). This flag gives the explicit operator action priority for exactly one pass, not indefinitely.
 let __forceResweepPending = false;
+// HUNG-PASS SAFETY VALVE (2026-07-14 live incident: a 300-post run auto-disarmed cleanly, then the always-on
+// persistent/cold-backlog drain went totally silent for 4h09m -- ZERO automatic comment_recovery/resweep activity
+// of any kind, while every OTHER task on the same heartbeat (ixBrowser 5-min reconcile, retention sweep) kept
+// firing on schedule without a gap, and a manual force resweep instantly found + fixed the backlog). Root cause:
+// __commentResweepInFlight had NO time bound -- unlike normalIxProfileUseLocks (Tier A hung-window reaper,
+// ~25min) or the autopilot tick (AUTOPILOT_TICK_MAX_MS watchdog), nothing existed to notice a wedged pass and
+// force it open again, so the mutex's own "!__commentResweepInFlight" gate faithfully (and permanently) refused
+// every subsequent automatic attempt once one pass got stuck (most likely an ixBrowser/connector call that
+// outlived its nominal timeout without the underlying OS-level process/connection ever actually tearing down --
+// the same class of failure this file's hung-window reaper already exists to work around, just not on THIS
+// promise). __commentResweepGen is a generation counter: a pass captures its own generation before starting, and
+// only clears the mutex/flags in its finally if that generation is STILL current -- so force-clearing a hung pass
+// (heartbeat or a force call) can never be clobbered by that abandoned pass's belated (or eternal) settlement.
+let __commentResweepGen = 0;
+let __commentResweepInFlightStartedAt = 0; // wall-clock start of the CURRENT __commentResweepInFlight pass
+const COMMENT_RESWEEP_HUNG_MS = 45 * 60 * 1000; // safely above the worst LEGIT single pass (2 sequential
+// re-approvals x <=15min connector timeout each, MAX_REAPPROVALS_PER_PASS, then up to 15min more for the
+// slowest concurrent comment dispatch =~35min worst case) -- older than this is WEDGED, not just slow.
+function isCommentResweepPassHung() {
+  return !!(__commentResweepInFlight && __commentResweepInFlightStartedAt && (Date.now() - __commentResweepInFlightStartedAt) > COMMENT_RESWEEP_HUNG_MS);
+}
 let __lastCommentResweepAt = 0;
 // Per-post comment-recovery BACKOFF (operator 2026-06-15): a post that just failed its recovery (e.g. pending
 // approval / not yet visible) must NOT be re-cycled through profiles every 90s sweep — that was the overnight profile
@@ -17024,25 +17046,41 @@ let __lastColdBacklogDrainAt = 0;
 const COLD_BACKLOG_DRAIN_INTERVAL_MS = 15 * 60 * 1000;
 async function resweepUncommentedFacebookPostsAsync(options = {}) {
   if (__commentResweepInFlight) {
-    // FORCE MUST NEVER BE SILENTLY SWALLOWED (2026-07-13, live incident): a force call (the operator's explicit
-    // manual "Resweep comments" catch-up, options.force) landing while a periodic non-force drain was already
-    // in-flight used to just return that OTHER call's promise -- discarding force's own windowHours/run-clamp-bypass
-    // entirely. On a continuously-busy run the mutex is rarely free, so the operator's explicit catch-up could go
-    // an entire run without ever actually executing, with no error and no log line (checked stayed 0).
-    // NOT a recursive re-call after `await`ing the prior promise -- on a busy box the periodic heartbeat (every
-    // few seconds, server.js ~22800) can re-acquire the now-null mutex in the gap before a recursive call's own
-    // `await` resumes and re-checks it, so a force call could keep losing that race indefinitely. Awaiting here
-    // and falling through to claim the mutex on the very next (synchronous, non-async) line closes that gap: once
-    // the `await` resumes, nothing else can run before this function synchronously reassigns
-    // __commentResweepInFlight itself.
-    if (!options.force) return __commentResweepInFlight;
-    // Flag stays true across the await AND the mutex reassignment right below -- clearing it any earlier (e.g. in
-    // a finally attached to just this await) reopens the exact gap this exists to close, since the heartbeat's
-    // own check-then-call happens at its OWN call site, not here.
-    __forceResweepPending = true;
-    try { await __commentResweepInFlight; } catch (_) {}
+    // HUNG-PASS SAFETY VALVE (2026-07-14 incident, see the declarations above): a pass older than
+    // COMMENT_RESWEEP_HUNG_MS is treated as abandoned -- for BOTH a plain call (the heartbeat only reaches this
+    // function at all once its own outer gate treats a hung mutex as non-blocking) and an explicit force call
+    // (so the operator's manual rescue is never itself stuck awaiting a promise that may never settle). Orphan it
+    // via the generation bump so its own eventual/never finally cannot clobber a NEWER pass's state.
+    const __staleMs = __commentResweepInFlightStartedAt ? (Date.now() - __commentResweepInFlightStartedAt) : 0;
+    if (__staleMs > COMMENT_RESWEEP_HUNG_MS) {
+      logEvent("comment_resweep_hung_pass_force_cleared", { staleMs: __staleMs, via: options.force ? "force_call" : "auto" });
+      __commentResweepGen += 1;
+      __commentResweepInFlight = null;
+      __forceResweepPending = false;
+    } else if (!options.force) {
+      // FORCE MUST NEVER BE SILENTLY SWALLOWED (2026-07-13, live incident): a force call (the operator's explicit
+      // manual "Resweep comments" catch-up, options.force) landing while a periodic non-force drain was already
+      // in-flight used to just return that OTHER call's promise -- discarding force's own windowHours/run-clamp-bypass
+      // entirely. On a continuously-busy run the mutex is rarely free, so the operator's explicit catch-up could go
+      // an entire run without ever actually executing, with no error and no log line (checked stayed 0).
+      // NOT a recursive re-call after `await`ing the prior promise -- on a busy box the periodic heartbeat (every
+      // few seconds, server.js ~22800) can re-acquire the now-null mutex in the gap before a recursive call's own
+      // `await` resumes and re-checks it, so a force call could keep losing that race indefinitely. Awaiting here
+      // and falling through to claim the mutex on the very next (synchronous, non-async) line closes that gap: once
+      // the `await` resumes, nothing else can run before this function synchronously reassigns
+      // __commentResweepInFlight itself.
+      return __commentResweepInFlight;
+    } else {
+      // Flag stays true across the await AND the mutex reassignment right below -- clearing it any earlier (e.g. in
+      // a finally attached to just this await) reopens the exact gap this exists to close, since the heartbeat's
+      // own check-then-call happens at its OWN call site, not here.
+      __forceResweepPending = true;
+      try { await __commentResweepInFlight; } catch (_) {}
+    }
   }
   __forceResweepPending = false; // cleared the instant we're about to reclaim the mutex ourselves, synchronously, no await in between
+  const __myCommentResweepGen = ++__commentResweepGen; // this pass's generation -- its finally only clears shared state if still current
+  __commentResweepInFlightStartedAt = Date.now();
   __commentResweepInFlight = (async () => {
     const summary = { checked: 0, recommented: 0, stillMissing: 0, errors: [] };
     try {
@@ -17422,9 +17460,15 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
     } catch (err) {
       summary.errors.push("fatal:" + oneLineField(err.message || String(err), 160));
     } finally {
-      __forcedCommentResweepActive = false;
-      __lastCommentResweepAt = Date.now();
-      __commentResweepInFlight = null;
+      // GENERATION GUARD (2026-07-14 hung-pass safety valve): if this pass was already declared HUNG and orphaned
+      // (heartbeat or a force call bumped __commentResweepGen and started a newer pass), this pass's generation is
+      // now stale -- its belated (or eternal) settlement must NOT clobber state a NEWER, live pass already owns.
+      if (__commentResweepGen === __myCommentResweepGen) {
+        __forcedCommentResweepActive = false;
+        __lastCommentResweepAt = Date.now();
+        __commentResweepInFlight = null;
+        __commentResweepInFlightStartedAt = 0;
+      }
     }
     if (summary.checked || summary.recommented || summary.reapproved || summary.errors.length) {
       logEvent("facebook_comment_resweep_complete", summary);
@@ -23066,7 +23110,10 @@ setInterval(() => {
   // flight, never reposts, never double-comments (the latestDifferentProfileVerifiedCommentForPost guard inside),
   // yields to active posting. ZERO browsers at rest: the latestPublishedFacebookPostAtMs gate is a no-op once no
   // post was published in the last 60 min.
-  if (!__commentResweepInFlight
+  if ((!__commentResweepInFlight || isCommentResweepPassHung()) // 2026-07-14: a HUNG pass (no time bound previously
+                                 // existed) must not permanently block the always-on drain -- treat it as free so
+                                 // the call below reaches resweepUncommentedFacebookPostsAsync's own safety valve,
+                                 // which force-clears it (loudly logged) and starts a fresh pass.
       && !__forceResweepPending // stand down for one tick so a waiting explicit force resweep (operator's manual
                                  // catch-up) actually gets the mutex instead of losing the race to this heartbeat
                                  // forever on a continuously-busy run (2026-07-13 live incident)
