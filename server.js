@@ -16997,11 +16997,24 @@ let __forceResweepPending = false;
 // (heartbeat or a force call) can never be clobbered by that abandoned pass's belated (or eternal) settlement.
 let __commentResweepGen = 0;
 let __commentResweepInFlightStartedAt = 0; // wall-clock start of the CURRENT __commentResweepInFlight pass
-const COMMENT_RESWEEP_HUNG_MS = 45 * 60 * 1000; // safely above the worst LEGIT single pass (2 sequential
-// re-approvals x <=15min connector timeout each, MAX_REAPPROVALS_PER_PASS, then up to 15min more for the
-// slowest concurrent comment dispatch =~35min worst case) -- older than this is WEDGED, not just slow.
+// NO-PROGRESS GUARD (2026-07-14 adversarial-verify finding, independently raised by 2 of 3 reviewers): a flat
+// elapsed-time-only threshold misfires on the exact scenario this valve exists to help recover from -- a
+// legitimately busy pass clearing a large backlog (up to maxToFix=50 candidates behind a maxConcurrentComments
+// 2-4 semaphore, each documented at 5-15min per post, see ~17278) can genuinely exceed 45min with ZERO hang,
+// most likely right after THIS fix's own deploy restart clears every in-memory backoff/cap. Mirrors the
+// AUTOPILOT_TICK_MAX_MS pattern already proven in this file (a slow-but-working tick is never reset): only
+// declare hung when BOTH the pass is stale AND nothing has settled (a candidate/re-approval) in that same
+// window. Stamped at pass start and after every candidate/re-approval settles below.
+let __commentResweepLastProgressAt = 0;
+const COMMENT_RESWEEP_HUNG_MS = 45 * 60 * 1000; // a floor, not a proven bound by itself -- the no-progress
+// check above is what actually protects a genuinely busy pass from being force-cleared.
+const COMMENT_RESWEEP_FORCE_POLL_MS = 30 * 1000; // force-wait re-check cadence, see the force branch below
 function isCommentResweepPassHung() {
-  return !!(__commentResweepInFlight && __commentResweepInFlightStartedAt && (Date.now() - __commentResweepInFlightStartedAt) > COMMENT_RESWEEP_HUNG_MS);
+  return !!(__commentResweepInFlight
+    && __commentResweepInFlightStartedAt
+    && (Date.now() - __commentResweepInFlightStartedAt) > COMMENT_RESWEEP_HUNG_MS
+    && __commentResweepLastProgressAt
+    && (Date.now() - __commentResweepLastProgressAt) > COMMENT_RESWEEP_HUNG_MS);
 }
 let __lastCommentResweepAt = 0;
 // Per-post comment-recovery BACKOFF (operator 2026-06-15): a post that just failed its recovery (e.g. pending
@@ -17045,42 +17058,61 @@ const PERSISTENT_DRAIN_WINDOW_MS = 60 * 60 * 1000;    // keep draining up to 60 
 let __lastColdBacklogDrainAt = 0;
 const COLD_BACKLOG_DRAIN_INTERVAL_MS = 15 * 60 * 1000;
 async function resweepUncommentedFacebookPostsAsync(options = {}) {
-  if (__commentResweepInFlight) {
-    // HUNG-PASS SAFETY VALVE (2026-07-14 incident, see the declarations above): a pass older than
-    // COMMENT_RESWEEP_HUNG_MS is treated as abandoned -- for BOTH a plain call (the heartbeat only reaches this
-    // function at all once its own outer gate treats a hung mutex as non-blocking) and an explicit force call
-    // (so the operator's manual rescue is never itself stuck awaiting a promise that may never settle). Orphan it
-    // via the generation bump so its own eventual/never finally cannot clobber a NEWER pass's state.
-    const __staleMs = __commentResweepInFlightStartedAt ? (Date.now() - __commentResweepInFlightStartedAt) : 0;
-    if (__staleMs > COMMENT_RESWEEP_HUNG_MS) {
+  // HUNG-PASS SAFETY VALVE (2026-07-14 incident, see the declarations above; restructured as a `while` after a
+  // 2nd adversarial-verify round found TWO defects in the first cut of this valve): isCommentResweepPassHung()
+  // requires BOTH staleness AND no progress -- a raw elapsed-time-only check here (the first cut's bug) would
+  // reintroduce the exact false-positive misfire the no-progress guard exists to prevent, because this is the
+  // ONLY check three direct callers ever reach without a heartbeat pre-gate: the operator's manual "Resweep
+  // comments" endpoint and the stop/run-end finish-drain loops. The `while` (rather than a one-shot check-then-
+  // fallthrough) closes a clobber race the first cut also had: a force caller that wakes from its poll must
+  // re-read __commentResweepInFlight FRESH, because another caller may have already cleared the pass it was
+  // waiting on AND started a brand-new, healthy, non-hung pass in the meantime -- falling through unconditionally
+  // would silently discard that new pass and spin up a redundant 3rd one. Looping back re-evaluates from scratch
+  // (mutex now null -> exit and reclaim; same pass still busy -> re-check hung; a DIFFERENT fresh pass -> wait on
+  // THAT one instead, never clobbering it).
+  while (__commentResweepInFlight) {
+    if (isCommentResweepPassHung()) {
+      // Orphan the hung pass via the generation bump so its own eventual/never finally cannot clobber the NEWER
+      // pass this call is about to start. Applies to BOTH a plain call (the heartbeat only reaches this function
+      // at all once its own outer gate treats a hung mutex as non-blocking) and an explicit force call (so the
+      // operator's manual rescue is never itself stuck awaiting a promise that may never settle).
+      const __staleMs = __commentResweepInFlightStartedAt ? (Date.now() - __commentResweepInFlightStartedAt) : 0;
       logEvent("comment_resweep_hung_pass_force_cleared", { staleMs: __staleMs, via: options.force ? "force_call" : "auto" });
       __commentResweepGen += 1;
       __commentResweepInFlight = null;
       __forceResweepPending = false;
+      break; // mutex now free -- exit the loop and reclaim it below
     } else if (!options.force) {
       // FORCE MUST NEVER BE SILENTLY SWALLOWED (2026-07-13, live incident): a force call (the operator's explicit
       // manual "Resweep comments" catch-up, options.force) landing while a periodic non-force drain was already
       // in-flight used to just return that OTHER call's promise -- discarding force's own windowHours/run-clamp-bypass
       // entirely. On a continuously-busy run the mutex is rarely free, so the operator's explicit catch-up could go
-      // an entire run without ever actually executing, with no error and no log line (checked stayed 0).
-      // NOT a recursive re-call after `await`ing the prior promise -- on a busy box the periodic heartbeat (every
-      // few seconds, server.js ~22800) can re-acquire the now-null mutex in the gap before a recursive call's own
-      // `await` resumes and re-checks it, so a force call could keep losing that race indefinitely. Awaiting here
-      // and falling through to claim the mutex on the very next (synchronous, non-async) line closes that gap: once
-      // the `await` resumes, nothing else can run before this function synchronously reassigns
-      // __commentResweepInFlight itself.
+      // an entire run without ever actually executing, with no error and no log line (checked stayed 0). A plain
+      // (non-force) caller never waits -- it just returns whatever promise is currently in flight.
       return __commentResweepInFlight;
     } else {
-      // Flag stays true across the await AND the mutex reassignment right below -- clearing it any earlier (e.g. in
-      // a finally attached to just this await) reopens the exact gap this exists to close, since the heartbeat's
+      // Flag stays true across the wait AND the mutex reassignment right below -- clearing it any earlier (e.g. in
+      // a finally attached to just this wait) reopens the exact gap this exists to close, since the heartbeat's
       // own check-then-call happens at its OWN call site, not here.
       __forceResweepPending = true;
-      try { await __commentResweepInFlight; } catch (_) {}
+      // BOUNDED WAIT (2026-07-14 adversarial-verify finding): a bare unconditional `await` on this promise could
+      // get stuck exactly like the original incident if the pass it joined goes hung moments later. Poll instead:
+      // periodically re-evaluate isCommentResweepPassHung() (via the outer while) so a force call is never at the
+      // mercy of a promise that may never settle. Safe against a double-clear race: the condition check + hung
+      // check + clear are fully synchronous (no await between them), so whichever caller's poll tick (or the
+      // heartbeat's own entry check) runs first atomically nulls the mutex before any other caller's next
+      // synchronous turn re-checks it.
+      await Promise.race([
+        __commentResweepInFlight.catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, COMMENT_RESWEEP_FORCE_POLL_MS)),
+      ]);
+      // loop back around to the top of the while: re-reads __commentResweepInFlight fresh (see comment above the loop)
     }
   }
   __forceResweepPending = false; // cleared the instant we're about to reclaim the mutex ourselves, synchronously, no await in between
   const __myCommentResweepGen = ++__commentResweepGen; // this pass's generation -- its finally only clears shared state if still current
   __commentResweepInFlightStartedAt = Date.now();
+  __commentResweepLastProgressAt = Date.now(); // no-progress clock starts at pass start; advanced by every candidate/re-approval settlement below
   __commentResweepInFlight = (async () => {
     const summary = { checked: 0, recommented: 0, stillMissing: 0, errors: [] };
     try {
@@ -17429,32 +17461,37 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
           });
         } catch (e) { summary.errors.push("reapprove:" + oneLineField(e.message || String(e), 120)); }
         summary.reapproved = (summary.reapproved || 0) + 1;
+        __commentResweepLastProgressAt = Date.now(); // no-progress guard: a completed re-approval attempt (success or caught error) counts as progress
       }
       await Promise.allSettled(__candidates.map(async (c) => {
-        if (!options.drain && !options.ignoreArmedGate && !options.force) await waitForPostingIdle({ label: "comment_resweep" });
-        else await waitForPostingIdle({ label: "comment_resweep", maxWaitMs: 15000 });
-        if (latestDifferentProfileVerifiedCommentForPost(c.postUrl, c.publisherId)) return; // a concurrent post may have just commented it
-        summary.checked += 1;
-        const groupUrl = facebookGroupUrlFromPostUrl(c.postUrl) || c.ev.actualGroupUrl || c.ev.groupUrl || c.row.groupUrl;
-        const ready = { profileId: c.publisherId, imagePath: c.row.imagePath || c.ev.imagePath || "" };
-        const closeResults = [];
         try {
-          const res = await addRequiredFirstCommentWithDifferentProfile({
-            row: c.row,
-            ready,
-            groupUrl,
-            postUrl: c.postUrl,
-            imagePath: ready.imagePath,
-            postValidation: { ok: true, errors: [], warnings: ["comment_resweep_recover"] },
-            ledgerKey: livePostLedgerKey(c.row, c.publisherId),
-            closeResults,
-          });
-          if (res?.skipped) { summary.skippedInFlight = (summary.skippedInFlight || 0) + 1; } // DOUBLE-COMMENT GUARD: the per-post in-flight lock skipped this — ANOTHER attempt is actively committing the comment. NOT a failure: do not count it stillMissing and do NOT stamp the backoff (that 8-min poison would delay re-checking a post that ends up genuinely uncommented if the in-flight attempt fails). Left un-backed-off, the next sweep re-checks it immediately.
-          else if (res?.ok || latestDifferentProfileVerifiedCommentForPost(c.postUrl, c.publisherId)) summary.recommented += 1;
-          else { summary.stillMissing += 1; if (c.__forcedSweep) __commentRecoveryBackoff.set(c.postUrl, Date.now()); } // forced sweep: stamp backoff only AFTER a real failure, so a clean attempt isn't poisoned by a race
-        } catch (err) {
-          if (c.__forcedSweep) __commentRecoveryBackoff.set(c.postUrl, Date.now()); // forced sweep: a thrown attempt also backs off (parity with the set-before path)
-          summary.errors.push(oneLineField(err.message || String(err), 160));
+          if (!options.drain && !options.ignoreArmedGate && !options.force) await waitForPostingIdle({ label: "comment_resweep" });
+          else await waitForPostingIdle({ label: "comment_resweep", maxWaitMs: 15000 });
+          if (latestDifferentProfileVerifiedCommentForPost(c.postUrl, c.publisherId)) return; // a concurrent post may have just commented it
+          summary.checked += 1;
+          const groupUrl = facebookGroupUrlFromPostUrl(c.postUrl) || c.ev.actualGroupUrl || c.ev.groupUrl || c.row.groupUrl;
+          const ready = { profileId: c.publisherId, imagePath: c.row.imagePath || c.ev.imagePath || "" };
+          const closeResults = [];
+          try {
+            const res = await addRequiredFirstCommentWithDifferentProfile({
+              row: c.row,
+              ready,
+              groupUrl,
+              postUrl: c.postUrl,
+              imagePath: ready.imagePath,
+              postValidation: { ok: true, errors: [], warnings: ["comment_resweep_recover"] },
+              ledgerKey: livePostLedgerKey(c.row, c.publisherId),
+              closeResults,
+            });
+            if (res?.skipped) { summary.skippedInFlight = (summary.skippedInFlight || 0) + 1; } // DOUBLE-COMMENT GUARD: the per-post in-flight lock skipped this — ANOTHER attempt is actively committing the comment. NOT a failure: do not count it stillMissing and do NOT stamp the backoff (that 8-min poison would delay re-checking a post that ends up genuinely uncommented if the in-flight attempt fails). Left un-backed-off, the next sweep re-checks it immediately.
+            else if (res?.ok || latestDifferentProfileVerifiedCommentForPost(c.postUrl, c.publisherId)) summary.recommented += 1;
+            else { summary.stillMissing += 1; if (c.__forcedSweep) __commentRecoveryBackoff.set(c.postUrl, Date.now()); } // forced sweep: stamp backoff only AFTER a real failure, so a clean attempt isn't poisoned by a race
+          } catch (err) {
+            if (c.__forcedSweep) __commentRecoveryBackoff.set(c.postUrl, Date.now()); // forced sweep: a thrown attempt also backs off (parity with the set-before path)
+            summary.errors.push(oneLineField(err.message || String(err), 160));
+          }
+        } finally {
+          __commentResweepLastProgressAt = Date.now(); // no-progress guard: any settlement (skip/success/failure) of a real candidate counts as progress
         }
       }));
     } catch (err) {
