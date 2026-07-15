@@ -23741,6 +23741,19 @@ function buildRunReports(force = false) {
   // history of a wedge tied to redundant reads of that file, avoid the repeated deepMerge/normalize/stringify cost.
   let __configuredGroupUrls = [];
   try { __configuredGroupUrls = (readState().posting?.groupAssignmentData || []).map((e) => e?.url || "").filter(Boolean); } catch (_) {}
+  // HOISTED (2026-07-15, same reasoning as __configuredGroupUrls above): readHarvestedProducts() re-parses the
+  // WHOLE harvested-products.jsonl file (no cache, unlike readJsonlAbsoluteFile) AND re-merges lastPostedAtByGroup
+  // across every line for every record on each call -- calling it once PER PRODUCT PER RUN (as harvestedRecordForKey
+  // would) turned an O(file size) read into O(products x runs x file size), which timed out the report endpoint on
+  // first deploy. Read it ONCE for this whole report pass and index by key for O(1) lookups below.
+  let __harvestedByKey = new Map();
+  try {
+    for (const rec of readHarvestedProducts()) {
+      if (!rec) continue;
+      const k = rec.productKey || harvestSyntheticKey(rec.firstCommentUrl);
+      if (k) __harvestedByKey.set(k, rec);
+    }
+  } catch (_) {}
   const out = runsRaw.map((run, idx) => {
     const groups = {};
     const gaps = [];
@@ -23787,7 +23800,23 @@ function buildRunReports(force = false) {
       detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profilePubLabel: String(p.profile || ""), profileCom: c ? c.profileId : null, profileComLabel: c ? String(c.profile || "") : "", productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable", wasPendingApproval: Boolean(__pendingStart), approvalWaitMinutes, approvedByModerator, approvalDurationMinutes });
       if (p.approvalVerification === "soft_clicked" && !c) softApproved += 1;
     }
-    const products = productOrder.map((pm) => ({ num: pm.num, key: pm.key, shortKey: pm.key.replace(/^harvested:/, ""), title: pm.title, total: pm.total, groups: pm.groups, groupCount: Object.keys(pm.groups).length, profiles: Array.from(pm.profiles) }));
+    // LIFETIME COVERAGE (operator 2026-07-15: "why he dont post the same product in all groupes" -- traced live:
+    // postToAllGroups coverage genuinely DOES reach every configured group per product, just spread across
+    // multiple reuse cycles (sometimes days apart, gated by each group's own reuse cooldown) rather than all
+    // within one run. This run's own groupCount alone made a fully-covered product look stuck/broken. Read the
+    // harvested-products record's lastPostedAtByGroup (already a cross-line MERGED union per group, see
+    // readHarvestedProducts) to show true all-time coverage next to this run's count. Folds in THIS run's own
+    // groups too, in case the record's on-disk write hasn't landed at the instant this report renders.
+    const products = productOrder.map((pm) => {
+      let lifetimeGroupCount = pm.groupCount;
+      try {
+        const hrec = __harvestedByKey.get(pm.key);
+        const keys = new Set(Object.keys(pm.groups));
+        if (hrec && hrec.lastPostedAtByGroup) for (const g of Object.keys(hrec.lastPostedAtByGroup)) keys.add(__reportGroupName(g));
+        lifetimeGroupCount = keys.size;
+      } catch (_) {}
+      return { num: pm.num, key: pm.key, shortKey: pm.key.replace(/^harvested:/, ""), title: pm.title, total: pm.total, groups: pm.groups, groupCount: Object.keys(pm.groups).length, lifetimeGroupCount, profiles: Array.from(pm.profiles) };
+    });
     const productsInBoth = products.filter((p) => p.groupCount >= 2).length;
     const winHeld = held.filter((e) => { const t = Date.parse(e.at || 0); return Number.isFinite(t) && t >= run.startT - 60000 && t <= (run.lastT || Date.now()) + 600000; });
     const heldByGroup = {};
@@ -23828,6 +23857,7 @@ function buildRunReports(force = false) {
       // INTERNAL ONLY (2026-07-05, not read by report.html): this run's own post identities, so a single-run
       // dismiss can permanently exclude exactly these posts by __postKey, immune to future cluster merges.
       postKeys: run.posts.map(__postKey),
+      configuredGroupCount: __configuredGroupUrls.length,
       durationMin: Math.round((run.lastT - run.startT) / 60000),
       avgPostIntervalSec,
       posts: run.posts.length,

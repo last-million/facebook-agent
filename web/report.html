@@ -323,9 +323,19 @@ function runBody(r){
     html += '<h2>By product <span class="ln"></span> <span class="tag">'+(r.productsInBoth||0)+'/'+(r.uniqueProducts||prods.length)+' in both groups</span></h2>';
     html += '<div class="tablecard"><table class="detail"><thead><tr>'
       + '<th>Product</th><th>Title</th><th>Posted</th><th>Groups</th><th>Profiles</th></tr></thead><tbody>';
+    var totalGroups = r.configuredGroupCount || 0;
     html += prods.map(function(p){
       var gl = Object.keys(p.groups||{}).map(function(g){ return grpPill(g)+' ×'+p.groups[g]; }).join(' ');
       var multi = (p.groupCount>=2) ? '<span class="ok">✓ '+p.groupCount+' groups</span>' : '<span class="slow">⚠ only 1</span>';
+      // LIFETIME COVERAGE (operator 2026-07-15: "why he dont post the same product in all groupes"): a product
+      // often finishes covering every configured group across SEVERAL reuse cycles (sometimes days apart, gated
+      // by each group's own reuse cooldown), not within one run — this run's own groupCount alone made a fully-
+      // covered product look stuck. Show the all-time figure next to it so that's clear at a glance.
+      if (totalGroups) {
+        var lifetime = p.lifetimeGroupCount!=null ? p.lifetimeGroupCount : p.groupCount;
+        if (lifetime >= totalGroups) multi += ' <span class="pill x ok" title="This product has reached every configured group across all runs, not just this one">✓ '+totalGroups+'/'+totalGroups+' all-time</span>';
+        else multi += ' <span class="pill x '+(lifetime>p.groupCount?'ok':'slow')+'" title="Groups reached across ALL runs, not just this one">'+lifetime+'/'+totalGroups+' all-time</span>';
+      }
       var prof = (p.profiles||[]).join(', ');
       var ttl = (p.title||p.shortKey||'').toString();
       return '<tr>'
