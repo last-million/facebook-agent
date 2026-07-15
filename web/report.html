@@ -296,7 +296,7 @@ function runBody(r){
         + '<td data-l="Posted by">'+poster+'</td>'
         + '<td data-l="Approved by">'+esc(String(d.approvedByModerator))+'</td>'
         + '<td data-l="Waited" class="'+(waitedMin!=null && waitedMin>=30?'no':'slow')+'">'+waitedTxt+'</td>'
-        + '<td data-l="Commented">'+(d.commentedAt?fmtTime(d.commentedAt):'<span class="no">not yet</span>')+'</td>'
+        + '<td data-l="Commented">'+(d.commentedAt?(fmtTime(d.commentedAt)+' <span class="pill x '+gapClass(d.gapSec)+'" title="Time from this post being approved to the comment landing">'+fmtGap(d.gapSec)+' after approval</span>'):'<span class="no">not yet</span>')+'</td>'
         + '<td data-l="Commented by">'+(d.commentedAt?commenter:'<span class="no">—</span>')+'</td></tr>';
     }).join("");
     html += '</tbody></table></div>';
