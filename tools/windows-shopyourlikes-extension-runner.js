@@ -21,7 +21,7 @@ function cdpEndpointFromIxOpenResult(result = {}) {
   for (const candidate of candidates) {
     const value = String(candidate);
     if (value.startsWith("ws://") || value.startsWith("http://")) return value;
-    if (/^(?:\d+\.\d+\.\d+\.\d+|127\.0\.0\.1|localhost):\d+$/i.test(value)) return `http://${value}`;
+    if (/^(?:\d+\.\d+\.\d+\.\d+|localhost):\d+$/i.test(value)) return `http://${value}`;
   }
   throw new Error(`IXBrowser opened the profile but did not return a CDP endpoint: ${JSON.stringify(result).slice(0, 500)}`);
 }

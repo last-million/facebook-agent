@@ -363,10 +363,12 @@ const SESSION_TOKEN = loadOrCreateDashboardToken();
 const PROMPT_INJECTION_PATTERN = /\b(ignore|disregard|override|forget)\s+(all\s+)?(previous|prior|above|system|developer|instructions?)|system prompt|developer message|jailbreak|do anything now/i;
 const EXTERNAL_SERVICE_TIMEOUT_MS = 20000;
 const IXBROWSER_DEFAULT_LOCAL_ENDPOINT = "http://127.0.0.1:53200/";
-const IXBROWSER_API_PATH_CANDIDATES = ["/", "/api/v2/"];
+const IXBROWSER_API_PATH_CANDIDATES = ["/", "/api/", "/api/v1/", "/api/v2/", "/api/v3/", "/api/v4/", "/api/v5/"];
 const IXBROWSER_LOOPBACK_HOST_CANDIDATES = ["127.0.0.1", "127.0.0.2"];
-const IXBROWSER_API_DISCOVERY_TIMEOUT_MS = 5000;
+const IXBROWSER_API_DISCOVERY_TIMEOUT_MS = 2000;
 const IXBROWSER_API_DISCOVERY_CACHE_MS = 5 * 60 * 1000;
+const IXBROWSER_LISTENING_DISCOVERY_CACHE_MS = 30000;
+const IXBROWSER_LISTENING_DISCOVERY_TIMEOUT_MS = 3500;
 const ALLOWED_WEBSHARE_HOSTS = new Set(["proxy.webshare.io"]);
 const ALLOWED_MAVLYNK_HOSTS = new Set(["mavlynk.com", "www.mavlynk.com"]);
 const ALLOWED_FIRECRAWL_HOSTS = new Set(["api.firecrawl.dev", "127.0.0.1", "localhost"]);
@@ -418,6 +420,7 @@ let heartbeat = {
 let lastAuthFailureLogAt = 0;
 let lastIxBrowserAutoOpenAt = 0;
 let ixBrowserApiBaseCache = { configuredBaseUrl: "", effectiveBaseUrl: "", at: 0 };
+let ixBrowserListeningEndpointCache = { endpoints: [], at: 0 };
 const ixBrowserCdpEndpointCache = new Map();
 const ixBrowserProfileOpenLocks = new Map();
 const normalIxProfileUseLocks = new Map();
@@ -936,7 +939,7 @@ function defaultSecrets() {
     ixbrowser: {
       apiKey: "",
       baseUrl: IXBROWSER_DEFAULT_LOCAL_ENDPOINT,
-      notes: "ixBrowser local API usually does not require an API key. Keep it on 127.0.0.1; the API path is detected automatically.",
+      notes: "ixBrowser local API usually does not require an API key. The agent auto-detects its local loopback host, port, and API path, then heals the saved endpoint.",
     },
     shopyourlikes: {
       apiKey: "",
@@ -5045,7 +5048,7 @@ function chatGptCdpUrl(assetState = {}) {
   const raw = String(assetState.chatgptEdgeCdp || "http://127.0.0.1:9334").trim();
   const url = new URL(raw || "http://127.0.0.1:9334");
   const host = url.hostname.toLowerCase();
-  if (!["127.0.0.1", "localhost", "::1"].includes(host)) {
+  if (!/^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(host) && !["localhost", "::1"].includes(host)) {
     throw new Error("ChatGPT browser CDP must stay on localhost/127.0.0.1.");
   }
   if (url.protocol !== "http:") {
@@ -22180,7 +22183,51 @@ try {
   }
 }
 
-function ixBrowserApiCandidateBaseUrls(configuredBaseUrl) {
+function isIxBrowserLoopbackHost(host) {
+  const value = String(host || "").toLowerCase();
+  return value === "localhost" || value === "::1" || /^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(value);
+}
+
+async function discoverIxBrowserListeningEndpoints() {
+  const now = Date.now();
+  if (now - ixBrowserListeningEndpointCache.at < IXBROWSER_LISTENING_DISCOVERY_CACHE_MS) {
+    return ixBrowserListeningEndpointCache.endpoints;
+  }
+  if (process.platform !== "win32") {
+    ixBrowserListeningEndpointCache = { endpoints: [], at: now };
+    return [];
+  }
+  const script = `
+$ids = @(Get-Process -Name 'ixBrowser' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
+if ($ids.Count -eq 0) { exit 0 }
+Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+  Where-Object { $ids -contains [int]$_.OwningProcess } |
+  ForEach-Object {
+    $address = [string]$_.LocalAddress
+    if ($address -eq '0.0.0.0' -or $address -eq '::' -or $address -eq '::1' -or $address -like '127.*') {
+      Write-Output ($address + '|' + [int]$_.LocalPort)
+    }
+  }
+`;
+  try {
+    const { stdout } = await execFileAsync("powershell.exe", [
+      "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script,
+    ], { windowsHide: true, timeout: IXBROWSER_LISTENING_DISCOVERY_TIMEOUT_MS, maxBuffer: 32 * 1024 });
+    const endpoints = String(stdout || "")
+      .split(/\r?\n/)
+      .map((line) => line.trim().split("|"))
+      .filter(([host, port]) => (host === "0.0.0.0" || host === "::" || host === "::1" || isIxBrowserLoopbackHost(host)) && /^\d+$/.test(port || ""))
+      .map(([host, port]) => ({ host, port: String(Number(port)) }));
+    ixBrowserListeningEndpointCache = { endpoints, at: now };
+    return endpoints;
+  } catch (err) {
+    ixBrowserListeningEndpointCache = { endpoints: [], at: now };
+    logEvent("ixbrowser_local_listening_discovery_failed", { error: oneLineField(err.message || String(err), 180) });
+    return [];
+  }
+}
+
+function ixBrowserApiCandidateBaseUrls(configuredBaseUrl, discoveredEndpoints = []) {
   const configured = normalizeIxBrowserBaseUrl(configuredBaseUrl || defaultSecrets().ixbrowser.baseUrl);
   const configuredUrl = new URL(configured);
   const seen = new Set();
@@ -22192,14 +22239,24 @@ function ixBrowserApiCandidateBaseUrls(configuredBaseUrl) {
     candidates.push(normalized);
   };
   add(configured);
-  const hostnames = ["localhost", "127.0.0.1"].includes(configuredUrl.hostname.toLowerCase())
+  const hostnames = new Set(isIxBrowserLoopbackHost(configuredUrl.hostname)
     ? IXBROWSER_LOOPBACK_HOST_CANDIDATES
-    : [configuredUrl.hostname];
+    : [configuredUrl.hostname]);
+  const ports = new Set([configuredUrl.port || "53200"]);
+  for (const endpoint of discoveredEndpoints) {
+    if (/^\d+$/.test(endpoint?.port || "")) ports.add(String(Number(endpoint.port)));
+    if (isIxBrowserLoopbackHost(endpoint?.host)) hostnames.add(String(endpoint.host).toLowerCase());
+  }
+  const paths = [configuredUrl.pathname, ...IXBROWSER_API_PATH_CANDIDATES];
   for (const hostname of hostnames) {
-    for (const pathname of IXBROWSER_API_PATH_CANDIDATES) {
-      const url = new URL(pathname, configured);
-      url.hostname = hostname;
-      add(url.toString());
+    for (const port of ports) {
+      for (const pathname of paths) {
+        const url = new URL(configured);
+        url.hostname = hostname;
+        url.port = port;
+        url.pathname = pathname;
+        add(url.toString());
+      }
     }
   }
   return candidates;
@@ -22207,9 +22264,16 @@ function ixBrowserApiCandidateBaseUrls(configuredBaseUrl) {
 
 function isIxBrowserApiShape(payload) {
   if (!payload || typeof payload !== "object") return false;
-  if (payload.error && typeof payload.error.code !== "undefined") return true;
-  if (typeof payload.code !== "undefined" && (Object.prototype.hasOwnProperty.call(payload, "data") || Object.prototype.hasOwnProperty.call(payload, "msg"))) return true;
-  return Array.isArray(payload.data) || Array.isArray(payload.list) || (payload.data && typeof payload.data === "object" && (Array.isArray(payload.data.data) || Array.isArray(payload.data.list)));
+  if (payload.error?.relay === "ixbrowser-wsl-relay") return false;
+  const hasProfileData = Array.isArray(payload.data)
+    || Array.isArray(payload.list)
+    || (payload.data && typeof payload.data === "object" && (Array.isArray(payload.data.data) || Array.isArray(payload.data.list)));
+  if (hasProfileData) return true;
+  const code = Number(payload.error?.code ?? payload.code);
+  // Wrong API paths return a JSON IX error (1007), so an error-shaped response
+  // alone must not make discovery accept that path.
+  if (code === 1007) return false;
+  return Boolean(payload.error && typeof payload.error.code !== "undefined") || (code === 0 && Object.prototype.hasOwnProperty.call(payload, "data"));
 }
 
 async function probeIxBrowserApiBaseUrl(baseUrl, headers) {
@@ -22223,10 +22287,11 @@ async function probeIxBrowserApiBaseUrl(baseUrl, headers) {
   return isIxBrowserApiShape(payload);
 }
 
-async function resolveIxBrowserApiBaseUrl(secrets = readSecrets()) {
+async function resolveIxBrowserApiBaseUrl(secrets = readSecrets(), options = {}) {
   const configured = normalizeIxBrowserBaseUrl(secrets.ixbrowser.baseUrl || defaultSecrets().ixbrowser.baseUrl);
   const now = Date.now();
   if (
+    !options.force &&
     ixBrowserApiBaseCache.configuredBaseUrl === configured &&
     ixBrowserApiBaseCache.effectiveBaseUrl &&
     now - ixBrowserApiBaseCache.at < IXBROWSER_API_DISCOVERY_CACHE_MS
@@ -22236,12 +22301,22 @@ async function resolveIxBrowserApiBaseUrl(secrets = readSecrets()) {
   const headers = { "content-type": "application/json" };
   if (secrets.ixbrowser.apiKey) headers.Authorization = `Bearer ${secrets.ixbrowser.apiKey}`;
   const failures = [];
-  for (const candidate of ixBrowserApiCandidateBaseUrls(configured)) {
+  const listeningEndpoints = await discoverIxBrowserListeningEndpoints();
+  for (const candidate of ixBrowserApiCandidateBaseUrls(configured, listeningEndpoints)) {
     try {
       if (await probeIxBrowserApiBaseUrl(candidate, headers)) {
         ixBrowserApiBaseCache = { configuredBaseUrl: configured, effectiveBaseUrl: candidate, at: now };
         if (candidate !== configured) {
           logEvent("ixbrowser_local_api_base_discovered", { configuredBaseUrl: configured, effectiveBaseUrl: candidate });
+          try {
+            const current = readSecrets();
+            if (normalizeIxBrowserBaseUrl(current.ixbrowser.baseUrl || defaultSecrets().ixbrowser.baseUrl) === configured) {
+              writeSecrets({ ixbrowser: { baseUrl: candidate } });
+              logEvent("ixbrowser_local_api_base_auto_healed", { baseUrl: candidate });
+            }
+          } catch (err) {
+            logEvent("ixbrowser_local_api_base_auto_heal_failed", { baseUrl: candidate, error: oneLineField(err.message || String(err), 180) });
+          }
         }
         return candidate;
       }
@@ -22250,14 +22325,12 @@ async function resolveIxBrowserApiBaseUrl(secrets = readSecrets()) {
       failures.push(`${candidate}: ${oneLineField(err.message || String(err), 160)}`);
     }
   }
-  ixBrowserApiBaseCache = { configuredBaseUrl: configured, effectiveBaseUrl: configured, at: now };
+  ixBrowserApiBaseCache = { configuredBaseUrl: configured, effectiveBaseUrl: "", at: 0 };
   logEvent("ixbrowser_local_api_base_discovery_failed", { configuredBaseUrl: configured, attempts: failures.slice(0, 4) });
   return configured;
 }
 
-async function ixBrowserRequestOnce(endpoint, payload = {}) {
-  const secrets = readSecrets();
-  const base = await resolveIxBrowserApiBaseUrl(secrets);
+async function ixBrowserRequestAtBase(endpoint, payload, secrets, base) {
   const url = new URL(endpoint.replace(/^\//, ""), base);
   const headers = { "content-type": "application/json" };
   if (secrets.ixbrowser.apiKey) headers.Authorization = `Bearer ${secrets.ixbrowser.apiKey}`;
@@ -22277,8 +22350,35 @@ async function ixBrowserRequestOnce(endpoint, payload = {}) {
   return response;
 }
 
+function isIxBrowserEndpointFailure(err) {
+  const status = Number(err?.remoteStatus || 0);
+  return err?.publicError === "external_network_error"
+    || [404, 405, 502, 503, 504].includes(status)
+    || /ECONNREFUSED|ECONNRESET|ETIMEDOUT|fetch failed|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost/i.test(String(err?.message || ""));
+}
+
+async function ixBrowserRequestOnce(endpoint, payload = {}) {
+  const secrets = readSecrets();
+  const base = await resolveIxBrowserApiBaseUrl(secrets);
+  try {
+    return await ixBrowserRequestAtBase(endpoint, payload, secrets, base);
+  } catch (err) {
+    if (!isIxBrowserEndpointFailure(err)) throw err;
+    ixBrowserApiBaseCache = { configuredBaseUrl: "", effectiveBaseUrl: "", at: 0 };
+    const healedBase = await resolveIxBrowserApiBaseUrl(readSecrets(), { force: true });
+    if (!healedBase) throw err;
+    logEvent("ixbrowser_local_api_request_redetected", {
+      endpoint,
+      previousBaseUrl: base,
+      effectiveBaseUrl: healedBase,
+      error: oneLineField(err.message || String(err), 180),
+    });
+    return await ixBrowserRequestAtBase(endpoint, payload, readSecrets(), healedBase);
+  }
+}
+
 function isIxBrowserLocalConnectionError(err) {
-  return err?.publicError === "external_network_error" && /127\.0\.0\.1|localhost/i.test(err.message || "");
+  return err?.publicError === "external_network_error" && /127\.\d{1,3}\.\d{1,3}\.\d{1,3}|localhost/i.test(err.message || "");
 }
 
 function isRecoverableIxBrowserDesktopError(err) {
@@ -22504,7 +22604,7 @@ async function ixBrowserPreflightCheck() {
     if (loginRequired) {
       message = "IXBrowser is logged out. Open the IXBrowser desktop app, sign in, keep it running, then re-launch the test.";
     } else if (networkDown) {
-      message = "IXBrowser desktop is not running or not reachable on 127.0.0.1:53200. Open the IXBrowser desktop app, sign in, keep it running, then re-launch the test.";
+      message = "IXBrowser desktop is not reachable. Open the IXBrowser desktop app and keep it running; the agent will auto-detect its local endpoint and retry.";
     } else {
       message = `IXBrowser preflight failed: ${err?.message || String(err)}. Open the IXBrowser desktop app, sign in, then re-launch the test.`;
     }
