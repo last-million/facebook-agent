@@ -15,7 +15,7 @@ steps to bring it up on a fresh Windows machine so it behaves identically.
 - **Windows 10/11 or Server 2022**, with an Administrator account.
 - **Node.js 18+** (this build ran on Node 24) — https://nodejs.org → install.
 - **ixBrowser** (desktop app) — https://www.ixbrowser.com — installed, with its
-  **Local API enabled** (Settings → API). Default local API: `http://127.0.0.1:53200/api/v2`.
+  **Local API enabled** (Settings → API). Default local API: `http://127.0.0.1:53200`.
 - The **Facebook accounts** you post/comment with, each as an ixBrowser profile,
   logged in. Plus the reserved profiles (see Step 6).
 - (Paid) **ChatGPT** logged into a persistent Edge profile for HD image upgrades.
@@ -46,7 +46,7 @@ In the dashboard → **Integrations**, fill in (these write `data/secrets.local.
 - **Firecrawl** key (product research), if used
 - **Webshare** proxy credentials
 - **ShopYourLikes** + **Mavlynk** (shortlink) credentials
-- **ixBrowser Local API** URL (e.g. `http://127.0.0.1:53200/api/v2`) + key if set
+- **ixBrowser Local API** URL (e.g. `http://127.0.0.1:53200`) + key if set. The backend detects the API path automatically.
 - Dedicated **ShopYourLikes proxy** (affiliateProxy), if used
 
 ## 6. ixBrowser profiles

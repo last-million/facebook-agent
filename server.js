@@ -362,6 +362,11 @@ function loadOrCreateDashboardToken() {
 const SESSION_TOKEN = loadOrCreateDashboardToken();
 const PROMPT_INJECTION_PATTERN = /\b(ignore|disregard|override|forget)\s+(all\s+)?(previous|prior|above|system|developer|instructions?)|system prompt|developer message|jailbreak|do anything now/i;
 const EXTERNAL_SERVICE_TIMEOUT_MS = 20000;
+const IXBROWSER_DEFAULT_LOCAL_ENDPOINT = "http://127.0.0.1:53200/";
+const IXBROWSER_API_PATH_CANDIDATES = ["/", "/api/v2/"];
+const IXBROWSER_LOOPBACK_HOST_CANDIDATES = ["127.0.0.1", "127.0.0.2"];
+const IXBROWSER_API_DISCOVERY_TIMEOUT_MS = 5000;
+const IXBROWSER_API_DISCOVERY_CACHE_MS = 5 * 60 * 1000;
 const ALLOWED_WEBSHARE_HOSTS = new Set(["proxy.webshare.io"]);
 const ALLOWED_MAVLYNK_HOSTS = new Set(["mavlynk.com", "www.mavlynk.com"]);
 const ALLOWED_FIRECRAWL_HOSTS = new Set(["api.firecrawl.dev", "127.0.0.1", "localhost"]);
@@ -412,6 +417,7 @@ let heartbeat = {
 };
 let lastAuthFailureLogAt = 0;
 let lastIxBrowserAutoOpenAt = 0;
+let ixBrowserApiBaseCache = { configuredBaseUrl: "", effectiveBaseUrl: "", at: 0 };
 const ixBrowserCdpEndpointCache = new Map();
 const ixBrowserProfileOpenLocks = new Map();
 const normalIxProfileUseLocks = new Map();
@@ -929,8 +935,8 @@ function defaultSecrets() {
     },
     ixbrowser: {
       apiKey: "",
-      baseUrl: "http://127.0.0.1:53200/api/v2",
-      notes: "ixBrowser local API usually does not require an API key. Keep it on 127.0.0.1.",
+      baseUrl: IXBROWSER_DEFAULT_LOCAL_ENDPOINT,
+      notes: "ixBrowser local API usually does not require an API key. Keep it on 127.0.0.1; the API path is detected automatically.",
     },
     shopyourlikes: {
       apiKey: "",
@@ -2229,11 +2235,19 @@ function serviceConfigError(message, publicError = "service_config_error") {
   return err;
 }
 
+function normalizeIxBrowserUrlInput(value) {
+  let text = String(value || "").trim();
+  if (/^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?(?:\/|$)/i.test(text)) {
+    text = `http://${text}`;
+  }
+  return normalizeBaseUrl(text);
+}
+
 function assertLoopbackUrl(value) {
-  const url = new URL(normalizeBaseUrl(value));
+  const url = new URL(normalizeIxBrowserUrlInput(value));
   const host = url.hostname.toLowerCase();
-  if (!["127.0.0.1", "localhost", "::1"].includes(host)) {
-    throw new Error("IXBrowser base URL must stay on localhost/127.0.0.1");
+  if (!["localhost", "::1"].includes(host) && !/^127\.(?:\d{1,3}\.){2}\d{1,3}$/.test(host)) {
+    throw new Error("IXBrowser base URL must stay on localhost/127.0.0.0/8");
   }
   return url.toString();
 }
@@ -2241,11 +2255,7 @@ function assertLoopbackUrl(value) {
 function normalizeIxBrowserBaseUrl(value) {
   const url = new URL(assertLoopbackUrl(value || defaultSecrets().ixbrowser.baseUrl));
   const normalizedPath = url.pathname.replace(/\/+$/, "").toLowerCase();
-  if (!normalizedPath || normalizedPath === "") {
-    url.pathname = "/api/v2/";
-  } else if (normalizedPath === "/api/v2") {
-    url.pathname = "/api/v2/";
-  }
+  url.pathname = normalizedPath ? `${normalizedPath}/` : "/";
   return url.toString();
 }
 
@@ -7981,6 +7991,7 @@ async function runWindowsShopYourLikesExtensionLinks(profileId, productUrls, opt
     profileId: Number(profileId),
     productUrls,
     cdpEndpoint: options.cdpEndpoint || "",
+    ixBrowserBaseUrl: configuredIxBrowserBaseUrl(),
     extensionId: SHOPYOURLIKES_EXTENSION_ID,
     shortenAfter: options.shortenAfter !== false,
   }, null, 2) + "\n");
@@ -13015,6 +13026,10 @@ function compactLivePostLog(objects = []) {
   });
 }
 
+function configuredIxBrowserBaseUrl() {
+  return normalizeIxBrowserBaseUrl(readSecrets().ixbrowser.baseUrl || defaultSecrets().ixbrowser.baseUrl);
+}
+
 function liveFacebookPostingScriptPath() {
   const preferred = safeProjectPath("tools/fb-post-test-capture-url.js");
   if (fs.existsSync(preferred)) return preferred;
@@ -13069,7 +13084,11 @@ async function runLiveFacebookPostScript(payload, options = {}) {
   const payloadRelative = path.join("data", fileName).replace(/\\/g, "/");
   const payloadPath = safeProjectPath(payloadRelative);
   const timeoutMs = clampNumber(options.timeoutMs || FACEBOOK_LIVE_POST_TIMEOUT_MS, 30000, 900000, FACEBOOK_LIVE_POST_TIMEOUT_MS);
-  atomicWrite(payloadPath, JSON.stringify(payload, null, 2) + "\n");
+  const scriptPayload = {
+    ...payload,
+    ixBrowserBaseUrl: payload.ixBrowserBaseUrl || configuredIxBrowserBaseUrl(),
+  };
+  atomicWrite(payloadPath, JSON.stringify(scriptPayload, null, 2) + "\n");
   let stdout = "";
   let stderr = "";
   const cleanupPayload = () => {
@@ -22161,9 +22180,84 @@ try {
   }
 }
 
+function ixBrowserApiCandidateBaseUrls(configuredBaseUrl) {
+  const configured = normalizeIxBrowserBaseUrl(configuredBaseUrl || defaultSecrets().ixbrowser.baseUrl);
+  const configuredUrl = new URL(configured);
+  const seen = new Set();
+  const candidates = [];
+  const add = (value) => {
+    const normalized = normalizeIxBrowserBaseUrl(value);
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    candidates.push(normalized);
+  };
+  add(configured);
+  const hostnames = ["localhost", "127.0.0.1"].includes(configuredUrl.hostname.toLowerCase())
+    ? IXBROWSER_LOOPBACK_HOST_CANDIDATES
+    : [configuredUrl.hostname];
+  for (const hostname of hostnames) {
+    for (const pathname of IXBROWSER_API_PATH_CANDIDATES) {
+      const url = new URL(pathname, configured);
+      url.hostname = hostname;
+      add(url.toString());
+    }
+  }
+  return candidates;
+}
+
+function isIxBrowserApiShape(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  if (payload.error && typeof payload.error.code !== "undefined") return true;
+  if (typeof payload.code !== "undefined" && (Object.prototype.hasOwnProperty.call(payload, "data") || Object.prototype.hasOwnProperty.call(payload, "msg"))) return true;
+  return Array.isArray(payload.data) || Array.isArray(payload.list) || (payload.data && typeof payload.data === "object" && (Array.isArray(payload.data.data) || Array.isArray(payload.data.list)));
+}
+
+async function probeIxBrowserApiBaseUrl(baseUrl, headers) {
+  const url = new URL("profile-list", baseUrl);
+  const payload = await fetchJson(url.toString(), {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ page: 1, limit: 1 }),
+    timeoutMs: IXBROWSER_API_DISCOVERY_TIMEOUT_MS,
+  });
+  return isIxBrowserApiShape(payload);
+}
+
+async function resolveIxBrowserApiBaseUrl(secrets = readSecrets()) {
+  const configured = normalizeIxBrowserBaseUrl(secrets.ixbrowser.baseUrl || defaultSecrets().ixbrowser.baseUrl);
+  const now = Date.now();
+  if (
+    ixBrowserApiBaseCache.configuredBaseUrl === configured &&
+    ixBrowserApiBaseCache.effectiveBaseUrl &&
+    now - ixBrowserApiBaseCache.at < IXBROWSER_API_DISCOVERY_CACHE_MS
+  ) {
+    return ixBrowserApiBaseCache.effectiveBaseUrl;
+  }
+  const headers = { "content-type": "application/json" };
+  if (secrets.ixbrowser.apiKey) headers.Authorization = `Bearer ${secrets.ixbrowser.apiKey}`;
+  const failures = [];
+  for (const candidate of ixBrowserApiCandidateBaseUrls(configured)) {
+    try {
+      if (await probeIxBrowserApiBaseUrl(candidate, headers)) {
+        ixBrowserApiBaseCache = { configuredBaseUrl: configured, effectiveBaseUrl: candidate, at: now };
+        if (candidate !== configured) {
+          logEvent("ixbrowser_local_api_base_discovered", { configuredBaseUrl: configured, effectiveBaseUrl: candidate });
+        }
+        return candidate;
+      }
+      failures.push(`${candidate}: unexpected_response`);
+    } catch (err) {
+      failures.push(`${candidate}: ${oneLineField(err.message || String(err), 160)}`);
+    }
+  }
+  ixBrowserApiBaseCache = { configuredBaseUrl: configured, effectiveBaseUrl: configured, at: now };
+  logEvent("ixbrowser_local_api_base_discovery_failed", { configuredBaseUrl: configured, attempts: failures.slice(0, 4) });
+  return configured;
+}
+
 async function ixBrowserRequestOnce(endpoint, payload = {}) {
   const secrets = readSecrets();
-  const base = normalizeIxBrowserBaseUrl(secrets.ixbrowser.baseUrl || defaultSecrets().ixbrowser.baseUrl);
+  const base = await resolveIxBrowserApiBaseUrl(secrets);
   const url = new URL(endpoint.replace(/^\//, ""), base);
   const headers = { "content-type": "application/json" };
   if (secrets.ixbrowser.apiKey) headers.Authorization = `Bearer ${secrets.ixbrowser.apiKey}`;
@@ -22172,9 +22266,15 @@ async function ixBrowserRequestOnce(endpoint, payload = {}) {
     headers,
     body: JSON.stringify(payload),
   });
-  if (!response || !response.error || typeof response.error.code === "undefined") return response;
-  if (response.error.code !== 0) throw ixBrowserError(response.error);
-  return Object.prototype.hasOwnProperty.call(response, "data") ? response.data : true;
+  if (response?.error && typeof response.error.code !== "undefined") {
+    if (Number(response.error.code) !== 0) throw ixBrowserError(response.error);
+    return Object.prototype.hasOwnProperty.call(response, "data") ? response.data : true;
+  }
+  if (response && typeof response.code !== "undefined") {
+    if (Number(response.code) !== 0) throw ixBrowserError({ code: response.code, message: response.message || response.msg });
+    return Object.prototype.hasOwnProperty.call(response, "data") ? response.data : true;
+  }
+  return response;
 }
 
 function isIxBrowserLocalConnectionError(err) {

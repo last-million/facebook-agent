@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const { chromium } = require("playwright-core");
+const { ixBrowserDataRequest, normalizeBaseUrl } = require("./ixbrowser-local-api");
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, ""));
@@ -25,22 +26,20 @@ function cdpEndpointFromIxOpenResult(result = {}) {
   throw new Error(`IXBrowser opened the profile but did not return a CDP endpoint: ${JSON.stringify(result).slice(0, 500)}`);
 }
 
+let ixBrowserBaseUrl = process.env.IXBROWSER_LOCAL_API || "";
+
+function configureIxBrowserBaseUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return;
+  ixBrowserBaseUrl = normalizeBaseUrl(text);
+}
+
 async function ixBrowserRequest(endpoint, body = {}) {
-  const response = await fetch(`http://127.0.0.1:53200/api/v2/${endpoint}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+  return ixBrowserDataRequest(endpoint, body, {
+    baseUrl: ixBrowserBaseUrl,
+    timeoutMs: 70000,
+    logDiscoveryFailure: true,
   });
-  const text = await response.text();
-  let payload;
-  try {
-    payload = JSON.parse(text);
-  } catch {
-    throw new Error(`IXBrowser returned non-JSON HTTP ${response.status}: ${text.slice(0, 500)}`);
-  }
-  if (!response.ok) throw new Error(`IXBrowser HTTP ${response.status}: ${text.slice(0, 500)}`);
-  if (payload.error && payload.error.code !== 0) throw new Error(`IXBrowser API error: ${JSON.stringify(payload.error)}`);
-  return payload.data || payload;
 }
 
 async function generateShopYourLikesLinkInExtension(context, productUrl, extensionId) {
@@ -121,6 +120,7 @@ async function main() {
   const requestPath = process.argv[2];
   if (!requestPath) throw new Error("request JSON path argument is required");
   const request = readJson(requestPath);
+  configureIxBrowserBaseUrl(request.ixBrowserBaseUrl || request.ixbrowserBaseUrl || request.ixBrowserLocalEndpoint);
   const profileId = Number(request.profileId);
   const productUrls = Array.isArray(request.productUrls) ? request.productUrls : [];
   const extensionId = request.extensionId || "ndoliganogoohcgigfagdepbgpjbdbkh";

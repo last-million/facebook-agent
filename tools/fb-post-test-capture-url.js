@@ -1,5 +1,6 @@
 const { chromium } = require('playwright-core');
 const fs = require('fs');
+const { ixBrowserRawRequest, normalizeBaseUrl } = require('./ixbrowser-local-api');
 
 // Anchor for the approve-attempt deadline budget (2026-07-13): the server SIGKILLs each admin-approval
 // attempt at its per-attempt budget (MAX_ADMIN_APPROVAL_ATTEMPT_MS, default 240s). Killed mid-poll, the
@@ -26,6 +27,14 @@ function clampInt(value, min, max) {
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
+let ixBrowserBaseUrl = process.env.IXBROWSER_LOCAL_API || '';
+
+function configureIxBrowserBaseUrl(value) {
+  const text = String(value || '').trim();
+  if (!text) return;
+  ixBrowserBaseUrl = normalizeBaseUrl(text);
+}
+
 function normalizeTextLoose(value) {
   return String(value || '')
     .normalize('NFD')
@@ -50,31 +59,11 @@ function markerTextMatches(haystack, marker) {
 }
 
 async function ixPost(path, body, timeoutMs = 70000) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let res;
-  try {
-    res = await fetch('http://127.0.0.1:53200/api/v2/' + path, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body || {}),
-      signal: controller.signal,
-    });
-  } catch (err) {
-    if (err?.name === 'AbortError') throw new Error(`ixbrowser_${path}_timeout_after_${Math.round(timeoutMs / 1000)}s`);
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
-  const text = await res.text();
-  let parsed;
-  try { parsed = JSON.parse(text); } catch { throw new Error(text.slice(0, 1000)); }
-  if (!res.ok) throw new Error(`IXBrowser ${path} HTTP ${res.status}: ${text.slice(0, 600)}`);
-  const code = Number(parsed?.error?.code || 0);
-  if (parsed?.error && code !== 0) {
-    throw new Error(`IXBrowser ${path} error ${code}: ${parsed.error.message || 'unknown error'}`);
-  }
-  return parsed;
+  return ixBrowserRawRequest(path, body, {
+    baseUrl: ixBrowserBaseUrl,
+    timeoutMs,
+    logDiscoveryFailure: true,
+  });
 }
 
 // Open an ixBrowser profile WITH 1004-recovery. Error 1004 ("Profile Open Failed") means the profile window
@@ -4555,6 +4544,7 @@ async function harvestGroupFeedGrid(page, count, opts = {}) {
 
 async function main() {
   const payload = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+  configureIxBrowserBaseUrl(payload.ixBrowserBaseUrl || payload.ixbrowserBaseUrl || payload.ixBrowserLocalEndpoint);
   const targetUrl = payload.harvestOnly && payload.groupUrl
     ? (String(payload.groupUrl).replace(/\/+$/, '').replace(/\/media$/i, '') + '/media')
     : ((payload.commentOnly || payload.approveOnly || payload.verifyOnly || payload.pinOnly) && payload.postUrl ? payload.postUrl : payload.groupUrl);

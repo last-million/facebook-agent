@@ -78,7 +78,7 @@ OpenRouter free fallbacks configured in Hermes
 - Register file reads/writes reject paths that escape this project, including symlink escapes.
 - Free-text product/text rotation fields are summarized before Hermes prompts, with prompt-like instruction lines redacted.
 - IXBrowser control is restricted to a localhost API URL by the backend.
-- IXBrowser Local API uses `http://127.0.0.1:53200/api/v2/` by default. A token is normally not required; the IXBrowser desktop app must be running and Local API must be enabled.
+- IXBrowser Local API uses `http://127.0.0.1:53200/` by default. The backend detects the API path automatically. A token is normally not required; the IXBrowser desktop app must be running and Local API must be enabled.
 - Hermes jobs have a dashboard-configurable runtime timeout and queue cap.
 - Enable does not auto-run queued jobs unless `autoStartQueuedJobs` is turned on; `Start Next` runs the next queued job manually.
 - Live 1-post tests launch from the dashboard test button; production full-plan live runs still require typed confirmation `PUBLISH FULL PLAN`.
