@@ -680,10 +680,12 @@ function defaultState() {
       groupProfileAssignments: "",
       groupAssignmentData: [],
       equalSplitAssignments: false, // Step-3 toggle: dispatch profiles equally, one group per profile
-      // CONTENT SOURCE GROUPS (default OFF): harvest recent posts (text + image + the link in the first
-      // comment) from these source FB groups and re-use them as ready-to-post content. enabled=false =>
-      // byte-for-byte current behavior (nothing reads groupsText). One facebook.com/groups/… URL per line.
-      contentSources: { enabled: false, groupsText: "", notes: "" },
+      // CONTENT SOURCE GROUPS (default ON, operator 2026-07-19: "Easy copy from group" is the default
+      // collection method): harvest recent posts (text + image + the link in the first comment) from
+      // these source FB groups and re-use them as ready-to-post content. Still a toggle -- the operator
+      // can switch to Manual scraping any time via the method switch in the dashboard. One
+      // facebook.com/groups/… URL per line.
+      contentSources: { enabled: true, groupsText: "", notes: "" },
       groupFallbackPolicy: "if a profile cannot post in its selected group, try the next available group URL from this run; if no group works, skip that profile and record the issue with profile id/name",
       profileGroupIssueLogEndpoint: "/api/posting/profile-group-issue",
       publishedPostUrls: "",
