@@ -12034,9 +12034,15 @@ function liveLogHasRequiredCommentNeedle(liveLogFile = "", commentText = "") {
   }
 }
 
-function latestPublishedFacebookLivePostForRow(row = {}, profileId = "") {
+function latestPublishedFacebookLivePostForRow(row = {}, profileId = "", preloadedRows = null) {
   const key = livePostLedgerKey(row, profileId);
-  const rows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 });
+  // OPTIONAL PRELOADED SNAPSHOT (2026-07-19, live incident): a caller looping over many orphans (see
+  // reconcilePendingPublishIntentsAsync) can pass ONE snapshot read once instead of re-reading here on every
+  // iteration. Every ledger write between iterations invalidates readJsonlAbsoluteFile's mtime/size cache,
+  // so without this a per-orphan loop forced a fresh full re-read of the (146MB+ and growing) ledger file on
+  // EVERY iteration -- confirmed live: 8-46 second event-loop freezes traced to exactly this pattern. Default
+  // (no preloadedRows) is byte-for-byte the original behavior.
+  const rows = preloadedRows || readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 });
   for (let index = rows.length - 1; index >= 0; index -= 1) {
     const item = rows[index];
     if (!item || item.key !== key || !item.postUrl) continue;
@@ -13502,6 +13508,12 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
       const max = clampNumber(options.max, 1, 20, 5);
       const planRows = latestPostingPlanRows();
       const reconState = readState();
+      // ONE ledger snapshot for the WHOLE loop (2026-07-19 fix, see latestPublishedFacebookLivePostForRow's
+      // comment): each orphan below independently has a unique key, so a write for orphan N is never the
+      // "already published" row a LATER orphan is checking for -- reusing one snapshot across the loop is
+      // behaviorally identical to a fresh read every iteration, just without paying for a full ledger
+      // re-read up to `max` times in a row.
+      const __reconcileLedgerSnapshot = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 5000 });
       let done = 0;
       for (const it of orphans) {
         if (done >= max) break;
@@ -13536,7 +13548,7 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
         // needs_manual_review at the same timestamp" clusters it produced) without changing any claim-release
         // behavior, which stays fully inside the untouched `!row` branch below.
         if (groupUrl && profileId) {
-          const already = latestPublishedFacebookLivePostForRow({ planId, sequence, groupUrl }, profileId);
+          const already = latestPublishedFacebookLivePostForRow({ planId, sequence, groupUrl }, profileId, __reconcileLedgerSnapshot);
           if (already && already.postUrl) {
             writeResolved("already_recorded", already.postUrl);
             logEvent("publish_intent_reconcile_already_recorded", { planId, sequence, profileId, postUrl: already.postUrl });
