@@ -8315,16 +8315,31 @@ function statusLineAppliesToFacebookGroup(line, groupUrl) {
   return lineGroupUrls.some((url) => normalizedFacebookGroupKey(url) === targetGroupKey);
 }
 
+// SHARED MEMOIZED BLOB-LINES (2026-07-19, live incident): isProfileBlockedForPosting / isFacebookProfileQuarantinedForFacebook /
+// isProfileGroupBlockedForPosting each independently re-join+lowercase+split the SAME two profile-status blobs
+// on every single call, and postingSlots' own comment documents these firing "hundreds of times per tick" --
+// with state.ixbrowser.failedProfiles previously uncapped (now capped, see the 1.5MB cap next to
+// facebookProfileStatus), this was real, compounding synchronous cost on the hot single-threaded posting path.
+// Cache is keyed by STRING VALUE (not a timestamp or counter) -- JS compares strings by value, so this can never
+// go stale: any real change to either blob is a different string and misses the cache exactly once, safely.
+let __profileStatusLinesCache = { status: null, failed: null, lines: null };
+function profileStatusLowercaseLines(state) {
+  const status = state.posting?.facebookProfileStatus || "";
+  const failed = state.ixbrowser?.failedProfiles || "";
+  if (__profileStatusLinesCache.status === status && __profileStatusLinesCache.failed === failed) {
+    return __profileStatusLinesCache.lines;
+  }
+  const lines = [status, failed].join("\n").toLowerCase().split(/\r?\n/);
+  __profileStatusLinesCache = { status, failed, lines };
+  return lines;
+}
 function isProfileBlockedForPosting(label, state, groupUrl = "") {
   const text = String(label || "").trim();
   if (!text) return false;
   if (isFacebookProfileQuarantinedForFacebook(text, state, groupUrl)) return true;
   const lowerLabel = text.toLowerCase();
   const profileId = profileIdFromLabel(text);
-  const sources = [
-    state.posting?.facebookProfileStatus,
-    state.ixbrowser?.failedProfiles,
-  ].join("\n").toLowerCase().split(/\r?\n/);
+  const sources = profileStatusLowercaseLines(state);
   const matching = sources.filter((line) => {
     if (!/status=(cannot_comment|cannot_post_in_any_group|resolved|approved|cleared|ignored)|action=(quarantined|skip_profile|profile_unblocked|profile_group_unblocked)/i.test(line)) return false;
     if (!statusLineAppliesToFacebookGroup(line, groupUrl)) return false;
@@ -8362,10 +8377,7 @@ function isFacebookProfileQuarantinedForFacebook(label, state = readState(), gro
   if (!text) return false;
   const lowerLabel = text.toLowerCase();
   const profileId = profileIdFromLabel(text);
-  const sources = [
-    state.posting?.facebookProfileStatus,
-    state.ixbrowser?.failedProfiles,
-  ].join("\n").toLowerCase().split(/\r?\n/);
+  const sources = profileStatusLowercaseLines(state);
   const matching = sources.filter((line) => {
     if (!/status=(facebook_account_suspended_or_disabled|facebook_account_blocked_or_review_required|facebook_account_disabled|facebook_account_suspended|facebook_account_locked|cannot_use_facebook|cannot_comment|resolved|approved|cleared|ignored)|issue=(facebook_account_status|account_unusable|account_hard_blocked)|action=(quarantined|skip_ixbrowser_profile_for_facebook|profile_unblocked|profile_group_unblocked)/i.test(line)) return false;
     if (!statusLineAppliesToFacebookGroup(line, groupUrl)) return false;
@@ -15138,13 +15150,25 @@ function autoEnableAdminApprovalIfPersistentFailures(groupUrl) {
 // sessions is safe. Each approval attempt's budget timer starts AFTER it acquires ITS profile's lock (queue-wait is
 // not charged against it).
 const __adminApprovalLockChains = new Map(); // profileId (string) -> Promise chain
+const LOCK_ACQUIRE_TIMEOUT_MS = 10 * 60 * 1000;
 function acquireAdminApprovalLock(profileId) {
   const key = String(profileId);
   let release;
   const next = new Promise((res) => { release = res; });
   const prior = __adminApprovalLockChains.get(key) || Promise.resolve();
   __adminApprovalLockChains.set(key, prior.then(() => next));
-  return prior.then(() => release);
+  // LOCK-WAIT HARD TIMEOUT (2026-07-19, live incident: a prior holder that never calls release() -- e.g. an
+  // unbounded await deep in that attempt -- otherwise wedges EVERY future acquirer of this per-profile chain
+  // forever, with no crash/log). Race the wait against a bounded timer so a caller always eventually proceeds;
+  // it still receives the real `release` (calling it later still resolves `next` for whoever queued behind it,
+  // so the chain keeps advancing rather than staying permanently poisoned).
+  return Promise.race([
+    prior.then(() => release),
+    new Promise((res) => setTimeout(() => {
+      try { logEvent("admin_approval_lock_wait_timeout_forced", { profileId: key }); } catch (_) {}
+      res(release);
+    }, LOCK_ACQUIRE_TIMEOUT_MS)),
+  ]);
 }
 async function approvePendingFacebookPostWithAdminProfiles(args) {
   // Moderator approval finishes an ALREADY-published (pending) post — let it complete through a run-limit
@@ -16277,7 +16301,17 @@ function acquirePostCaptureLock() {
   const next = new Promise((res) => { release = res; });
   const prior = __postCaptureLockChain;
   __postCaptureLockChain = prior.then(() => next);
-  return prior.then(() => release);
+  // LOCK-WAIT HARD TIMEOUT (2026-07-19, mirrors acquireAdminApprovalLock): this is a box-wide SINGLETON chain
+  // (every post-capture attempt funnels through it), so one holder that never calls release() wedges EVERY
+  // future post attempt on the entire box forever, with no crash/log. Bounded race, same reasoning: the real
+  // release is still handed out, so calling it later still lets the chain advance for whoever queued behind.
+  return Promise.race([
+    prior.then(() => release),
+    new Promise((res) => setTimeout(() => {
+      try { logEvent("post_capture_lock_wait_timeout_forced", {}); } catch (_) {}
+      res(release);
+    }, LOCK_ACQUIRE_TIMEOUT_MS)),
+  ]);
 }
 
 async function recoverFacebookCommentWithProfiles(args) {
