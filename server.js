@@ -8460,7 +8460,14 @@ function isCommentVerificationFailureLine(line = "") {
 }
 
 function recordLineAgeMs(line) {
-  const match = String(line || "").match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/);
+  // CASE-INSENSITIVE (2026-07-19 fix): isProfileBlockedForPosting/isAutoBlacklistedStickyBench lowercase
+  // the whole source blob before extracting "latest" (for case-insensitive status matching elsewhere in
+  // those functions), which turned every ISO timestamp's T/Z into t/z -- this regex required uppercase,
+  // so it NEVER matched, recordLineAgeMs always returned Infinity, and postingFailureLineExceededAgeBudget
+  // always saw a non-finite age and returned false (never expired). Every auto-blacklist bench was
+  // therefore permanently sticky regardless of age, silently defeating the 60min/6h/24h expiry windows --
+  // confirmed live: the entire 40-profile posting roster was stuck with 0 eligible profiles because of this.
+  const match = String(line || "").match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)/i);
   if (!match) return Number.POSITIVE_INFINITY;
   const at = Date.parse(match[1]);
   if (!Number.isFinite(at)) return Number.POSITIVE_INFINITY;
@@ -10943,18 +10950,32 @@ function detectIncompleteRunAtBoot() {
   }
 }
 
+const AUTOPILOT_SCHEDULER_HARD_TIMEOUT_MS = 25 * 60 * 1000;
 function startAutopilotScheduler() {
   if (__autopilotSchedulerTimer) return;
   const tick = async () => {
     __autopilotSchedulerTimer = null;
+    let __hardTimeoutTimer;
     try {
       const state = readState();
       if (state.operator?.autopilotEnabled && state.operator?.armedForExternalActions) {
-        await autopilotTickAsync();
+        // SCHEDULER HARD TIMEOUT (2026-07-19, post-incident: a hung tick left this recursive setTimeout
+        // chain permanently dead for 16+ hours with zero crash/log — the finally below is the ONLY place
+        // that re-arms the next tick, and it only runs once this await settles). If autopilotTickAsync()
+        // ever hangs on an unbounded await (mutex, connector, anything) for ANY reason, current or future,
+        // this race forces the tick to move on so the scheduler can never again die silently. The orphaned
+        // call keeps running harmlessly in the background (JS can't truly cancel it); __autopilotTickGen
+        // (see the reentrancy guard at the top of autopilotTickAsync) already protects against a late-
+        // settling orphan corrupting a newer tick's in-flight state.
+        await Promise.race([
+          autopilotTickAsync(),
+          new Promise((_, reject) => { __hardTimeoutTimer = setTimeout(() => reject(new Error("autopilot_scheduler_tick_hard_timeout")), AUTOPILOT_SCHEDULER_HARD_TIMEOUT_MS); }),
+        ]);
       }
     } catch (err) {
       logEvent("autopilot_scheduler_error", { error: oneLineField(err.message || String(err), 200) });
     } finally {
+      clearTimeout(__hardTimeoutTimer);
       const op = readState().operator || {};
       const normalSecs = clampNumber(op.autopilotTickSeconds, 30, 3600, 120);
       // FAST-RETRY: when the last tick couldn't post only because the ready buffer was momentarily
