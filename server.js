@@ -1855,6 +1855,7 @@ function normalizeWorkflowState(state) {
   })();
   state.posting.groupAssignmentMode = "percentage_manual_review";
   state.posting.facebookProfileStatus = capRecordLogTail(state.posting.facebookProfileStatus, 1500000); // was unbounded (2.80MB); 1.5MB spans ~19 days at the current rate, well over the 7-day requirement
+  state.ixbrowser.failedProfiles = capRecordLogTail(state.ixbrowser.failedProfiles, 1500000); // 2026-07-19: mirrors the cap above -- this sibling field was uncapped, growing forever and slowing every isProfileBlockedForPosting-style scan (hundreds of calls/tick) more each day
   state.tracking = state.tracking || {};
   // 4MB (was unbounded, 2.79MB): adversarial re-verify measured dailyActionLog's growth rate ACCELERATING sharply
   // (+148% recent vs early, tracking the 2->4 group scale-up) -- 2MB only retained ~5.4 days at the recent peak-day
@@ -8254,6 +8255,7 @@ function postingSlots(state) {
         const profileId = profileIdFromLabel(label);
         if (__liveIds && profileId && !__liveIds.has(profileId)) continue; // DYNAMIC: profile no longer exists in ixBrowser (operator deleted/renamed) -> auto-skip, no stale 2007 failure
         if (__disconnectedIds.has(String(profileId)) || __erroredIds.has(String(profileId)) || __suspendedIds.has(String(profileId)) || __notGroupMemberIds.has(String(profileId))) continue; // parked (not logged in / account error / suspended / not a member of any configured group) -> skipped until released
+        if (isProfileInSoftCooldown(profileId)) continue; // brief in-memory pacing after a transient failure (2026-07-19 retry-storm fix) -- NOT a blacklist, self-clears in ~2min
         if (isDedicatedShopYourLikesProfileLabel(label, state)) continue;
         if (isBlockedIxBrowserProfileLabel(label, state)) continue;
         if (isFacebookProfileQuarantinedForFacebook(label, state, groupUrl)) continue;
@@ -20308,6 +20310,22 @@ function unblockPostingProfile(body = {}) {
 let __profileBlockStreak = {};
 const PROFILE_AUTO_BLOCK_THRESHOLD = 2;
 const PROFILE_AUTO_BLOCK_RECENT_WINDOW_MS = 3 * 60 * 60 * 1000;
+// SOFT-FAILURE COOLDOWN (2026-07-19, retry-storm fix): removing the persistent auto-blacklist for transient
+// posting failures (composer/timeout/proxy) also removed the only thing pacing retry volume under load -- a
+// profile that just failed has an unchanged today-count, so orderFreshFirst sorts it back to the FRONT and the
+// scheduler's ~25s fast-retry re-dispatches it almost immediately, which can turn a momentary box slowdown into
+// a sustained retry storm (confirmed live: repeated multi-minute HTTP-unresponsive windows). This is IN-MEMORY
+// ONLY (no state.json write, no bench line, nothing for isProfileBlockedForPosting to see) -- it never permanently
+// blocks a profile, it only keeps a just-failed profile out of the NEXT immediate re-pick for a short window,
+// self-clears on restart, and fails open if anything here errors.
+let __profileSoftCooldownUntil = {};
+const PROFILE_SOFT_FAILURE_COOLDOWN_MS = 120000;
+function isProfileInSoftCooldown(profileId) {
+  try {
+    const until = __profileSoftCooldownUntil[Number(profileId)];
+    return Boolean(until) && Date.now() < until;
+  } catch (_) { return false; }
+}
 // PERSISTENT profile-OPEN (1004) park: a single 1004 "Profile Open Failed" stays transient infra (never benched),
 // but a profile ixBrowser can NEVER open keeps getting picked as the freshest in its group and burns the slot
 // (the even split never LANDS). Park it (errored -> Prod tab + Release) after N strikes in the window, counted
@@ -20548,7 +20566,11 @@ function autoBlacklistProfileIfNeeded(opts = {}) {
       // (composer/timeout/proxy-type issues). These could get stuck for a long time under a case-
       // sensitivity bug in the age-expiry check (fixed the same day), and the operator wants them to
       // just keep retrying instead of ever being benched for this. Genuine FB account suspensions (the
-      // hard branch below) are a real, unfixable-by-retrying block and are unaffected by this.
+      // hard branch below) are a real, unfixable-by-restarting block and are unaffected by this.
+      // Still apply a short in-memory-only cooldown (see PROFILE_SOFT_FAILURE_COOLDOWN_MS above) so a
+      // just-failed profile isn't immediately re-picked first and thrown straight back at a possibly
+      // stressed box -- this is pacing, not blacklisting: no bench line, nothing persisted, self-clears.
+      __profileSoftCooldownUntil[pid] = Date.now() + PROFILE_SOFT_FAILURE_COOLDOWN_MS;
       try { logEvent("profile_soft_failure_not_blacklisted", { profileId: pid, profile, streak, persisted, total, source: opts.source || "", lastError: oneLineField(errorText, 160) }); } catch (_) {}
       return;
     }
