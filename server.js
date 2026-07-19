@@ -33,6 +33,27 @@ function __logFatal(kind, err) {
 }
 process.on("uncaughtException", (err) => { __logFatal("uncaughtException", err); process.exit(1); });
 process.on("unhandledRejection", (err) => { __logFatal("unhandledRejection", err); });
+// EVENT-LOOP LAG WATCHDOG (2026-07-19, live incident: the HTTP server went unresponsive for minutes at a time
+// under posting load, repeatedly, and every prior diagnostic pass was static code-reading after the fact --
+// there was no live data on what was actually blocking the event loop when it happened). A 1s timer that only
+// fires after 1s proves the event loop was free; any large overshoot IS the event loop being busy/blocked, no
+// guessing required. Logged to crash.log (same file+shape as __logFatal) so the NEXT time this happens, the
+// exact moment and severity of the block is already captured without needing another live debugging session.
+let __lastEventLoopCheckAt = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  const lagMs = now - __lastEventLoopCheckAt - 1000;
+  __lastEventLoopCheckAt = now;
+  if (lagMs > 2000) {
+    try {
+      const mu = process.memoryUsage();
+      fs.appendFileSync(path.join(DATA_DIR, "crash.log"), JSON.stringify({
+        at: new Date().toISOString(), kind: "event_loop_lag", lagMs,
+        rssMB: Math.round(mu.rss / 1048576), heapUsedMB: Math.round(mu.heapUsed / 1048576), freeMemMB: Math.round(os.freemem() / 1048576),
+      }) + "\n");
+    } catch (_) {}
+  }
+}, 1000).unref();
 const AGENT_CHATGPT_EDGE_USER_DATA_DIR = path.join(DATA_DIR, "chatgpt-agent-edge-profile");
 const JOBS_FILE = path.join(DATA_DIR, "jobs.json");
 const LOG_FILE = path.join(DATA_DIR, "events.log");
@@ -1008,6 +1029,8 @@ let __lastReadWasDefaults = false; // true ONLY when readState fell all the way 
 // cost, while the disk I/O + retry-blocking risk -- the actual root cause -- is skipped whenever the file is
 // unchanged.
 let __stateFileCache = { mtimeMs: 0, size: -1, parsed: null };
+let __stateFileCacheGen = 0; // bumped only on an actual disk re-parse (see readParsedStateFileCached) -- lets
+// readStateFresh skip re-stringifying its failure-recovery backup on every cache-hit call (see there)
 function readParsedStateFileCached() {
   let st = null;
   try { st = fs.statSync(STATE_FILE); } catch { /* missing/unreadable -> fall through to a real parse attempt below, which will throw the same way parseJsonFile always did */ }
@@ -1016,6 +1039,7 @@ function readParsedStateFileCached() {
   }
   const parsed = parseJsonFile(STATE_FILE);
   if (st) __stateFileCache = { mtimeMs: st.mtimeMs, size: st.size, parsed };
+  __stateFileCacheGen++;
   return parsed;
 }
 
@@ -1025,10 +1049,19 @@ function readParsedStateFileCached() {
 // writeState's own correctness must never depend on stale data; since this always re-checks the file's
 // (mtimeMs, size) before ever returning cached content, it is exactly as fresh as a full re-read whenever the
 // file has actually changed (which it always has immediately after writeState's own atomicWrite completes).
+let __lastGoodStateRawGen = -1;
 function readStateFresh() {
   try {
     const parsed = readParsedStateFileCached();
-    __lastGoodStateRaw = JSON.stringify(parsed);
+    // PERF (2026-07-19, live incident: 14-46 SECOND event-loop freezes traced to readState()'s per-call cost --
+    // this call is documented elsewhere in this file as firing "hundreds of times per tick"): only re-stringify
+    // the emergency failure-recovery backup when the underlying parsed content actually changed (a real disk
+    // re-parse), not on every cache-hit call. __lastGoodStateRaw only needs to be at least as fresh as the last
+    // real change, never on-every-call fresh -- this is purely additive, zero behavior change on a real failure.
+    if (__lastGoodStateRawGen !== __stateFileCacheGen) {
+      __lastGoodStateRaw = JSON.stringify(parsed);
+      __lastGoodStateRawGen = __stateFileCacheGen;
+    }
     __lastReadWasDefaults = false;
     const state = deepMerge(defaultState(), parsed);
     normalizeWorkflowState(state);
@@ -8489,10 +8522,7 @@ function isProfileGroupBlockedForPosting(label, groupUrl, state) {
   if (!text || !groupKey) return false;
   const lowerLabel = text.toLowerCase();
   const profileId = profileIdFromLabel(text);
-  const sources = [
-    state.posting?.facebookProfileStatus,
-    state.ixbrowser?.failedProfiles,
-  ].join("\n").toLowerCase().split(/\r?\n/);
+  const sources = profileStatusLowercaseLines(state);
   // PERF (2026-07-04): groupKeyAliasSet(groupUrl) depends only on the FIXED target group, not on the per-line
   // lineGroupRaw -- computed ONCE here instead of via groupsMatchByAlias() (2 groupKeyAliasSet calls) inside the
   // filter callback below. Profiled live (node --prof) and found THIS was the actual cause of the recurring
