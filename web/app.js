@@ -1528,6 +1528,47 @@ function getValue(id) {
   return el.type === "checkbox" ? el.checked : el.value;
 }
 
+// LIVE HARVEST STATUS (2026-07-20, operator: "show which group he's harvesting from, dynamically, in Step 2"):
+// renders state.posting.contentSources.harvestStatus (written server-side every harvest round) into a small
+// status line in Step 2 so the source group, last-check time, and what was found are always visible, not
+// just the static textarea the operator typed the URL into.
+function renderHarvestLiveStatus(state) {
+  const el = document.getElementById("harvestLiveStatus");
+  if (!el) return;
+  const enabled = state.posting?.contentSources?.enabled === true || state.operator?.contentSourcesEnabled === true;
+  const hs = state.posting?.contentSources?.harvestStatus;
+  if (!enabled || !hs) { el.style.display = "none"; el.textContent = ""; return; }
+  const ago = (iso) => {
+    const t = Date.parse(iso || "");
+    if (!Number.isFinite(t)) return "";
+    const mins = Math.max(0, Math.round((Date.now() - t) / 60000));
+    if (mins < 1) return "just now";
+    if (mins < 60) return mins === 1 ? "1 min ago" : `${mins} min ago`;
+    const hrs = Math.round(mins / 60);
+    return hrs === 1 ? "1 hour ago" : `${hrs} hours ago`;
+  };
+  const until = (iso) => {
+    const t = Date.parse(iso || "");
+    if (!Number.isFinite(t)) return "";
+    const mins = Math.max(0, Math.round((t - Date.now()) / 60000));
+    return mins <= 0 ? "any moment now" : (mins === 1 ? "~1 min" : `~${mins} min`);
+  };
+  const groups = Array.isArray(hs.sourceGroupUrls) ? hs.sourceGroupUrls : [];
+  const groupLabel = groups.length
+    ? groups.map((g) => String(g).replace(/^https?:\/\/(www\.)?facebook\.com\/groups\//i, "")).join(", ")
+    : "(no source group configured yet)";
+  let html;
+  if (hs.poolFull) {
+    html = `&#9989; Harvest pool full (${hs.poolSize}/${hs.poolTarget}) &mdash; paused, next check in ${until(hs.nextHarvestAt)}.`;
+  } else if (hs.lastHarvestAt) {
+    html = `&#128269; Harvesting from: <b>${escapeHtml(groupLabel)}</b><br>Last check: ${ago(hs.lastHarvestAt)} &mdash; <b>${hs.harvestedNew || 0}</b> new, ${hs.reusedOld || 0} reused, ${hs.skippedSeen || 0} already seen. Next check in ${until(hs.nextHarvestAt)}.`;
+  } else {
+    el.style.display = "none"; el.textContent = ""; return;
+  }
+  el.innerHTML = html;
+  el.style.display = "";
+}
+
 function renderState(state) {
   workflowState = state;
   if (__lastSnapshot === null && state) { try { __lastSnapshot = JSON.stringify(state); } catch (e) {} }
@@ -1608,6 +1649,7 @@ function renderState(state) {
   setValue("contentSourceGroupsText", state.posting.contentSources?.groupsText);
   setValue("contentSourcesNotes", state.posting.contentSources?.notes);
   if (typeof updateContentSourceBranch === "function") updateContentSourceBranch(); // show copy vs scrape branch per saved method
+  renderHarvestLiveStatus(state);
   renderGroupAssignmentBuilder();
 
   setValue("productAssetsEnabled", state.productAssets.enabled);

@@ -3789,6 +3789,20 @@ function harvestedAgeMs(rec) {
   const h = Date.parse((rec && (rec.firstHarvestedAt || rec.harvestedAt)) || "");
   return Number.isFinite(h) ? Math.max(0, Date.now() - h) : 0;
 }
+// TIER-3 GRACE GATE (2026-07-20, restored per operator: "24h reused, or 48h max if none fresher available" --
+// fresh+tier2-empty is the trigger, but a pure instantaneous snapshot would flip open/closed on every ~2min
+// tick, so track elapsed time since the pool FIRST read empty and only open once tier3GraceMinutes has
+// elapsed continuously. In-memory only (module-level); resets naturally (and safely) on process restart.
+// UNLIKE the removed 2026-07-19 design, there is NO tier beyond this one -- content older than tier3Hours is
+// NEVER posted; the operator wants an idle tick over anything past 48h, full stop.
+let __tier12EmptySinceMs = 0;
+function tier3GateOpen(isEmptyNow, state) {
+  const graceMs = clampNumber(state.posting?.contentSources?.tier3GraceMinutes, 0, 720, 15) * 60000;
+  if (!isEmptyNow) { __tier12EmptySinceMs = 0; return false; }
+  const now = Date.now();
+  if (!__tier12EmptySinceMs) __tier12EmptySinceMs = now;
+  return (now - __tier12EmptySinceMs) >= graceMs;
+}
 function collectProductUrlsForPosting(state, options = {}) {
   const latestOnly = Boolean(options.latestDiscoveryOnly || options.latest_discovery_only);
   const candidateRows = latestOnly
@@ -3828,7 +3842,7 @@ function collectProductUrlsForPosting(state, options = {}) {
     const everPosted = (r) => Boolean(r.lastPostedAt || r.posted) || __maxGroupStampMs(r) > 0;
     const __reuseMs = rh * 3600 * 1000;
     const __fanout = state.operator?.postToAllGroups === true;
-    const { tier2Ms: __tier2Ms } = harvestedTierAgeBoundsMs(state);
+    const { tier2Ms: __tier2Ms, tier3Ms: __tier3Ms } = harvestedTierAgeBoundsMs(state);
     const __ageCache = new Map();
     const __ageOf = (r) => { let a = __ageCache.get(r.productKey); if (a === undefined) { a = harvestedAgeMs(r); __ageCache.set(r.productKey, a); } return a; };
     // NEWEST-FIRST (2026-07-19, operator: "check for fresh posts... and post them" -- today's never-posted
@@ -3900,16 +3914,23 @@ function collectProductUrlsForPosting(state, options = {}) {
       const __isPartial = (r) => __coveredCount(r) > 0 && __owesServableGroup(r); // mid-duplication AND the missing group can actually post now
       const partial = reeligibleRecs.filter(__isPartial).map((r) => r.productKey); // never age-gated -- task #214 coverage-priority is orthogonal to freshness tiering
       const recycleRecs = reeligibleRecs.filter((r) => !__isPartial(r));
-      // FRESHNESS CEILING (2026-07-20, operator: "don't post saved products older than 24h -- if none fresh and
-      // none <=24h old, just WAIT, don't fall back to older content"). Recycled/saved content older than
-      // tier2MaxAgeHours (default 24h since the IMMUTABLE firstHarvestedAt) is never offered as a candidate.
-      // Supersedes the 2026-07-19 "always include recycleBeyond" design -- that existed to avoid starving the
-      // perpetual-reuse mechanism, but the operator has explicitly chosen an idle tick over stale content.
-      const recycle = recycleRecs.filter((r) => __ageOf(r) <= __tier2Ms).map((r) => r.productKey);
+      // FRESHNESS CEILING (2026-07-20, operator: "fresh first, then <=24h saved, then <=48h ONLY if nothing
+      // fresher is available, otherwise wait -- NEVER post anything older than 48h"). tier2 (<=24h) is always
+      // offered; tier3 (24-48h) is gated behind tier3GateOpen so a momentary empty tick doesn't flap it in and
+      // out, but there is NO tier beyond 48h -- content past tier3Ms is simply never a candidate.
+      const recycleTier2 = recycleRecs.filter((r) => __ageOf(r) <= __tier2Ms);
+      const recycleTier3Window = recycleRecs.filter((r) => __ageOf(r) > __tier2Ms && __ageOf(r) <= __tier3Ms);
+      const __tier12EmptyNow = fresh.length === 0 && recycleTier2.length === 0 && partial.length === 0;
+      const __tier3Open = tier3GateOpen(__tier12EmptyNow, state);
+      const recycle = [...recycleTier2, ...(__tier3Open ? recycleTier3Window : [])].map((r) => r.productKey);
       harvestedKeys = [...partial, ...fresh, ...recycle];
     } else {
       // FRESHNESS CEILING (2026-07-20): same rationale as the fanout branch above.
-      const recycle = reeligibleRecs.filter((r) => __ageOf(r) <= __tier2Ms).map((r) => r.productKey);
+      const recycleTier2 = reeligibleRecs.filter((r) => __ageOf(r) <= __tier2Ms);
+      const recycleTier3Window = reeligibleRecs.filter((r) => __ageOf(r) > __tier2Ms && __ageOf(r) <= __tier3Ms);
+      const __tier12EmptyNow = fresh.length === 0 && recycleTier2.length === 0;
+      const __tier3Open = tier3GateOpen(__tier12EmptyNow, state);
+      const recycle = [...recycleTier2, ...(__tier3Open ? recycleTier3Window : [])].map((r) => r.productKey);
       harvestedKeys = [...fresh, ...recycle];
     }
   }
@@ -9644,7 +9665,17 @@ async function harvestContentSourcesAsync(options = {}) {
     // reaches a high poolTarget (default 2000). reserveTarget/refillAt stay only as telemetry + cadence hints.
     const poolSize = readHarvestedProducts(state).length;
     const poolTarget = clampNumber(cs.poolTarget, 50, 100000, 2000);
-    if (poolSize >= poolTarget) { __harvestNextAt = Date.now() + newCheckMs; logEvent("harvest_pool_full", { poolSize, poolTarget, reserve }); return { poolFull: poolSize }; }
+    if (poolSize >= poolTarget) {
+      __harvestNextAt = Date.now() + newCheckMs;
+      logEvent("harvest_pool_full", { poolSize, poolTarget, reserve });
+      try {
+        const st0 = readState();
+        st0.posting = st0.posting || {}; st0.posting.contentSources = st0.posting.contentSources || {};
+        st0.posting.contentSources.harvestStatus = { ...(st0.posting.contentSources.harvestStatus || {}), poolFull: true, poolSize, poolTarget, nextHarvestAt: new Date(__harvestNextAt).toISOString() };
+        writeState(st0);
+      } catch (_) {}
+      return { poolFull: poolSize };
+    }
     const effectiveTarget = poolTarget;
     const lines = recordLines(state.posting?.contentSources?.groupsText);
     const pool = [...new Set(postingSlots(state).map((s) => Number(s.profileId)).filter(Boolean))]; // round-robin pool for bare urls
@@ -9817,6 +9848,15 @@ async function harvestContentSourcesAsync(options = {}) {
     try {
       const st2 = readState();
       st2.posting = st2.posting || {}; st2.posting.contentSources = st2.posting.contentSources || {};
+      // LIVE HARVEST STATUS (2026-07-20, operator: "show which group he's harvesting from, dynamically, in
+      // Step 2 on the Prod tab"): a small persisted snapshot the frontend can poll via /api/state -- this round's
+      // source group(s), when it last ran, what it found, and when the next round is due.
+      st2.posting.contentSources.harvestStatus = {
+        sourceGroupUrls: [...new Set(pairs.map((p) => p.groupUrl))],
+        lastHarvestAt: new Date().toISOString(),
+        harvestedNew, reusedOld, skippedSeen,
+        nextHarvestAt: new Date(Date.now() + newCheckMs).toISOString(),
+      };
       if (Object.keys(resumeUpdates).length) {
         let prev = {}; try { prev = JSON.parse(String(st2.posting.contentSources.harvestResume || "{}")) || {}; } catch (_) { prev = {}; }
         // MONOTONIC cursor: FB photo fbids are time-ordered DESCENDING (older = numerically smaller). Keep the SMALLER
@@ -24136,6 +24176,29 @@ function buildRunReports(force = false) {
       if (k) __harvestedByKey.set(k, rec);
     }
   } catch (_) {}
+  // CONTENT FRESHNESS AT POST TIME (2026-07-20, operator: "show how many fresh harvested products he posted vs
+  // how many old ones (<=24h / <=48h) he reused"). A post is FRESH if it's the earliest-ever publish of that
+  // productKey across the WHOLE ledger (not just this run) -- reposts of the same product later are "reused".
+  // For reused posts, age is measured from the IMMUTABLE firstHarvestedAt to THIS post's own timestamp (not
+  // "now" -- this report covers historical runs too), matching the live posting-selection tiers exactly.
+  const __firstPostTimeByProductKey = new Map();
+  for (const p of posts) {
+    const pk = String(p.productKey || "");
+    if (!pk) continue;
+    const ex = __firstPostTimeByProductKey.get(pk);
+    if (ex === undefined || p._t < ex) __firstPostTimeByProductKey.set(pk, p._t);
+  }
+  const __contentAgeClassFor = (p) => {
+    const pk = String(p.productKey || "");
+    if (!pk) return { isFresh: false, ageHours: null, bucket: "unknown" };
+    if (__firstPostTimeByProductKey.get(pk) === p._t) return { isFresh: true, ageHours: 0, bucket: "fresh" };
+    const hrec = __harvestedByKey.get(pk);
+    const h = hrec ? Date.parse(hrec.firstHarvestedAt || hrec.harvestedAt || "") : NaN;
+    if (!Number.isFinite(h)) return { isFresh: false, ageHours: null, bucket: "unknown" };
+    const ageHours = Math.max(0, (p._t - h) / 3600000);
+    const bucket = ageHours <= 24 ? "under24h" : (ageHours <= 48 ? "under48h" : "over48h");
+    return { isFresh: false, ageHours, bucket };
+  };
   const out = runsRaw.map((run, idx) => {
     const groups = {};
     const gaps = [];
@@ -24147,6 +24210,7 @@ function buildRunReports(force = false) {
     // which profiles) — so the operator can verify the same product is duplicated across BOTH groups vs only one.
     const productMap = new Map(); // productKey -> { num, key, title, total, groups:{g:n}, profiles:Set }
     const productOrder = [];
+    const contentFreshness = { fresh: 0, under24h: 0, under48h: 0, over48h: 0, unknown: 0 };
     for (const p of run.posts) {
       const g = __reportGroupName(p.groupUrl || p.actualGroupUrl || p.postUrl);
       const gg = groups[g] || (groups[g] = { posts: 0, commented: 0, gaps: [] });
@@ -24156,9 +24220,10 @@ function buildRunReports(force = false) {
       if (c && c.t >= p._t) { gapSec = Math.round((c.t - p._t) / 1000); gaps.push(gapSec); gg.gaps.push(gapSec); gg.commented += 1; commented += 1; }
       const pk = String(p.productKey || "");
       let pnum = 0;
+      let pm = null;
       if (pk) {
-        let pm = productMap.get(pk);
-        if (!pm) { pm = { num: productOrder.length + 1, key: pk, title: String(p.title || p.ogTitle || ""), total: 0, groups: {}, profiles: new Set() }; productMap.set(pk, pm); productOrder.push(pm); }
+        pm = productMap.get(pk);
+        if (!pm) { pm = { num: productOrder.length + 1, key: pk, title: String(p.title || p.ogTitle || ""), total: 0, groups: {}, profiles: new Set(), hasFreshPost: false }; productMap.set(pk, pm); productOrder.push(pm); }
         pm.total += 1;
         pm.groups[g] = (pm.groups[g] || 0) + 1;
         if (p.profileId) pm.profiles.add(Number(p.profileId));
@@ -24179,7 +24244,9 @@ function buildRunReports(force = false) {
       const __appr = approvalResolvedByKey.get(__postKey(p)) || approvalResolvedByPlanSeq.get(__psKey);
       const approvedByModerator = __appr ? (__appr.moderator || String(__appr.moderatorId || "")) : null;
       const approvalDurationMinutes = (__appr && __pendingStart) ? Math.max(0, Math.round((__appr.t - __pendingStart.t) / 60000)) : null;
-      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profilePubLabel: String(p.profile || ""), profileCom: c ? c.profileId : null, profileComLabel: c ? String(c.profile || "") : "", productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable", wasPendingApproval: Boolean(__pendingStart), approvalWaitMinutes, approvedByModerator, approvalDurationMinutes });
+      const __freshness = __contentAgeClassFor(p);
+      contentFreshness[__freshness.bucket] = (contentFreshness[__freshness.bucket] || 0) + 1;
+      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profilePubLabel: String(p.profile || ""), profileCom: c ? c.profileId : null, profileComLabel: c ? String(c.profile || "") : "", productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable", wasPendingApproval: Boolean(__pendingStart), approvalWaitMinutes, approvedByModerator, approvalDurationMinutes, isFreshPost: __freshness.isFresh, contentAgeHours: __freshness.ageHours != null ? Math.round(__freshness.ageHours * 10) / 10 : null });
       if (p.approvalVerification === "soft_clicked" && !c) softApproved += 1;
     }
     // LIFETIME COVERAGE (operator 2026-07-15: "why he dont post the same product in all groupes" -- traced live:
@@ -24260,6 +24327,16 @@ function buildRunReports(force = false) {
       products,
       uniqueProducts: products.length,
       productsInBoth,
+      // CONTENT FRESHNESS (2026-07-20, operator: fresh-vs-reused breakdown): fresh = first-ever publish of that
+      // product; under24h/under48h = reused saved content at that age when posted; over48h = reused content
+      // older than the posting rule now allows (should only appear on runs that predate the 2026-07-20 fix).
+      contentFreshness: {
+        fresh: contentFreshness.fresh,
+        reusedUnder24h: contentFreshness.under24h,
+        reusedUnder48h: contentFreshness.under48h,
+        reusedOver48h: contentFreshness.over48h,
+        unknown: contentFreshness.unknown,
+      },
       // PENDING APPROVAL (2026-07-04): posts submitted and awaiting moderator approval, not yet resolved either way
       // -- see the pendingApproval/pendingUnclustered computation above buildRunReports' run-clustering.
       pendingApproval: { count: pendingItems.length, items: pendingItems },
