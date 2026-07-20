@@ -122,3 +122,6 @@
 2026-07-20T10:35:15  watchdog: FB server (port 9317) DOWN (crashed_port_free) -> restarted
 2026-07-20T10:49:14  watchdog: FB server (port 9317) DOWN (crashed_port_free) -> restarted
 2026-07-20T11:02:14  watchdog: FB server (port 9317) DOWN (crashed_port_free) -> restarted
+2026-07-20T11:10:18  watchdog: FB server (port 9317) DOWN (crashed_port_free) -> restarted
+2026-07-20T11:21:13  watchdog: FB server (port 9317) DOWN (crashed_port_free) -> restarted
+2026-07-20T11:26:41  watchdog: FB server (port 9317) DOWN (wedged_3_misses) -> restarted

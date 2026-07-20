@@ -339,8 +339,9 @@ function runBody(r){
       }
       var prof = (p.profiles||[]).join(', ');
       var ttl = (p.title||p.shortKey||'').toString();
+      var freshBadge = p.isFreshProduct ? '<span class="pill x ok" title="This product was harvested and posted for the first time ever during this run">&#127793; Fresh</span>' : '';
       return '<tr>'
-        + '<td data-l="Product"><b>P'+p.num+'</b></td>'
+        + '<td data-l="Product"><b>P'+p.num+'</b> '+freshBadge+'</td>'
         + '<td data-l="Title" title="'+esc(p.key)+'">'+esc(ttl.length>46?ttl.slice(0,46)+'…':ttl)+'</td>'
         + '<td data-l="Posted"><b>'+p.total+'×</b> '+multi+'</td>'
         + '<td data-l="Groups">'+gl+'</td>'
@@ -349,12 +350,13 @@ function runBody(r){
     html += '</tbody></table></div>';
   }
   html += '<h2>Post detail <span class="ln"></span></h2><div class="tablecard"><table class="detail"><thead><tr>'
-    + '<th>#</th><th>Product</th><th>Group</th><th>Published</th><th>Commented</th><th>Approval</th><th>Delay</th><th>Profiles</th></tr></thead><tbody>';
+    + '<th>#</th><th>Product</th><th>Group</th><th>Published</th><th>Commented</th><th>Approval</th><th title="Time between this post going live and the comment landing">Comment time</th><th>Profiles</th></tr></thead><tbody>';
   html += (r.detail||[]).map(function(d,i){
     var pubTxt = d.profilePub ? (d.profilePub + (d.profilePubLabel? " - "+esc(d.profilePubLabel) : "")) : "—";
     var comTxt = d.profileCom ? (d.profileCom + (d.profileComLabel? " - "+esc(d.profileComLabel) : "")) : "—";
     var prof = d.profilePub ? (pubTxt + " → " + comTxt) : "—";
-    var pnum = d.productNum ? ('<span class="pill x" title="'+esc(d.productKey||"")+'">P'+d.productNum+'</span>') : '—';
+    var freshTag = d.isFreshPost ? ' <span class="pill x ok" title="First-ever publish of this product">&#127793;</span>' : '';
+    var pnum = d.productNum ? ('<span class="pill x" title="'+esc(d.productKey||"")+'">P'+d.productNum+'</span>'+freshTag) : '—';
     // 2026-07-11 (operator): show WHICH moderator approved this post + how long the approval took.
     var appr = '—';
     if (d.approvedByModerator) {
@@ -370,7 +372,7 @@ function runBody(r){
       + '<td data-l="Published">'+fmtTime(d.publishedAt)+'</td>'
       + '<td data-l="Commented">'+(d.commentedAt?(fmtTime(d.commentedAt)+(d.wasPendingApproval?' <span class="pill x" title="This post waited for a moderator\'s approval before it could be commented.">⏳ waiting '+(d.approvalWaitMinutes!=null?d.approvalWaitMinutes+'min':'?')+'</span>':'')):(d.approvalVerification==="soft_clicked"?'<span class="slow">approval in progress…</span>':'<span class="no">not commented</span>'))+'</td>'
       + '<td data-l="Approval">'+appr+'</td>'
-      + '<td data-l="Delay" class="'+gapClass(d.gapSec)+'">'+fmtGap(d.gapSec)+'</td>'
+      + '<td data-l="Comment time" class="'+gapClass(d.gapSec)+'" title="Time between this post going live and the comment landing">'+fmtGap(d.gapSec)+'</td>'
       + '<td data-l="Profiles">'+esc(prof)+'</td></tr>';
   }).join("");
   html += '</tbody></table></div>';

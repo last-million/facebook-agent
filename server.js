@@ -24246,6 +24246,7 @@ function buildRunReports(force = false) {
       const approvalDurationMinutes = (__appr && __pendingStart) ? Math.max(0, Math.round((__appr.t - __pendingStart.t) / 60000)) : null;
       const __freshness = __contentAgeClassFor(p);
       contentFreshness[__freshness.bucket] = (contentFreshness[__freshness.bucket] || 0) + 1;
+      if (pm && __freshness.isFresh) pm.hasFreshPost = true;
       detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profilePubLabel: String(p.profile || ""), profileCom: c ? c.profileId : null, profileComLabel: c ? String(c.profile || "") : "", productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable", wasPendingApproval: Boolean(__pendingStart), approvalWaitMinutes, approvedByModerator, approvalDurationMinutes, isFreshPost: __freshness.isFresh, contentAgeHours: __freshness.ageHours != null ? Math.round(__freshness.ageHours * 10) / 10 : null });
       if (p.approvalVerification === "soft_clicked" && !c) softApproved += 1;
     }
@@ -24264,7 +24265,7 @@ function buildRunReports(force = false) {
         if (hrec && hrec.lastPostedAtByGroup) for (const g of Object.keys(hrec.lastPostedAtByGroup)) keys.add(__reportGroupName(g));
         lifetimeGroupCount = keys.size;
       } catch (_) {}
-      return { num: pm.num, key: pm.key, shortKey: pm.key.replace(/^harvested:/, ""), title: pm.title, total: pm.total, groups: pm.groups, groupCount: Object.keys(pm.groups).length, lifetimeGroupCount, profiles: Array.from(pm.profiles) };
+      return { num: pm.num, key: pm.key, shortKey: pm.key.replace(/^harvested:/, ""), title: pm.title, total: pm.total, groups: pm.groups, groupCount: Object.keys(pm.groups).length, lifetimeGroupCount, profiles: Array.from(pm.profiles), isFreshProduct: Boolean(pm.hasFreshPost) };
     });
     const productsInBoth = products.filter((p) => p.groupCount >= 2).length;
     const winHeld = held.filter((e) => { const t = Date.parse(e.at || 0); return Number.isFinite(t) && t >= run.startT - 60000 && t <= (run.lastT || Date.now()) + 600000; });
@@ -25851,9 +25852,17 @@ server.listen(PORT, HOST, () => {
   // comments; on AUTO-RESUME it keeps the same runId so the resumed run finishes its own posts' comments; and
   // (2) on STOP — stopAllExternalWork's stop-drain. A disarmed/given-up run's owed comments simply WAIT until the
   // operator launches/resumes prod. (boot crash-recovery setTimeout intentionally removed.)
-  // ORPHAN CLEANUP: a few seconds after boot (and ONLY if no run got armed in the meantime), kill leftover
-  // ixBrowser chrome from the prior/crashed process so it can't wedge ixBrowser or hog RAM. Targeted + safe.
-  setTimeout(() => { try { const __st = readState(); if (!(__st.operator?.autopilotEnabled && __st.operator?.armedForExternalActions)) cleanOrphanIxBrowserChromeAtBoot(); else logEvent("boot_orphan_cleanup_skipped_armed", {}); } catch (_) {} }, 4000);
+  // ORPHAN CLEANUP: a few seconds after boot, kill leftover ixBrowser chrome from the prior/crashed process so it
+  // can't wedge ixBrowser or hog RAM. Targeted + safe.
+  // (2026-07-20 fix, live incident: this used to skip entirely whenever the run was "armed" -- but crash-resume
+  // (autopilotAutoResumeEnabled) keeps a run armed straight THROUGH a restart, so every single restart of an
+  // in-progress run skipped this cleanup, and stray chrome from each prior process piled up across restarts
+  // (confirmed live: 37 stray ixBrowser chrome processes after a handful of same-day restarts, pinning CPU at
+  // 99-100% and collapsing the adaptive concurrency ceiling to 1 worker). "Armed" alone doesn't mean a fresh
+  // browser window has actually opened yet -- normalIxProfileUseLocks tracks that directly (same criterion the
+  // live Tier-B OS reaper already trusts, see hungWindowReaperSweep): if nothing has opened a tracked session in
+  // the few seconds since THIS boot, any chrome still around is unconditionally leftover from before it.
+  setTimeout(() => { try { if (normalIxProfileUseLocks.size === 0) cleanOrphanIxBrowserChromeAtBoot(); else logEvent("boot_orphan_cleanup_skipped_in_use", { openLocks: normalIxProfileUseLocks.size }); } catch (_) {} }, 4000);
   // Stage 3 autonomous publisher. Dormant unless operator.autopilotEnabled +
   // armed; dry-run by default (logs decisions, never posts) until
   // operator.autopilotDryRun is set false.
