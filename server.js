@@ -1307,7 +1307,7 @@ function writeState(state, opts = {}) {
   if (!opts.allowOperatorConfig && existing.posting && existing.posting.contentSources) {
     clean.posting = clean.posting || {};
     clean.posting.contentSources = clean.posting.contentSources || {};
-    for (const f of ["reuseHours", "imageRetentionDays", "harvestMaxAgeDays", "newCheckMinutes"]) {
+    for (const f of ["reuseHours", "imageRetentionDays", "harvestMaxAgeDays", "newCheckMinutes", "tier2MaxAgeHours", "tier3MaxAgeHours", "tier3GraceMinutes"]) {
       if (existing.posting.contentSources[f] !== undefined) clean.posting.contentSources[f] = existing.posting.contentSources[f];
     }
   }
@@ -1947,6 +1947,11 @@ function normalizeWorkflowState(state) {
   // imageRetentionDays to free disk (the text+url record stays for dedup).
   state.posting.contentSources.reuseHours = clampNumber(state.posting.contentSources.reuseHours, 1, 720, 24); // operator 2026-06-19: reuse every 24h (was 26/48). With retention 2d a product recycles ~1x before its image is deleted.
   state.posting.contentSources.imageRetentionDays = clampNumber(state.posting.contentSources.imageRetentionDays, 1, 90, 2); // operator 2026-06-17: remove saved products after 2 days (was 15)
+  // FRESHNESS TIER knobs (operator 2026-07-19): post never-posted harvest first, then saved products <=24h
+  // since first harvested, then (only once both are empty for a grace window) saved products 24-48h old.
+  state.posting.contentSources.tier2MaxAgeHours = clampNumber(state.posting.contentSources.tier2MaxAgeHours, 1, 720, 24);
+  state.posting.contentSources.tier3MaxAgeHours = clampNumber(state.posting.contentSources.tier3MaxAgeHours, 1, 720, 48);
+  state.posting.contentSources.tier3GraceMinutes = clampNumber(state.posting.contentSources.tier3GraceMinutes, 0, 720, 15);
   // NEW-PRODUCT CHECK CADENCE + FRESHNESS CAP (operator 2026-06-17): harvest checks for new products every
   // newCheckMinutes (default 60min) and never harvests a listing older than harvestMaxAgeDays (default 2 days).
   state.posting.contentSources.newCheckMinutes = clampNumber(state.posting.contentSources.newCheckMinutes, 5, 720, 60);
@@ -2566,6 +2571,7 @@ function appendHarvestedProduct(record, state = readState()) {
     ogDescription: String(record.ogDescription || "").slice(0, 500),
     ogTriedAt: (record.ogTitle || record.ogDescription) ? new Date().toISOString() : "",
     harvestedAt: new Date().toISOString(),
+    firstHarvestedAt: new Date().toISOString(), // IMMUTABLE (2026-07-19): never overwritten by the heal path or any patch -- the tier2/tier3 age clock
     posted: "",
     imageDeleted: false,
   });
@@ -3760,6 +3766,42 @@ function recentProductGroupFailureCounts() {
   }
   return counts;
 }
+// HARVESTED-TIER age bounds (2026-07-19, operator request + adversarial-verify workflow): tier2/tier3 subdivide
+// the already-posted, reuse-cooldown-cleared, non-partial recycle pool by age-since-FIRST-harvest, used ONLY to
+// REORDER/DEFER (never to exclude -- see collectProductUrlsForPosting). tier2Hours is floored to reuseHours+1:
+// a record can only reach the recycle pool at all once now-lastPostedAt(perGroup) >= reuseMs, and
+// firstHarvestedAt/harvestedAt can never postdate a record's own last post (you cannot post something before it
+// was harvested) -- so age-since-harvest is PROVABLY >= reuseHours for every recycle candidate. Without this
+// floor, tier2MaxAgeHours<=reuseHours (e.g. matching 24/24 defaults) makes tier2 permanently, unconditionally
+// empty (adversarial-review finding, confirmed against the live code).
+function harvestedTierAgeBoundsMs(state) {
+  const reuseHours = clampNumber(state.posting?.contentSources?.reuseHours, 1, 720, 24);
+  const tier2HoursConfigured = clampNumber(state.posting?.contentSources?.tier2MaxAgeHours, 1, 720, 24);
+  const tier3HoursConfigured = clampNumber(state.posting?.contentSources?.tier3MaxAgeHours, 1, 720, 48);
+  const tier2Hours = Math.max(reuseHours + 1, tier2HoursConfigured);
+  const tier3Hours = Math.max(tier2Hours + 1, tier3HoursConfigured); // always strictly above tier2 -> structurally mutually exclusive
+  return { reuseHours, tier2Hours, tier3Hours, tier2Ms: tier2Hours * 3600000, tier3Ms: tier3Hours * 3600000 };
+}
+// firstHarvestedAt is the IMMUTABLE original-discovery stamp (never touched by the harvest heal path or any
+// updateHarvestedProductRecord patch) -- prefer it; harvestedAt (mutable, reset on heal) is the fallback for
+// records saved before this field existed. Fail-open to age 0 on an unparseable date (never wrongly excludes).
+function harvestedAgeMs(rec) {
+  const h = Date.parse((rec && (rec.firstHarvestedAt || rec.harvestedAt)) || "");
+  return Number.isFinite(h) ? Math.max(0, Date.now() - h) : 0;
+}
+// TIER-3 GRACE GATE (2026-07-19): a pure instantaneous "fresh+tier2(+partial) all empty right now" snapshot
+// would flip open/closed on every ~2min tick, contradicting the operator's stated "15-minute wait for fresh
+// content" intent. Track elapsed time since the pool FIRST read empty; only open once tier3GraceMinutes has
+// elapsed continuously. In-memory only (module-level), matching the existing __harvestNextAt/__harvestEmptyRounds
+// precedent -- resets naturally (and safely) on process restart.
+let __tier12EmptySinceMs = 0;
+function tier3GateOpen(isEmptyNow, state) {
+  const graceMs = clampNumber(state.posting?.contentSources?.tier3GraceMinutes, 0, 720, 15) * 60000;
+  if (!isEmptyNow) { __tier12EmptySinceMs = 0; return false; }
+  const now = Date.now();
+  if (!__tier12EmptySinceMs) __tier12EmptySinceMs = now;
+  return (now - __tier12EmptySinceMs) >= graceMs;
+}
 function collectProductUrlsForPosting(state, options = {}) {
   const latestOnly = Boolean(options.latestDiscoveryOnly || options.latest_discovery_only);
   const candidateRows = latestOnly
@@ -3799,7 +3841,17 @@ function collectProductUrlsForPosting(state, options = {}) {
     const everPosted = (r) => Boolean(r.lastPostedAt || r.posted) || __maxGroupStampMs(r) > 0;
     const __reuseMs = rh * 3600 * 1000;
     const __fanout = state.operator?.postToAllGroups === true;
-    const fresh = recs.filter((r) => onDisk(r) && !everPosted(r)).map((r) => r.productKey);
+    const { tier2Ms: __tier2Ms, tier3Ms: __tier3Ms } = harvestedTierAgeBoundsMs(state);
+    const __ageCache = new Map();
+    const __ageOf = (r) => { let a = __ageCache.get(r.productKey); if (a === undefined) { a = harvestedAgeMs(r); __ageCache.set(r.productKey, a); } return a; };
+    // NEWEST-FIRST (2026-07-19, operator: "check for fresh posts... and post them" -- today's never-posted
+    // pool had NO explicit sort, just incidental insertion order (oldest-harvested-first, since a growing
+    // backlog is appended at the end) -- confirmed live: a 44h-old never-posted product was posted ahead of an
+    // 18-minute-old one purely because it was harvested earlier. Sort by age ascending (freshest first) so a
+    // just-harvested product is offered before an older backlog item; this is pure reordering of the SAME set
+    // onDisk()/!everPosted() already selects -- nothing is added or excluded, so no backlog item can be starved,
+    // it just yields to genuinely fresher content first.
+    const fresh = recs.filter((r) => onDisk(r) && !everPosted(r)).sort((a, b) => __ageOf(a) - __ageOf(b)).map((r) => r.productKey);
     // RE-ELIGIBLE: product-level window when posting to a single group; GROUP-AWARE (still owes a configured group)
     // when postToAllGroups, so a product posted to ONE group stays eligible for the remaining group(s) instead of
     // being dropped from the pool for the whole window (the "same product not in all groups" bug).
@@ -3855,11 +3907,27 @@ function collectProductUrlsForPosting(state, options = {}) {
         return false;
       };
       const __isPartial = (r) => __coveredCount(r) > 0 && __owesServableGroup(r); // mid-duplication AND the missing group can actually post now
-      const partial = reeligibleRecs.filter(__isPartial).map((r) => r.productKey); // complete the duplication NOW
-      const recycle = reeligibleRecs.filter((r) => !__isPartial(r)).map((r) => r.productKey); // stale-recycle, or owes only an unservable group -> behind fresh (don't starve the healthy group)
+      const partial = reeligibleRecs.filter(__isPartial).map((r) => r.productKey); // never age-gated -- task #214 coverage-priority is orthogonal to freshness tiering
+      const recycleRecs = reeligibleRecs.filter((r) => !__isPartial(r));
+      // FRESHNESS TIERING (2026-07-19, operator request): reorder-only, never excludes. tier2 (<=24h since first
+      // harvest) is offered first, tier3 (24-48h) only once tier1+tier2+partial have been empty for a full grace
+      // window, and "beyond" (>48h -- i.e. today's normal steady-state recycle catalog) is ALWAYS included so
+      // nothing already eligible today is ever silently dropped (adversarial-verify critical-finding fix).
+      const recycleTier2 = recycleRecs.filter((r) => __ageOf(r) <= __tier2Ms);
+      const recycleTier3Window = recycleRecs.filter((r) => __ageOf(r) > __tier2Ms && __ageOf(r) <= __tier3Ms);
+      const recycleBeyond = recycleRecs.filter((r) => __ageOf(r) > __tier3Ms); // ALWAYS included -- never permanently stranded
+      const __tier12EmptyNow = fresh.length === 0 && recycleTier2.length === 0 && partial.length === 0;
+      const __tier3Open = tier3GateOpen(__tier12EmptyNow, state);
+      const recycle = [...recycleTier2, ...(__tier3Open ? recycleTier3Window : []), ...recycleBeyond].map((r) => r.productKey);
       harvestedKeys = [...partial, ...fresh, ...recycle];
     } else {
-      harvestedKeys = [...fresh, ...reeligibleRecs.map((r) => r.productKey)];
+      const recycleTier2 = reeligibleRecs.filter((r) => __ageOf(r) <= __tier2Ms);
+      const recycleTier3Window = reeligibleRecs.filter((r) => __ageOf(r) > __tier2Ms && __ageOf(r) <= __tier3Ms);
+      const recycleBeyond = reeligibleRecs.filter((r) => __ageOf(r) > __tier3Ms); // ALWAYS included, same rationale as the fanout branch
+      const __tier12EmptyNow = fresh.length === 0 && recycleTier2.length === 0;
+      const __tier3Open = tier3GateOpen(__tier12EmptyNow, state);
+      const reeligibleForPool = [...recycleTier2, ...(__tier3Open ? recycleTier3Window : []), ...recycleBeyond];
+      harvestedKeys = [...fresh, ...reeligibleForPool.map((r) => r.productKey)];
     }
   }
   // EXCLUSIVE mode: post ONLY copied products (skip web-discovery products entirely). When off, copied
@@ -10124,7 +10192,11 @@ async function sweepHarvestedImagesAsync() {
   __harvestedImageSweepInFlight = true;
   try {
     const state = readState();
-    const retentionDays = clampNumber(state.posting?.contentSources?.imageRetentionDays, 1, 90, 2);
+    const configuredRetentionDays = clampNumber(state.posting?.contentSources?.imageRetentionDays, 1, 90, 2);
+    // FLOOR (2026-07-19): must never sweep an image out from under the new tier2/tier3 freshness window --
+    // otherwise a tier-3 candidate's image (and thus onDisk() eligibility) would be deleted before the selection
+    // logic in collectProductUrlsForPosting ever gets a chance to offer it, silently emptying tier3 in practice.
+    const retentionDays = Math.max(configuredRetentionDays, Math.ceil(harvestedTierAgeBoundsMs(state).tier3Hours / 24) + 1);
     const cutoffMs = retentionDays * 86400 * 1000;
     const now = Date.now();
     let deleted = 0, errors = 0;
@@ -10173,7 +10245,11 @@ async function sweepHarvestedProductsByAgeAsync() {
     // compact-rewrite can never silently drop a lastPostedAtByGroup entry that a naive last-line-wins dedup
     // would have discarded (task #214, see readHarvestedProducts' own comment).
     const recs = readHarvestedProducts(state);
-    const retentionDays = clampNumber(state.posting?.contentSources?.imageRetentionDays, 1, 90, 2);
+    const configuredRetentionDays = clampNumber(state.posting?.contentSources?.imageRetentionDays, 1, 90, 2);
+    // FLOOR (2026-07-19): must match sweepHarvestedImagesAsync's floor exactly, or a tier-3 candidate's jsonl
+    // RECORD could be permanently deleted here under the old shorter cutoff while its image survives there --
+    // reopening the same risk from the other side.
+    const retentionDays = Math.max(configuredRetentionDays, Math.ceil(harvestedTierAgeBoundsMs(state).tier3Hours / 24) + 1);
     const cutoffMs = retentionDays * 86400 * 1000;
     const now = Date.now();
     const keep = [], prune = [];
