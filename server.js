@@ -14770,6 +14770,18 @@ async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState
       candidates: candidates.length,
       totalProfiles: rows.total || rows.profiles?.length || 0,
     });
+    // MODERATOR POOL FLOOR ALERT (2026-07-20, root-caused via workflow: the pool silently thinned to 4/88
+    // profiles with zero alerting while the coded ceiling (MAX_APPROVAL_MODERATOR_POOL=8) went unused -- this
+    // starvation was the dominant driver of a 99.4% admin-approval failure rate). Surface it loudly so it's
+    // never silent again.
+    if (candidates.length > 0 && candidates.length < 6) {
+      logEvent("facebook_admin_approval_pool_low", {
+        groupUrl,
+        candidates: candidates.length,
+        ceiling: MAX_APPROVAL_MODERATOR_POOL,
+        message: `Only ${candidates.length} moderator candidate(s) available for this group (coded ceiling is ${MAX_APPROVAL_MODERATOR_POOL}) -- approval throughput is likely bottlenecked. Add more FB-moderator-capable ixBrowser profiles or resolve any parked/blocked ones.`,
+      });
+    }
   } catch (err) {
     logEvent("facebook_admin_approval_profiles_load_failed", {
       groupUrl,
@@ -15281,12 +15293,20 @@ function autoEnableAdminApprovalIfPersistentFailures(groupUrl) {
 // not charged against it).
 const __adminApprovalLockChains = new Map(); // profileId (string) -> Promise chain
 const LOCK_ACQUIRE_TIMEOUT_MS = 10 * 60 * 1000;
-function acquireAdminApprovalLock(profileId) {
+// (2026-07-20 fix, root-caused via workflow after live incident: 209/day admin_approval_lock_wait_timeout_forced
+// events, 100% on the same starved 4-profile moderator pool) LOCK_ACQUIRE_TIMEOUT_MS (10min) is LONGER than the
+// caller's own MAX_ADMIN_APPROVAL_WALL_CLOCK_MS session budget (8min) -- so a caller queued behind a wedged
+// profile could burn its ENTIRE session just waiting on ONE profile's lock and bail via budgetExceeded without
+// ever attempting a single real scan/click. Callers now pass their own remaining budget so the wait can never
+// outlast what they have left; the 10min ceiling remains as the backstop for a caller with a full budget (keeps
+// the "genuinely wedged forever" protection generous enough to rarely misfire on a merely-slow, not hung, holder).
+function acquireAdminApprovalLock(profileId, maxWaitMs) {
   const key = String(profileId);
   let release;
   const next = new Promise((res) => { release = res; });
   const prior = __adminApprovalLockChains.get(key) || Promise.resolve();
   __adminApprovalLockChains.set(key, prior.then(() => next));
+  const waitMs = clampNumber(maxWaitMs, 1000, LOCK_ACQUIRE_TIMEOUT_MS, LOCK_ACQUIRE_TIMEOUT_MS);
   // LOCK-WAIT HARD TIMEOUT (2026-07-19, live incident: a prior holder that never calls release() -- e.g. an
   // unbounded await deep in that attempt -- otherwise wedges EVERY future acquirer of this per-profile chain
   // forever, with no crash/log). Race the wait against a bounded timer so a caller always eventually proceeds;
@@ -15295,9 +15315,9 @@ function acquireAdminApprovalLock(profileId) {
   return Promise.race([
     prior.then(() => release),
     new Promise((res) => setTimeout(() => {
-      try { logEvent("admin_approval_lock_wait_timeout_forced", { profileId: key }); } catch (_) {}
+      try { logEvent("admin_approval_lock_wait_timeout_forced", { profileId: key, waitMs }); } catch (_) {}
       res(release);
-    }, LOCK_ACQUIRE_TIMEOUT_MS)),
+    }, waitMs)),
   ]);
 }
 async function approvePendingFacebookPostWithAdminProfiles(args) {
@@ -15443,7 +15463,11 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
       // wait for THIS profile's lock now counts against the session's own budget (recomputed AFTER the wait, not
       // before) so a contended profile can't let an attempt overshoot MAX_ADMIN_APPROVAL_WALL_CLOCK_MS.
       const lockRequestedAt = Date.now();
-      const releaseApprovalLock = await acquireAdminApprovalLock(adminProfile.profileId);
+      // (2026-07-20 fix) never wait on this lock longer than the session actually has left -- a wait that
+      // outlasts the remaining budget is guaranteed to end in budgetExceeded below anyway, so bound it now
+      // instead of blocking uselessly for up to the full LOCK_ACQUIRE_TIMEOUT_MS.
+      const __remainingForLockWait = MAX_ADMIN_APPROVAL_WALL_CLOCK_MS - (Date.now() - approvalStartedAt) - 5000;
+      const releaseApprovalLock = await acquireAdminApprovalLock(adminProfile.profileId, __remainingForLockWait);
       logEvent("facebook_admin_approval_lock_acquired", { profileId: adminProfile.profileId, queueWaitMs: Date.now() - lockRequestedAt });
       const remainingBudgetMs = MAX_ADMIN_APPROVAL_WALL_CLOCK_MS - (Date.now() - approvalStartedAt);
       if (remainingBudgetMs <= 5000) {

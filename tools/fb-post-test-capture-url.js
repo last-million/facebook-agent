@@ -3686,7 +3686,10 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
   // run's post is at/near the TOP and old pending posts sit DEEP. Keep the search SHALLOW so the moderator stays
   // on recent posts and never scrolls down into the old backlog. If our post isn't in the top screens yet (FB's
   // 10-30min propagation), the patient retry-poll below re-checks the top later instead of dredging old posts.
-  const MAX_SCROLLS_PER_TARGET = 4; // was 12 — stay near the top (recent posts), don't reach the old backlog
+  // (2026-07-20) raised 4->8: the pending queue has grown to a real 24+ item backlog of OUR OWN stuck posts (not
+  // old unrelated ones), so a 4-screen cap increasingly misses posts that haven't reached the very top yet. Still
+  // well short of the original 12 to avoid dredging into genuinely old/unrelated backlog.
+  const MAX_SCROLLS_PER_TARGET = 8; // was 4 (before that, 12) — stay near the top (recent posts), don't reach the old backlog
   const cleanPublisherId = String(publisherUserId || '').replace(/\D+/g, '');
   // EXPAND collapsed posts: a just-published post's unique marker (hashtags / #fb fingerprint) often sits at
   // the END of the caption behind a "See more" / "Ver más" fold, so it is NOT in body.innerText and the marker
