@@ -243,6 +243,18 @@ function runCard(r,i){
 function runBody(r){
   var ramTxt = r.minRamPct==null ? "—" : (r.minRamPct+"%");
   var chrTxt = r.chromePeak==null ? "—" : r.chromePeak;
+  // APPROVAL WAIT SUMMARY (2026-07-20, operator: "how much time was it approved in"): a top-level stat card so
+  // this is visible without scrolling down to the per-post "Approved after waiting" table.
+  var __waitedMins = (r.detail||[]).filter(function(d){ return d.wasPendingApproval; })
+    .map(function(d){ return d.approvalDurationMinutes!=null ? d.approvalDurationMinutes : d.approvalWaitMinutes; })
+    .filter(function(m){ return m!=null; });
+  var approvalWaitCard = "";
+  if (__waitedMins.length) {
+    var __avgWait = Math.round(__waitedMins.reduce(function(a,b){ return a+b; },0) / __waitedMins.length);
+    var __sorted = __waitedMins.slice().sort(function(a,b){ return a-b; });
+    var __maxWait = __sorted[__sorted.length-1];
+    approvalWaitCard = statCard("Approval wait", __avgWait+'<small> min avg</small>', __waitedMins.length+" post(s) waited, max "+__maxWait+" min", __avgWait>=15?"r":(__avgWait>=8?"a":"g"));
+  }
   var html = '<div class="stats">'
     + statCard("Posts published", r.posts, "over "+r.durationMin+" min", "")
     + statCard("Average post time", fmtMinSec(r.avgPostIntervalSec), "between each published post", "v")
@@ -250,6 +262,7 @@ function runBody(r){
     + (r.contentFreshness ? statCard("Fresh harvested", r.contentFreshness.fresh, r.contentFreshness.reusedUnder24h+" reused ≤24h, "+r.contentFreshness.reusedUnder48h+" reused ≤48h"+(r.contentFreshness.reusedOver48h?", "+r.contentFreshness.reusedOver48h+" older (pre-fix)":""), (r.contentFreshness.reusedOver48h>0?"r":(r.contentFreshness.fresh>0?"g":"a"))) : "")
     + statCard("Commented", r.commentRate+'<small>%</small>', r.commented+"/"+r.posts+" • "+r.uncommented+" without", r.commentRate>=90?"g":(r.commentRate>=70?"a":"r"))
     + statCard("Median delay", fmtGap(r.gap.medianSec), "max "+fmtGap(r.gap.maxSec), "v")
+    + approvalWaitCard
     + statCard("Chrome peak", chrTxt, "min free RAM "+ramTxt, (r.chromePeak&&r.chromePeak>120)?"r":"g")
     + statCard("Restarts", r.restarts, r.restarts? "server restarted":"none — stable", r.restarts?"a":"g")
     + ((r.pendingApproval&&r.pendingApproval.count)? statCard("Awaiting approval", r.pendingApproval.count, "moderator hasn't passed yet", "a") : "")
@@ -282,20 +295,27 @@ function runBody(r){
   // next to the still-pending list, so both halves of the approval story (waiting now / waited-and-resolved)
   // read together without scrolling. Pure client-side re-render of r.detail already sent by the server --
   // no server change, takes effect on next page load.
-  var resolvedApprovals = (r.detail||[]).filter(function(d){ return d.wasPendingApproval && d.approvedByModerator; });
+  // WIDENED (2026-07-20, operator: still couldn't see this -- traced live: requiring approvedByModerator hid
+  // EVERY post approved via the soft-success/background path (approvalClicked=true but never resolved to the
+  // strict "approved_and_verified" moderator-credit record), which is the DOMINANT outcome today given the
+  // moderator-pool constraints -- so this section rendered EMPTY on real runs that had posts wait 7-8+ min and
+  // still get approved. wasPendingApproval alone is correct: every row in r.detail already represents a post
+  // that WAS published, so a pending-flagged one unambiguously got approved one way or another.
+  var resolvedApprovals = (r.detail||[]).filter(function(d){ return d.wasPendingApproval; });
   if (resolvedApprovals.length) {
     html += '<h2>Approved after waiting <span class="ln"></span> <span class="tag">'+resolvedApprovals.length+'</span></h2>';
     html += '<div class="tablecard"><table class="detail"><thead><tr>'
-      + '<th>Group</th><th>Posted by</th><th>Approved by</th><th>Waited</th><th>Commented</th><th>Commented by</th></tr></thead><tbody>';
+      + '<th>Group</th><th>Posted by</th><th>Approved by</th><th title="Time from admin-approval starting to the post going live">Waited</th><th>Commented</th><th>Commented by</th></tr></thead><tbody>';
     html += resolvedApprovals.map(function(d){
       var poster = d.profilePub ? (d.profilePub + (d.profilePubLabel? ' — '+esc(d.profilePubLabel) : '')) : '—';
       var commenter = d.profileCom ? (d.profileCom + (d.profileComLabel? ' — '+esc(d.profileComLabel) : '')) : '—';
       var waitedMin = d.approvalDurationMinutes!=null ? d.approvalDurationMinutes : d.approvalWaitMinutes;
       var waitedTxt = waitedMin!=null ? waitedMin+' min' : '?';
+      var approvedByTxt = d.approvedByModerator ? esc(String(d.approvedByModerator)) : '<span class="slow" title="Approved via the background/soft-success path -- no specific moderator was recorded">soft-approved</span>';
       return '<tr>'
         + '<td data-l="Group">'+grpPill(d.group)+'</td>'
         + '<td data-l="Posted by">'+poster+'</td>'
-        + '<td data-l="Approved by">'+esc(String(d.approvedByModerator))+'</td>'
+        + '<td data-l="Approved by">'+approvedByTxt+'</td>'
         + '<td data-l="Waited" class="'+(waitedMin!=null && waitedMin>=30?'no':'slow')+'">'+waitedTxt+'</td>'
         + '<td data-l="Commented">'+(d.commentedAt?(fmtTime(d.commentedAt)+' <span class="pill x '+gapClass(d.gapSec)+'" title="Time from this post being approved to the comment landing">'+fmtGap(d.gapSec)+' after approval</span>'):'<span class="no">not yet</span>')+'</td>'
         + '<td data-l="Commented by">'+(d.commentedAt?commenter:'<span class="no">—</span>')+'</td></tr>';
