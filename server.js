@@ -10613,11 +10613,15 @@ async function autopilotTickAsync(options = {}) {
     // GROUP FAIRNESS: today's per-group counts (from the same single ledger scan) so the picker
     // prefers the least-posted group first, then the least-used profile — equal across BOTH.
     const usageByGroupKey = autopilotPublishedTodayByProfile(state).byGroup || new Map();
+    // CONTENT FRESHNESS (2026-07-20): map every harvested product to its age since first harvest, so
+    // orderReadyRowsLeastUsed can put the freshest content first regardless of profile/group fairness order.
+    const ageByProductKey = new Map(readHarvestedProducts(state).map((r) => [String(r.productKey || ""), harvestedAgeMs(r)]));
     let readyRows = orderReadyRowsLeastUsed(
       latestPostingPlanRows(readState()).filter((row) => row.runType === "full_posting_plan" && row.planId === plan.planId && String(row.liveExecution || "").startsWith("ready")),
       usageByPid,
       recentlyFailed,
       usageByGroupKey,
+      ageByProductKey,
     );
     // PRODUCT-ADJACENCY (operator 2026-06-30: "post each product to ALL groups together, then the NEXT product").
     // The fairness sort above scatters a product's per-group fan-out rows and the picker takes one product per batch,
@@ -16878,13 +16882,22 @@ function orderProfilesLeastUsedFirst(profiles, usageMap, failedSet = new Set()) 
   });
 }
 // Order ready posting-plan rows: healthy-least-used first, just-failed profiles last (fair + no stall).
-function orderReadyRowsLeastUsed(rows, postCountByPid, failedSet = new Set(), groupCountByKey = new Map()) {
+function orderReadyRowsLeastUsed(rows, postCountByPid, failedSet = new Set(), groupCountByKey = new Map(), ageByProductKey = new Map()) {
   return rows.slice().sort((a, b) => {
     // HARVESTED content-source products post FIRST — the whole point of the feature is to publish the
     // copied products. When content-sources is off there are none, so this is inert (all === 1).
     const ha = String(a.productKey || "").startsWith("harvested:") ? 0 : 1;
     const hb = String(b.productKey || "").startsWith("harvested:") ? 0 : 1;
     if (ha !== hb) return ha - hb;
+    // CONTENT FRESHNESS (2026-07-20, operator: "prod should ALWAYS start with fresh harvesting to post in
+    // priority"): collectProductUrlsForPosting orders candidate PRODUCTS freshest-first, but this function
+    // re-sorts the resulting per-profile/per-group READY ROWS by throttle-safety fairness, which was silently
+    // discarding that order (a 17-min-old fresh item lost to a 29-min-old one purely because of profile/group
+    // fairness). Sort by content age FIRST -- freshest product always wins -- then apply the existing
+    // fairness tiers only to break ties among rows with equal or unknown age (e.g. non-harvested rows).
+    const aa = ageByProductKey.get(String(a.productKey || "")) ?? Infinity;
+    const bb = ageByProductKey.get(String(b.productKey || "")) ?? Infinity;
+    if (aa !== bb) return aa - bb;
     const pa = Number(a.profileId || profileIdFromLabel(a.profile) || 0);
     const pb = Number(b.profileId || profileIdFromLabel(b.profile) || 0);
     const fa = failedSet.has(pa) ? 1 : 0, fb = failedSet.has(pb) ? 1 : 0;
