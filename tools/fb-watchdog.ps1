@@ -33,7 +33,20 @@ if ($owner) {
 }
 
 # 3) Start ONE FB server (its EADDRINUSE handler makes it exit if 9317 is actually taken -> never a duplicate).
-Start-Process -FilePath $node -ArgumentList 'server.js' -WorkingDirectory $proj -WindowStyle Hidden -RedirectStandardOutput (Join-Path $proj 'server-stdout.log') -RedirectStandardError (Join-Path $proj 'server-stderr.log')
+# STDERR/STDOUT (2026-07-20 fix, live incident): fixed filenames here used to get TRUNCATED (not appended) by
+# Start-Process on every single restart -- PowerShell's redirect behaves like shell `>`, not `>>` -- so a fatal
+# V8 line (e.g. "JavaScript heap out of memory", which bypasses server.js's own uncaughtException/unhandledRejection
+# handler entirely) was destroyed before anyone could read it on every one of today's several restarts. Timestamp
+# the filenames per restart (matching the already-proven pattern in data\fb-server-watchdog.ps1) so the NEXT crash's
+# fatal output survives; prune to the last 15 to bound disk.
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$outLog = Join-Path $proj "data\server-stdout-$stamp.log"
+$errLog = Join-Path $proj "data\server-stderr-$stamp.log"
+try {
+  Get-ChildItem -Path (Join-Path $proj 'data') -Filter 'server-stdout-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 15 | Remove-Item -Force -ErrorAction SilentlyContinue
+  Get-ChildItem -Path (Join-Path $proj 'data') -Filter 'server-stderr-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 15 | Remove-Item -Force -ErrorAction SilentlyContinue
+} catch {}
+Start-Process -FilePath $node -ArgumentList 'server.js' -WorkingDirectory $proj -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog
 Set-Content -Path $missFile -Value '0'
-Add-Content -Path $log -Value ("{0}  watchdog: FB server (port 9317) DOWN ({1}) -> restarted" -f (Get-Date).ToString('s'), $reason)
+Add-Content -Path $log -Value ("{0}  watchdog: FB server (port 9317) DOWN ({1}) -> restarted (stderr: {2})" -f (Get-Date).ToString('s'), $reason, (Split-Path $errLog -Leaf))
 exit 0
