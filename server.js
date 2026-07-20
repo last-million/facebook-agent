@@ -3880,7 +3880,11 @@ function collectProductUrlsForPosting(state, options = {}) {
       for (const e of (state.posting?.groupAssignmentData || [])) {
         const gk = normalizedFacebookGroupKey(e.url);
         if (!gk) continue;
-        const servable = (e.profiles || []).some((p) => { const id = String(profileIdFromLabel(String(p)) || ""); return id && !__disconnectedIds.has(id) && !isProfileBlockedForPosting(String(p), state, e.url); });
+        // (2026-07-20 fix) also exclude a profile currently in its in-memory soft-failure cooldown (added 2026-07-19) --
+        // isProfileBlockedForPosting can't see it (no state.json write, no bench line by design), so without this a
+        // group whose only eligible profile just soft-failed was wrongly reported servable, front-loading a partial
+        // no profile could actually post this tick and keeping the tier3 grace gate from ever reading "empty".
+        const servable = (e.profiles || []).some((p) => { const id = String(profileIdFromLabel(String(p)) || ""); return id && !__disconnectedIds.has(id) && !isProfileBlockedForPosting(String(p), state, e.url) && !isProfileInSoftCooldown(id); });
         if (servable) __servableGroupKeys.add(gk);
       }
       // PRODUCT+GROUP FAILURE COOLDOWN (2026-07-07 review fix): "servable" above only checks PROFILE availability --
@@ -10181,6 +10185,7 @@ const AUTOPILOT_TICK_MAX_MS = 3 * 60 * 1000; // a tick stuck > this WITH no post
 const AUTO_RESUME_STABILITY_GRACE_MS = 20 * 60 * 1000; // 2026-07-06: see the heartbeat's "AUTO-RESUME STABILITY GRACE" block -- 20min of proven continuous stability before auto-continuing a boot-time-declined pending banner.
 let __autopilotLastDecision = null;
 let __autopilotSchedulerTimer = null;
+let __autopilotSchedulerForceReject = null; // set while tick() awaits its hard-timeout race; lets the heartbeat watchdog force an immediate settle instead of waiting the full 25min (2026-07-20 fix)
 let __autopilotDiscoveryInFlight = false;
 let __autopilotLastDiscoveryAt = 0;
 let __harvestedImageSweepInFlight = false;
@@ -11061,13 +11066,20 @@ function startAutopilotScheduler() {
         // settling orphan corrupting a newer tick's in-flight state.
         await Promise.race([
           autopilotTickAsync(),
-          new Promise((_, reject) => { __hardTimeoutTimer = setTimeout(() => reject(new Error("autopilot_scheduler_tick_hard_timeout")), AUTOPILOT_SCHEDULER_HARD_TIMEOUT_MS); }),
+          new Promise((_, reject) => {
+            __hardTimeoutTimer = setTimeout(() => reject(new Error("autopilot_scheduler_tick_hard_timeout")), AUTOPILOT_SCHEDULER_HARD_TIMEOUT_MS);
+            // (2026-07-20) expose this reject so the 3min heartbeat hung-tick watchdog can force this race to
+            // settle NOW instead of leaving the scheduler's recursive chain dead for up to ~22 more minutes
+            // waiting on the full 25min hard timeout -- see the heartbeat block for the paired call.
+            __autopilotSchedulerForceReject = reject;
+          }),
         ]);
       }
     } catch (err) {
       logEvent("autopilot_scheduler_error", { error: oneLineField(err.message || String(err), 200) });
     } finally {
       clearTimeout(__hardTimeoutTimer);
+      __autopilotSchedulerForceReject = null;
       const op = readState().operator || {};
       const normalSecs = clampNumber(op.autopilotTickSeconds, 30, 3600, 120);
       // FAST-RETRY: when the last tick couldn't post only because the ready buffer was momentarily
@@ -23621,6 +23633,14 @@ setInterval(() => {
     try { logEvent("autopilot_tick_watchdog_reset", { heldMinutes: Math.round((Date.now() - __autopilotTickStartedAt) / 60000), via: "heartbeat" }); } catch (_) {}
     __autopilotTickInFlight = false; __autopilotTickStartedAt = 0;
     setTimeout(() => { autopilotTickAsync().catch(() => {}); }, 0); // kick a fresh tick immediately so posting resumes
+    // (2026-07-20 fix) ALSO force the scheduler's own stuck tick() to settle right now, instead of leaving its
+    // recursive setTimeout chain dead for up to ~22 more minutes waiting on the 25min hard timeout -- without
+    // this, a genuine hang produced one recovery burst here then went silent again until the hard timeout fired.
+    if (__autopilotSchedulerForceReject) {
+      const __forceReject = __autopilotSchedulerForceReject;
+      __autopilotSchedulerForceReject = null;
+      try { __forceReject(new Error("autopilot_scheduler_tick_hard_timeout_forced_by_heartbeat")); } catch (_) {}
+    }
   }
   const state = readState();
   // AUTO-RESUME STABILITY GRACE (2026-07-06 wedge-fix follow-up): detectIncompleteRunAtBoot's crash-loop cap
