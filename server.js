@@ -3789,19 +3789,6 @@ function harvestedAgeMs(rec) {
   const h = Date.parse((rec && (rec.firstHarvestedAt || rec.harvestedAt)) || "");
   return Number.isFinite(h) ? Math.max(0, Date.now() - h) : 0;
 }
-// TIER-3 GRACE GATE (2026-07-19): a pure instantaneous "fresh+tier2(+partial) all empty right now" snapshot
-// would flip open/closed on every ~2min tick, contradicting the operator's stated "15-minute wait for fresh
-// content" intent. Track elapsed time since the pool FIRST read empty; only open once tier3GraceMinutes has
-// elapsed continuously. In-memory only (module-level), matching the existing __harvestNextAt/__harvestEmptyRounds
-// precedent -- resets naturally (and safely) on process restart.
-let __tier12EmptySinceMs = 0;
-function tier3GateOpen(isEmptyNow, state) {
-  const graceMs = clampNumber(state.posting?.contentSources?.tier3GraceMinutes, 0, 720, 15) * 60000;
-  if (!isEmptyNow) { __tier12EmptySinceMs = 0; return false; }
-  const now = Date.now();
-  if (!__tier12EmptySinceMs) __tier12EmptySinceMs = now;
-  return (now - __tier12EmptySinceMs) >= graceMs;
-}
 function collectProductUrlsForPosting(state, options = {}) {
   const latestOnly = Boolean(options.latestDiscoveryOnly || options.latest_discovery_only);
   const candidateRows = latestOnly
@@ -3841,7 +3828,7 @@ function collectProductUrlsForPosting(state, options = {}) {
     const everPosted = (r) => Boolean(r.lastPostedAt || r.posted) || __maxGroupStampMs(r) > 0;
     const __reuseMs = rh * 3600 * 1000;
     const __fanout = state.operator?.postToAllGroups === true;
-    const { tier2Ms: __tier2Ms, tier3Ms: __tier3Ms } = harvestedTierAgeBoundsMs(state);
+    const { tier2Ms: __tier2Ms } = harvestedTierAgeBoundsMs(state);
     const __ageCache = new Map();
     const __ageOf = (r) => { let a = __ageCache.get(r.productKey); if (a === undefined) { a = harvestedAgeMs(r); __ageCache.set(r.productKey, a); } return a; };
     // NEWEST-FIRST (2026-07-19, operator: "check for fresh posts... and post them" -- today's never-posted
@@ -3913,25 +3900,17 @@ function collectProductUrlsForPosting(state, options = {}) {
       const __isPartial = (r) => __coveredCount(r) > 0 && __owesServableGroup(r); // mid-duplication AND the missing group can actually post now
       const partial = reeligibleRecs.filter(__isPartial).map((r) => r.productKey); // never age-gated -- task #214 coverage-priority is orthogonal to freshness tiering
       const recycleRecs = reeligibleRecs.filter((r) => !__isPartial(r));
-      // FRESHNESS TIERING (2026-07-19, operator request): reorder-only, never excludes. tier2 (<=24h since first
-      // harvest) is offered first, tier3 (24-48h) only once tier1+tier2+partial have been empty for a full grace
-      // window, and "beyond" (>48h -- i.e. today's normal steady-state recycle catalog) is ALWAYS included so
-      // nothing already eligible today is ever silently dropped (adversarial-verify critical-finding fix).
-      const recycleTier2 = recycleRecs.filter((r) => __ageOf(r) <= __tier2Ms);
-      const recycleTier3Window = recycleRecs.filter((r) => __ageOf(r) > __tier2Ms && __ageOf(r) <= __tier3Ms);
-      const recycleBeyond = recycleRecs.filter((r) => __ageOf(r) > __tier3Ms); // ALWAYS included -- never permanently stranded
-      const __tier12EmptyNow = fresh.length === 0 && recycleTier2.length === 0 && partial.length === 0;
-      const __tier3Open = tier3GateOpen(__tier12EmptyNow, state);
-      const recycle = [...recycleTier2, ...(__tier3Open ? recycleTier3Window : []), ...recycleBeyond].map((r) => r.productKey);
+      // FRESHNESS CEILING (2026-07-20, operator: "don't post saved products older than 24h -- if none fresh and
+      // none <=24h old, just WAIT, don't fall back to older content"). Recycled/saved content older than
+      // tier2MaxAgeHours (default 24h since the IMMUTABLE firstHarvestedAt) is never offered as a candidate.
+      // Supersedes the 2026-07-19 "always include recycleBeyond" design -- that existed to avoid starving the
+      // perpetual-reuse mechanism, but the operator has explicitly chosen an idle tick over stale content.
+      const recycle = recycleRecs.filter((r) => __ageOf(r) <= __tier2Ms).map((r) => r.productKey);
       harvestedKeys = [...partial, ...fresh, ...recycle];
     } else {
-      const recycleTier2 = reeligibleRecs.filter((r) => __ageOf(r) <= __tier2Ms);
-      const recycleTier3Window = reeligibleRecs.filter((r) => __ageOf(r) > __tier2Ms && __ageOf(r) <= __tier3Ms);
-      const recycleBeyond = reeligibleRecs.filter((r) => __ageOf(r) > __tier3Ms); // ALWAYS included, same rationale as the fanout branch
-      const __tier12EmptyNow = fresh.length === 0 && recycleTier2.length === 0;
-      const __tier3Open = tier3GateOpen(__tier12EmptyNow, state);
-      const reeligibleForPool = [...recycleTier2, ...(__tier3Open ? recycleTier3Window : []), ...recycleBeyond];
-      harvestedKeys = [...fresh, ...reeligibleForPool.map((r) => r.productKey)];
+      // FRESHNESS CEILING (2026-07-20): same rationale as the fanout branch above.
+      const recycle = reeligibleRecs.filter((r) => __ageOf(r) <= __tier2Ms).map((r) => r.productKey);
+      harvestedKeys = [...fresh, ...recycle];
     }
   }
   // EXCLUSIVE mode: post ONLY copied products (skip web-discovery products entirely). When off, copied
