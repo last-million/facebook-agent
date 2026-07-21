@@ -1079,8 +1079,109 @@ function readStateFresh() {
   }
 }
 
+// MERGED-STATE CACHE (2026-07-20): caches the deepMerge(defaultState(), parsed) + normalizeWorkflowState()
+// result -- the expensive step that previously ran unconditionally on every single readState() call (~314
+// call sites file-wide) -- keyed on the IDENTITY of the object readParsedStateFileCached() returns, NOT on
+// __stateFileCacheGen. A generation counter is a PASSIVE signal: it only advances when something actually
+// calls readParsedStateFileCached(), so a cache keyed on "gen === last-seen-gen" without calling that function
+// itself would never notice a write that happened between two calls unless some UNRELATED caller (writeState,
+// requireExternalArmed) happened to run readStateFresh() first and bump it -- during an idle/disarmed window
+// that can serve pre-write data indefinitely. Confirmed 100% reproducible today: POST /api/profiles/release
+// and /api/profiles/disconnect read-modify-writeState() then immediately readState() again in the SAME
+// synchronous handler body with nothing in between to bump a passive counter -- a gen-keyed cache would hand
+// the dashboard the PRE-release/PRE-disconnect profile lists right after a successful write. Calling
+// readParsedStateFileCached() directly on every readState() call is cheap on a hit (one fs.statSync + a
+// numeric comparison) -- it IS the freshness check -- so this cache uses ITS OWN return value's identity as
+// the cache key: the same object reference back means the file is provably unchanged since the merge was
+// last computed; a new reference means readParsedStateFileCached() already did a real re-parse, so treat it
+// as a miss.
+//
+// This wraps readState() ONLY, never readStateFresh() itself: writeState()'s merge base (line ~1233, "NEVER
+// the cached readState()") and requireExternalArmed()'s kill-switch gate (line ~22954, "Reads FRESH, never
+// the cached readState()") both call readStateFresh() directly on purpose and must keep getting a fully
+// independent, current deepMerge+normalize on every call -- unaffected by anything below.
+//
+// Two things are deliberately excluded from the cache so a hit can never serve wrong data:
+// (1) __lastReadWasDefaults (readStateFresh's raw-defaults fallback -- no deepMerge/normalize at all, only
+//     reachable before the very first successful parse this process) -- never cached, sentinel below.
+// (2) a currently-IN-PROGRESS test run: sanitizeTestRunState (called from normalizeWorkflowState) computes
+//     timing.elapsedMs from Date.now() whenever timing.startedAt is set and timing.finishedAt is not -- caching
+//     that result would freeze the test-run progress timer at whatever instant the cache was populated instead
+//     of reflecting true wall-clock elapsed time. Detected directly off the raw parsed JSON (cheap, no merge
+//     needed), so the bypass costs nothing outside an active 1-post test run, which is rare and short-lived.
+//
+// The prior attempt at this idea (see the FIRST DESIGN note above readParsedStateFileCached, ~line 1021)
+// cached the merged object on a 250ms TTL and paid its ~33ms structuredClone() cost on EVERY call regardless
+// of whether anything had changed -- a measured live regression (14s health-check response). This design pays
+// that cost only once per real file change (whichever caller first observes a new parsed-object identity after
+// a write/reparse) -- BUT every call, hit or miss, still pays one structuredClone() to hand back an
+// independently-mutable object (unavoidable: some caller mutating its result must never corrupt what any other
+// caller -- past, cached, concurrent, or future -- sees). Because that per-call clone cost is the exact thing
+// that sank the earlier design, and the state file has grown from 4.75MB to 7.48MB since that benchmark was
+// taken, this cache also self-monitors it: if clone time blows the budget several calls in a row, it disables
+// ITSELF for a cooldown window and falls back to the pre-fix, no-cache behavior (plain readStateFresh(), which
+// needs no clone -- deepMerge already builds an independent object graph every call) -- the same self-disabling
+// safety-valve pattern already used elsewhere in this file (see the 2026-07-14 hung-pass safety valve) --
+// rather than trusting a one-time static size estimate forever. Tune MERGE_CACHE_CLONE_BUDGET_MS from real
+// merged_state_cache_self_disabled log volume after deploy.
+const MERGE_CACHE_CLONE_BUDGET_MS = 40; // structuredClone benchmarked at ~33ms on a 4.75MB tree (2026-07-19);
+  // budgeted a bit above that measured cost on the current (larger) file, not exactly at it
+const MERGE_CACHE_OVERBUDGET_STREAK_LIMIT = 5; // consecutive over-budget clones before self-disabling
+const MERGE_CACHE_DISABLE_COOLDOWN_MS = 5 * 60 * 1000; // retry enabling every 5min -- self-heals if load drops
+let __mergedStateCache = { parsedRef: null, state: null };
+let __mergeCacheOverBudgetStreak = 0;
+let __mergeCacheDisabledUntil = 0;
+
+// Mirrors sanitizeTestRunState's own precedence (timing.startedAt || source.startedAt) so this stays accurate
+// against the legacy pre-timing-object shape too. Reads the RAW parsed JSON (pre-merge) -- no need to pay for
+// a merge just to answer this.
+function isTestRunTimingActive(parsed) {
+  const tr = parsed && typeof parsed === "object" ? parsed.testRun : null;
+  if (!tr || typeof tr !== "object") return false;
+  const timing = tr.timing && typeof tr.timing === "object" ? tr.timing : {};
+  const startedAt = timing.startedAt || tr.startedAt || "";
+  const finishedAt = timing.finishedAt || tr.finishedAt || "";
+  return Boolean(startedAt) && !finishedAt;
+}
+
+function recordMergeCacheCloneCost(startHrtime) {
+  const ms = Number(process.hrtime.bigint() - startHrtime) / 1e6;
+  if (ms <= MERGE_CACHE_CLONE_BUDGET_MS) {
+    __mergeCacheOverBudgetStreak = 0;
+    return;
+  }
+  __mergeCacheOverBudgetStreak++;
+  if (__mergeCacheOverBudgetStreak >= MERGE_CACHE_OVERBUDGET_STREAK_LIMIT) {
+    __mergeCacheOverBudgetStreak = 0; // fresh streak required before it can re-trip after the cooldown below
+    __mergeCacheDisabledUntil = Date.now() + MERGE_CACHE_DISABLE_COOLDOWN_MS;
+    logEvent("merged_state_cache_self_disabled", {
+      lastCloneMs: Math.round(ms),
+      budgetMs: MERGE_CACHE_CLONE_BUDGET_MS,
+      cooldownMs: MERGE_CACHE_DISABLE_COOLDOWN_MS,
+    });
+  }
+}
+
 function readState() {
-  return readStateFresh();
+  const parsed = readParsedStateFileCached();
+  if (Date.now() < __mergeCacheDisabledUntil) {
+    return readStateFresh(); // safety valve tripped -- see comment above; identical to this function's pre-fix body
+  }
+  const testRunActive = isTestRunTimingActive(parsed);
+  if (!testRunActive && __mergedStateCache.state !== null && __mergedStateCache.parsedRef === parsed) {
+    const t0 = process.hrtime.bigint();
+    const clone = structuredClone(__mergedStateCache.state);
+    recordMergeCacheCloneCost(t0);
+    return clone;
+  }
+  const state = readStateFresh();
+  __mergedStateCache = (__lastReadWasDefaults || testRunActive)
+    ? { parsedRef: null, state: null }
+    : { parsedRef: parsed, state };
+  const t0 = process.hrtime.bigint();
+  const clone = structuredClone(state);
+  recordMergeCacheCloneCost(t0);
+  return clone;
 }
 
 function readSecrets() {
