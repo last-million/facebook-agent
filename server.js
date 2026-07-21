@@ -10048,6 +10048,33 @@ async function backfillProductTitlesAsync(options = {}) {
 // inside schedule, the scheduler auto-publishes ready buffer products within
 // per-profile daily caps, then prepares tomorrow's buffer once the cap is met.
 // Manual flows are unaffected; only autopilot-context posts bypass approval.
+// TAIL READ (2026-07-20, live incident: repeated 20-56 SECOND event-loop freezes traced to this function's full
+// fs.readFileSync of the ledger, now 153MB+ and growing daily -- its cache is busted the instant ANY post lands
+// (see runWorker), so during an active run this expensive synchronous read+split reruns on nearly every single
+// post, not just every 30s). The ledger is strictly APPEND-ONLY and chronological, so "today's" data can only
+// ever live in the file's recent tail -- reading a generous trailing window instead of the whole file is exactly
+// as correct, just far cheaper. maxBytes is sized to comfortably cover many days of even a high-volume run
+// (observed ~600 posts/day x ~20 ledger lines/post x ~300 bytes/line =~ 3.5MB/day -- 30MB is a wide safety margin).
+function tailReadFileSync(filePath, maxBytes) {
+  const fd = fs.openSync(filePath, "r");
+  try {
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - maxBytes);
+    const length = size - start;
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, start);
+    let text = buffer.toString("utf8");
+    if (start > 0) {
+      // we started mid-file -- the first line is very likely a partial fragment of a longer line; drop it
+      const nl = text.indexOf("\n");
+      if (nl >= 0) text = text.slice(nl + 1);
+    }
+    return text;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+const AUTOPILOT_LEDGER_TAIL_BYTES = 30 * 1024 * 1024;
 let __todayByProfileCache = { at: 0, tz: "", result: null };
 function autopilotPublishedTodayByProfile(state = readState()) {
   const tz = state.operator?.scheduleTimezone || state.rules?.peakHoursTimezone || "America/New_York";
@@ -10080,7 +10107,7 @@ function autopilotPublishedTodayByProfile(state = readState()) {
   let total = 0;
   let lastPostAt = 0;
   try {
-    const raw = fs.readFileSync(FB_LIVE_POST_LEDGER_FILE, "utf8");
+    const raw = tailReadFileSync(FB_LIVE_POST_LEDGER_FILE, AUTOPILOT_LEDGER_TAIL_BYTES);
     for (const line of raw.split(/\r?\n/)) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.indexOf('"postUrl":"http') === -1) continue; // only successful publishes
