@@ -17170,7 +17170,68 @@ async function addRequiredFirstCommentWithDifferentProfile(args) {
     if (__urlLock) __commentInFlightPostUrls.delete(__urlLock);
   }
 }
-async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, groupUrl, postUrl, imagePath, postValidation, ledgerKey, closeResults }) {
+// SOFT-SUCCESS FALLBACK THROTTLE bounds (2026-07-20, synthesizing 2 adversarial reviews). See the usage site
+// inside addRequiredFirstCommentWithDifferentProfileImpl (approvalMayHelp branch) for the full design rationale.
+// COMMENT_SOFT_SUCCESS_FALLBACK_MIN_AGE_MS mirrors APPROVAL_REDRIVE_MAX_AGE_MS (~13916, 2.5h) -- the existing
+// "stop re-driving admin approval" precedent this file already uses for the analogous PRE-publish case.
+const COMMENT_SOFT_SUCCESS_FALLBACK_MIN_AGE_MS = 150 * 60 * 1000;
+// Minimum failed admin_approval_finished rows needed before a spread can even be measured (the spread check
+// itself, not this raw count, is what actually corroborates a genuinely-stuck post -- see the helper below).
+const COMMENT_SOFT_SUCCESS_FALLBACK_MIN_FAILED_APPROVALS = 2;
+// Bounded, in-memory, log-once-per-key set so a permanently-stuck post doesn't re-append the new observability
+// ledger event on every single resweep/drain pass for the rest of its life. Resets on restart; harmless (the
+// event is pure observability, it never gates any behavior -- mirrors __reapprovalAttemptsByUrl's own pattern, ~17521).
+const __softSuccessFallbackLoggedForKey = new Set();
+// Returns { eligible, throttle, softSuccessAt }. `eligible` alone means "this post has a durable, aged,
+// corroborated-stuck soft-click"; `throttle` (only meaningful when eligible) means "an admin_approval_finished
+// row already landed for this key within PENDING_PUBLIC_BACKOFF_MS, so skip re-firing approval THIS call" -- it
+// is NOT a permanent latch: the next call, after that window elapses, naturally recomputes throttle=false and
+// lets a real approval attempt through again. Accepts an optional preloaded `rows`/`state` (the resweep already
+// has both) to avoid a redundant full-ledger re-read+re-parse on the dominant repeated-invocation path.
+function facebookCommentSoftSuccessFallbackEligible(ledgerKey, { rows, state } = {}) {
+  if (!ledgerKey) return { eligible: false };
+  let allRows = rows;
+  if (!Array.isArray(allRows)) {
+    try { allRows = readJsonlAbsoluteFile(FB_LIVE_POST_LEDGER_FILE, { limit: 8000 }); } catch { return { eligible: false }; }
+  }
+  // Same gate __isStuckSoft already trusts (~17754): a plain "published" row can never carry
+  // approvalVerification:"soft_clicked" (only "published_after_admin_approval" rows can, per
+  // completeVerifiedFacebookPostWithComment ~18087) -- deliberately not OR'd with "published" here.
+  const publishedRow = allRows.find((r) => r && r.key === ledgerKey
+    && r.event === "published_after_admin_approval" && r.approvalVerification === "soft_clicked");
+  if (!publishedRow) return { eligible: false };
+  const softSuccessAt = Date.parse(publishedRow.at || "") || 0;
+  if (!softSuccessAt || (Date.now() - softSuccessAt) < COMMENT_SOFT_SUCCESS_FALLBACK_MIN_AGE_MS) return { eligible: false };
+  const failedApprovalTimes = allRows
+    .filter((r) => r && r.key === ledgerKey && r.event === "admin_approval_finished" && r.status === "admin_approval_failed")
+    .map((r) => Date.parse(r.at || "") || 0)
+    .filter((t) => t >= softSuccessAt)
+    .sort((a, b) => a - b);
+  if (failedApprovalTimes.length < COMMENT_SOFT_SUCCESS_FALLBACK_MIN_FAILED_APPROVALS) return { eligible: false };
+  // CORROBORATION BY SPREAD, not raw count (adversarial review finding: a single ~8min admin-approval session
+  // can already produce several "admin_approval_failed" rows on its own, making a raw count floor nearly
+  // meaningless). Require the failures to be spread across separate sessions/passes, reusing the SAME spread
+  // bar __isStuckSoft/__isProvablyPending already use (operator.commentCorroborationMinSpreadMinutes, default
+  // 30min, ~17758).
+  const spreadMs = failedApprovalTimes[failedApprovalTimes.length - 1] - failedApprovalTimes[0];
+  let __state = state; if (!__state) { try { __state = readState(); } catch { __state = {}; } }
+  const minSpreadMs = clampNumber(__state?.operator?.commentCorroborationMinSpreadMinutes, 0, 720, 30) * 60000;
+  if (spreadMs < minSpreadMs) return { eligible: false };
+  // THROTTLE, NOT PERMANENT (required reviewer fix -- the first draft latched this off forever per ledgerKey,
+  // which could silently strand a post whose ONLY remaining unstick lever is this exact re-approval call,
+  // violating the 2026-07-01 "never abandon the owed comment" directive). Matches ANY admin_approval_finished
+  // row for this key regardless of which code path fired it (including the resweep's own
+  // __isStuckSoft/__reapprovalAttemptsByUrl lane, ~17919-17955), so the two lanes never independently double up
+  // on moderator-pool pressure.
+  const lastApprovalAt = allRows.reduce((max, r) => {
+    if (!r || r.key !== ledgerKey || r.event !== "admin_approval_finished") return max;
+    const t = Date.parse(r.at || "") || 0;
+    return t > max ? t : max;
+  }, 0);
+  const throttle = lastApprovalAt > 0 && (Date.now() - lastApprovalAt) < PENDING_PUBLIC_BACKOFF_MS;
+  return { eligible: true, throttle, softSuccessAt };
+}
+async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, groupUrl, postUrl, imagePath, postValidation, ledgerKey, closeResults, preloadedLedgerRows }) {
   const state = readState();
   const configuredProfiles = commentRecoveryFallbackProfilesForGroup(row, groupUrl, state, { excludeProfileId: ready.profileId });
   const ixProfiles = await ixBrowserCommentFallbackProfilesForGroup(row, groupUrl, state, { excludeProfileId: ready.profileId });
@@ -17289,7 +17350,52 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
     /^comment_blocked:(comments_disabled|post_pending_or_unavailable|content_unavailable|page_unavailable)/i.test(error) ||
     isPendingPostCommentError(error) // PENDING post (FB not yet public) MUST fire moderator approval — same set the comment-recovery break uses; this drift left pending posts with 0 approval attempts
   ));
-  if (!recovery.ok && approvalMayHelp) {
+  // SOFT-SUCCESS FALLBACK THROTTLE (2026-07-20): a post that already carries a durable soft-success signal
+  // (approvalVerification:"soft_clicked" on its published_after_admin_approval row -- a moderator genuinely
+  // clicked Approve) but whose subsequent admin-approval re-verification keeps failing should not have this
+  // branch re-fire a fresh moderator-approval session on EVERY single invocation forever (today's actual
+  // behavior -- the "dozens of admin_approval_started/finished cycles over 2.5h" incident). This throttles that
+  // re-invocation to at most once per PENDING_PUBLIC_BACKOFF_MS once the post is confirmed aged+corroborated-stuck
+  // -- it is never a permanent stop, and it makes zero new comment attempts of its own: the plain comment-recovery
+  // attempt already made above (`recovery`) is completely unaffected either way, and stays covered by all 4
+  // existing double-comment guards (in-flight lock, in-memory verified-comment map, ledger dedup index, connector
+  // dup-check) exactly as before.
+  const __softSuccessCheck = (!recovery.ok && approvalMayHelp)
+    ? facebookCommentSoftSuccessFallbackEligible(ledgerKey, { rows: preloadedLedgerRows, state })
+    : { eligible: false };
+  const softSuccessFallback = Boolean(__softSuccessCheck.eligible && __softSuccessCheck.throttle);
+  if (softSuccessFallback) {
+    // Not `ok` (adversarial review: an `ok:true` nested inside a result whose top-level `ok` is false is a
+    // pattern-match footgun for future/dashboard code) -- this only records that the throttle applied this call,
+    // never a success signal.
+    recovery.softSuccessFallbackApplied = {
+      applied: true,
+      throttleMs: PENDING_PUBLIC_BACKOFF_MS,
+      softSuccessAt: __softSuccessCheck.softSuccessAt || null,
+      reason: "soft_click_confirmed_throttling_reapproval",
+    };
+    if (!__softSuccessFallbackLoggedForKey.has(ledgerKey)) {
+      __softSuccessFallbackLoggedForKey.add(ledgerKey);
+      if (__softSuccessFallbackLoggedForKey.size > 5000) __softSuccessFallbackLoggedForKey.clear(); // bound memory, mirrors __commentRecoveryBackoff's own size cap (~17909)
+      try {
+        appendFacebookLivePostLedger({
+          event: "comment_soft_success_fallback_triggered",
+          key: ledgerKey,
+          planId: row.planId,
+          sequence: row.sequence,
+          profileId: ready.profileId,
+          profile: row.profile || "",
+          groupUrl,
+          actualGroupUrl: groupUrl,
+          postUrl,
+          status: "trusting_prior_soft_click_throttled",
+          message: `Original moderator Approve click is >=${Math.round(COMMENT_SOFT_SUCCESS_FALLBACK_MIN_AGE_MS / 60000)}min old with corroborated repeated re-verification failures; throttling admin-approval re-invocation to at most every ~${Math.round(PENDING_PUBLIC_BACKOFF_MS / 60000)}min instead of every pass (NOT a permanent stop -- approval keeps being retried on that cadence, and this call's own plain comment attempt already ran above).`,
+          validation: recovery.validation || null,
+        });
+      } catch (_) {}
+    }
+  }
+  if (!recovery.ok && approvalMayHelp && !softSuccessFallback) {
     const approvalResult = await approvePendingFacebookPostWithAdminProfiles({
       row,
       ready,
@@ -17429,6 +17535,12 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
     recovery.approvalResult = approvalResult || null;
   }
   if (!recovery.ok && approvalMayHelp) {
+    // UNCHANGED CONDITION (adversarial review requirement): this must keep firing even when softSuccessFallback
+    // skipped the admin-approval retry above, because __lastResortCountByUrl (built from this exact event,
+    // ~17716) drives the resweep's chronic-failure deprioritization AND its escalating backoff multiplier
+    // (~17886-17898) -- gating this on `!softSuccessFallback` would freeze both at whatever value they'd reached
+    // the moment the throttle first tripped, for as long as it keeps re-tripping. Only the status/message differ
+    // so the ledger accurately reflects which of the two distinct reasons this pass didn't retry approval.
     appendFacebookLivePostLedger({
       event: "publisher_comment_last_resort_skipped",
       key: ledgerKey,
@@ -17439,15 +17551,15 @@ async function addRequiredFirstCommentWithDifferentProfileImpl({ row, ready, gro
       groupUrl,
       actualGroupUrl: groupUrl,
       postUrl,
-      status: "same_profile_comment_blocked_by_policy",
-      message: "Different-profile comment failed, but same-profile first comments are disabled by policy.",
+      status: softSuccessFallback ? "soft_success_fallback_throttling_reapproval" : "same_profile_comment_blocked_by_policy",
+      message: softSuccessFallback
+        ? "Admin-approval re-invocation throttled this pass for an aged, repeatedly-unverifiable soft-approved post (see comment_soft_success_fallback_triggered); different-profile comment attempt still failed."
+        : "Different-profile comment failed, but same-profile first comments are disabled by policy.",
       validation: recovery.validation || null,
     });
-    recovery.publisherCommentFallback = {
-      ok: false,
-      skipped: true,
-      reason: "same_profile_comment_blocked_by_policy",
-    };
+    recovery.publisherCommentFallback = softSuccessFallback
+      ? { ok: false, skipped: true, reason: "soft_success_fallback_throttling_reapproval" }
+      : { ok: false, skipped: true, reason: "same_profile_comment_blocked_by_policy" };
   }
   return {
     ...recovery,
@@ -17972,6 +18084,7 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
               postValidation: { ok: true, errors: [], warnings: ["comment_resweep_recover"] },
               ledgerKey: livePostLedgerKey(c.row, c.publisherId),
               closeResults,
+              preloadedLedgerRows: rows, // PERF (adversarial review finding): avoid re-reading+re-parsing the whole (146MB+, growing) ledger file inside facebookCommentSoftSuccessFallbackEligible on every concurrently-dispatched candidate in this pass -- reuse the SAME `rows` snapshot this pass already loaded above.
             });
             if (res?.skipped) { summary.skippedInFlight = (summary.skippedInFlight || 0) + 1; } // DOUBLE-COMMENT GUARD: the per-post in-flight lock skipped this — ANOTHER attempt is actively committing the comment. NOT a failure: do not count it stillMissing and do NOT stamp the backoff (that 8-min poison would delay re-checking a post that ends up genuinely uncommented if the in-flight attempt fails). Left un-backed-off, the next sweep re-checks it immediately.
             else if (res?.ok || latestDifferentProfileVerifiedCommentForPost(c.postUrl, c.publisherId)) summary.recommented += 1;
