@@ -261,6 +261,7 @@ function runBody(r){
     + statCard("Unique products", (r.uniqueProducts||0), (r.productsInBoth||0)+" in both groups", (r.uniqueProducts? (r.productsInBoth>0?"g":"a") : ""))
     + (r.contentFreshness ? statCard("Fresh harvested", r.contentFreshness.fresh, r.contentFreshness.reusedUnder24h+" reused ≤24h, "+r.contentFreshness.reusedUnder48h+" reused ≤48h"+(r.contentFreshness.reusedOver48h?", "+r.contentFreshness.reusedOver48h+" older (pre-fix)":""), (r.contentFreshness.reusedOver48h>0?"r":(r.contentFreshness.fresh>0?"g":"a"))) : "")
     + statCard("Commented", r.commentRate+'<small>%</small>', r.commented+"/"+r.posts+" • "+r.uncommented+" without", r.commentRate>=90?"g":(r.commentRate>=70?"a":"r"))
+    + statCard("Average comment time", fmtGap(r.gap.avgSec), "from post going public to comment landing", (r.gap.avgSec>=240?"r":(r.gap.avgSec>=120?"a":"g")))
     + statCard("Median delay", fmtGap(r.gap.medianSec), "max "+fmtGap(r.gap.maxSec), "v")
     + approvalWaitCard
     + statCard("Chrome peak", chrTxt, "min free RAM "+ramTxt, (r.chromePeak&&r.chromePeak>120)?"r":"g")
