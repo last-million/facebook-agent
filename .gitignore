@@ -37,3 +37,10 @@ hermes-config/
 /_*.cpuprofile
 data/_*
 isolate-*.log
+
+# ── root-level runtime logs (2026-07-24): these were tracked with no rotation, meaning
+# every auto-sync cycle committed+pushed their growth forever. Local only from here on. ──
+/fb-watchdog.log
+/server-stdout.log
+/server-stderr.log
+/test2-err.log
