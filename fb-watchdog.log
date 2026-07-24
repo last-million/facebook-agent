@@ -150,3 +150,4 @@
 2026-07-24T10:05:42  watchdog: FB server (port 9317) DOWN (wedged_3_misses) -> restarted (stderr: server-stderr-20260724-100541.log)
 2026-07-24T10:26:27  watchdog: FB server (port 9317) DOWN (wedged_3_misses) -> restarted (stderr: server-stderr-20260724-102626.log)
 2026-07-24T10:38:13  watchdog: FB server (port 9317) DOWN (crashed_port_free) -> restarted (stderr: server-stderr-20260724-103813.log)
+2026-07-24T10:55:25  watchdog: FB server (port 9317) DOWN (wedged_3_misses) -> restarted (stderr: server-stderr-20260724-105525.log)
