@@ -6099,12 +6099,17 @@ function uxAttachIncompleteRunBanner() {
   async function renderProdTab() {
     try {
       populateProdRunMode((workflowState && workflowState.operator) || {}); // snappy + survives a failed status fetch
-      const [statusRes, health, activity] = await Promise.all([
+      const [statusRes, health, activity, reportsRes] = await Promise.all([
         api("/api/autopilot/status").catch(() => null),
         api("/api/prod/health").catch(() => null),
         api("/api/prod/activity").catch(() => null),
+        api("/api/reports/runs").catch(() => null),
       ]);
       const ap = (statusRes && statusRes.autopilot) || {};
+      // ledger-derived, restart-durable "posts done"/"true target" for THIS run -- op.autopilotPostsThisRun/
+      // autopilotMaxPostsPerRun get reset/shrunk on every crash-resume, which made this cell look like the
+      // run "restarted from near-zero" after a restart even though the run's real total kept climbing.
+      const liveReport = (reportsRes && reportsRes.live) || {};
       const last = statusRes && statusRes.lastDecision;
       let st = (workflowState && workflowState.operator) ? workflowState : null;
       if (!st) { const r = await api("/api/state").catch(() => null); st = r ? (r.state || r) : {}; }
@@ -6141,7 +6146,7 @@ function uxAttachIncompleteRunBanner() {
         ["Buffer ready", (buf.readyCount != null ? buf.readyCount : "?") + " / " + (buf.target != null ? buf.target : "?")],
         ["Posted today", String(cap.totalPostedToday != null ? cap.totalPostedToday : "-")],
         ["Capacity left", String(cap.totalRemaining != null ? cap.totalRemaining : "-")],
-        ["Run target", op.scheduleEnabled ? ("⏰ " + (op.startTime || "--:--") + "–" + (op.stopTime || "--:--")) : (Number(op.autopilotMaxPostsPerRun) > 0 ? ((op.autopilotPostsThisRun || 0) + "/" + op.autopilotMaxPostsPerRun + " posts") : "unlimited")],
+        ["Run target", op.scheduleEnabled ? ("⏰ " + (op.startTime || "--:--") + "–" + (op.stopTime || "--:--")) : (Number(op.autopilotMaxPostsPerRun) > 0 ? ((liveReport.postedThisRun != null ? liveReport.postedThisRun : (op.autopilotPostsThisRun || 0)) + "/" + (liveReport.target || op.autopilotMaxPostsPerRun) + " posts") : "unlimited")],
         ["Tick", (ap.tickSeconds != null ? ap.tickSeconds : "?") + "s"],
         ["CPU governor", (op.cpuGovernorMaxPercent != null ? op.cpuGovernorMaxPercent : 85) + "%"],
         ["Box CPU", health ? (health.cpuPercent + "%") : "?"],

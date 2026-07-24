@@ -24627,10 +24627,26 @@ function buildRunReports(force = false) {
   let live = { armed: false, postedThisRun: 0, target: null };
   try {
     const __op = readState().operator || {};
-    live = { armed: !!__op.armedForExternalActions, postedThisRun: Number(__op.autopilotPostsThisRun || 0), target: (Number(__op.autopilotMaxPostsPerRun || 0) || null) };
+    // Prefer the frozen original target (set once at fresh-arm/relaunch, never touched by
+    // crash-resume/stability-grace) over the resettable "remaining budget" field, so the
+    // livecard's target doesn't shrink out from under the operator after every auto-resume.
+    const __origTarget = Number(__op.autopilotOriginalMaxPostsPerRun) || 0;
+    const __fallbackTarget = Number(__op.autopilotMaxPostsPerRun) || 0;
+    live = { armed: !!__op.armedForExternalActions, postedThisRun: Number(__op.autopilotPostsThisRun || 0), target: (__origTarget || __fallbackTarget || null) };
     if (live.armed && outVisible[0]) {
       const __lastT = Date.parse(outVisible[0].endedAt || 0);
-      if (Number.isFinite(__lastT) && Date.now() - __lastT < RUN_SPLIT_GAP_MS) outVisible[0].live = true;
+      if (Number.isFinite(__lastT) && Date.now() - __lastT < RUN_SPLIT_GAP_MS) {
+        outVisible[0].live = true;
+        // Only trust the ledger-cluster's post count as "posted this run" when that cluster
+        // actually started at/after the CURRENT run's arm time -- otherwise (e.g. Relaunch
+        // within the 2h clustering window) it would misattribute a PRIOR run's posts to the
+        // freshly-relaunched one, which is worse than the resettable counter it replaces.
+        const __clusterStartT = Date.parse(outVisible[0].startedAt || 0);
+        const __runIdMs = Number(__op.autopilotRunId) || 0;
+        if (Number.isFinite(__clusterStartT) && __runIdMs && __clusterStartT >= __runIdMs) {
+          live.postedThisRun = outVisible[0].posts;
+        }
+      }
     }
   } catch (_) {}
   // GLOBAL pre-clustering total (2026-07-12, run-limit overshoot fix): the run-clustering split above attaches
@@ -25005,6 +25021,12 @@ const server = http.createServer(async (req, res) => {
       } else if (!wasEnabled && nowEnabled) {
         __armTransition = true; // false->true arm: kick an immediate tick after writeState (below) so batch 1 doesn't wait ~120s
         incoming.operator.autopilotPostsThisRun = 0; // fresh arm => count THIS run only
+        // Freeze the run's TRUE original target for display (report.html livecard / Prod-tab "Run target"),
+        // separate from autopilotMaxPostsPerRun which keeps getting shrunk to "remaining budget" on every
+        // crash-resume -- without this, the UI looks like the run "restarted from near-zero" after a restart.
+        incoming.operator.autopilotOriginalMaxPostsPerRun = Number(
+          incoming.operator.autopilotMaxPostsPerRun != null ? incoming.operator.autopilotMaxPostsPerRun : before.operator?.autopilotMaxPostsPerRun
+        ) || 0;
         incoming.operator.commentDrainPaused = false; // a fresh launch re-enables the comment drain a prior operator STOP had paused (else this run's tail/late comments stay blocked)
         incoming.operator.autopilotRunId = String(Date.now()); // fresh per-run product-claim namespace (no cross-run carryover)
         pruneStaleClaimDirs(incoming); // drop only claim dirs past their reuse window -- see pruneStaleClaimDirs comment
@@ -25463,6 +25485,10 @@ const server = http.createServer(async (req, res) => {
       // never re-posts the segment it already completed.)
       state.operator.autopilotRunId = String(Date.now());
       pruneStaleClaimDirs(state); // drop only claim dirs past their reuse window -- see pruneStaleClaimDirs comment
+      // Relaunch = a fresh full-count run under a fresh runId, so it also needs a fresh frozen
+      // display target (see PUT /api/state's fresh-arm branch for why). 'continue' deliberately
+      // keeps the SAME runId, so its already-frozen original target still correctly applies.
+      state.operator.autopilotOriginalMaxPostsPerRun = newMax;
     }
     state.operator.lastIncompleteRun = { ...run, status: action === "continue" ? "continued" : "relaunched", resolvedAt: new Date().toISOString() };
     const next = writeState(state, { controlWrite: true, operatorControl: true }); // explicit relaunch/continue — may set armed/enabled true
