@@ -16178,6 +16178,14 @@ async function runFacebookCommentRecoveryAttempt({ row, profileId, profileLabel,
       validation,
       closeResults,
       message: err.message || String(err),
+      // CAPACITY-DEFER TAG (2026-07-25, measured): distinguish "the BOX had no free slot" from "this PROFILE
+      // failed". A capacity refusal opens NO browser and learns NOTHING about the post, yet the caller's roster
+      // loop treated it like a normal per-profile miss and kept walking the whole roster -- measured at ~9 rows
+      // burned per blocked moment in ~600ms, 2941 junk ledger rows in one tail. Worse, the post then exited as
+      // "not verified after N profile attempts" and got a 4-minute ESCALATING backoff stamped on it despite
+      // having made ZERO real attempts. That is what makes the drain look stupid: it punishes a post for the
+      // box being briefly full. Callers use this flag to stop the roster walk and retry soon instead.
+      capacityDeferred: (err?.publicError === "ixbrowser_posting_reserved" || err?.publicError === "ixbrowser_profile_budget_exceeded"),
       liveLog: [],
       liveLogFile: "",
       payloadFile: "",
@@ -16906,6 +16914,30 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
       message: oneLineField(attempt.message || "", 300),
     });
     closeResults.push(...(attempt.closeResults || []));
+    // CAPACITY DEFER (2026-07-25): the box had no free browser slot, so NOTHING was learned about this post or
+    // this profile -- and the very next profile in the roster will hit the exact same global wall within
+    // milliseconds. Walking the rest of the list just burns ~9 junk ledger rows per blocked moment and then
+    // falsely reports "no profile could comment", which stamps an escalating backoff on a post that never got a
+    // real attempt. Stop immediately and tell the caller this was capacity, not failure, so it can retry soon.
+    if (attempt.capacityDeferred) {
+      try {
+        logEvent("comment_recovery_capacity_deferred", {
+          postUrl, planId: row?.planId, sequence: row?.sequence,
+          profileId: attempt.profileId, attemptNumber, totalProfiles,
+          profilesSkipped: Math.max(0, totalProfiles - attemptNumber),
+        });
+      } catch (_) {}
+      return {
+        ok: false,
+        deferredCapacity: true, // caller: do NOT treat as a failed attempt, do NOT escalate the backoff
+        postUrl,
+        planId: row?.planId,
+        sequence: row?.sequence,
+        closeResults,
+        attempts,
+        message: "Deferred: no free browser slot for the comment (box at capacity). No profile attempt was made.",
+      };
+    }
     if (!attempt.ok) {
       const errors = Array.isArray(attempt.validation?.errors) ? attempt.validation.errors.join(", ") : "";
       persistTestRunStepProgress({
