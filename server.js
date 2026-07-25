@@ -24971,7 +24971,22 @@ const server = http.createServer(async (req, res) => {
       try {
         const s = readState();
         s.operator = s.operator || {};
-        s.operator.reportSinceAt = new Date().toISOString();
+        // NEVER HIDE THE RUN THAT IS CURRENTLY RUNNING (operator 2026-07-25: "I see 'run in progress' but I
+        // don't see the task section"). Cutting at NOW also cuts every post the LIVE run has already made, so
+        // clearing history mid-run emptied the run's own card and the operator lost all visibility into what was
+        // happening -- and it needed a manual timestamp fix to recover. "Clear history" means "drop the OLD
+        // runs", never "blind me to the one in flight". When a run is armed, cut just BEFORE it started
+        // (autopilotRunId is the arm time in epoch ms) so this run stays fully visible and only earlier runs are
+        // hidden. Fully dynamic: no manual recalibration, correct for every future clear.
+        let __cut = Date.now();
+        try {
+          const __armed = s.operator.armedForExternalActions === true || s.operator.autopilotEnabled === true;
+          const __runStartMs = Number(s.operator.autopilotRunId) || 0;
+          if (__armed && __runStartMs > 0 && __runStartMs <= __cut) {
+            __cut = __runStartMs - 120000; // 2min of slack: the first posts land slightly after the arm instant
+          }
+        } catch (_) {}
+        s.operator.reportSinceAt = new Date(__cut).toISOString();
         writeState(s);
       } catch (_) {}
     } else {
