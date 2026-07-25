@@ -15487,12 +15487,33 @@ function acquireAdminApprovalLock(profileId, maxWaitMs) {
   // forever, with no crash/log). Race the wait against a bounded timer so a caller always eventually proceeds;
   // it still receives the real `release` (calling it later still resolves `next` for whoever queued behind it,
   // so the chain keeps advancing rather than staying permanently poisoned).
+  // PHANTOM-TIMER FIX (2026-07-24): Promise.race does NOT cancel the losing branch, and this timer handle was
+  // never captured or cleared. Every acquisition -- including the ~49% that are INSTANT -- left an armed timer
+  // that fired minutes later and logged admin_approval_lock_wait_timeout_forced for a lock that was acquired
+  // cleanly and already released. Measured: 379 of 465 such events in one day (81.5%) were phantoms, which is
+  // what made moderator approval look like it was timing out on every single attempt. Worse, the logged waitMs
+  // was the NOMINAL timer duration, and since the caller passes (budget - elapsed - 5000) the due instant is
+  // always approvalStartedAt+475000 -- so every timer one session armed fired at the SAME millisecond with
+  // DIFFERENT waitMs values, producing fake "many waiters flushing at once" clusters. Capture the handle, clear
+  // it on whichever branch wins, and log the MEASURED wait alongside the nominal one.
+  const lockRequestedAt = Date.now();
+  let timer = null;
+  const clear = () => { if (timer) { clearTimeout(timer); timer = null; } };
   return Promise.race([
-    prior.then(() => release),
-    new Promise((res) => setTimeout(() => {
-      try { logEvent("admin_approval_lock_wait_timeout_forced", { profileId: key, waitMs }); } catch (_) {}
-      res(release);
-    }, waitMs)),
+    prior.then(() => { clear(); return release; }),
+    new Promise((res) => {
+      timer = setTimeout(() => {
+        timer = null;
+        try {
+          logEvent("admin_approval_lock_wait_timeout_forced", {
+            profileId: key,
+            waitMs,                                  // nominal budget granted to this wait
+            waitedMs: Date.now() - lockRequestedAt,  // ACTUAL measured wait -- trust this one
+          });
+        } catch (_) {}
+        res(release);
+      }, waitMs);
+    }),
   ]);
 }
 async function approvePendingFacebookPostWithAdminProfiles(args) {
@@ -15614,6 +15635,10 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
   const attempts = [];
   const MAX_ADMIN_APPROVAL_ATTEMPTS = 6;
   const MAX_ADMIN_APPROVAL_WALL_CLOCK_MS = 8 * 60 * 1000;
+  // Budget that must remain AFTER queueing for a moderator lock for the attempt to be worth starting at all.
+  // Measured median real approval work is ~96-112s, so a leg arriving with less than this can only bail --
+  // which is exactly the wasted-wait bug this bounds (see the lock-wait computation below).
+  const MIN_USEFUL_APPROVAL_WORK_MS = 45 * 1000;
   // PER-ATTEMPT cap (operator 2026-06-29): one hung/empty-queue attempt used to consume the ENTIRE 8-min budget on a
   // SINGLE moderator (budget_exceeded {attempts:1}), so the 2nd moderator was never tried and the session approved
   // nothing. Cap each attempt to 4 min so the 8-min budget buys ~2 tries -> BOTH moderators get rotated within one
@@ -15641,7 +15666,20 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
       // (2026-07-20 fix) never wait on this lock longer than the session actually has left -- a wait that
       // outlasts the remaining budget is guaranteed to end in budgetExceeded below anyway, so bound it now
       // instead of blocking uselessly for up to the full LOCK_ACQUIRE_TIMEOUT_MS.
-      const __remainingForLockWait = MAX_ADMIN_APPROVAL_WALL_CLOCK_MS - (Date.now() - approvalStartedAt) - 5000;
+      // SELF-DEFEATING-WAIT FIX (2026-07-24): the old formula was `remaining - 5000`, numerically identical to
+      // the `remainingBudgetMs <= 5000` bail directly below -- so ANY leg that actually waited out its grant
+      // arrived with EXACTLY 5000ms and unconditionally bailed having opened no browser and done no Facebook
+      // work. Measured: 84 of 86 real forced grants (97.7%) released the lock within 100ms. The 2026-07-20
+      // change that made callers pass their own remaining budget accidentally turned the safety valve into a
+      // guaranteed no-op, burning ~3.1 hours of approval wall-clock in one day for zero work. Now: never spend
+      // more than 40% of what's left queueing, and always keep at least one useful attempt's worth of budget in
+      // reserve -- so a leg that gives up waiting on a busy moderator still has time to try the NEXT one
+      // (moderator ordering/fairness is unchanged; this only bounds how long it queues on any single profile).
+      const __budgetLeftNow = MAX_ADMIN_APPROVAL_WALL_CLOCK_MS - (Date.now() - approvalStartedAt);
+      const __remainingForLockWait = Math.max(
+        1000,
+        Math.min(__budgetLeftNow - MIN_USEFUL_APPROVAL_WORK_MS, Math.floor(__budgetLeftNow * 0.4))
+      );
       const releaseApprovalLock = await acquireAdminApprovalLock(adminProfile.profileId, __remainingForLockWait);
       logEvent("facebook_admin_approval_lock_acquired", { profileId: adminProfile.profileId, queueWaitMs: Date.now() - lockRequestedAt });
       const remainingBudgetMs = MAX_ADMIN_APPROVAL_WALL_CLOCK_MS - (Date.now() - approvalStartedAt);
