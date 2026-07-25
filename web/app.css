@@ -346,13 +346,17 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   gap: 16px;
   align-content: start;
   width: 100%;
-  max-width: 1200px;
+  /* FULL WIDTH (operator 2026-07-25): the main column used to be capped at 1200px and centred, which wasted
+     most of a wide screen and forced the dense tables (report, profile lists, group assignments) to wrap.
+     Now it fills the viewport. The 12-column grid below is unchanged, so panels simply get wider tracks
+     instead of being squeezed; a large upper bound keeps line lengths sane on very wide/ultrawide monitors. */
+  max-width: 2560px;
   margin-inline: auto;
   padding: 22px 26px 64px;
   min-width: 0;
 }
-/* center the sticky topbar content to match the capped main column */
-.topbar { padding-inline: max(26px, calc((100% - 1200px) / 2 + 26px)); }
+/* topbar padding now just matches the main column's own padding (no centring offset needed at full width) */
+.topbar { padding-inline: 26px; }
 
 /* view engine — EXACT preservation of behavior */
 .viewsReady [data-view] { display: none; }
