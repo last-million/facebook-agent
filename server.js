@@ -15431,7 +15431,34 @@ function autoEnableAdminApprovalIfPersistentFailures(groupUrl) {
   // a 2nd occurrence cuts that detection window substantially for any newly-added group, at low risk: this only
   // flips requiresAdminApproval from false->true (never disables it), and a group that genuinely doesn't need
   // moderation would need a false "uncertain_after_post_click" signal to mis-fire even once.
-  if (recentUncertain.length < 1) return false;
+  // THRESHOLD 1 -> 3 + TIME SPREAD (2026-07-25, measured): the 1-signal threshold above was far too hot and it
+  // silently flagged EVERY configured group as requiring moderation. Evidence: all 5 groups ended up with
+  // requiresAdminApproval=true, none set by the operator; meanwhile 165 of 197 approval-gated posts (83.8%) went
+  // public with NO agent approval at all, and 68% of all moderator wall-clock (15.2h of 22.1h in one 8.8h run)
+  // was spent opening moderator browsers against groups that publish freely -- for a 1.2% success rate.
+  // "uncertain_after_post_click" does NOT mean "this group moderates": it fires whenever a post was submitted but
+  // the permalink was not captured, which also happens on a slow render, a connector timeout, or a DOM change.
+  // One such blip permanently converted a free group into a "moderated" one, because this flip is ONE-WAY and
+  // nothing ever clears it. Require several signals spread over real time so a single flaky post can no longer
+  // do it. (Turning an already-flagged group back OFF is deliberately NOT done here -- doing that wrongly would
+  // strand genuinely-pending posts with no moderator, so it stays an explicit operator decision.)
+  const MIN_UNCERTAIN_SIGNALS_TO_FLAG = 3;
+  const MIN_UNCERTAIN_SPREAD_MS = 30 * 60 * 1000;
+  if (recentUncertain.length < MIN_UNCERTAIN_SIGNALS_TO_FLAG) return false;
+  const __uncertainTimes = recentUncertain
+    .map((item) => Date.parse(item.at || 0))
+    .filter((t) => Number.isFinite(t))
+    .sort((a, b) => a - b);
+  const __spreadMs = __uncertainTimes.length >= 2 ? (__uncertainTimes[__uncertainTimes.length - 1] - __uncertainTimes[0]) : 0;
+  if (__spreadMs < MIN_UNCERTAIN_SPREAD_MS) {
+    try {
+      logEvent("facebook_group_auto_flag_skipped_burst", {
+        groupUrl, signals: recentUncertain.length, spreadMinutes: Math.round(__spreadMs / 60000),
+        needSignals: MIN_UNCERTAIN_SIGNALS_TO_FLAG, needSpreadMinutes: MIN_UNCERTAIN_SPREAD_MS / 60000,
+      });
+    } catch (_) {}
+    return false; // a burst inside one bad patch is one incident, not proof the group moderates
+  }
   const stateToUpdate = readState();
   let changed = false;
   for (const g of (Array.isArray(stateToUpdate.posting?.groupAssignmentData) ? stateToUpdate.posting.groupAssignmentData : [])) {
