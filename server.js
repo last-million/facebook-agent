@@ -385,7 +385,12 @@ const PROMPT_INJECTION_PATTERN = /\b(ignore|disregard|override|forget)\s+(all\s+
 const EXTERNAL_SERVICE_TIMEOUT_MS = 20000;
 const IXBROWSER_DEFAULT_LOCAL_ENDPOINT = "http://127.0.0.1:53200/";
 const IXBROWSER_API_PATH_CANDIDATES = ["/", "/api/", "/api/v1/", "/api/v2/", "/api/v3/", "/api/v4/", "/api/v5/"];
-const IXBROWSER_LOOPBACK_HOST_CANDIDATES = ["127.0.0.1", "127.0.0.2"];
+// ORDER MATTERS (2026-07-24): 127.0.0.2 is probed FIRST. On this box a Hermes WSL relay binds
+// 127.0.0.1:53200 specifically while ixBrowser binds 0.0.0.0:53200 -- Windows routes to the more
+// specific bind, so 127.0.0.1:53200 reaches the relay, NOT ixBrowser. The agent had already
+// auto-healed its saved endpoint to 127.0.0.2; this just stops every fresh discovery pass from
+// re-probing the hijacked host first and burning retries on it.
+const IXBROWSER_LOOPBACK_HOST_CANDIDATES = ["127.0.0.2", "127.0.0.1"];
 const IXBROWSER_API_DISCOVERY_TIMEOUT_MS = 2000;
 const IXBROWSER_API_DISCOVERY_CACHE_MS = 5 * 60 * 1000;
 const IXBROWSER_LISTENING_DISCOVERY_CACHE_MS = 30000;
