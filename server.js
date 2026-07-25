@@ -1124,8 +1124,15 @@ function readStateFresh() {
 // safety-valve pattern already used elsewhere in this file (see the 2026-07-14 hung-pass safety valve) --
 // rather than trusting a one-time static size estimate forever. Tune MERGE_CACHE_CLONE_BUDGET_MS from real
 // merged_state_cache_self_disabled log volume after deploy.
-const MERGE_CACHE_CLONE_BUDGET_MS = 40; // structuredClone benchmarked at ~33ms on a 4.75MB tree (2026-07-19);
-  // budgeted a bit above that measured cost on the current (larger) file, not exactly at it
+// 2026-07-24 RETUNE (live evidence, not theory): at 40ms this valve TRIPPED 7 times in one evening
+// (observed lastCloneMs 55, 65, 69, 95, 97, 165, 168 -- every trip disables the cache for 5 minutes and
+// reverts readState() to a full readStateFresh() deepMerge over a 7.1MB state file across ~314 call sites,
+// i.e. exactly the pre-fix behavior task #211 diagnosed as the multi-minute wedge). The valve exists to catch
+// cloning being WORSE than the merge it replaces -- but a 55-168ms clone is not worse than that merge, so the
+// old budget was simply mistuned and the valve was firing on healthy operation under load. Budget now sits
+// clearly above the observed working range; a genuine pathology (clone cost blowing past a quarter second)
+// still self-disables. The real long-term fix is shrinking workflow-state.json (7,365 stale bench lines).
+const MERGE_CACHE_CLONE_BUDGET_MS = 250;
 const MERGE_CACHE_OVERBUDGET_STREAK_LIMIT = 5; // consecutive over-budget clones before self-disabling
 const MERGE_CACHE_DISABLE_COOLDOWN_MS = 5 * 60 * 1000; // retry enabling every 5min -- self-heals if load drops
 let __mergedStateCache = { parsedRef: null, state: null };
@@ -3120,7 +3127,19 @@ function appendJsonlAbsoluteFile(filePath, row) {
     if (entry) {
       const trimmed = line.trim();
       if (trimmed && !trimmed.startsWith("#")) entry.lines.push(trimmed);
-      const st = fs.statSync(filePath);
+      // 2026-07-24: this statSync used to be UNGUARDED, and the catch below then dropped the whole cache entry
+      // on any transient failure. For the 182MB live-post ledger that means the very next read re-slurps and
+      // re-parses ~190k lines -- a multi-second event-loop block -- triggered by nothing worse than a momentary
+      // EBUSY/EPERM, which is a documented occurrence on this box during 5-way parallel posting (the append
+      // retry ladder directly above exists for exactly that reason). Give the stat the same brief retry ladder
+      // so one blip can no longer cost a full re-slurp; a genuinely persistent failure still falls through to
+      // the cache-drop below, which stays correct-but-slow rather than incorrect.
+      let st = null;
+      for (const __d of [0, 15, 40, 90]) {
+        try { if (__d) sleepSync(__d); st = fs.statSync(filePath); break; }
+        catch (e) { if (!(e && ["EBUSY", "EPERM", "EACCES", "EMFILE", "ENFILE"].includes(e.code))) throw e; }
+      }
+      if (!st) st = fs.statSync(filePath); // exhausted retries -> final attempt; a throw lands in the catch below
       entry.mtimeMs = st.mtimeMs; entry.size = st.size;
     }
   } catch (_) { __jsonlLineCache.delete(filePath); } // on any mismatch, drop the cache so the next read rebuilds it cleanly

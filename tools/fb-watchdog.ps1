@@ -14,8 +14,14 @@ $missFile = Join-Path $proj 'fb-watchdog-misses.txt'
 function Get-Port9317Owner { (Get-NetTCPConnection -LocalPort 9317 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess }
 
 # 1) Healthy?
+# TIMEOUT (2026-07-24): was 10s. Measured event-loop lag on this server has a p50 of ~8.5s and a p90 of ~25.6s
+# under real posting load, so a 10s probe was timing out on a server that was merely BUSY, not dead -- and three
+# such probes force-killed it. Every force-kill destroys in-flight posting/approval/comment work and kills
+# ixBrowser Chrome sessions mid-flight (a plausible mechanism for Facebook accounts losing their session, since
+# the cookie jar never flushes). 30s only declares a miss when the loop is genuinely wedged well past normal
+# busy latency. The miss threshold stays at 3, so a truly dead server is still recovered in ~3 minutes.
 $up = $false
-try { if ((Invoke-WebRequest -Uri 'http://127.0.0.1:9317/' -UseBasicParsing -TimeoutSec 10).StatusCode -eq 200) { $up = $true } } catch {}
+try { if ((Invoke-WebRequest -Uri 'http://127.0.0.1:9317/' -UseBasicParsing -TimeoutSec 30).StatusCode -eq 200) { $up = $true } } catch {}
 if ($up) { Set-Content -Path $missFile -Value '0'; exit 0 }   # healthy -> do NOTHING else (never touch other node procs / Pinterest)
 
 # 2) Down. Is port 9317 owned (FB server alive-but-slow) or free (crashed)?
@@ -25,7 +31,14 @@ if ($owner) {
   $misses++
   Set-Content -Path $missFile -Value "$misses"
   if ($misses -lt 3) { exit 0 }                 # busy/slow during a heavy run, not dead — wait (avoid killing mid-run)
-  try { Stop-Process -Id $owner -Force } catch {}  # wedged ~3 min -> kill ONLY the FB port-9317 owner
+  # RE-VERIFY OWNERSHIP BEFORE KILLING (2026-07-24): $owner was captured at the top of this script, up to ~90s
+  # ago (3 probes x 30s). A PID can be recycled in that window, so killing the stale value could terminate an
+  # UNRELATED process -- including, worst case, the co-resident Pinterest agent. Re-read the port owner and only
+  # kill if it still owns 9317 and still matches; if ownership changed, the situation already resolved itself.
+  $ownerNow = Get-Port9317Owner
+  if (-not $ownerNow) { $reason = "recovered_port_free_before_kill"; Set-Content -Path $missFile -Value '0'; exit 0 }
+  if ($ownerNow -ne $owner) { Set-Content -Path $missFile -Value '0'; exit 0 }  # different process now owns it -> do not kill
+  try { Stop-Process -Id $ownerNow -Force } catch {}  # wedged ~3 min -> kill ONLY the FB port-9317 owner
   Start-Sleep -Seconds 2
   $reason = "wedged_${misses}_misses"
 } else {
