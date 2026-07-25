@@ -25154,7 +25154,34 @@ const server = http.createServer(async (req, res) => {
     const id = url.searchParams.get("profileId") || "";
     const ok = releaseParkedProfile(id); // clears ANY parked list (disconnected / account error / suspended / comment-limited)
     const stx = readState();
-    return json(res, 200, { ok, profileId: id, disconnected: (stx.posting?.disconnectedProfiles || []), errored: (stx.posting?.erroredProfiles || []), suspended: (stx.posting?.suspendedProfiles || []), commentLimited: commentLimitedProfilesWithExpiry(stx) });
+    // A Release un-benches the profile, but a profile that is in NO group still cannot post -- it would sit idle
+    // and silently do nothing, with nothing on screen explaining why (operator 2026-07-25). Report how many groups
+    // it is actually assigned to so the dashboard can say plainly whether Release alone is enough, instead of
+    // nagging with a generic "assign it to a group" every time (which is wrong for the common case).
+    let assignedGroupCount = 0;
+    let assignedGroupNames = [];
+    let excludedFromBuilder = false;
+    try {
+      const pid = Number(id) || 0;
+      const gad = Array.isArray(stx.posting?.groupAssignmentData) ? stx.posting.groupAssignmentData : [];
+      for (const g of gad) {
+        const inGroup = (Array.isArray(g?.profiles) ? g.profiles : []).some((p) => Number(profileIdFromLabel(String(p || ""))) === pid);
+        if (inGroup) {
+          assignedGroupCount += 1;
+          const __u = String(g?.url || "");
+          const __m = __u.match(/\/groups\/([^/?#]+)/i);
+          assignedGroupNames.push(__m ? __m[1] : __u);
+        }
+      }
+      // If it is ALSO on the excluded/blocked list, it will not even appear in the assignment picker, so telling
+      // the operator to "add it to a group" would be a dead end until they clear that first.
+      excludedFromBuilder = recordLines(stx.ixbrowser?.blockedProfiles).some((l) => Number(profileIdFromLabel(l)) === pid);
+    } catch (_) {}
+    return json(res, 200, {
+      ok, profileId: id,
+      assignedGroupCount, assignedGroupNames, excludedFromBuilder,
+      disconnected: (stx.posting?.disconnectedProfiles || []), errored: (stx.posting?.erroredProfiles || []), suspended: (stx.posting?.suspendedProfiles || []), commentLimited: commentLimitedProfilesWithExpiry(stx),
+    });
   }
   if (req.method === "POST" && url.pathname === "/api/profiles/disconnect") {
     const id = url.searchParams.get("profileId") || "";

@@ -5875,7 +5875,7 @@ function uxAttachDisconnectedProfiles() {
         const info = document.createElement("div"); info.className = "di-info";
         info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "not logged in") + (r.at ? ' · ' + r.at : '') + '</div>';
         const btn = document.createElement("button"); btn.type = "button"; btn.textContent = "Release";
-        btn.addEventListener("click", async () => { btn.disabled = true; try { await api("/api/profiles/release?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
+        btn.addEventListener("click", async () => { btn.disabled = true; try { await releaseProfileAndExplain(r.profileId); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
         const sus = document.createElement("button"); sus.type = "button"; sus.textContent = "→ Suspended"; sus.title = "This account is suspended/banned — move it to the Suspended list & keep it blocked"; sus.style.background = "#5b2f2f"; sus.style.borderColor = "#6b3a3a";
         sus.addEventListener("click", async () => { sus.disabled = true; try { await api("/api/profiles/suspend?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); if (typeof uxAttachSuspendedProfiles === "function") uxAttachSuspendedProfiles(); } catch (e) { sus.disabled = false; if (typeof showToast === "function") showToast("Failed"); } });
         const wrap = document.createElement("div"); wrap.style.display = "flex"; wrap.style.gap = "6px"; wrap.appendChild(sus); wrap.appendChild(btn);
@@ -5912,6 +5912,31 @@ function uxAttachNotGroupMemberProfiles() {
   load();
 }
 
+// RELEASE FEEDBACK (operator 2026-07-25): a Release un-benches the account, but if that profile is in NO group it
+// still cannot post -- it just sits idle with nothing on screen saying why. The server now returns how many groups
+// the profile is actually assigned to, so we can tell the truth per case instead of showing the same generic
+// "go assign it to a group" every time (which would be wrong for the common case and quickly ignored).
+async function releaseProfileAndExplain(profileId) {
+  const r = await api("/api/profiles/release?profileId=" + encodeURIComponent(profileId), { method: "POST", body: "{}" });
+  const n = Number(r && r.assignedGroupCount) || 0;
+  const names = (r && Array.isArray(r.assignedGroupNames)) ? r.assignedGroupNames : [];
+  if (n > 0) {
+    if (typeof showToast === "function") {
+      showToast("Profile " + profileId + " released — assigned to " + n + " group" + (n > 1 ? "s" : "") +
+        (names.length ? " (" + names.slice(0, 3).join(", ") + (names.length > 3 ? "…" : "") + ")" : "") +
+        ". It will be used on the next run.");
+    }
+  } else {
+    const extra = (r && r.excludedFromBuilder)
+      ? "\n\nNOTE: it is also in the EXCLUDED list, so it will not even appear in the group picker until you remove it from Excluded first."
+      : "";
+    window.alert("Profile " + profileId + " has been released.\n\n" +
+      "BUT it is not assigned to ANY group, so it will NOT post.\n\n" +
+      "Add it to a group in \"Posting Groups & Profiles\" and save." + extra);
+  }
+  return r;
+}
+
 function uxAttachErroredProfiles() {
   const list = $("erroredProfilesList");
   if (!list) return;
@@ -5927,7 +5952,7 @@ function uxAttachErroredProfiles() {
         const info = document.createElement("div"); info.className = "di-info";
         info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "account error") + (r.at ? ' · ' + r.at : '') + '</div>';
         const btn = document.createElement("button"); btn.type = "button"; btn.textContent = "Release";
-        btn.addEventListener("click", async () => { btn.disabled = true; try { await api("/api/profiles/release?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
+        btn.addEventListener("click", async () => { btn.disabled = true; try { await releaseProfileAndExplain(r.profileId); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
         const sus = document.createElement("button"); sus.type = "button"; sus.textContent = "→ Suspended"; sus.title = "This account is suspended/banned — move it to the Suspended list & keep it blocked"; sus.style.background = "#5b2f2f"; sus.style.borderColor = "#6b3a3a";
         sus.addEventListener("click", async () => { sus.disabled = true; try { await api("/api/profiles/suspend?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); if (typeof uxAttachSuspendedProfiles === "function") uxAttachSuspendedProfiles(); } catch (e) { sus.disabled = false; if (typeof showToast === "function") showToast("Failed"); } });
         const wrap = document.createElement("div"); wrap.style.display = "flex"; wrap.style.gap = "6px"; wrap.appendChild(sus); wrap.appendChild(btn);
@@ -5954,7 +5979,7 @@ function uxAttachSuspendedProfiles() {
         const info = document.createElement("div"); info.className = "di-info";
         info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "suspended") + (r.at ? ' · ' + r.at : '') + '</div>';
         const btn = document.createElement("button"); btn.type = "button"; btn.textContent = "Release";
-        btn.addEventListener("click", async () => { btn.disabled = true; try { await api("/api/profiles/release?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
+        btn.addEventListener("click", async () => { btn.disabled = true; try { await releaseProfileAndExplain(r.profileId); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
         row.appendChild(info); row.appendChild(btn); list.appendChild(row);
       }
     } catch (e) { list.innerHTML = '<div style="opacity:.6">Could not load suspended accounts.</div>'; }
@@ -5983,7 +6008,7 @@ function uxAttachBlockedModerators() {
         const status = r.retesting ? 'retesting on next approval' : ('blocked · ~' + mins + ' min left');
         info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "stuck on forced_account_switch") + ' · ' + status + '</div>';
         const btn = document.createElement("button"); btn.type = "button"; btn.textContent = "Release";
-        btn.addEventListener("click", async () => { btn.disabled = true; try { await api("/api/profiles/release?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
+        btn.addEventListener("click", async () => { btn.disabled = true; try { await releaseProfileAndExplain(r.profileId); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
         row.appendChild(info); row.appendChild(btn); list.appendChild(row);
       }
     } catch (e) { list.innerHTML = '<div style="opacity:.6">Could not load blocked moderators.</div>'; }
@@ -6009,7 +6034,7 @@ function uxAttachCommentLimitedPostOnlyProfiles() {
         const status = r.expired ? "auto-released — eligible to comment again" : ("~" + r.autoReleaseHoursRemaining + "h until auto-release");
         info.innerHTML = '<span class="di-id">Profile ' + (r.profileId || "?") + '</span>' + (r.label ? ' <span class="di-meta">' + r.label + '</span>' : '') + '<div class="di-meta">' + (r.reason || "comment-limited (still posting)") + (r.at ? ' · ' + r.at : '') + ' · ' + status + '</div>';
         const btn = document.createElement("button"); btn.type = "button"; btn.textContent = "Release";
-        btn.addEventListener("click", async () => { btn.disabled = true; try { await api("/api/profiles/release?profileId=" + encodeURIComponent(r.profileId), { method: "POST", body: "{}" }); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
+        btn.addEventListener("click", async () => { btn.disabled = true; try { await releaseProfileAndExplain(r.profileId); await load(); } catch (e) { btn.disabled = false; if (typeof showToast === "function") showToast("Release failed"); } });
         row.appendChild(info); row.appendChild(btn); list.appendChild(row);
       }
     } catch (e) { list.innerHTML = '<div style="opacity:.6">Could not load comment-limited profiles.</div>'; }
