@@ -3587,8 +3587,20 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
           if (key) for (const a of articles) { if ((a.innerText || '').includes(key) || articleRenderedIncludes(a, key)) { target = a; break; } }
           if (!target) return { clicked: false, reason: 'no_target_article' };
           const tr = target.getBoundingClientRect();
+          // MASS-APPROVE GUARD (2026-07-25): this fallback scans the WHOLE document for approve-like controls and
+          // then picks the geometrically nearest one. approveRe (APPROVE_NAME_RE) deliberately includes the BULK
+          // labels "approve all" / "aprobar todo" / "approva tutto" / "aprovar tudo" because the same regex is
+          // reused for confirm-dialog buttons -- so without this filter the nearest match could be the queue's
+          // "Approve all" control, mass-approving OTHER MEMBERS' pending posts in the group. Exclude any bulk
+          // label here; only a genuine per-post Approve may ever be clicked by this path.
+          const BULK_APPROVE_RE = /\b(all|todo|todas|todos|tutto|tutti|tudo|alle|tous|toutes|الكل|جميع)\b/i;
           const btns = [...document.querySelectorAll('div[role="button"],button,a[role="button"]')].filter(vis)
-            .filter((b) => approveRe.test(norm(b.innerText)) || approveRe.test(norm(b.getAttribute('aria-label'))));
+            .filter((b) => {
+              const lbl = norm(b.innerText) || norm(b.getAttribute('aria-label'));
+              if (!lbl) return false;
+              if (BULK_APPROVE_RE.test(lbl)) return false; // never a bulk/"approve all" control
+              return approveRe.test(norm(b.innerText)) || approveRe.test(norm(b.getAttribute('aria-label')));
+            });
           if (!btns.length) return { clicked: false, reason: 'no_approve_button_on_surface' };
           let best = null, bestD = Infinity;
           for (const b of btns) { const br = b.getBoundingClientRect(); const below = br.top >= tr.top - 30; const d = Math.abs(br.top - tr.bottom) + (below ? 0 : 1e6); if (d < bestD) { bestD = d; best = b; } }
