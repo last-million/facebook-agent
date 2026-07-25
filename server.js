@@ -101,6 +101,30 @@ const MAX_BG_COMMENT_IN_FLIGHT = 6;
 // (no comment ever dropped), so this costs at most a short queue wait for a comment, never a skipped one.
 const BG_APPROVAL_RESERVED_SLOTS = 2;
 const MAX_BG_COMMENT_ONLY_IN_FLIGHT = Math.max(1, MAX_BG_COMMENT_IN_FLIGHT - BG_APPROVAL_RESERVED_SLOTS);
+// How many moderator accounts can actually take work RIGHT NOW (configured, minus parked/suspended/disconnected).
+// Used to bound concurrent approval legs -- running more of them than there are moderators cannot approve
+// anything faster, it just parks extra legs on the per-moderator locks while they hold a shared comment slot.
+// Recomputed on demand (cheap, small lists) so adding or losing a moderator takes effect immediately, with no
+// restart and no config: fully dynamic. Falls back to the reserved-slot constant if the state read fails.
+function usableFacebookAdminApprovalProfileCount() {
+  try {
+    const st = readState();
+    const ids = new Set();
+    for (const line of recordLines(st?.ixbrowser?.moderatorProfiles)) {
+      const pid = Number(profileIdFromLabel(line) || 0);
+      if (pid) ids.add(pid);
+    }
+    if (!ids.size) return BG_APPROVAL_RESERVED_SLOTS;
+    const parked = new Set([
+      ...(Array.isArray(st?.posting?.suspendedProfiles) ? st.posting.suspendedProfiles : []),
+      ...(Array.isArray(st?.posting?.disconnectedProfiles) ? st.posting.disconnectedProfiles : []),
+      ...(Array.isArray(st?.posting?.erroredProfiles) ? st.posting.erroredProfiles : []),
+    ].map((e) => Number(e?.profileId || 0)).filter(Boolean));
+    let usable = 0;
+    for (const pid of ids) if (!parked.has(pid)) usable += 1;
+    return Math.max(1, usable);
+  } catch (_) { return BG_APPROVAL_RESERVED_SLOTS; }
+}
 // FAST-FIRE WAITER QUEUE (2026-07-07): replaces "DEFER-TO-DRAIN = log it and hope the periodic resweep looks."
 // When the cap is full, a task is pushed here instead of dropped; the moment ANY backgrounded task's .finally
 // below runs, it hands the just-freed slot to the OLDEST queued waiter FIRST -- synchronously, in the same
@@ -8552,6 +8576,25 @@ function statusLineAppliesToFacebookGroup(line, groupUrl) {
 // facebookProfileStatus), this was real, compounding synchronous cost on the hot single-threaded posting path.
 // Cache is keyed by STRING VALUE (not a timestamp or counter) -- JS compares strings by value, so this can never
 // go stale: any real change to either blob is a different string and misses the cache exactly once, safely.
+// ANCHORED PROFILE-ID MATCH (2026-07-25, measured live bug). The bench/quarantine predicates below used a bare
+// `line.includes("profile_id=" + id)` substring test. That silently cross-attributes one account's bench to
+// another whenever one id is a PREFIX of another: "profile_id=127" contains "profile_id=1", "profile_id=12" and
+// "profile_id=10". Confirmed on the live blob -- profile 127's
+// `status=facebook_account_suspended_or_disabled ... action=quarantined_skip_ixbrowser_profile_for_facebook`
+// line was being inherited by profiles 1, 10 and 12, and profile 1 is a MODERATOR: it was silently excluded from
+// group 4854972804605257's approval pool, leaving that group on 2 moderators while every other group had 3.
+// Match counts for pid 1 were 1495 unanchored vs 39 anchored. This is the same digit-boundary anchor already
+// used elsewhere in this file (see the pidRe definitions near the reconcile/move paths) -- now shared, so the
+// five read sites can never drift apart again. A trailing (?!\d) is sufficient: the "profile_id=" prefix already
+// pins the left edge, so only a longer number to the RIGHT can create a false match.
+const __pidLineReCache = new Map();
+function profileIdLineMatch(line, profileId) {
+  const pid = Number(profileId);
+  if (!pid || !line) return false;
+  let re = __pidLineReCache.get(pid);
+  if (!re) { re = new RegExp(`profile_id=${pid}(?!\\d)`); __pidLineReCache.set(pid, re); }
+  return re.test(line);
+}
 let __profileStatusLinesCache = { status: null, failed: null, lines: null };
 function profileStatusLowercaseLines(state) {
   const status = state.posting?.facebookProfileStatus || "";
@@ -8573,7 +8616,7 @@ function isProfileBlockedForPosting(label, state, groupUrl = "") {
   const matching = sources.filter((line) => {
     if (!/status=(cannot_comment|cannot_post_in_any_group|resolved|approved|cleared|ignored)|action=(quarantined|skip_profile|profile_unblocked|profile_group_unblocked)/i.test(line)) return false;
     if (!statusLineAppliesToFacebookGroup(line, groupUrl)) return false;
-    if (profileId && line.includes(`profile_id=${profileId}`)) return true;
+    if (profileId && profileIdLineMatch(line, profileId)) return true;
     return lowerLabel.length > 2 && line.includes(lowerLabel);
   });
   const latest = matching[matching.length - 1] || "";
@@ -8593,7 +8636,7 @@ function isAutoBlacklistedStickyBench(profileId, state) {
     const pid = Number(profileId);
     if (!pid) return false;
     const lines = [String(state.posting?.facebookProfileStatus || ""), String(state.ixbrowser?.failedProfiles || "")]
-      .join("\n").toLowerCase().split(/\r?\n/).filter((l) => l.includes(`profile_id=${pid}`));
+      .join("\n").toLowerCase().split(/\r?\n/).filter((l) => profileIdLineMatch(l, pid));
     const latest = lines[lines.length - 1] || "";
     if (!latest) return false;
     if (/action=(profile_unblocked|profile_group_unblocked)|status=(resolved|approved|cleared|ignored)/i.test(latest)) return false;
@@ -8611,7 +8654,7 @@ function isFacebookProfileQuarantinedForFacebook(label, state = readState(), gro
   const matching = sources.filter((line) => {
     if (!/status=(facebook_account_suspended_or_disabled|facebook_account_blocked_or_review_required|facebook_account_disabled|facebook_account_suspended|facebook_account_locked|cannot_use_facebook|cannot_comment|resolved|approved|cleared|ignored)|issue=(facebook_account_status|account_unusable|account_hard_blocked)|action=(quarantined|skip_ixbrowser_profile_for_facebook|profile_unblocked|profile_group_unblocked)/i.test(line)) return false;
     if (!statusLineAppliesToFacebookGroup(line, groupUrl)) return false;
-    if (profileId && line.includes(`profile_id=${profileId}`)) return true;
+    if (profileId && profileIdLineMatch(line, profileId)) return true;
     return lowerLabel.length > 2 && line.includes(lowerLabel);
   });
   const latest = matching[matching.length - 1] || "";
@@ -8744,7 +8787,7 @@ function isProfileGroupBlockedForPosting(label, groupUrl, state) {
     // live: 65/65 posting_profile_group_issue events in a 3h9m window hit ONLY the 2 vanity-configured new groups,
     // 0 on the numeric-configured old groups.
     if (lineGroup !== groupKey && !targetAliasSet.has(lineGroup)) return false;
-    if (profileId && line.includes(`profile_id=${profileId}`)) return true;
+    if (profileId && profileIdLineMatch(line, profileId)) return true;
     return lowerLabel.length > 2 && line.includes(lowerLabel);
   });
   const latest = matching[matching.length - 1] || "";
@@ -10200,6 +10243,26 @@ function tailReadFileSync(filePath, maxBytes) {
   }
 }
 const AUTOPILOT_LEDGER_TAIL_BYTES = 30 * 1024 * 1024;
+// PHANTOM ROWS (2026-07-25, measured live): the two fairness counters below select ledger rows by the mere
+// PRESENCE of a "postUrl", then credit row.profileId with that post. That is wrong for rows where profileId is
+// a CANDIDATE that was considered and SKIPPED -- those rows carry the skipped profile's id next to the ORIGINAL
+// POSTER's postUrl, so a profile got counted as "published" for doing literally nothing. Impact was severe and
+// INVERTED the ordering: /api/autopilot/status reported 2,537 posts for a day whose real count was ~300, and the
+// profiles it ranked busiest (45->82, 122->68, 126->63) had actually published ZERO while the real top posters
+// (14->19, 60->17) looked idle. Since this feeds least-used-FIRST selection, the accounts that had done the most
+// work were repeatedly chosen next and genuinely idle accounts were never reached.
+// Only PHANTOM events are excluded here -- deliberately NOT narrowed to publishes-only. An adversarial review
+// measured that a publish-only counter would sort the fleet's heaviest COMMENTERS to the front of the posting
+// queue (they have ~0 publishes but 15-30 comments/day), stacking posting onto the busiest accounts. Counting
+// real work of any kind keeps posters and commenters balanced against each other, which is what protects the
+// accounts. Verified NOT phantom (they carry the poster's OWN id on the poster's own post, so they collapse
+// into the poster's dedupe key and inflate nothing): comment_profile_required_planned, comment_lock_queue_started,
+// browser_closed_before_comment_profile_fallback.
+const FAIRNESS_PHANTOM_LEDGER_EVENTS = new Set([
+  "comment_recovery_skipped",              // dominant: "IXBrowser profile N is already busy" -- candidate skipped, zero work
+  "comment_pin_recovery_planned",          // planning only, no browser opened
+  "publisher_comment_last_resort_skipped", // skipped, by definition
+]);
 let __todayByProfileCache = { at: 0, tz: "", result: null };
 function autopilotPublishedTodayByProfile(state = readState()) {
   const tz = state.operator?.scheduleTimezone || state.rules?.peakHoursTimezone || "America/New_York";
@@ -10229,15 +10292,17 @@ function autopilotPublishedTodayByProfile(state = readState()) {
   const byGroup = new Map(); // per-group today-counts for group fairness (piggybacked on this scan)
   const seen = new Set();
   const lastAtByProfile = new Map();
+  // (FAIRNESS_PHANTOM_LEDGER_EVENTS is defined just above this function -- see its comment for why.)
   let total = 0;
   let lastPostAt = 0;
   try {
     const raw = tailReadFileSync(FB_LIVE_POST_LEDGER_FILE, AUTOPILOT_LEDGER_TAIL_BYTES);
     for (const line of raw.split(/\r?\n/)) {
       const trimmed = line.trim();
-      if (!trimmed || trimmed.indexOf('"postUrl":"http') === -1) continue; // only successful publishes
+      if (!trimmed || trimmed.indexOf('"postUrl":"http') === -1) continue; // only rows that name a real post
       let row;
       try { row = JSON.parse(trimmed); } catch { continue; }
+      if (FAIRNESS_PHANTOM_LEDGER_EVENTS.has(String(row.event || ""))) continue; // see the set's comment: NO work by this profile
       const postUrl = String(row.postUrl || "").trim();
       if (!postUrl) continue;
       const at = String(row.at || "");
@@ -10279,8 +10344,9 @@ function autopilotPostHistoryByProfile() {
     const raw = fs.readFileSync(FB_LIVE_POST_LEDGER_FILE, "utf8");
     for (const line of raw.split(/\r?\n/)) {
       const t = line.trim();
-      if (!t || t.indexOf('"postUrl":"http') === -1) continue; // successful publishes only
+      if (!t || t.indexOf('"postUrl":"http') === -1) continue; // only rows that name a real post
       let r; try { r = JSON.parse(t); } catch { continue; }
+      if (FAIRNESS_PHANTOM_LEDGER_EVENTS.has(String(r.event || ""))) continue; // see the set's comment
       const pid = Number(r.profileId || 0);
       const u = String(r.postUrl || "");
       if (!pid || !u.startsWith("http")) continue;
@@ -19271,10 +19337,25 @@ async function runLiveFacebookPostFromPlan(body = {}) {
           // the comment-stage decouple (no second, independent concurrency pool), and the
           // __approvalInFlightKeys mutex inside approvePendingFacebookPostWithAdminProfiles prevents a
           // double-Approve-click race against any other approval attempt for this same ledgerKey.
+          // COMMENT STARVATION FIX (2026-07-25): this admitted against the FULL shared pool while comment-only
+          // tasks are capped at MAX_BG_COMMENT_ONLY_IN_FLIGHT (=4). BG_APPROVAL_RESERVED_SLOTS reserved headroom
+          // FOR approval but never CAPPED it, so approval legs -- each parked for up to the full 8-minute
+          // moderator wall-clock -- could occupy all 6 slots and drive comment admission to ZERO. Measured: 45%
+          // of posts had to queue for a comment slot (median 6m, p90 15m33s, worst 42m07s).
+          // The cap is DYNAMIC and derived from reality: you can never usefully run more concurrent approval legs
+          // than you have usable moderator accounts -- extra legs just block on the per-moderator locks while
+          // holding a shared comment slot hostage. So bound it by the live moderator count (floor 1 so a
+          // single-moderator fleet still works, and never above the pool itself). Comments keep at least
+          // MAX_BG_COMMENT_IN_FLIGHT - cap slots available at all times.
+          const __bgApprovalCap = Math.max(1, Math.min(
+            MAX_BG_COMMENT_IN_FLIGHT - 1,
+            usableFacebookAdminApprovalProfileCount(),
+          ));
           const __bgPreApprovalEligible = ready.__autopilotRunPost === true
             && groupRequiresApproval
             && readState().operator?.commentDrainDisabled !== true
             && __bgCommentInFlight < MAX_BG_COMMENT_IN_FLIGHT
+            && __bgApprovalLegInFlightKeys.size < __bgApprovalCap
             && !__approvalInFlightKeys.has(ledgerKey);
           if (__bgPreApprovalEligible) {
             appendFacebookLivePostLedger({
@@ -20919,7 +21000,7 @@ function recentProfileBlockingFailureCount(pid, state) {
   const sources = [state.posting?.facebookProfileStatus, state.ixbrowser?.failedProfiles].join("\n").split(/\r?\n/);
   let n = 0;
   for (const line of sources) {
-    if (!line.includes(`profile_id=${pid}`)) continue;
+    if (!profileIdLineMatch(line, pid)) continue;
     if (/status=(resolved|approved|cleared|ignored)|action=(profile_unblocked|profile_group_unblocked)/i.test(line)) continue;
     if (!/status=cannot_post_in_any_group|action=skip_profile|skip_profile_for_posting_run|auto_soft_strike=1/i.test(line)) continue;
     const m = line.match(/(\d{4}-\d{2}-\d{2}T[0-9:.]+Z)/);
