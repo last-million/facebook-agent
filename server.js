@@ -1467,11 +1467,20 @@ function writeState(state, opts = {}) {
   if (Array.isArray(clean.posting?.groupAssignmentData) && Array.isArray(existing.posting?.groupAssignmentData)) {
     for (const newEntry of clean.posting.groupAssignmentData) {
       if (!newEntry?.url) continue;
-      if (Object.prototype.hasOwnProperty.call(newEntry, "requiresAdminApproval") && newEntry.requiresAdminApproval === true) continue;
+      // ONE-WAY LATCH REMOVED (2026-07-25). This block used to force requiresAdminApproval back to TRUE whenever
+      // the existing state had it true, honouring the incoming value ONLY when it was explicitly true -- so an
+      // explicit FALSE was silently reverted on every write. Combined with the auto-flag (which fires one-way
+      // from false->true), a group could become "requires moderation" permanently, and NOTHING -- not the
+      // dashboard, not the API, not the operator -- could ever undo it. Live effect: all 5 groups ended up
+      // flagged, and 68% of moderator wall-clock went to groups that publish freely, at a 1.2% success rate.
+      // The latch's REAL purpose is protecting the flag from an incidental/partial write that omits the field.
+      // That is preserved exactly: if the field is ABSENT we still inherit the existing value. What changes is
+      // that an EXPLICIT value -- true or false -- is now respected, so the setting is genuinely two-way.
+      if (Object.prototype.hasOwnProperty.call(newEntry, "requiresAdminApproval")) continue; // caller stated it explicitly -> honour it
       const newKey = normalizedFacebookGroupKey(newEntry.url);
       const existingMatch = existing.posting.groupAssignmentData.find((e) => normalizedFacebookGroupKey(e?.url) === newKey);
       if (existingMatch && existingMatch.requiresAdminApproval === true) {
-        newEntry.requiresAdminApproval = true;
+        newEntry.requiresAdminApproval = true; // field omitted entirely -> keep the known value (anti-clobber)
       }
     }
   }
