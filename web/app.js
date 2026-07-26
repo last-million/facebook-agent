@@ -5987,6 +5987,69 @@ function uxAttachNotGroupMemberProfiles() {
 // still cannot post -- it just sits idle with nothing on screen saying why. The server now returns how many groups
 // the profile is actually assigned to, so we can tell the truth per case instead of showing the same generic
 // "go assign it to a group" every time (which would be wrong for the common case and quickly ignored).
+// MODERATOR GATE POPUP (2026-07-26, operator: "stop prod and show pop up ... ask if want to continue and exclude
+// the groups that don't have a moderator allowed in it, or stop the prod till fixing it").
+// Resolves to "exclude" (run without those groups) or "cancel" (don't launch). Blocking by design: launching a run
+// whose posts can never be approved is worse than making the operator answer one question.
+function showModeratorGateModal(pf) {
+  return new Promise(function (resolve) {
+    const noModerator = (pf && pf.reason === "no_usable_moderator");
+    const groups = (pf && Array.isArray(pf.groupsWithoutModerator)) ? pf.groupsWithoutModerator : [];
+    const back = document.createElement("div");
+    back.setAttribute("role", "dialog");
+    back.setAttribute("aria-modal", "true");
+    back.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.62);display:flex;align-items:center;justify-content:center;z-index:9999;padding:20px";
+    const box = document.createElement("div");
+    box.style.cssText = "max-width:640px;width:100%;background:#1b1416;border:2px solid #e04a4a;border-radius:12px;padding:22px;color:#f2e9e9;box-shadow:0 18px 50px rgba(0,0,0,.55);max-height:82vh;overflow:auto";
+    const h = document.createElement("h3");
+    h.style.cssText = "margin:0 0 10px;color:#ff6b6b;font-size:19px";
+    h.textContent = noModerator ? "Production blocked — no usable moderator" : "Production blocked — a group has no moderator";
+    box.appendChild(h);
+    const p = document.createElement("p");
+    p.style.cssText = "margin:0 0 14px;line-height:1.5";
+    p.textContent = noModerator
+      ? "No moderator account is usable right now (all of them are disconnected, suspended or parked). Groups that require admin approval need at least 1 working moderator — without one, every post would stay pending forever."
+      : "These groups require admin approval, but none of your moderators can actually open their pending queue. Posts sent there would stay pending forever:";
+    box.appendChild(p);
+    if (groups.length) {
+      const ul = document.createElement("ul");
+      ul.style.cssText = "margin:0 0 14px;padding-left:20px;line-height:1.7";
+      groups.forEach(function (g) { const li = document.createElement("li"); li.textContent = String(g); ul.appendChild(li); });
+      box.appendChild(ul);
+    }
+    if (pf && pf.recommended) {
+      const rec = document.createElement("p");
+      rec.style.cssText = "margin:0 0 16px;opacity:.85;font-size:13px";
+      rec.textContent = "Recommended for your current setup: " + pf.recommended + " working moderator" + (pf.recommended > 1 ? "s" : "") + ".";
+      box.appendChild(rec);
+    }
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap";
+    const stop = document.createElement("button");
+    stop.type = "button";
+    stop.textContent = "Stop — I'll fix it first";
+    stop.style.cssText = "padding:9px 15px;border-radius:8px;border:1px solid #e04a4a;background:#e04a4a;color:#fff;cursor:pointer;font-weight:600";
+    stop.addEventListener("click", function () { document.body.removeChild(back); resolve("cancel"); });
+    if (!noModerator) {
+      // Only offered when specific groups are the problem. With zero usable moderators there is nothing to
+      // exclude -- every approval-gated group is unserviceable -- so the choice would be meaningless.
+      const cont = document.createElement("button");
+      cont.type = "button";
+      cont.textContent = "Continue without these groups";
+      cont.style.cssText = "padding:9px 15px;border-radius:8px;border:1px solid #6b5a3a;background:#2a2320;color:#f0e2c8;cursor:pointer";
+      cont.title = "Run now, posting only to the groups that have a working moderator. They come back automatically once a later check passes.";
+      cont.addEventListener("click", function () { document.body.removeChild(back); resolve("exclude"); });
+      row.appendChild(cont);
+    }
+    row.appendChild(stop);
+    box.appendChild(row);
+    back.appendChild(box);
+    back.addEventListener("click", function (e) { if (e.target === back) { document.body.removeChild(back); resolve("cancel"); } });
+    document.body.appendChild(back);
+    stop.focus();
+  });
+}
+
 async function releaseProfileAndExplain(profileId) {
   const r = await api("/api/profiles/release?profileId=" + encodeURIComponent(profileId), { method: "POST", body: "{}" });
   const n = Number(r && r.assignedGroupCount) || 0;
@@ -6412,6 +6475,29 @@ function uxAttachIncompleteRunBanner() {
         if (!n) { prodResult("⚠ Enter how many posts (1–500) first."); return; }
         patch = { operator: Object.assign({}, base, { scheduleEnabled: false, autopilotMaxPostsPerRun: n, autopilotPostsThisRun: 0 }), rules: { peakStartTime: "", peakStopTime: "" }, ixbrowser: { maxConcurrentProfiles: 999 } };
         msg = "● LIVE — will post " + n + " then auto-stop.";
+      }
+      // MODERATOR PREFLIGHT before arming (2026-07-26). Verifies each moderator really can open the pending queue
+      // of every approval-gated group. Proven pairs are cached server-side, so on a stable setup this returns
+      // instantly and opens no browser; only a NEW group or a NEW moderator costs a real check.
+      // The server enforces the same gate on PUT /api/state, so this is the friendly path, not the guarantee.
+      try {
+        prodResult("Checking moderators can approve in every group…");
+        const pf = await api("/api/moderators/preflight", { method: "POST", body: "{}", timeoutMs: 1800000 });
+        if (pf && pf.ok === false) {
+          const choice = await showModeratorGateModal(pf);
+          if (choice !== "exclude") {
+            setProdCtlButtons(false, false);
+            prodResult("⛔ Launch cancelled — fix the moderator rights, then start again.");
+            return;
+          }
+          await api("/api/moderators/preflight/resolve", { method: "POST", body: JSON.stringify({ action: "exclude" }) });
+        }
+      } catch (e) {
+        // A preflight that itself fails must not silently become a green light: the server-side gate would
+        // refuse the arm anyway, so tell the operator plainly instead of leaving a half-started run.
+        setProdCtlButtons(false, false);
+        prodResult("⚠ Moderator check failed: " + ((e && e.message) || e) + " — not launching.");
+        return;
       }
       prodResult("Launching…");
       setProdCtlButtons(true, false); // optimistic running view — no double-start window before the re-render

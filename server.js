@@ -10595,6 +10595,10 @@ function autopilotRunLimit(state = readState()) {
 function autopilotPostsThisRunCount(state = readState()) {
   return clampNumber(state.operator?.autopilotPostsThisRun, 0, 1000000, 0);
 }
+// Sustained-blocking latch for the runtime moderator gate (see autopilotTickAsync). Deliberately in-memory: a
+// restart re-observes the live condition rather than inheriting a stale "was blocked" verdict.
+let __moderatorGateBlockedSince = 0;
+const MODERATOR_GATE_GRACE_MS = 12 * 60 * 1000; // ~6 ticks: long enough to ride out a transient park, short enough that a truly dead pool stops the run before it buries many posts
 function autopilotAutoDisarm(reason, detail) {
   const s = readState();
   s.operator = s.operator || {};
@@ -10676,6 +10680,41 @@ async function autopilotTickAsync(options = {}) {
   if (!state.operator?.autopilotEnabled) return { skipped: "autopilot_disabled" };
   if (!state.operator?.armedForExternalActions) return { skipped: "not_armed" };
   const dryRun = state.operator?.autopilotDryRun !== false;
+  // RUNTIME MODERATOR GATE (2026-07-26, operator: "if all moderators get disconnected or suspended, prod should
+  // stop and show that we need at least 1 moderator"). Mid-run, moderator accounts can be parked one by one until
+  // none is left; every post the run keeps making would then go pending forever.
+  // SUSTAINED, NOT INSTANT: it must stay blocking for MODERATOR_GATE_GRACE_MS before the run is stopped. Parking
+  // is often transient (a forced_account_switch wall auto-clears, an operator Release un-parks instantly), and
+  // killing a live production on a momentary dip would be far worse than the condition it guards against.
+  if (!dryRun) {
+    const __gate = facebookRunArmBlock(state);
+    if (!__gate) {
+      __moderatorGateBlockedSince = 0;
+    } else {
+      if (!__moderatorGateBlockedSince) {
+        __moderatorGateBlockedSince = Date.now();
+        logEvent("moderator_gate_blocking_started", { reason: __gate.reason, groups: (__gate.groups || []).join(",") });
+      }
+      if (Date.now() - __moderatorGateBlockedSince >= MODERATOR_GATE_GRACE_MS) {
+        const s = readState();
+        s.operator = s.operator || {};
+        s.operator.lastArmBlocked = {
+          at: new Date().toISOString(),
+          reason: __gate.reason,
+          groups: __gate.groups || [],
+          configuredCount: __gate.readiness.configuredCount,
+          parkedIds: __gate.readiness.parkedIds,
+          approvalGroupCount: __gate.readiness.approvalGroupCount,
+          recommended: __gate.readiness.recommended,
+          stoppedRun: true,
+        };
+        writeState(s, { controlWrite: true });
+        autopilotAutoDisarm("moderator_gate", `${__gate.reason}; blocked for ${Math.round((Date.now() - __moderatorGateBlockedSince) / 60000)}min`);
+        __moderatorGateBlockedSince = 0;
+        return { skipped: "moderator_gate" };
+      }
+    }
+  }
   // Sync the roster + blacklist with what actually exists in iX before computing capacity, so
   // GONE profiles are dropped and stale automation benches re-enter rotation. FAIL-CLOSED +
   // debounced + interval-throttled internally; never throws into the tick.
@@ -14989,6 +15028,7 @@ function facebookApprovalReadiness(state = readState()) {
   // Key-variant tolerant, same as isAdminApprovalEnabledForGroup.
   const approvalGroups = groups.filter((g) => g
     && Boolean(g.requiresAdminApproval || g.requires_admin_approval || g.adminApproval || g.admin_approval)
+    && g.excludedFromRun !== true
     && Array.isArray(g.profiles) && g.profiles.length > 0);
   const configured = [];
   for (const line of recordLines(state?.ixbrowser?.moderatorProfiles)) {
@@ -15021,6 +15061,26 @@ function facebookApprovalReadiness(state = readState()) {
     // The only condition that must ever stop or block a run.
     blocking: approvalGroups.length > 0 && usable.length === 0,
   };
+}
+// THE single decision point for "may a run start right now?". Returns null (go) or a reason object the dashboard
+// renders as the red popup. Two independent blockers, both about approval-gated groups only:
+//   no_usable_moderator     -> not one moderator account is usable at all
+//   group_without_moderator -> a specific group has no moderator who can reach its queue, and the operator has
+//                              not yet answered the prompt about it
+function facebookRunArmBlock(state = readState()) {
+  const readiness = facebookApprovalReadiness(state);
+  if (readiness.blocking) return { reason: "no_usable_moderator", readiness };
+  const pf = state.posting?.moderatorPreflight;
+  if (pf && pf.ok === false && !pf.acknowledgedAt) {
+    const assignments = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
+    // A group the operator already excluded is settled -- it cannot keep blocking launches.
+    const stillFailing = (pf.groupsWithoutModerator || []).filter((u) => {
+      const g = assignments.find((x) => normalizedFacebookGroupKey(x?.url) === normalizedFacebookGroupKey(u));
+      return g && g.excludedFromRun !== true;
+    });
+    if (stillFailing.length) return { reason: "group_without_moderator", groups: stillFailing, readiness, preflight: pf };
+  }
+  return null;
 }
 // MODERATOR-RIGHTS PREFLIGHT (2026-07-26, operator: "at the start of prod he must open the moderators one by one
 // and verify they are really moderators in all the groups; if not, stop prod and show a popup").
@@ -25517,6 +25577,41 @@ const server = http.createServer(async (req, res) => {
     const report = await closeAllOpenIxProfiles(); // cleanup leaked/open ixBrowser windows
     return json(res, 200, report);
   }
+  // MODERATOR PREFLIGHT (2026-07-26). The dashboard calls this BEFORE arming: it opens each moderator that has an
+  // unproven group and verifies it can really reach that group's pending queue. Cached pairs cost no browser open,
+  // so on a stable setup this returns in milliseconds and the launch feels instant.
+  if (req.method === "POST" && url.pathname === "/api/moderators/preflight") {
+    try {
+      const result = await runModeratorPreflightAsync();
+      return json(res, 200, result);
+    } catch (err) {
+      return json(res, 500, { ok: false, reason: "preflight_error", message: oneLineField((err && err.message) || String(err), 300) });
+    }
+  }
+  // The operator's answer to a failed preflight. "exclude" = run without the groups that have no moderator;
+  // anything else just records that the verdict was seen (the launch stays blocked until it is re-run and passes).
+  if (req.method === "POST" && url.pathname === "/api/moderators/preflight/resolve") {
+    const body = await readJson(req).catch(() => ({}));
+    const action = String(body?.action || "").toLowerCase();
+    const state = readState();
+    const pf = state.posting?.moderatorPreflight;
+    if (!pf) return json(res, 400, { ok: false, reason: "no_preflight_result" });
+    const failing = new Set((pf.groupsWithoutModerator || []).map((u) => normalizedFacebookGroupKey(u)));
+    let excluded = 0;
+    if (action === "exclude") {
+      for (const g of (Array.isArray(state.posting.groupAssignmentData) ? state.posting.groupAssignmentData : [])) {
+        if (g && failing.has(normalizedFacebookGroupKey(g.url))) {
+          g.excludedFromRun = true;
+          g.excludedFromRunReason = "no moderator holds approval rights in this group (preflight " + String(pf.checkedAt || "") + ")";
+          excluded += 1;
+        }
+      }
+    }
+    state.posting.moderatorPreflight = { ...pf, acknowledgedAt: new Date().toISOString(), acknowledgedAction: action };
+    writeState(state);
+    logEvent("moderator_preflight_resolved", { action, excludedGroups: excluded });
+    return json(res, 200, { ok: true, action, excludedGroups: excluded });
+  }
   if (req.method === "POST" && url.pathname === "/api/profiles/release") {
     const id = url.searchParams.get("profileId") || "";
     const ok = releaseParkedProfile(id); // clears ANY parked list (disconnected / account error / suspended / comment-limited)
@@ -25592,26 +25687,31 @@ const server = http.createServer(async (req, res) => {
         incoming.operator.autopilotEnabled = false;
         incoming.operator.armedForExternalActions = false;
         logEvent("arm_blocked_stop_cooldown", { sinceStopMs: Date.now() - __externalStopRequested });
-      } else if (!wasEnabled && nowEnabled && (__armReadiness = facebookApprovalReadiness(before)).blocking) {
-        // MODERATOR READINESS GATE at LAUNCH (2026-07-26, operator: "if launch prod and no moderator valid that
-        // work available then stop prod and show the popup in red"). An approval-gated group with zero usable
-        // moderators cannot ever publish: every post it makes goes pending and stays there. Refuse the arm loudly
-        // instead of running a production that silently buries everything it posts.
+      } else if (!wasEnabled && nowEnabled && (__armReadiness = facebookRunArmBlock(before))) {
+        // MODERATOR GATE at LAUNCH (2026-07-26, operator: "if launch prod and no moderator valid that work
+        // available then stop prod and show the popup in red"). An approval-gated group with no moderator who can
+        // open its queue cannot ever publish: every post it makes goes pending and stays there. Refuse the arm
+        // loudly instead of running a production that silently buries everything it posts.
+        // Enforced HERE, at the state layer, rather than in the dashboard: any client (or a stale browser tab)
+        // hitting PUT /api/state is stopped the same way, so the guarantee does not depend on the UI.
         incoming.operator.autopilotEnabled = false;
         incoming.operator.armedForExternalActions = false;
         incoming.operator.lastArmBlocked = {
           at: new Date().toISOString(),
-          reason: "no_usable_moderator",
-          configuredCount: __armReadiness.configuredCount,
-          parkedIds: __armReadiness.parkedIds,
-          approvalGroupCount: __armReadiness.approvalGroupCount,
-          recommended: __armReadiness.recommended,
+          reason: __armReadiness.reason,
+          groups: __armReadiness.groups || [],
+          configuredCount: __armReadiness.readiness.configuredCount,
+          parkedIds: __armReadiness.readiness.parkedIds,
+          approvalGroupCount: __armReadiness.readiness.approvalGroupCount,
+          recommended: __armReadiness.readiness.recommended,
         };
-        logEvent("arm_blocked_no_usable_moderator", {
-          configured: __armReadiness.configuredCount,
-          parked: __armReadiness.parkedIds.join(","),
-          approvalGroups: __armReadiness.approvalGroupCount,
-          recommended: __armReadiness.recommended,
+        logEvent("arm_blocked_moderator_gate", {
+          reason: __armReadiness.reason,
+          groups: (__armReadiness.groups || []).join(","),
+          configured: __armReadiness.readiness.configuredCount,
+          parked: __armReadiness.readiness.parkedIds.join(","),
+          approvalGroups: __armReadiness.readiness.approvalGroupCount,
+          recommended: __armReadiness.readiness.recommended,
         });
       } else if (!wasEnabled && nowEnabled) {
         __armTransition = true; // false->true arm: kick an immediate tick after writeState (below) so batch 1 doesn't wait ~120s
@@ -26054,6 +26154,23 @@ const server = http.createServer(async (req, res) => {
       const next = writeState(state, { controlWrite: true });
       logEvent("incomplete_run_dismissed", { posted: run.posted, max: run.max });
       return json(res, 200, { ok: true, action, state: next });
+    }
+    // MODERATOR GATE (2026-07-26): Continue/Relaunch arm a run just like the Launch button, so they must pass the
+    // same check -- otherwise the banner would be a way around it. 'dismiss' is exempt (handled above: it only
+    // clears the banner and stays disarmed).
+    {
+      const __block = facebookRunArmBlock(state);
+      if (__block) {
+        logEvent("resume_blocked_moderator_gate", { action, reason: __block.reason, groups: (__block.groups || []).join(",") });
+        return json(res, 409, {
+          error: "moderator_gate_blocked",
+          reason: __block.reason,
+          groups: __block.groups || [],
+          configuredCount: __block.readiness.configuredCount,
+          parkedIds: __block.readiness.parkedIds,
+          recommended: __block.readiness.recommended,
+        });
+      }
     }
     const origMax = Number(run.max) || 0;
     // DYNAMIC IN-FLIGHT RECONCILIATION (2026-07-12) -- same fix as detectIncompleteRunAtBoot's boot-time
