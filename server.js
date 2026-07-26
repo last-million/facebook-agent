@@ -703,6 +703,13 @@ function defaultState() {
       // in ONE day: 66 profile moves between groups plus 26 auto-unassigns. Balancing is still available for
       // anyone who wants it, but it must be an explicit opt-in, never the default that silently overrides a
       // manual assignment.
+      // STICKY MODERATOR WINDOW (2026-07-26, operator: "keep at least one moderator ixBrowser profile always
+      // open"). When true, an approval attempt does NOT close the moderator's ixBrowser window afterwards, so the
+      // next approval reuses it instead of paying a cold open (measured: 761 approval opens in 24h, 274 of them on
+      // the single working moderator, against an already-exceeded daily budget). Only holds while a run is armed;
+      // every stop/disarm path reaps it via closeStickyModeratorWindows. OFF by default so a deploy never changes
+      // live behaviour until the operator opts in and watches one run.
+      moderatorSessionEnabled: false,
       autoRebalanceGroupsEnabled: false,      // 2026-07-07 (operator: "redispatch equally between groups" when
                                               // accounts fall out of service): auto-redispatch healthy profiles
                                               // across ALL currently-configured groups so each group's healthy
@@ -8080,10 +8087,35 @@ async function ixBrowserOpenForCdp(profileId, options = {}) {
 async function ixBrowserCloseAfterUse(profileId, reason) {
   const numericProfileId = Number(profileId);
   if (!numericProfileId) return { ok: false, status: "profile_id_missing" };
+  // Keeps the SYL window open only while the reservation is active -- i.e. only in manual-scraping mode. In
+  // harvest mode isDedicatedShopYourLikesIxProfile returns false (see isShopYourLikesReservationActive), so this
+  // branch is skipped entirely and the profile closes like any other.
   if (isDedicatedShopYourLikesIxProfile(numericProfileId)) {
     logEvent("ixbrowser_dedicated_shopyourlikes_kept_open", { profileId: numericProfileId, reason: oneLineField(reason || "completed", 120) });
     return { ok: true, status: "kept_open_dedicated_shopyourlikes_profile", profileId: numericProfileId };
   }
+  // STICKY MODERATOR WINDOW (2026-07-26, operator: "keep at least one moderator ixBrowser profile always open").
+  // Mirrors the proven ShopYourLikes pattern directly above: skip the close, so the profile's ixBrowser window and
+  // its cached CDP endpoint survive, and the NEXT approval attempt reuses them instead of paying a cold open.
+  // MEASURED WASTE this addresses: 761 browser opens in 24h on approval alone, 274 of them on the one working
+  // moderator for 186 posts -- against an ixBrowser daily budget the box has ALREADY exceeded.
+  // Safe to hold: moderators appear in NO group's posting roster and are blocked from posting/commenting by three
+  // separate guards, so a held window blocks no other work.
+  // THREE BOUNDS, deliberately:
+  //  1. OFF unless the operator opts in (operator.moderatorSessionEnabled === true).
+  //  2. Only while a run is ARMED -- at rest this system's rule is "zero open browsers", and the disarm path
+  //     (closeAllKeepOpenSessions / stop-all) reaps it.
+  //  3. Only for a profile that is genuinely a configured moderator RIGHT NOW, re-read from state every call, so
+  //     removing an account from Profiles roles stops it being held with no code change.
+  try {
+    const __mState = readState();
+    if (__mState.operator?.moderatorSessionEnabled === true
+        && __mState.operator?.armedForExternalActions === true
+        && isFacebookAdminApprovalProfileId(numericProfileId, __mState, "")) {
+      logEvent("ixbrowser_moderator_session_kept_open", { profileId: numericProfileId, reason: oneLineField(reason || "completed", 120) });
+      return { ok: true, status: "kept_open_moderator_session", profileId: numericProfileId };
+    }
+  } catch (_) { /* never let this gate break a close */ }
   ixBrowserCdpEndpointCache.delete(numericProfileId);
   writeIxBrowserCdpCacheFile();
   try {
@@ -8143,12 +8175,29 @@ function dedicatedShopYourLikesIxProfileId(state = readState()) {
   return Number.isFinite(profileId) && profileId > 0 ? profileId : 0;
 }
 
+// IS THE SHOPYOURLIKES RESERVATION IN FORCE AT ALL? (2026-07-26, operator: "ShopYourLikes should not be used --
+// it should only be used if we select manual scraping in step 2").
+// SYL mints affiliate links for the OLD web-scraping content method. Under "Easy copy from group"
+// (posting.contentSources.enabled === true, mirrored onto operator.contentSourcesEnabled) the link comes from the
+// harvested source post's own first comment, so SYL plays no part in the pipeline -- verified on a full day of the
+// live audit log: zero shopyourlikes events and the dedicated profile never opened once.
+// While it is dormant, reserving its ixBrowser profile costs a whole working Facebook account for nothing: the
+// reservation strips that profile out of groupAssignmentData in the state normalizer, so the operator ticking it
+// in Prod > Step 3 was silently undone -- the same "it removes what I selected" behaviour they objected to.
+// So: the reservation applies ONLY in manual-scraping mode. This does NOT auto-add the profile to any group --
+// the operator still has to tick it; it just stops being stripped when they do.
+function isShopYourLikesReservationActive(state = readState()) {
+  try { return state?.operator?.contentSourcesEnabled !== true; } catch (_) { return true; } // unknown -> keep reserving (safe default)
+}
+
 function isDedicatedShopYourLikesIxProfile(profileId, state = readState()) {
+  if (!isShopYourLikesReservationActive(state)) return false;
   const dedicatedProfileId = dedicatedShopYourLikesIxProfileId(state);
   return Boolean(dedicatedProfileId && Number(profileId) === dedicatedProfileId);
 }
 
 function isDedicatedShopYourLikesProfileLabel(label, state = readState()) {
+  if (!isShopYourLikesReservationActive(state)) return false;
   const clean = String(label || "").trim();
   if (!clean) return false;
   const lower = clean.toLowerCase();
@@ -19588,6 +19637,31 @@ async function closeAllKeepOpenSessions(reason = "") {
     try { await ixBrowserCloseAfterUse(Number(pid), "keepopen_close_" + oneLineField(reason, 24)); } catch (_) {}
     try { sess.release && sess.release(); } catch (_) {}
   }
+  await closeStickyModeratorWindows("keepopen_close_" + oneLineField(reason, 24));
+}
+// Reaper for the sticky moderator window (see the keep-open branch in ixBrowserCloseAfterUse). That window is NOT
+// tracked in __keepOpenSession -- it is simply "not closed" -- so the loop above would never reap it.
+// Closes UNCONDITIONALLY via the raw ixBrowser call rather than through ixBrowserCloseAfterUse: that function's own
+// keep-open gate reads armedForExternalActions, and on some stop paths this runs BEFORE the disarm is written, which
+// would leave the window open forever. This is the "server at rest opens ZERO browsers" guarantee for moderators.
+async function closeStickyModeratorWindows(reason = "") {
+  try {
+    const st = readState();
+    for (const line of recordLines(st?.ixbrowser?.moderatorProfiles)) {
+      const pid = Number(profileIdFromLabel(line) || 0);
+      if (!pid) continue;
+      ixBrowserCdpEndpointCache.delete(pid);
+      try {
+        await ixBrowserRequest("profile-close", { profile_id: pid });
+        logEvent("ixbrowser_moderator_session_closed", { profileId: pid, reason: oneLineField(reason || "stop", 120) });
+      } catch (err) {
+        if (!isIxBrowserProfileAlreadyClosedError(err)) {
+          try { logEvent("ixbrowser_moderator_session_close_error", { profileId: pid, error: oneLineField((err && err.message) || String(err), 160) }); } catch (_) {}
+        }
+      }
+    }
+    try { writeIxBrowserCdpCacheFile(); } catch (_) {}
+  } catch (_) { /* never let the reaper throw into a stop path */ }
 }
 function closeStaleKeepOpenSessions() {
   // NOTE: kept SYNCHRONOUS deliberately. An earlier attempt added an async per-session alive-probe for fast idle-dead
