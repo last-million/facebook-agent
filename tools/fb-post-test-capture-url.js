@@ -3850,16 +3850,48 @@ async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = 
     } catch { return false; }
   }, reviewMatchKey).catch(() => false);
   // Scan ONE loaded surface (expand -> first screen -> scroll, expanding each step). Returns a found-result or null.
+  // OWN-CONTENT BOUNDARY (2026-07-26, operator: "the moderator should not scroll to OLD posts, only today's
+  // posts that HE posted in prod"). Every post this system publishes carries a unique `#fb<hex>` fingerprint in
+  // its caption; posts made by anyone else -- and our own genuinely old backlog beyond the loaded window -- do
+  // not appear between ours. So the queue region that still contains ANY #fb token is, by construction, still our
+  // own recent block. Once two CONSECUTIVE screens contain no #fb token at all, we have scrolled off the end of
+  // our own posts and everything below is foreign/old: stop, regardless of the remaining scroll budget.
+  // Language-independent (no date parsing, no FB relative-time strings) and it can never hide one of our posts,
+  // since ours all carry the token. Purely a STOP condition -- it never approves anything; the per-post marker
+  // gate downstream is untouched.
+  const countOwnFingerprints = async () => page.evaluate(() => {
+    try {
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+        acceptNode(n) {
+          if (n.nodeType === 1) return /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(n.tagName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
+          return NodeFilter.FILTER_ACCEPT;
+        },
+      });
+      let n, hits = 0;
+      while ((n = walker.nextNode())) { const m = (n.nodeValue || '').match(/#fb[0-9a-f]{6}/gi); if (m) hits += m.length; }
+      return hits;
+    } catch { return -1; } // -1 = could not tell -> treated as "do not stop"
+  }).catch(() => -1);
   const scanLoadedSurface = async (methodPrefix) => {
     await expandSeeMore();
     if (await markerCheck()) return { opened: true, url: page.url(), visited, method: `${methodPrefix}_first_screen`, scrollsRequired: 0 };
     let lastHeight = await page.evaluate(() => document.body.scrollHeight).catch(() => 0);
     let stagnantScrolls = 0;
+    let ownContentDry = 0;
     for (let scroll = 1; scroll <= MAX_SCROLLS_PER_TARGET; scroll += 1) {
       await page.mouse.wheel(0, 1800).catch(() => {});
       await humanPause(1500, 2400);
       await expandSeeMore();
       if (await markerCheck()) return { opened: true, url: page.url(), visited, method: `${methodPrefix}_after_scroll`, scrollsRequired: scroll };
+      // Have we scrolled past the end of our own run's posts?
+      const ownHits = await countOwnFingerprints();
+      if (ownHits === 0) {
+        ownContentDry += 1;
+        if (ownContentDry >= 2) {
+          try { console.log(JSON.stringify({ step: 'admin_approval_scan_stopped_own_content_end', methodPrefix, scrollsUsed: scroll, maxScrolls: MAX_SCROLLS_PER_TARGET, reason: 'two consecutive screens with no #fb fingerprint -- below this point the queue is not ours' })); } catch (_) {}
+          break;
+        }
+      } else if (ownHits > 0) { ownContentDry = 0; }
       const newHeight = await page.evaluate(() => document.body.scrollHeight).catch(() => 0);
       if (newHeight <= lastHeight + 20) { stagnantScrolls += 1; if (stagnantScrolls >= 2) break; }
       else { stagnantScrolls = 0; lastHeight = newHeight; }
