@@ -21537,12 +21537,26 @@ function recordGroupMembershipExclusion(profileId, groupUrl) {
     writeState(state);
   } catch (_) {}
 }
+// How long an auto-detected "this profile cannot post to this group" verdict stays in force. Long enough that a
+// broken pair is not retried every few minutes, short enough that the operator joining the account to the group
+// on Facebook takes effect on its own, without them having to know this list exists.
+const GROUP_MEMBERSHIP_EXCLUSION_TTL_MS = 48 * 60 * 60 * 1000;
 function isGroupMembershipExcluded(profileId, groupUrl, state) {
   try {
     const pid = Number(profileId) || 0; const gu = String(groupUrl || "").trim();
     if (!pid || !gu) return false;
     const excl = JSON.parse(String(state?.posting?.groupMembershipExcluded || "{}")) || {};
-    return Boolean(excl[`${normalizedFacebookGroupKey(gu)}|${pid}`]);
+    const at = Number(excl[`${normalizedFacebookGroupKey(gu)}|${pid}`]) || 0;
+    if (!at) return false;
+    // EXPIRES (2026-07-26). This list stopped being advisory the moment it became a plan-time posting filter
+    // (it replaced deleting the profile from the operator's Step-3 selection). A permanent verdict would be a
+    // silent, invisible shrink of that selection -- exactly what the operator objected to -- and group membership
+    // is not permanent anyway: they can add the account to the group on Facebook at any time, and there is no
+    // event that would tell us. So a pair goes stale after GROUP_MEMBERSHIP_EXCLUSION_TTL_MS and the profile is
+    // simply retried once; if it still cannot post, one wasted attempt re-arms the exclusion for another window.
+    // Cheap insurance against a stale verdict quietly costing throughput forever.
+    if (Date.now() - at > GROUP_MEMBERSHIP_EXCLUSION_TTL_MS) return false;
+    return true;
   } catch (_) { return false; }
 }
 // NOT-A-MEMBER-OF-ANY-GROUP BENCH (2026-07-11, operator: "switch profiles between groupes that work for
