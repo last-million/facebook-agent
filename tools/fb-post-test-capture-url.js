@@ -3335,6 +3335,7 @@ async function batchApproveAllPublisherPosts(page, gid, publisherId) {
   // and NEVER reach the OLD backlog deep in the queue (honors "approve only this run's posts, not old ones"). With one
   // moderator this is pure throughput; the per-session cap keeps any single account from being flagged for too many.
   const MAX_EXTRA_PER_SESSION = 4;
+  const approvedFingerprints = []; // per-post attribution: which posts this session's extra clicks approved
   for (let round = 0; round < MAX_EXTRA_PER_SESSION; round += 1) {
     try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }); } catch (_) {} // HARD REFRESH: surface newly-propagated pendings + reset scroll to TOP (newest = this run)
     await humanPause(2500, 4200);
@@ -3343,9 +3344,27 @@ async function batchApproveAllPublisherPosts(page, gid, publisherId) {
       const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
       // RECENCY GUARD (operator: never approve OLD posts): a post whose nearest SHORT time element shows a days/
       // weeks/months-old stamp is from a previous run -> skip. Short-element-only so a caption like "30 days return"
-      // can't false-match; fail-open (no time found -> allow, since top-of-queue after a refresh already = newest).
+      // can't false-match. FAILS CLOSED since 2026-07-26 (see below) -- it used to fail OPEN.
       const OLD_RE = /(^|[\s·])\d{1,3}\s?(d|days?|w|wks?|weeks?|mo|months?|y|yrs?|years?)([\s·]|$)|yesterday|hier|ayer|gestern|أمس|ontem|ieri/i;
-      const looksOld = (art) => { try { for (const e of art.querySelectorAll('a[role="link"],abbr,time,a[href*="permalink"],a[href*="/posts/"],span')) { const t = norm(e.innerText || e.getAttribute('aria-label') || ''); if (t && t.length <= 28 && OLD_RE.test(t)) return true; } } catch (_) {} return false; };
+      // POSITIVE freshness proof, multilingual: seconds / minutes / hours ago, or "just now".
+      const RECENT_RE = /(^|[\s·])\d{1,2}\s?(s|sec|secs?|seconds?|m|min|mins?|minutes?|h|hr|hrs?|hours?)([\s·]|$)|just now|il y a|hace|vor|منذ|agora|adesso/i;
+      // FAIL CLOSED (2026-07-26): returns true ("treat as old, skip") when NO short time element can be read.
+      // It used to return false there -- documented as "fail-open ... top-of-queue after a refresh already =
+      // newest" -- so a post whose timestamp Facebook did not render was approved as if it were fresh. Combined
+      // with the missing fingerprint check below, that was a real hole in the marker gate. Skipping an ambiguous
+      // post costs one batched approval; the post is still approved moments later via the marker-verified path.
+      const looksOld = (art) => {
+        try {
+          let sawFresh = false;
+          for (const e of art.querySelectorAll('a[role="link"],abbr,time,a[href*="permalink"],a[href*="/posts/"],span')) {
+            const t = norm(e.innerText || e.getAttribute('aria-label') || '');
+            if (!t || t.length > 28) continue;
+            if (OLD_RE.test(t)) return true;       // explicitly old -> skip
+            if (RECENT_RE.test(t)) sawFresh = true; // explicitly recent -> proof
+          }
+          return !sawFresh; // no readable timestamp at all -> treat as old
+        } catch (_) { return true; }
+      };
       const vis = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 20 && r.height > 12 && s.visibility !== 'hidden' && s.display !== 'none'; };
       const isPerPostApprove = (b) => {
         const al = norm(b.getAttribute('aria-label')); const tx = norm(b.innerText);
@@ -3378,22 +3397,41 @@ async function batchApproveAllPublisherPosts(page, gid, publisherId) {
         if (!resolved) continue;
         const byUs = [...resolved.querySelectorAll('a[href]')].some((l) => { const h = String(l.href || ''); return h.includes(`/user/${pub}/`) || h.includes(`profile.php?id=${pub}`); });
         if (!byUs) continue;
-        if (looksOld(resolved)) continue; // days-old pending post from a previous run -> never approve it
+        if (looksOld(resolved)) continue; // old / undatable pending post -> never approve it (fails closed)
+        // FINGERPRINT REQUIRED (2026-07-26). This was the hole: the batch path scoped only by author link +
+        // the fail-open recency guard, and never checked the #fb<hex> token at all. Every post this system
+        // publishes carries one; a post by anyone else never does -- so this is what makes "ours" provable
+        // instead of inferred. Walks rendered TEXT NODES and REJECTS SCRIPT/STYLE/NOSCRIPT/TEMPLATE subtrees so
+        // Facebook's embedded JSON (which holds captions of posts NOT rendered here) can never fake a match --
+        // the same technique the marker-verified path uses.
+        let fp = '';
+        try {
+          const w = document.createTreeWalker(resolved, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+            acceptNode(n) {
+              if (n.nodeType === 1) return /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(n.tagName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_SKIP;
+              return NodeFilter.FILTER_ACCEPT;
+            },
+          });
+          let n;
+          while ((n = w.nextNode())) { const h = (n.nodeValue || '').toLowerCase().match(/#fb[0-9a-f]{6}/); if (h) { fp = h[0]; break; } }
+        } catch (_) { fp = ''; }
+        if (!fp) continue; // no fingerprint of ours in this post -> never click
         b.scrollIntoView({ block: 'center' });
         b.click();
-        return { clicked: true };
+        return { clicked: true, fingerprint: fp };
       }
       return { clicked: false };
     }, { pub: cleanPub }).catch(() => ({ clicked: false }));
     if (!r.clicked) break;
     approved += 1;
+    if (r.fingerprint) approvedFingerprints.push(r.fingerprint);
     await humanPause(1800, 3200); // let the queue re-render before the next click
     await clickFirst(page, [
       page.locator('div[role="dialog"]').getByRole('button', { name: APPROVE_NAME_RE }),
       page.getByRole('button', { name: /^(confirm|done|ok|yes|confirmar|aceptar)$/i }),
     ], { timeout: 1500 }).catch(() => {});
   }
-  if (approved) console.log(JSON.stringify({ step: 'batch_approved_publisher_posts', count: approved, publisherId: cleanPub }));
+  if (approved) console.log(JSON.stringify({ step: 'batch_approved_publisher_posts', count: approved, publisherId: cleanPub, fingerprints: approvedFingerprints }));
   return approved;
 }
 
