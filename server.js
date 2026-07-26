@@ -697,7 +697,13 @@ function defaultState() {
       autoRemoveGoneProfilesEnabled: false,   // HARD RULE: NEVER auto-remove a profile that vanished from
                                               // ixBrowser — the operator removes manually. true re-enables the
                                               // old GONE-removal (not advised).
-      autoRebalanceGroupsEnabled: true,       // 2026-07-07 (operator: "redispatch equally between groups" when
+      // DEFAULT FLIPPED TO false (2026-07-26). The operator assigns profiles per group by hand in Prod > Step 3
+      // and expects that selection to be honoured: "prod must RESPECT the ticked profiles for each group -- why
+      // does it remove them and add others". With this on, PASS 4 rewrote that selection continuously -- measured
+      // in ONE day: 66 profile moves between groups plus 26 auto-unassigns. Balancing is still available for
+      // anyone who wants it, but it must be an explicit opt-in, never the default that silently overrides a
+      // manual assignment.
+      autoRebalanceGroupsEnabled: false,      // 2026-07-07 (operator: "redispatch equally between groups" when
                                               // accounts fall out of service): auto-redispatch healthy profiles
                                               // across ALL currently-configured groups so each group's healthy
                                               // headcount stays roughly equal, dynamically, for any number of
@@ -8555,6 +8561,12 @@ function postingSlots(state) {
         if (__liveIds && profileId && !__liveIds.has(profileId)) continue; // DYNAMIC: profile no longer exists in ixBrowser (operator deleted/renamed) -> auto-skip, no stale 2007 failure
         if (__disconnectedIds.has(String(profileId)) || __erroredIds.has(String(profileId)) || __suspendedIds.has(String(profileId)) || __notGroupMemberIds.has(String(profileId))) continue; // parked (not logged in / account error / suspended / not a member of any configured group) -> skipped until released
         if (isProfileInSoftCooldown(profileId)) continue; // brief in-memory pacing after a transient failure (2026-07-19 retry-storm fix) -- NOT a blacklist, self-clears in ~2min
+        // CONFIRMED NON-MEMBER OF *THIS* GROUP (2026-07-26). Replaces the old behaviour of deleting the profile
+        // from the operator's Step-3 selection: the pair is recorded in groupMembershipExcluded and skipped HERE
+        // instead, so the dashboard keeps showing exactly what the operator ticked while the planner still stops
+        // burning a real Facebook attempt on a group this account cannot post to. The profile stays fully usable
+        // for every OTHER group, and re-ticking it in the dashboard clears the pair (see the release/assign path).
+        if (isGroupMembershipExcluded(profileId, groupUrl, state)) continue;
         if (isDedicatedShopYourLikesProfileLabel(label, state)) continue;
         if (isBlockedIxBrowserProfileLabel(label, state)) continue;
         // 2026-07-26: the standalone isFacebookProfileQuarantinedForFacebook(label, state, groupUrl) call that used
@@ -21473,17 +21485,22 @@ function recordGroupPostFailureAndMaybeUnassign(profileId, groupUrl, definitive)
     const key = `${normalizedFacebookGroupKey(gu)}|${pid}`;
     counts[key] = (Number(counts[key]) || 0) + 1;
     if (counts[key] >= (definitive ? 1 : 2)) {
-      let removed = false;
-      for (const entry of (Array.isArray(state.posting.groupAssignmentData) ? state.posting.groupAssignmentData : [])) {
-        if (normalizedFacebookGroupKey(entry.url) !== normalizedFacebookGroupKey(gu)) continue;
-        const kept = (Array.isArray(entry.profiles) ? entry.profiles : []).filter((p) => profileIdFromLabel(p) !== pid);
-        if (kept.length !== (entry.profiles || []).length) { entry.profiles = kept; removed = true; }
-      }
-      // also strip it from the text plan for THIS group's block (keep other groups intact)
+      // OPERATOR SELECTION IS IMMUTABLE (2026-07-26, operator: "in step 3 I assign the profiles that work for
+      // each group -- prod must RESPECT the ticked profiles, why does it remove them and add others").
+      // This used to DELETE the profile from state.posting.groupAssignmentData[].profiles, i.e. it silently
+      // rewrote the operator's Step-3 tick boxes (26 such removals in one day, alongside 66 rebalancer moves).
+      // The behaviour it wanted -- stop wasting a real ~10-30s Facebook attempt on a profile that provably cannot
+      // post to this group -- is now achieved by RECORDING the (group, profile) pair in the exclusion list and
+      // FILTERING on it at plan time (see postingSlots), which leaves the operator's list exactly as ticked.
+      // Same effect on posting, zero effect on what the dashboard shows.
+      recordGroupMembershipExclusion(pid, gu);
       delete counts[key];
       state.posting.groupPostFailCounts = JSON.stringify(counts);
       writeState(state);
-      if (removed) logEvent("posting_profile_auto_unassigned_from_group", { profileId: pid, groupUrl: gu, definitive: !!definitive, reason: "cannot post to this group (auto-detected) — removed from this group's roster, kept for any group it belongs to" });
+      logEvent("posting_profile_group_excluded_not_unassigned", {
+        profileId: pid, groupUrl: gu, definitive: !!definitive,
+        reason: "cannot post to this group (auto-detected) — skipped for THIS group at plan time; the operator's Step-3 selection is left untouched",
+      });
     } else {
       state.posting.groupPostFailCounts = JSON.stringify(counts);
       writeState(state);
@@ -26067,6 +26084,37 @@ const server = http.createServer(async (req, res) => {
     try {
       const before = readState();
       __beforeOpForCacheBust = before.operator || {};
+      // OPERATOR RE-TICK CLEARS THE EXCLUSION (2026-07-26). Auto-detected "can't post to this group" pairs are now
+      // a plan-time FILTER instead of a deletion from the operator's list (see recordGroupPostFailureAndMaybeUnassign).
+      // That filter must not outlive the operator's own decision: if they ADD a profile to a group here that was
+      // not in that group before, treat it as an explicit override and drop the exclusion for that exact pair.
+      // Deliberately keyed on a genuine ADD (absent before, present now) rather than on mere presence -- the
+      // dashboard auto-saves constantly, and clearing on presence would wipe every exclusion on every save.
+      try {
+        const __beforeGroups = Array.isArray(before.posting?.groupAssignmentData) ? before.posting.groupAssignmentData : [];
+        const __incomingGroups = Array.isArray(incoming.posting?.groupAssignmentData) ? incoming.posting.groupAssignmentData : [];
+        if (__incomingGroups.length) {
+          let __excl = {};
+          try { __excl = JSON.parse(String(before.posting?.groupMembershipExcluded || "{}")) || {}; } catch (_) { __excl = {}; }
+          let __clearedPairs = 0;
+          for (const g of __incomingGroups) {
+            const gKey = normalizedFacebookGroupKey(g?.url);
+            if (!gKey) continue;
+            const prev = __beforeGroups.find((x) => normalizedFacebookGroupKey(x?.url) === gKey);
+            const prevIds = new Set((Array.isArray(prev?.profiles) ? prev.profiles : []).map((p) => profileIdFromLabel(p)).filter(Boolean));
+            for (const p of (Array.isArray(g?.profiles) ? g.profiles : [])) {
+              const pid = profileIdFromLabel(p);
+              if (!pid || prevIds.has(pid)) continue; // not a new tick
+              if (__excl[`${gKey}|${pid}`]) { delete __excl[`${gKey}|${pid}`]; __clearedPairs += 1; }
+            }
+          }
+          if (__clearedPairs) {
+            incoming.posting = incoming.posting || {};
+            incoming.posting.groupMembershipExcluded = JSON.stringify(__excl);
+            logEvent("group_membership_exclusion_cleared_by_operator_assign", { pairs: __clearedPairs });
+          }
+        }
+      } catch (_) {}
       const wasEnabled = before.operator?.autopilotEnabled === true;
       const nowEnabled = incoming.operator?.autopilotEnabled === true;
       const wasArmed = before.operator?.armedForExternalActions === true;
