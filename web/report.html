@@ -203,8 +203,8 @@ function elapsedCard(r){
   var nowMs = live ? Date.now() : Date.parse(toIso || 0);
   var val = '<span class="elapsedTick" data-from="'+esc(r.startedAt)+'" data-to="'+esc(toIso)+'">'
     + fmtElapsed(nowMs - fromMs) + '</span>';
-  return statCard(live ? "Durée (en cours)" : "Durée totale", val,
-    live ? "depuis le démarrage — compteur en direct" : "du 1er au dernier post", live ? "v" : "");
+  return statCard(live ? "Elapsed (live)" : "Total duration", val,
+    live ? "since the run started — live counter" : "first post to last post", live ? "v" : "");
 }
 // one global ticker for every elapsed card currently on screen
 setInterval(function(){
@@ -306,14 +306,14 @@ function runBody(r){
   var pendOk = pend.filter(function(d){ return !!d.commentedAt; });
   var pendPct = pend.length ? Math.round(pendOk.length*100/pend.length) : null;
 
-  var cycleCard = statCard("Cycle complet (moyen)", avgCycle!=null?fmtGap(avgCycle):"—",
-    "de la soumission du post jusqu'au commentaire vérifié" + (cyc.length? " • "+cyc.length+" posts" : ""),
+  var cycleCard = statCard("Full cycle (average)", avgCycle!=null?fmtGap(avgCycle):"—",
+    "from post submitted to comment verified" + (cyc.length? " • "+cyc.length+" posts" : ""),
     avgCycle==null?"":(avgCycle>=900?"r":(avgCycle>=480?"a":"g")));
-  var apprCard = statCard("Approbation (moyenne)", avgAppr!=null?(Math.round(avgAppr*10)/10+" min"):"—",
-    appr.length? appr.length+" post"+(appr.length>1?"s":"")+" passé"+(appr.length>1?"s":"")+" par un modérateur" : "aucun post modéré",
+  var apprCard = statCard("Approval (average)", avgAppr!=null?(Math.round(avgAppr*10)/10+" min"):"—",
+    appr.length? appr.length+" post"+(appr.length>1?"s":"")+" went through a moderator" : "no moderated posts",
     avgAppr==null?"":(avgAppr>=15?"r":(avgAppr>=6?"a":"g")));
-  var pendCard = statCard("Posts en attente aboutis", pendPct!=null?(pendPct+'<small>%</small>'):"—",
-    pend.length? pendOk.length+"/"+pend.length+" ont fini commentés" : "aucun post en attente",
+  var pendCard = statCard("Pending posts completed", pendPct!=null?(pendPct+'<small>%</small>'):"—",
+    pend.length? pendOk.length+"/"+pend.length+" ended up commented" : "no pending posts",
     pendPct==null?"":(pendPct>=90?"g":(pendPct>=70?"a":"r")));
 
   var html = '<div class="stats">'
@@ -429,22 +429,22 @@ function runBody(r){
     if (!rows.length) return "";
     var h = '<h2>'+esc(title)+' <span class="ln"></span> <span class="tag">'+rows.length+'</span></h2>'
       + '<div class="tablecard"><table class="detail"><thead><tr>'
-      + '<th>'+esc(note)+'</th><th>Posts</th><th>Commentés</th><th>Taux</th><th>Cycle moyen</th></tr></thead><tbody>';
+      + '<th>'+esc(note)+'</th><th>Posts</th><th>Commented</th><th>Rate</th><th>Avg cycle</th></tr></thead><tbody>';
     h += rows.map(function(e){
       var weak = (e.n >= (minN||3) && e.pct < 90);
       return '<tr>'
-        + '<td data-l="Nom">'+(weak?'<span class="pill r" title="sous 90% de commentaires sur au moins '+(minN||3)+' posts">faible</span> ':'')+esc(e.label)+'</td>'
+        + '<td data-l="Name">'+(weak?'<span class="pill r" title="under 90% commented, on at least '+(minN||3)+' posts">weak</span> ':'')+esc(e.label)+'</td>'
         + '<td data-l="Posts">'+e.n+'</td>'
-        + '<td data-l="Commentés">'+e.ok+'</td>'
-        + '<td data-l="Taux">'+rateBar(e.pct)+'<small>'+e.pct+'%</small></td>'
+        + '<td data-l="Commented">'+e.ok+'</td>'
+        + '<td data-l="Rate">'+rateBar(e.pct)+'<small>'+e.pct+'%</small></td>'
         + '<td data-l="Cycle">'+(e.avgCyc!=null?fmtGap(e.avgCyc):"—")+'</td>'
         + '</tr>';
     }).join("");
     return h + '</tbody></table></div>';
   }
-  html += __breakdown("Par groupe", "Groupe (le plus faible en premier)", __agg(det, function(d){ return d.group; }), 3);
-  html += __breakdown("Par profil qui poste", "Profil éditeur — sur ses posts publiés", __agg(det, function(d){ return d.profilePub; }, function(d){ return d.profilePubLabel || String(d.profilePub); }), 3);
-  html += __breakdown("Par profil qui commente", "Profil commentateur — commentaires vérifiés", __agg(det.filter(function(d){ return d.profileCom; }), function(d){ return d.profileCom; }, function(d){ return d.profileComLabel || String(d.profileCom); }), 3);
+  html += __breakdown("By group", "Group (weakest first)", __agg(det, function(d){ return d.group; }), 3);
+  html += __breakdown("By posting profile", "Publisher profile — on its published posts", __agg(det, function(d){ return d.profilePub; }, function(d){ return d.profilePubLabel || String(d.profilePub); }), 3);
+  html += __breakdown("By commenting profile", "Commenter profile — verified comments", __agg(det.filter(function(d){ return d.profileCom; }), function(d){ return d.profileCom; }, function(d){ return d.profileComLabel || String(d.profileCom); }), 3);
 
   // BY PRODUCT — each harvested product, its number, how many times posted, in which groups, by which profiles
   var prods = r.products || [];
