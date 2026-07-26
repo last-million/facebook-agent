@@ -15071,14 +15071,27 @@ function facebookRunArmBlock(state = readState()) {
   const readiness = facebookApprovalReadiness(state);
   if (readiness.blocking) return { reason: "no_usable_moderator", readiness };
   const pf = state.posting?.moderatorPreflight;
-  if (pf && pf.ok === false && !pf.acknowledgedAt) {
+  if (pf && pf.ok === false) {
+    // Two failure shapes, one resolution path. "no_usable_moderator" = every moderator account is logged out or
+    // checkpointed (the parked-list check above cannot see this: a logged-out profile is not "parked", which is
+    // exactly how a run could previously start with nothing able to approve it). "group_without_moderator" =
+    // accounts are fine but hold no rights in specific groups.
+    // Both list the unserviceable groups in groupsWithoutModerator, so both are settled the same way: fix the
+    // accounts/rights, or exclude those groups and run the rest. A group already excluded stops blocking.
     const assignments = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
-    // A group the operator already excluded is settled -- it cannot keep blocking launches.
     const stillFailing = (pf.groupsWithoutModerator || []).filter((u) => {
       const g = assignments.find((x) => normalizedFacebookGroupKey(x?.url) === normalizedFacebookGroupKey(u));
       return g && g.excludedFromRun !== true;
     });
-    if (stillFailing.length) return { reason: "group_without_moderator", groups: stillFailing, readiness, preflight: pf };
+    if (stillFailing.length) {
+      return {
+        reason: pf.reason || "group_without_moderator",
+        groups: stillFailing,
+        readiness,
+        preflight: pf,
+        unusableModerators: pf.unusableModerators || [],
+      };
+    }
   }
   return null;
 }
@@ -15199,12 +15212,38 @@ async function runModeratorPreflightAsync() {
       };
     });
     const groupsWithoutModerator = groups.filter((g) => g.status === "no_moderator").map((g) => g.url);
+    // UNUSABLE-ACCOUNT CLASSIFICATION (2026-07-26, from the first live preflight: 2 of 3 moderators landed on
+    // /login and the third bounced to home.php, yet the run would have been allowed to start).
+    // A logged-out or checkpointed account is NOT an inconclusive probe -- it is firm evidence the account cannot
+    // moderate anywhere, so it must not be laundered into "unknown". Kept separate from hasRights===false, which
+    // means "logged in, but not a moderator of THIS group": the two need different fixes and different messages.
+    const isUnusableReason = (r) => /^(login_required|checkpoint|.*account_blocked.*|.*suspend.*)$/i.test(String(r || ""));
+    const unusableModerators = moderators.filter((m) => {
+      if (m.accountBlocked) return true;
+      if (!m.groups.length) return false; // nothing probed (all cached) -> previously proven, not unusable
+      return m.groups.every((g) => g.hasRights !== true && isUnusableReason(g.reason));
+    });
+    // Feed the approval-rotation ordering straight away: a login wall observed here is the same signal the live
+    // approval path learns from, so the very next approval attempt already prefers whichever account is logged in.
+    for (const m of moderators) {
+      for (const g of (m.groups || [])) {
+        if (g.fromCache) continue;
+        if (g.hasRights === true) { try { noteModeratorSessionHealth(m.profileId, true); } catch (_) {} break; }
+        if (isUnusableReason(g.reason)) { try { noteModeratorSessionHealth(m.profileId, false); } catch (_) {} break; }
+      }
+    }
+    const allModeratorsUnusable = moderators.length > 0 && unusableModerators.length === moderators.length;
     const result = {
-      ok: groupsWithoutModerator.length === 0,
+      ok: groupsWithoutModerator.length === 0 && !allModeratorsUnusable,
+      reason: allModeratorsUnusable ? "no_usable_moderator" : (groupsWithoutModerator.length ? "group_without_moderator" : ""),
+      // With every account unusable, EVERY approval-gated group is unserviceable -- list them all so the operator
+      // still gets the "run the other groups meanwhile" option instead of a dead end. (Here the run keeps going
+      // to the pre-approved groups, which is usually most of them.)
+      unusableModerators: unusableModerators.map((m) => ({ profileId: m.profileId, label: m.label, reason: (m.groups.find((g) => isUnusableReason(g.reason)) || {}).reason || (m.accountBlocked ? "account_blocked" : "") })),
       checkedAt: new Date().toISOString(),
       groups,
       moderators: moderators.map((m) => ({ profileId: m.profileId, label: m.label, accountBlocked: m.accountBlocked, error: m.error })),
-      groupsWithoutModerator,
+      groupsWithoutModerator: allModeratorsUnusable ? readiness.approvalGroupNames : groupsWithoutModerator,
       recommended: readiness.recommended,
       // Freshly-proven rights only (cache hits are already stored). Negatives are deliberately absent -- see
       // the cache comment above for why a "no rights" verdict must never be remembered.
@@ -15229,9 +15268,11 @@ function applyModeratorPreflightResult(result) {
   state.posting = state.posting || {};
   state.posting.moderatorPreflight = {
     ok: Boolean(result.ok),
+    reason: String(result.reason || ""),
     checkedAt: result.checkedAt,
     groups: result.groups,
     moderators: result.moderators,
+    unusableModerators: result.unusableModerators || [],
     groupsWithoutModerator: result.groupsWithoutModerator,
     acknowledgedAt: "", // an operator decision on THIS verdict; a fresh preflight always re-asks
   };
@@ -23729,6 +23770,16 @@ function requireExternalArmed() {
   // let them finish after a run-limit auto-disarm, but NEVER after a real operator STOP (which sets
   // __externalStopRequested and also kills connector children). New posts stay capped via autopilotMayPostNow.
   if (__postCompletionExternalActionInFlight > 0 && __externalStopRequested === 0) return;
+  // MODERATOR PREFLIGHT (2026-07-26). By design it runs BEFORE arming -- it is what decides whether arming is
+  // allowed at all -- so this gate would otherwise make the feature impossible ("External actions are locked" on
+  // every probe, observed on the first live run).
+  // Narrow and justified: the connector's moderatorAudit branch only NAVIGATES and reads the landed URL, then
+  // returns; it reaches no publish, comment or approve code path, so it cannot write anything to Facebook. The
+  // flag is set only by an explicit operator-initiated POST /api/moderators/preflight, is cleared in that
+  // function's finally, and the pass is strictly sequential and bounded.
+  // Deliberately NOT gated on __externalStopRequested: after an operator Stop the very next thing the operator
+  // does is press Launch, which must be able to run its own preflight.
+  if (__moderatorPreflightInFlight) return;
   // Reads FRESH, never the cached readState() (2026-07-04 hardening, cheap here — only ~24 call sites, none of
   // them the hot 1s heartbeat): this is the final kill-switch gate before every connector spawn, so it must never
   // depend on the cache-vs-write ordering argument even as insurance against a future refactor.

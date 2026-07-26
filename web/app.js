@@ -6008,9 +6008,19 @@ function showModeratorGateModal(pf) {
     const p = document.createElement("p");
     p.style.cssText = "margin:0 0 14px;line-height:1.5";
     p.textContent = noModerator
-      ? "No moderator account is usable right now (all of them are disconnected, suspended or parked). Groups that require admin approval need at least 1 working moderator — without one, every post would stay pending forever."
+      ? "None of your moderator accounts is usable right now — they are logged out of Facebook, suspended or parked. A group that requires admin approval needs at least 1 working moderator; without one, every post sent there stays pending forever. Affected groups:"
       : "These groups require admin approval, but none of your moderators can actually open their pending queue. Posts sent there would stay pending forever:";
     box.appendChild(p);
+    if (noModerator && Array.isArray(pf.unusableModerators) && pf.unusableModerators.length) {
+      const ul = document.createElement("ul");
+      ul.style.cssText = "margin:0 0 14px;padding-left:20px;line-height:1.7;font-size:13px;opacity:.9";
+      pf.unusableModerators.forEach(function (m) {
+        const li = document.createElement("li");
+        li.textContent = (m.label || m.profileId) + " — " + (m.reason === "login_required" ? "logged out of Facebook" : String(m.reason || "unusable"));
+        ul.appendChild(li);
+      });
+      box.appendChild(ul);
+    }
     if (groups.length) {
       const ul = document.createElement("ul");
       ul.style.cssText = "margin:0 0 14px;padding-left:20px;line-height:1.7";
@@ -6030,9 +6040,9 @@ function showModeratorGateModal(pf) {
     stop.textContent = "Stop — I'll fix it first";
     stop.style.cssText = "padding:9px 15px;border-radius:8px;border:1px solid #e04a4a;background:#e04a4a;color:#fff;cursor:pointer;font-weight:600";
     stop.addEventListener("click", function () { document.body.removeChild(back); resolve("cancel"); });
-    if (!noModerator) {
-      // Only offered when specific groups are the problem. With zero usable moderators there is nothing to
-      // exclude -- every approval-gated group is unserviceable -- so the choice would be meaningless.
+    if (groups.length) {
+      // Offered in BOTH failure shapes: with every account unusable, the listed groups are all the approval-gated
+      // ones, so excluding them still lets the run proceed to the pre-approved groups (usually most of them).
       const cont = document.createElement("button");
       cont.type = "button";
       cont.textContent = "Continue without these groups";

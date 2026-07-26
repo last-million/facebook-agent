@@ -3698,8 +3698,23 @@ async function probeGroupModeratorAccess(page, groupUrl, groupId = '') {
     if (!gid) {
       await page.goto(rawBase, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
       await humanPause(2000, 3200);
-      if (await dismissForcedAccountSwitch(page)) await humanPause(1500, 2500);
+      // Dismissing the forced account-switch interstitial NAVIGATES AWAY (measured live: profile 16 ended on
+      // /home.php), so the group id must be resolved from a RE-LOADED group page -- reading it off wherever the
+      // dismissal landed yields a false 'group_id_unresolved' on a perfectly healthy account. Same re-goto the
+      // approval path already does after this call.
+      if (await dismissForcedAccountSwitch(page)) {
+        await humanPause(1500, 2500);
+        await page.goto(rawBase, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+        await humanPause(2000, 3200);
+      }
       gid = String(await resolveNumericGroupIdFromPage(page).catch(() => '') || '').replace(/\D+/g, '');
+      // Second chance: a slow first render is common on these group pages, and giving up here would report an
+      // inconclusive verdict for what is really just a slow load.
+      if (!gid) {
+        await page.goto(rawBase, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+        await humanPause(3000, 4500);
+        gid = String(await resolveNumericGroupIdFromPage(page).catch(() => '') || '').replace(/\D+/g, '');
+      }
       out.groupId = gid;
     }
     const snap = await facebookLoginSnapshot(page).catch(() => null);
