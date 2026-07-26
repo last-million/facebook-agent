@@ -292,8 +292,35 @@ function runBody(r){
     var __maxWait = __sorted[__sorted.length-1];
     approvalWaitCard = statCard("Approval wait", __avgWait+'<small> min avg</small>', __waitedMins.length+" post(s) waited, max "+__maxWait+" min", __avgWait>=15?"r":(__avgWait>=8?"a":"g"));
   }
+  // ---- FULL CYCLE / APPROVAL / BREAKDOWN METRICS (operator 2026-07-26) -------------------------------
+  // Every number below is computed ONLY from fields the server actually records. Where a stat cannot be
+  // honestly derived it is shown as "—" rather than guessed. Note the detail rows contain PUBLISHED posts
+  // only, so a profile that failed to post at all never appears here -- these are "performance on work that
+  // landed", not "success rate of every attempt". The labels say so explicitly.
+  var det = r.detail || [];
+  var cyc = det.filter(function(d){ return d.cycleSec != null; }).map(function(d){ return d.cycleSec; });
+  var avgCycle = cyc.length ? Math.round(cyc.reduce(function(a,b){return a+b;},0)/cyc.length) : null;
+  var appr = det.filter(function(d){ return d.approvalDurationMinutes != null; }).map(function(d){ return d.approvalDurationMinutes; });
+  var avgAppr = appr.length ? (appr.reduce(function(a,b){return a+b;},0)/appr.length) : null;
+  var pend = det.filter(function(d){ return d.wasPendingApproval; });
+  var pendOk = pend.filter(function(d){ return !!d.commentedAt; });
+  var pendPct = pend.length ? Math.round(pendOk.length*100/pend.length) : null;
+
+  var cycleCard = statCard("Cycle complet (moyen)", avgCycle!=null?fmtGap(avgCycle):"—",
+    "de la soumission du post jusqu'au commentaire vérifié" + (cyc.length? " • "+cyc.length+" posts" : ""),
+    avgCycle==null?"":(avgCycle>=900?"r":(avgCycle>=480?"a":"g")));
+  var apprCard = statCard("Approbation (moyenne)", avgAppr!=null?(Math.round(avgAppr*10)/10+" min"):"—",
+    appr.length? appr.length+" post"+(appr.length>1?"s":"")+" passé"+(appr.length>1?"s":"")+" par un modérateur" : "aucun post modéré",
+    avgAppr==null?"":(avgAppr>=15?"r":(avgAppr>=6?"a":"g")));
+  var pendCard = statCard("Posts en attente aboutis", pendPct!=null?(pendPct+'<small>%</small>'):"—",
+    pend.length? pendOk.length+"/"+pend.length+" ont fini commentés" : "aucun post en attente",
+    pendPct==null?"":(pendPct>=90?"g":(pendPct>=70?"a":"r")));
+
   var html = '<div class="stats">'
     + elapsedCard(r)
+    + cycleCard
+    + apprCard
+    + pendCard
     + statCard("Posts published", r.posts, "over "+r.durationMin+" min", "")
     + statCard("Average post time", fmtMinSec(r.avgPostIntervalSec), "between posts going public (includes moderator-approval wait)", "v")
     + statCard("Unique products", (r.uniqueProducts||0), (r.productsInBoth||0)+" in both groups", (r.uniqueProducts? (r.productsInBoth>0?"g":"a") : ""))
@@ -377,6 +404,48 @@ function runBody(r){
     }).join("");
     html += '</div>';
   }
+  // ---- PERFORMANCE BREAKDOWN + BARS (operator 2026-07-26: "which profiles are weak, which groups are weak") --
+  // Bars are plain divs (no chart library): the page is served under a strict CSP and must stay dependency-free.
+  // SCOPE HONESTY: r.detail only contains posts that actually PUBLISHED. A profile that failed to post at all
+  // never appears, so this is "how did the work that landed perform", NOT "success rate of every attempt".
+  // Headings say so, so nobody reads a missing profile as a good profile.
+  function __agg(rows, keyFn, labelFn){
+    var m = {};
+    rows.forEach(function(d){
+      var k = keyFn(d); if (k == null || k === "" ) return;
+      if (!m[k]) m[k] = { k: k, label: labelFn ? labelFn(d) : String(k), n: 0, ok: 0, cyc: [] };
+      m[k].n++;
+      if (d.commentedAt) m[k].ok++;
+      if (d.cycleSec != null) m[k].cyc.push(d.cycleSec);
+    });
+    return Object.keys(m).map(function(k){
+      var e = m[k];
+      e.pct = e.n ? Math.round(e.ok*100/e.n) : 0;
+      e.avgCyc = e.cyc.length ? Math.round(e.cyc.reduce(function(a,b){return a+b;},0)/e.cyc.length) : null;
+      return e;
+    }).sort(function(a,b){ return (a.pct - b.pct) || (b.n - a.n); }); // worst first — that is what needs action
+  }
+  function __breakdown(title, note, rows, minN){
+    if (!rows.length) return "";
+    var h = '<h2>'+esc(title)+' <span class="ln"></span> <span class="tag">'+rows.length+'</span></h2>'
+      + '<div class="tablecard"><table class="detail"><thead><tr>'
+      + '<th>'+esc(note)+'</th><th>Posts</th><th>Commentés</th><th>Taux</th><th>Cycle moyen</th></tr></thead><tbody>';
+    h += rows.map(function(e){
+      var weak = (e.n >= (minN||3) && e.pct < 90);
+      return '<tr>'
+        + '<td data-l="Nom">'+(weak?'<span class="pill r" title="sous 90% de commentaires sur au moins '+(minN||3)+' posts">faible</span> ':'')+esc(e.label)+'</td>'
+        + '<td data-l="Posts">'+e.n+'</td>'
+        + '<td data-l="Commentés">'+e.ok+'</td>'
+        + '<td data-l="Taux">'+rateBar(e.pct)+'<small>'+e.pct+'%</small></td>'
+        + '<td data-l="Cycle">'+(e.avgCyc!=null?fmtGap(e.avgCyc):"—")+'</td>'
+        + '</tr>';
+    }).join("");
+    return h + '</tbody></table></div>';
+  }
+  html += __breakdown("Par groupe", "Groupe (le plus faible en premier)", __agg(det, function(d){ return d.group; }), 3);
+  html += __breakdown("Par profil qui poste", "Profil éditeur — sur ses posts publiés", __agg(det, function(d){ return d.profilePub; }, function(d){ return d.profilePubLabel || String(d.profilePub); }), 3);
+  html += __breakdown("Par profil qui commente", "Profil commentateur — commentaires vérifiés", __agg(det.filter(function(d){ return d.profileCom; }), function(d){ return d.profileCom; }, function(d){ return d.profileComLabel || String(d.profileCom); }), 3);
+
   // BY PRODUCT — each harvested product, its number, how many times posted, in which groups, by which profiles
   var prods = r.products || [];
   if (prods.length) {

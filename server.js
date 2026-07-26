@@ -24437,6 +24437,26 @@ function buildRunReports(force = false) {
     const ex = pendingStartByKey.get(k);
     if (!ex || t < ex.t) pendingStartByKey.set(k, { t, at: r.at, groupUrl: r.groupUrl || "", profileId: Number(r.profileId || 0), profile: String(r.profile || ""), planId: String(r.planId || ""), sequence: Number(r.sequence || 0) });
   }
+  // FULL-CYCLE START (2026-07-26, operator: "average time from starting to post the post till getting commented").
+  // publishedAt is NOT the start of the cycle -- it is written only once the post is confirmed/resolved, so the
+  // real work before it (opening the profile, composing, submitting, and for moderated groups the whole approval
+  // wait) is invisible. publish_intent is the FIRST durable row for a post attempt, written when the agent
+  // commits to posting it, so it is the honest "cycle started here" marker. Same keying as pendingStartByKey
+  // (planId:sequence:groupKey, no profileId) so a retry on another profile does not fork into a new identity,
+  // and keep the EARLIEST intent per key so retries measure from the first real attempt, not the last.
+  const submittedStartByKey = new Map();
+  const submittedStartByPlanSeq = new Map();
+  for (const r of rows) {
+    if (!r || r.event !== "publish_intent" || !r.at) continue;
+    const t = Date.parse(r.at);
+    if (!Number.isFinite(t)) continue;
+    const k = (r.planId || "") + ":" + (r.sequence || 0) + ":" + normalizedFacebookGroupKey(r.groupUrl || r.actualGroupUrl || "");
+    const ex = submittedStartByKey.get(k);
+    if (!ex || t < ex.t) submittedStartByKey.set(k, { t, at: r.at });
+    const ps = (r.planId || "") + ":" + (r.sequence || 0);
+    const exPs = submittedStartByPlanSeq.get(ps);
+    if (!exPs || t < exPs.t) submittedStartByPlanSeq.set(ps, { t, at: r.at });
+  }
   // PUBLISHER LOOKUP (2026-07-13, operator: "in awaiting approval he should show the profile that posted and the
   // moderator"): post_captured_awaiting_admin_approval is written by the PUBLISHING profile right before the
   // backgrounded approval leg starts -- the one ledger row that reliably identifies who actually submitted a
@@ -24699,7 +24719,11 @@ function buildRunReports(force = false) {
       const __freshness = __contentAgeClassFor(p);
       contentFreshness[__freshness.bucket] = (contentFreshness[__freshness.bucket] || 0) + 1;
       if (pm && __freshness.isFresh) pm.hasFreshPost = true;
-      detail.push({ seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profilePubLabel: String(p.profile || ""), profileCom: c ? c.profileId : null, profileComLabel: c ? String(c.profile || "") : "", productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable", wasPendingApproval: Boolean(__pendingStart), approvalWaitMinutes, approvedByModerator, approvalDurationMinutes, isFreshPost: __freshness.isFresh, contentAgeHours: __freshness.ageHours != null ? Math.round(__freshness.ageHours * 10) / 10 : null });
+      // full cycle = first publish_intent -> verified comment (see submittedStartByKey above for why)
+      const __sub = submittedStartByKey.get(__postKey(p)) || submittedStartByPlanSeq.get(__psKey);
+      const submittedAt = __sub ? __sub.at : null;
+      const cycleSec = (__sub && c) ? Math.max(0, Math.round((Date.parse(c.at) - __sub.t) / 1000)) : null;
+      detail.push({ submittedAt, cycleSec, seq: Number(p.sequence || 0), group: g, publishedAt: p.at, commentedAt: c ? c.at : null, gapSec, profilePub: Number(p.profileId || 0), profilePubLabel: String(p.profile || ""), profileCom: c ? c.profileId : null, profileComLabel: c ? String(c.profile || "") : "", productNum: pnum, productKey: pk, title: String(p.title || ""), approvalVerification: p.approvalVerification || "not_applicable", wasPendingApproval: Boolean(__pendingStart), approvalWaitMinutes, approvedByModerator, approvalDurationMinutes, isFreshPost: __freshness.isFresh, contentAgeHours: __freshness.ageHours != null ? Math.round(__freshness.ageHours * 10) / 10 : null });
       if (p.approvalVerification === "soft_clicked" && !c) softApproved += 1;
     }
     // LIFETIME COVERAGE (operator 2026-07-15: "why he dont post the same product in all groupes" -- traced live:
