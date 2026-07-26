@@ -4943,7 +4943,55 @@ async function main() {
   if ((payload.commentOnly || payload.pinOnly) && payload.postUrl) {
     await page.goto(payload.postUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(e => console.log(JSON.stringify({ step: 'goto_warn', message: e.message })));
     await humanPause(1800, 3200);
-    await ensureFacebookLoggedIn(page, payload, payload.pinOnly ? 'pin_only_post_url' : 'comment_only_post_url');
+    // LOGGED-OUT FAST-FAIL (2026-07-26, corrected after adversarial review). A commenter whose Facebook session is
+    // gone used to sit here until the SERVER's 240s kill -- measured on one profile: 153 attempts, 130 timeouts,
+    // ZERO successes, 548 browser-minutes. The server now sends waitForManualLogin:false for commentOnly, so
+    // ensureFacebookLoggedIn takes the assertFacebookLoggedIn path and THROWS quickly instead of waiting 300s.
+    // Catching that throw here (rather than probing after the call, which is unreachable -- the call either
+    // returns with a healthy session or throws) lets us emit the exact step names the server's ONE classifier
+    // already parses, so there is no second classifier to keep in sync:
+    //   facebook_login_required_waiting -> comment_profile_login_required  (server parks the profile)
+    //   facebook_account_status_blocked -> facebook_account_status_blocked (server suspends it)
+    // Interstitials and the forced-account-switch wall are dismissed INSIDE ensureFacebookLoggedIn before it
+    // asserts, so a healthy profile cannot trip a false login wall here.
+    try {
+      await ensureFacebookLoggedIn(page, payload, payload.pinOnly ? 'pin_only_post_url' : 'comment_only_post_url');
+    } catch (loginErr) {
+      const __msg = String((loginErr && loginErr.message) || loginErr || '');
+      const __blocked = /facebook_account_suspended_or_disabled|account_blocked|checkpoint/i.test(__msg);
+      const __loggedOut = /facebook_login_required_for_profile|login_required/i.test(__msg);
+      if (!__blocked && !__loggedOut) throw loginErr; // anything else is a real error -> keep the existing behaviour
+      const __snap = await facebookLoginSnapshot(page).catch(() => null);
+      console.log(JSON.stringify({
+        step: 'comment_login_fast_fail',
+        mode: payload.pinOnly ? 'pin_only' : 'comment_only',
+        profileId: payload.profileId,
+        accountBlocked: __blocked,
+        url: String((__snap && __snap.url) || page.url() || '').slice(0, 200),
+        elapsedMs: Date.now() - __SCRIPT_STARTED_AT,
+        error: __msg.slice(0, 200),
+      }));
+      if (__blocked) {
+        console.log(JSON.stringify({
+          step: 'facebook_account_status_blocked',
+          accountBlocked: true,
+          accountBlockReason: (__snap && __snap.accountBlockReason) || 'account_blocked',
+          url: String((__snap && __snap.url) || page.url() || '').slice(0, 200),
+        }));
+      } else {
+        // Emitted WITHOUT a later facebook_login_restored step, which is exactly what the server's validation
+        // builder turns into `comment_profile_login_required` for a commentOnly payload.
+        console.log(JSON.stringify({ step: 'facebook_login_required_waiting', stage: payload.pinOnly ? 'pin_only_post_url' : 'comment_only_post_url', reason: 'no_facebook_session' }));
+      }
+      console.log(JSON.stringify({
+        step: 'result', mode: payload.pinOnly ? 'pin_only' : 'comment_only', postUrl: payload.postUrl, postPageUrl: payload.postUrl,
+        bodyChecks: { markerVisible: false, ownControls: false }, imageVerified: false, postMediaVerified: false,
+        commentResult: { skipped: true, clicked: false, typed: false, submitted: false, verified: false, reason: __blocked ? 'facebook_account_status_blocked' : 'comment_profile_login_required' },
+        commentPinResult: { requested: false, skipped: true, menuOpened: false, clicked: false, confirmed: false, verified: false, reason: '' },
+        candidateCount: 0, verified: [],
+      }, null, 2));
+      return; // the finally block closes the browser
+    }
     console.log(JSON.stringify({ step: 'page_loaded', url: page.url(), title: await page.title().catch(() => ''), mode: payload.pinOnly ? 'pin_only' : 'comment_only' }));
     let targetPreflight = await commentTargetPreflight(page, payload.postUrl, marker);
     console.log(JSON.stringify({ step: 'comment_target_preflight', attempt: 1, ...targetPreflight, postPageUrl: payload.postUrl }));

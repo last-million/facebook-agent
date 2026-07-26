@@ -442,7 +442,12 @@ const DEFAULT_WALMART_DISCOVERY_URLS = [
   "https://www.walmart.com/search?q=summer&facet=special_offers%3AClearance%7C%7Cspecial_offers%3AReduced+Price%7C%7Cspecial_offers%3ARollback%7C%7Cretailer_type%3APro+Sellers",
 ].join("\n");
 const DEFAULT_BLOCKED_IXBROWSER_PROFILES = "wise";
-const DEFAULT_MODERATOR_IXBROWSER_PROFILES = "41 - moderator\n42 - moderator";
+// EMPTY BY DESIGN (2026-07-26, operator: "don't hardcode which moderators to use -- I may change them, I assign
+// them in Profiles roles"). This used to seed "41 - moderator\n42 - moderator", profile ids that belong to nobody
+// on this install. It only applies when the key is absent (a fresh install or a state reset), but in exactly that
+// case it would silently point the approval pool at two non-existent accounts. Empty is the safe seed: the
+// moderator readiness gate then says "you need at least 1 moderator" instead of failing quietly against ghosts.
+const DEFAULT_MODERATOR_IXBROWSER_PROFILES = "";
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 fs.mkdirSync(LOCAL_DB_DIR, { recursive: true });
@@ -3109,6 +3114,24 @@ function releaseParkedProfile(profileId) {
   // category that shares this function: Disconnected, Errored (account/access), Suspended, Blocked moderators,
   // Comment-limited, and Profiles-having-issue.
   if (id) { try { unblockPostingProfile({ profileId: id }); } catch (_) {} }
+  // MODERATOR-PREFLIGHT VERDICT (2026-07-26). The preflight can bench a moderator for up to 12h by writing it to
+  // state.posting.moderatorPreflight.unusableModerators, and NOTHING else clears that -- so an operator who logged
+  // the account back in and clicked Release still had it silently excluded from the approval pool until the
+  // freshness window expired. Same reasoning (and same "one Release fully re-admits the profile" promise) as the
+  // text-bench clear directly above. A later preflight re-observes the truth and rewrites the list either way.
+  if (id) {
+    try {
+      const st = readState();
+      const pf = st.posting?.moderatorPreflight;
+      if (pf && Array.isArray(pf.unusableModerators) && pf.unusableModerators.some((m) => String(m?.profileId || "") === id)) {
+        pf.unusableModerators = pf.unusableModerators.filter((m) => String(m?.profileId || "") !== id);
+        st.posting.moderatorPreflight = pf;
+        writeState(st);
+        logEvent("moderator_preflight_unusable_cleared_by_release", { profileId: id });
+        changed = true;
+      }
+    } catch (_) {}
+  }
   // FAIRNESS-CACHE BUST: the lifetime post-history tie-break cache can otherwise serve a stale count as the
   // secondary sort key in orderFreshFirst/orderReadyRowsLeastUsed for up to 5 minutes right after a release.
   try { __postHistoryCache = { at: 0, map: null }; } catch (_) {}
@@ -8534,7 +8557,12 @@ function postingSlots(state) {
         if (isProfileInSoftCooldown(profileId)) continue; // brief in-memory pacing after a transient failure (2026-07-19 retry-storm fix) -- NOT a blacklist, self-clears in ~2min
         if (isDedicatedShopYourLikesProfileLabel(label, state)) continue;
         if (isBlockedIxBrowserProfileLabel(label, state)) continue;
-        if (isFacebookProfileQuarantinedForFacebook(label, state, groupUrl)) continue;
+        // 2026-07-26: the standalone isFacebookProfileQuarantinedForFacebook(label, state, groupUrl) call that used
+        // to sit here was provably redundant -- isProfileBlockedForPosting's FIRST action (see its body) is the
+        // identical quarantine check with the identical label/state/groupUrl, and it runs unconditionally two lines
+        // below. ~625 duplicate full-blob scans per postingSlots pass. Behaviour-identical deletion.
+        // NOTE: the sibling call inside the group-fallback branch below is NOT redundant -- it re-checks against a
+        // DIFFERENT (fallback) group url, where a quarantine would otherwise be missed. Leave that one alone.
         if (isFacebookAdminApprovalProfileLabel(label, state, groupUrl)) continue;
         if (isProfileBlockedForPosting(label, state, groupUrl)) continue;
         let effectiveGroupUrl = groupUrl;
@@ -8581,12 +8609,21 @@ function filterExcludedProfileSlots(slots = [], options = {}) {
   });
 }
 
-function statusLineAppliesToFacebookGroup(line, groupUrl) {
-  const targetGroupKey = normalizedFacebookGroupKey(groupUrl);
+// Key-taking variant (2026-07-26 perf). The original recomputed normalizedFacebookGroupKey(groupUrl) -- 4 string
+// allocations -- on EVERY one of the ~6.4M per-line calls made from the predicates below, for a value that is
+// constant across a whole filter. Callers now hoist the key out of the loop and call this. Mirrors the same
+// loop-invariant hoist already applied inside isProfileGroupBlockedForPosting (2026-07-04).
+function statusLineAppliesToFacebookGroupKey(line, targetGroupKey) {
   if (!targetGroupKey) return true;
   const lineGroupUrls = sanitizeFacebookGroupUrlList(line);
   if (!lineGroupUrls.length) return true;
   return lineGroupUrls.some((url) => normalizedFacebookGroupKey(url) === targetGroupKey);
+}
+// Original 2-arg form. After the 2026-07-26 hoist its only two call sites moved to the Key variant above, so this
+// currently has NO callers -- kept as the convenience entry point for future code (and so the url-taking shape
+// stays available), implemented as a thin wrapper so the two can never diverge.
+function statusLineAppliesToFacebookGroup(line, groupUrl) {
+  return statusLineAppliesToFacebookGroupKey(line, normalizedFacebookGroupKey(groupUrl));
 }
 
 // SHARED MEMOIZED BLOB-LINES (2026-07-19, live incident): isProfileBlockedForPosting / isFacebookProfileQuarantinedForFacebook /
@@ -8623,8 +8660,134 @@ function profileStatusLowercaseLines(state) {
     return __profileStatusLinesCache.lines;
   }
   const lines = [status, failed].join("\n").toLowerCase().split(/\r?\n/);
-  __profileStatusLinesCache = { status, failed, lines };
+  __profileStatusLinesCache = { status, failed, lines, index: null };
   return lines;
+}
+// PROFILE-ID INDEX (2026-07-26). MEASURED root cause of the event-loop freeze, and it is the largest single
+// blocking cost in this process: the three predicates below each `sources.filter(...)` ALL 6,971 blob lines, and
+// postingSlots calls them 675 times per pass -> 14,116,275 line evaluations = 11,663 ms of UNINTERRUPTED
+// synchronous work per call, measured on this box with the live blob. Nothing else runs during it: no timer, no
+// comment continuation, no HTTP response, no connector-exit handler. At ~75 calls/hour that is ~22% of wall clock.
+// (A prior node --prof session reached the same conclusion -- see the comment at isProfileGroupBlockedForPosting.)
+//
+// All three filters are the same pure conjunction:
+//     statusRegex(line) && statusLineAppliesToFacebookGroup(line, groupUrl) && (pidMatch || labelSubstring)
+// so any line that can survive must satisfy the third clause. Index by the anchored `profile_id=<pid>` token and
+// keep every line that has NO pid token at all (those can still match via the label-substring branch).
+//
+// ORDER IS LOAD-BEARING: every caller takes `matching[matching.length - 1]` ("latest wins"), so candidates MUST
+// come back in original file order. Indices are stored, then merged as two already-sorted lists -- never
+// concatenated, which would put all no-pid lines after all pid lines and silently change which line is "latest".
+//
+// CORRECTNESS CAVEAT, handled: a line carrying a DIFFERENT pid could in principle still contain this label as a
+// substring, and the index would miss it. `__verifyProfileStatusIndexOnce` below proves that cannot happen on the
+// real blob by diffing index-vs-fullscan for every configured profile; if it ever finds a divergence it logs it
+// and permanently falls back to the full scan for the rest of the process.
+let __profileStatusIndexDisabled = false;
+let __profileStatusIndexVerifiedFor = ""; // blob-value key this verifier last ran against
+// RUNTIME SELF-CHECK. An earlier version of this comment PROMISED this function without it existing -- an
+// adversarial review caught that, and the same review then found a real divergence class on the live blob (a line
+// carrying profile_id=64 whose `profile=10 - 10` token made the old full scan return it for profile 10 too).
+// The index now buckets label tokens as well, so it should be a strict superset. This proves it on the ACTUAL
+// blob instead of trusting that argument: for every configured profile, compare the candidate subset against the
+// full line list under the same identity predicate. Any divergence disables the index for the rest of the process
+// (correct-but-slow beats subtly-wrong) and logs loudly. Runs at most once per distinct blob value, and only over
+// configured labels, so it is cheap.
+function __verifyProfileStatusIndexOnce(state, index, lines) {
+  try {
+    const key = String(__profileStatusLinesCache.status || "").length + ":" + String(__profileStatusLinesCache.failed || "").length;
+    if (__profileStatusIndexVerifiedFor === key || __profileStatusIndexDisabled) return;
+    __profileStatusIndexVerifiedFor = key;
+    const labels = new Set();
+    for (const g of (Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [])) {
+      for (const p of (Array.isArray(g?.profiles) ? g.profiles : [])) { const s = String(p || "").trim(); if (s) labels.add(s); }
+    }
+    for (const k of ["moderatorProfiles", "activeProfiles", "blockedProfiles"]) {
+      for (const l of recordLines(state.ixbrowser?.[k])) labels.add(l);
+    }
+    for (const label of labels) {
+      const pid = profileIdFromLabel(label);
+      if (!pid) continue;
+      const lower = label.toLowerCase();
+      const identity = (line) => profileIdLineMatch(line, pid) || (lower.length > 2 && line.includes(lower));
+      const full = lines.filter(identity);
+      const mine = index.byPid.get(String(pid)) || [];
+      const subset = [];
+      let a = 0, b = 0;
+      while (a < mine.length || b < index.noPid.length) {
+        if (b >= index.noPid.length || (a < mine.length && mine[a] < index.noPid[b])) subset.push(lines[mine[a++]]);
+        else subset.push(lines[index.noPid[b++]]);
+      }
+      const got = subset.filter(identity);
+      if (got.length !== full.length || got[got.length - 1] !== full[full.length - 1]) {
+        __profileStatusIndexDisabled = true;
+        try { logEvent("profile_status_index_disabled_divergence", { label: String(label).slice(0, 80), profileId: pid, indexMatches: got.length, fullMatches: full.length }); } catch (_) {}
+        return;
+      }
+    }
+    try { logEvent("profile_status_index_verified", { labels: labels.size, lines: lines.length }); } catch (_) {}
+  } catch (_) {
+    __profileStatusIndexDisabled = true; // verifier itself broke -> fall back to the full scan, never guess
+  }
+}
+function profileStatusIndexFor(state) {
+  profileStatusLowercaseLines(state); // ensure the line cache matches the current blob values
+  const cache = __profileStatusLinesCache;
+  if (cache.index) return cache.index;
+  const byPid = new Map();
+  const noPid = [];
+  const lines = cache.lines || [];
+  const put = (key, i) => {
+    let arr = byPid.get(key);
+    if (!arr) { arr = []; byPid.set(key, arr); }
+    if (arr[arr.length - 1] !== i) arr.push(i); // ascending + deduped (a line can yield the same pid twice)
+  };
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    let hasPid = false;
+    let m;
+    const idRe = /profile_id=(\d+)/g;
+    while ((m = idRe.exec(line))) { hasPid = true; put(m[1], i); }
+    // LABEL-SUBSTRING COVERAGE (2026-07-26, caught by adversarial review and then PROVEN on the live blob).
+    // The predicates' identity clause is `pidMatch || line.includes(lowerLabel)`, so a line carrying a FOREIGN
+    // profile_id can still match another profile through its LABEL text. Indexing on profile_id alone would drop
+    // exactly those lines. Real example on today's blob (1 occurrence):
+    //   ... | profile_id=64 | profile=10 - 10 | name=10 | status=facebook_account_suspended_or_disabled ...
+    // which the old full scan also returned for profile 10. Bucket the line under the pid embedded in any
+    // `profile=`/`name=` label token as well, so the candidate set is a SUPERSET of what the label-substring
+    // branch could match -- the filter itself is unchanged, so the final verdict stays byte-identical.
+    const labRe = /(?:profile|name)=([^|]+)/g;
+    while ((m = labRe.exec(line))) {
+      const lp = profileIdFromLabel(String(m[1] || "").trim());
+      if (lp) put(String(lp), i);
+    }
+    if (!hasPid) noPid.push(i);
+  }
+  cache.index = { byPid, noPid };
+  __verifyProfileStatusIndexOnce(state, cache.index, lines);
+  return cache.index;
+}
+// Ordered candidate subset for `profileId`. Falls back to the full line list when there is no usable pid, when
+// the index is disabled, or on any internal error -- so this can only ever be a speed-up, never a behaviour change.
+function profileStatusCandidateLines(state, profileId) {
+  const lines = profileStatusLowercaseLines(state);
+  const pid = Number(profileId) || 0;
+  if (!pid || __profileStatusIndexDisabled) return lines;
+  try {
+    const { byPid, noPid } = profileStatusIndexFor(state);
+    const mine = byPid.get(String(pid));
+    if (!mine || !mine.length) return noPid.length ? noPid.map((i) => lines[i]) : [];
+    // merge two ascending index lists -> original file order preserved ("latest wins" stays correct)
+    const out = [];
+    let a = 0, b = 0;
+    while (a < mine.length || b < noPid.length) {
+      if (b >= noPid.length || (a < mine.length && mine[a] < noPid[b])) out.push(lines[mine[a++]]);
+      else out.push(lines[noPid[b++]]);
+    }
+    return out;
+  } catch (_) {
+    return lines; // never let an index bug break a posting decision
+  }
 }
 function isProfileBlockedForPosting(label, state, groupUrl = "") {
   const text = String(label || "").trim();
@@ -8632,12 +8795,14 @@ function isProfileBlockedForPosting(label, state, groupUrl = "") {
   if (isFacebookProfileQuarantinedForFacebook(text, state, groupUrl)) return true;
   const lowerLabel = text.toLowerCase();
   const profileId = profileIdFromLabel(text);
-  const sources = profileStatusLowercaseLines(state);
+  const sources = profileStatusCandidateLines(state, profileId); // indexed subset, original order (see profileStatusIndexFor)
+  const __targetGroupKey = normalizedFacebookGroupKey(groupUrl); // hoisted: constant across the filter (was recomputed per line)
   const matching = sources.filter((line) => {
+    // Cheap anchored identity clause FIRST: it rejects the overwhelming majority of lines without running the
+    // status regex or the group check. Pure conjunction, so reordering cannot change the result.
+    if (!(profileId && profileIdLineMatch(line, profileId)) && !(lowerLabel.length > 2 && line.includes(lowerLabel))) return false;
     if (!/status=(cannot_comment|cannot_post_in_any_group|resolved|approved|cleared|ignored)|action=(quarantined|skip_profile|profile_unblocked|profile_group_unblocked)/i.test(line)) return false;
-    if (!statusLineAppliesToFacebookGroup(line, groupUrl)) return false;
-    if (profileId && profileIdLineMatch(line, profileId)) return true;
-    return lowerLabel.length > 2 && line.includes(lowerLabel);
+    return statusLineAppliesToFacebookGroupKey(line, __targetGroupKey);
   });
   const latest = matching[matching.length - 1] || "";
   if (!latest) return false;
@@ -8670,12 +8835,12 @@ function isFacebookProfileQuarantinedForFacebook(label, state = readState(), gro
   if (!text) return false;
   const lowerLabel = text.toLowerCase();
   const profileId = profileIdFromLabel(text);
-  const sources = profileStatusLowercaseLines(state);
+  const sources = profileStatusCandidateLines(state, profileId); // indexed subset, original order (see profileStatusIndexFor)
+  const __targetGroupKey = normalizedFacebookGroupKey(groupUrl); // hoisted: constant across the filter
   const matching = sources.filter((line) => {
+    if (!(profileId && profileIdLineMatch(line, profileId)) && !(lowerLabel.length > 2 && line.includes(lowerLabel))) return false;
     if (!/status=(facebook_account_suspended_or_disabled|facebook_account_blocked_or_review_required|facebook_account_disabled|facebook_account_suspended|facebook_account_locked|cannot_use_facebook|cannot_comment|resolved|approved|cleared|ignored)|issue=(facebook_account_status|account_unusable|account_hard_blocked)|action=(quarantined|skip_ixbrowser_profile_for_facebook|profile_unblocked|profile_group_unblocked)/i.test(line)) return false;
-    if (!statusLineAppliesToFacebookGroup(line, groupUrl)) return false;
-    if (profileId && profileIdLineMatch(line, profileId)) return true;
-    return lowerLabel.length > 2 && line.includes(lowerLabel);
+    return statusLineAppliesToFacebookGroupKey(line, __targetGroupKey);
   });
   const latest = matching[matching.length - 1] || "";
   if (!latest) return false;
@@ -8782,7 +8947,7 @@ function isProfileGroupBlockedForPosting(label, groupUrl, state) {
   if (!text || !groupKey) return false;
   const lowerLabel = text.toLowerCase();
   const profileId = profileIdFromLabel(text);
-  const sources = profileStatusLowercaseLines(state);
+  const sources = profileStatusCandidateLines(state, profileId); // indexed subset, original order (see profileStatusIndexFor)
   // PERF (2026-07-04): groupKeyAliasSet(groupUrl) depends only on the FIXED target group, not on the per-line
   // lineGroupRaw -- computed ONCE here instead of via groupsMatchByAlias() (2 groupKeyAliasSet calls) inside the
   // filter callback below. Profiled live (node --prof) and found THIS was the actual cause of the recurring
@@ -8795,6 +8960,9 @@ function isProfileGroupBlockedForPosting(label, groupUrl, state) {
   // have returned true) and costs a single Set.has() per line instead of two function calls + two fresh Sets.
   const targetAliasSet = groupKeyAliasSet(groupUrl);
   const matching = sources.filter((line) => {
+    // 2026-07-26: cheap anchored identity clause FIRST (pure conjunction -- result-identical, see the two sibling
+    // predicates above). Rejects almost every line before the status regex and the group-alias work run at all.
+    if (!(profileId && profileIdLineMatch(line, profileId)) && !(lowerLabel.length > 2 && line.includes(lowerLabel))) return false;
     if (!/status=(cannot_post_in_group|resolved|approved|cleared|ignored)|action=(profile_unblocked|profile_group_unblocked)/i.test(line)) return false;
     const lineGroupRaw = (line.match(/group_url=([^|]+)/i) || [])[1] || "";
     const lineGroup = normalizedFacebookGroupKey(lineGroupRaw);
@@ -8806,9 +8974,8 @@ function isProfileGroupBlockedForPosting(label, groupUrl, state) {
     // the identical vanity<->numeric mismatch for attributedCommentProfileIdsForGroup -- mirrored here. Measured
     // live: 65/65 posting_profile_group_issue events in a 3h9m window hit ONLY the 2 vanity-configured new groups,
     // 0 on the numeric-configured old groups.
-    if (lineGroup !== groupKey && !targetAliasSet.has(lineGroup)) return false;
-    if (profileId && profileIdLineMatch(line, profileId)) return true;
-    return lowerLabel.length > 2 && line.includes(lowerLabel);
+    // identity already established by the hoisted clause at the top of this filter
+    return lineGroup === groupKey || targetAliasSet.has(lineGroup);
   });
   const latest = matching[matching.length - 1] || "";
   if (!latest) return false;
@@ -15332,8 +15499,38 @@ async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState
   // result / the /api/profiles/mark-suspended admin button) or logged-out via markProfileDisconnected stayed in the
   // approval rotation and got opened anyway. Both sets are Release-gated (cleared when the admin releases the
   // profile), and a suspended/logged-out FB account can never approve, so this only removes provably-dead work.
-  const __suspendedIds = suspendedProfileIdSet(state);
   const __disconnectedIds = disconnectedProfileIdSet(state);
+  // PREFLIGHT-PROVEN UNUSABLE (2026-07-26). runModeratorPreflightAsync already opens each moderator and records
+  // the ones that landed on the Facebook login page / a checkpoint, into
+  // state.posting.moderatorPreflight.unusableModerators -- but grep proved NOTHING read that field: the preflight's
+  // only runtime effect was noteModeratorSessionHealth, which is ORDERING ONLY and deliberately never excludes.
+  // So every approval session kept walking dead accounts, opening a Chromium for each (measured: ~264 pointless
+  // opens and ~332 min of ixBrowser open-budget per ~9h, against a daily budget already exceeded: 1,661 vs 1,072).
+  //
+  // FULLY DYNAMIC BY CONSTRUCTION (operator 2026-07-26: "don't hardcode which moderators to use -- I assign them
+  // in Profiles roles and I may change them"). Nothing here names a profile: the set is rebuilt from whatever the
+  // last preflight observed about whatever accounts are currently configured. Swap your moderators and the next
+  // preflight re-analyses the new ones and rewrites this set with no code change.
+  //
+  // TWO SAFETY GATES, both deliberate:
+  //  1. FRESHNESS -- a verdict older than 12h is ignored entirely. An operator who logs an account back in must not
+  //     have to wait for anything, and a stale verdict must never permanently bench a healthy account.
+  //  2. NEVER EMPTY THE POOL -- if excluding would leave zero candidates, the exclusion is skipped and every
+  //     moderator is tried. Ordering (__authRank) still puts the healthy one first. An exclusion that can empty
+  //     the pool stops all approvals, which is far worse than a few wasted opens.
+  const __preflightUnusableIds = (() => {
+    const out = new Set();
+    try {
+      const pf = state.posting?.moderatorPreflight;
+      if (!pf || !Array.isArray(pf.unusableModerators) || !pf.unusableModerators.length) return out;
+      const at = Date.parse(String(pf.checkedAt || "")) || 0;
+      if (!at || (Date.now() - at) > 12 * 60 * 60 * 1000) return out; // stale -> ignore (gate 1)
+      for (const m of pf.unusableModerators) { const pid = Number(m?.profileId || 0); if (pid) out.add(String(pid)); }
+    } catch (_) { return new Set(); }
+    return out;
+  })();
+  const __suspendedIds = suspendedProfileIdSet(state);
+  const __preflightExcluded = []; // candidates held back by the preflight verdict; restored if that would empty the pool
   const add = (profileId, profile, source) => {
     const numericProfileId = Number(profileId || profileIdFromLabel(profile) || 0);
     const label = oneLineField(profile || numericProfileId || "", 180);
@@ -15344,6 +15541,14 @@ async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState
     if (isFacebookProfileQuarantinedForFacebook(label, state, groupUrl)) return;
     const approvalOnlyProfile = isFacebookAdminApprovalProfileId(numericProfileId, state, groupUrl) || isFacebookAdminApprovalProfileLabel(label, state, groupUrl);
     if (isBlockedIxBrowserProfileLabel(label, state) && !approvalOnlyProfile) return;
+    // LAST gate, deliberately (2026-07-26 review): a profile only lands in __preflightExcluded after it has passed
+    // every HARD gate above (SYL-dedicated, quarantined, name-blocked, suspended, disconnected, cooldown). The
+    // never-empty fallback below re-admits this list verbatim, so anything stashed here must already be otherwise
+    // eligible -- otherwise that fallback could resurrect a quarantined account into the approval pool.
+    if (__preflightUnusableIds.has(String(numericProfileId))) {
+      __preflightExcluded.push({ profileId: numericProfileId, profile: label, groupUrl, source: oneLineField(source, 80) });
+      return;
+    }
     seen.add(numericProfileId);
     candidates.push({ profileId: numericProfileId, profile: label, groupUrl, source: oneLineField(source, 80) });
   };
@@ -15393,6 +15598,16 @@ async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState
   // EQUAL ROTATION: order moderators least-used-first so approvals spread evenly across all of them instead
   // of always hitting the first-listed one. Stable sort keeps configured order for ties.
   const { counts: __apprUsage, lastApprovedAt: __apprLastAt } = facebookApprovalCountByProfile();
+  // NEVER-EMPTY FALLBACK for the preflight exclusion (gate 2, see __preflightUnusableIds). If honouring the
+  // preflight would leave ZERO moderators, put them all back: a wrong/stale verdict must never be able to stop
+  // approvals outright. Ordering (__authRank, just below) still tries the healthiest-looking account first, and
+  // the run-level moderator gate surfaces the real problem loudly rather than silently burying posts.
+  if (!candidates.length && __preflightExcluded.length) {
+    for (const c of __preflightExcluded) { if (!seen.has(c.profileId)) { seen.add(c.profileId); candidates.push(c); } }
+    try { logEvent("admin_approval_preflight_exclusion_bypassed_pool_would_be_empty", { restored: __preflightExcluded.length, groupUrl }); } catch (_) {}
+  } else if (__preflightExcluded.length) {
+    try { logEvent("admin_approval_preflight_unusable_excluded", { excluded: __preflightExcluded.map((c) => c.profileId).join(","), remaining: candidates.length, groupUrl }); } catch (_) {}
+  }
   // MODERATOR ROTATION (2026-07-11): least-used FIRST (primary), then oldest-successful-approval FIRST (secondary)
   // so the moderator that just approved sinks to the back -> approvals spread evenly across moderators, reducing
   // per-account suspension risk. A never-yet-successful moderator (lastAt 0) sorts to the very front, which is
@@ -16112,6 +16327,10 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
   }
   const attempts = [];
   const MAX_ADMIN_APPROVAL_ATTEMPTS = 6;
+  // Attempts that actually reached Facebook. An attempt flagged `zeroWork` was rejected by the profile-in-use
+  // mutex before any browser opened (see the forced-lock-grant comment further down), so it must not spend one of
+  // the 6 slots -- otherwise a session's real budget is consumed by pure lock churn.
+  const __realAttemptCount = () => attempts.reduce((n, a) => n + (a && a.zeroWork ? 0 : 1), 0);
   const MAX_ADMIN_APPROVAL_WALL_CLOCK_MS = 8 * 60 * 1000;
   // Budget that must remain AFTER queueing for a moderator lock for the attempt to be worth starting at all.
   // Measured median real approval work is ~96-112s, so a leg arriving with less than this can only bail --
@@ -16130,7 +16349,7 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
   outer: for (const postUrl of targetUrls) {
     let urlMarkerMissing = false;
     for (const adminProfile of adminProfiles) {
-      if (attempts.length >= MAX_ADMIN_APPROVAL_ATTEMPTS) { budgetExceeded = true; break outer; }
+      if (__realAttemptCount() >= MAX_ADMIN_APPROVAL_ATTEMPTS) { budgetExceeded = true; break outer; }
       // Strictly bound the HELD box-wide moderator lock: the 8-min cap was only checked
       // BETWEEN attempts, so a single 6-min attempt could hold the lock ~14 min and stall
       // every other pending-post approval. Never start an attempt with <20s of budget, and
@@ -16201,7 +16420,10 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
         break outer;
       }
       closeResults.push(...(attempt.closeResults || []));
-      attempts.push({
+      // Keep a reference to the STORED record. `attempts` holds fresh literals, not `attempt` itself, so the
+      // zeroWork flag set further down must be written HERE, on the array element -- an adversarial review caught
+      // that marking `attempt` instead made the whole un-counting change a silent no-op.
+      const __attemptRecord = {
         profileId: attempt.profileId,
         profile: attempt.profile,
         postUrl: attempt.postUrl || postUrl,
@@ -16209,7 +16431,9 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
         validation: attempt.validation,
         liveLogFile: attempt.liveLogFile || "",
         message: oneLineField(attempt.message || "", 300),
-      });
+        zeroWork: false,
+      };
+      attempts.push(__attemptRecord);
       if (attempt.ok && attempt.postUrl) {
         try { releaseModeratorBlocked(attempt.profileId); } catch (_) {} // this moderator just approved successfully -> auto-clear any temporary block (retest passed)
         return {
@@ -16269,6 +16493,26 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
       // a glitchy 41) must never stop us from trying the other (42). Only a real pending-queue scan (the
       // fast-bail below) ends the cycle. This is what lets a working moderator approve when another errors.
       const attemptErrored = !attempt.validation || (Array.isArray(attempt.validation.errors) && attempt.validation.errors.some((e) => /profile_busy|quarantined|name_blocked|connector_failed|session|timeout|page_unavailable|not_found/i.test(String(e || ""))));
+      // ZERO-WORK ATTEMPT -> DON'T BURN AN ATTEMPT SLOT (2026-07-26). acquireAdminApprovalLock force-grants the
+      // lock when its wait times out (192s cap) even though the prior holder may legitimately still be working
+      // (a holder can hold for up to MAX_ADMIN_APPROVAL_ATTEMPT_MS = 240s) -- so the waiter times out ~48s too
+      // early BY CONSTRUCTION, takes the forced grant, and is then rejected with certainty by the SECOND,
+      // non-bypassable mutex in acquireNormalIxProfileUse. Measured today: 219 forced grants totalling 252.5 min,
+      // 219 of them followed by a profile_busy rejection on the SAME profile within 5 seconds.
+      // No browser was opened and no Facebook work was done, so counting it against MAX_ADMIN_APPROVAL_ATTEMPTS
+      // silently spends the session's real budget on nothing -- which is why budget-exceeded sessions managed only
+      // 2-3 genuine tries. Un-count it; the wall-clock cap above still bounds the session, so this cannot loop.
+      // Safe by construction: no Approve was clicked, so __approvalInFlightKeys and the #fb<hex> marker gate are
+      // untouched and this cannot cause a double approval.
+      const __zeroWorkBusy = Array.isArray(attempt.validation?.errors)
+        && attempt.validation.errors.length === 1
+        && /^(admin_approval_profile_busy|ixbrowser_profile_busy|comment_recovery_profile_busy)$/i.test(String(attempt.validation.errors[0] || ""));
+      // Marked, NOT removed: the attempt stays in `attempts` so the ledger/report still shows it happened; only
+      // the CAP check below discounts it (see __realAttemptCount).
+      if (__zeroWorkBusy) {
+        __attemptRecord.zeroWork = true; // the ARRAY element -- see the comment at its construction
+        try { logEvent("facebook_admin_approval_zero_work_attempt_not_counted", { profileId: attempt.profileId, realAttempts: __realAttemptCount(), totalAttempts: attempts.length, maxAttempts: MAX_ADMIN_APPROVAL_ATTEMPTS }); } catch (_) {}
+      }
       if (attemptErrored && !attempt.validation?.noPendingPostForPublisher) {
         logEvent("facebook_admin_approval_profile_errored_trying_next", { profileId: attempt.profileId, errors: attempt.validation?.errors || ["unknown"] });
         continue;
@@ -16540,6 +16784,14 @@ async function runFacebookCommentRecoveryAttempt({ row, profileId, profileLabel,
     commentOnly: true,
     postUrl,
     imagePath: "",
+    // NO MANUAL-LOGIN WAIT for a commenter (2026-07-26). The shared payload builder sets waitForManualLogin:true
+    // with a 300s window, which is longer than this attempt's own 240s kill -- so a commenter whose Facebook
+    // session is gone just sat there until the server SIGKILLed it, and the clean "logged out" verdict never came
+    // back. Measured on one profile: 153 attempts, 130 timeouts, ZERO successes, 548 browser-minutes.
+    // Nobody is sitting at this machine to log a commenter in mid-run, so the wait buys nothing. false makes
+    // ensureFacebookLoggedIn take the assertFacebookLoggedIn fast-throw path instead (it still dismisses cookie
+    // banners and the forced-account-switch wall first, so a healthy profile cannot trip a false login wall).
+    waitForManualLogin: false,
   };
   let releaseProfileUse = () => {};
   try {
@@ -16627,6 +16879,24 @@ async function runFacebookCommentRecoveryAttempt({ row, profileId, profileLabel,
       payloadFile: scriptResult.payloadFile || "",
     });
     noteCommentAttemptOutcome(numericProfileId, validation); // OPERATOR 2026-06-26: track repeated commenter-specific failures -> auto comment-limit a broken commenter (post-only)
+    // LOGGED-OUT COMMENTER -> PARK (2026-07-26). `comment_profile_login_required` had exactly ONE occurrence in
+    // this whole file: the place that EMITS it. No park, blacklist or cooldown path keyed on it, so a profile
+    // whose Facebook session is simply gone was retried forever -- it hung until the 240s connector timeout, which
+    // the classifier then buckets as a generic transient "connector timed out" and answers with a 5-minute bench.
+    // Measured on the 14-day ledger tail: 153 attempts, 130 timeouts, ZERO successes ever, 548 browser-minutes.
+    // Route it to the same disconnected park the POSTING side already uses for facebook_profile_login_required, so
+    // it is excluded from the commenter pool (__parkedCommentIds) until the operator logs in and Releases it.
+    // KEYED ON THE ERROR TOKEN, NEVER ON A PROFILE ID: whichever profile emits this today or after the operator
+    // swaps accounts gets the same treatment, with nothing to edit in code.
+    // Deliberately NOT keyed on the generic timeout -- this file has two documented mass-false-park incidents, and
+    // a bare timeout is not evidence of a dead session.
+    if (!validation.ok && (validation.errors || []).some((e) => String(e) === "comment_profile_login_required")) {
+      try {
+        if (markProfileDisconnected(numericProfileId, cleanProfile, "commenter has no Facebook session (comment_profile_login_required)")) {
+          logEvent("comment_profile_logged_out_parked", { profileId: numericProfileId, profile: cleanProfile, postUrl });
+        }
+      } catch (_) {}
+    }
     if (!validation.ok) {
       recordPublishedPostCommentIssue({
         row,
@@ -17262,9 +17532,33 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
   // RELEASES it — the same exclusion the posting roster applies. This comment-recovery pool previously skipped
   // only comment-limited + cooldown, so logged-out/dead profiles (e.g. 45, 84) were opened to comment and failed.
   const __parkedCommentIds = new Set([...disconnectedProfileIdSet(__cState), ...erroredProfileIdSet(__cState), ...suspendedProfileIdSet(__cState)].map(String));
+  // WALL-CLOCK BUDGET ON THE ROSTER WALK (2026-07-26). MEASURED: the comment semaphore (maxConcurrentComments,
+  // default 4) is held across this ENTIRE loop, not per browser attempt -- the concurrency unit is "one post's
+  // whole recovery". Live numbers: average queue wait 82.4s, p99 17.9 min, worst single lock hold 30.4 min. One
+  // doomed walk therefore removes 25% of all comment throughput for its full duration, which is a direct driver
+  // of the long tail every OTHER post sees.
+  // This is a DEFERRAL, never an abandonment: the post stays owed, is not marked failed, and the drain retries it.
+  // Sized so it can never cut a walk that was going to succeed -- 275 of 303 eventually-commented posts landed
+  // within their first 3 attempts, and at ~2.2 min/attempt a 6-min budget still permits ~3 profiles.
+  // Deliberately NOT "release the semaphore per attempt": that lets many posts interleave inside the same 4 slots
+  // and raises peak concurrent chrome (already 67, peak 105) and profile opens (1,661 vs a learned limit of 1,072).
+  const COMMENT_WALK_BUDGET_MS = clampNumber(__cState.operator?.commentWalkBudgetMinutes, 2, 30, 6) * 60 * 1000;
+  const __walkStartedAt = Date.now();
+  let __walkBudgetHit = false;
   for (const profile of profileList) {
     const profileId = Number(profile?.profileId || profile?.profile_id || profile);
     if (!profileId) continue;
+    if (Date.now() - __walkStartedAt > COMMENT_WALK_BUDGET_MS) {
+      __walkBudgetHit = true;
+      try {
+        logEvent("comment_recovery_walk_budget_reached", {
+          postUrl, planId: row?.planId, sequence: row?.sequence,
+          elapsedMs: Date.now() - __walkStartedAt, budgetMs: COMMENT_WALK_BUDGET_MS,
+          attemptsMade: attempts.length, profilesRemaining: Math.max(0, totalProfiles - attempts.length),
+        });
+      } catch (_) {}
+      break; // hand the comment slot back; the post stays owed and the drain picks it up again
+    }
     if (__parkedCommentIds.has(String(profileId))) {
       attempts.push({ profileId, profile: profile?.profile || profile?.label || profileId, ok: false, skipped: "parked_profile_not_released" });
       continue; // disconnected/errored/suspended -> never comment until admin releases (matches posting roster)
@@ -17430,6 +17724,13 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
   return {
     ok: false,
     posted: true,
+    // Ran out of wall-clock budget with profiles still untried. Reported as its OWN signal and deliberately NOT
+    // as deferredCapacity: an adversarial review caught that conflation, and it was a real defect. A capacity
+    // refusal opens NO browser and learns nothing, so clearing its backoff is right; a walk-budget break has
+    // already opened ~3 browsers and made real failing attempts, so clearing the backoff would re-walk a doomed
+    // post on every 3-min drain tick with no throttle at all -- defeating both the escalating chronic backoff and
+    // the provably-pending 30-min floor. The caller keeps the normal backoff for this case.
+    walkBudgetHit: __walkBudgetHit || undefined,
     postUrl,
     planId: row.planId,
     sequence: row.sequence,
@@ -17443,9 +17744,11 @@ async function recoverFacebookCommentWithProfilesInner({ row, ready, groupUrl, p
     payloadDeleted: false,
     liveLogFile: lastAttempt?.liveLogFile || "",
     script: path.relative(ROOT, liveFacebookPostingScriptPath()).replace(/\\/g, "/"),
-    message: attempts.length
-      ? `Post published, but the first-comment link was not verified after ${attempts.length} profile attempt(s).`
-      : "Post published, but no approved fallback profile is assigned to this group for first-comment recovery.",
+    message: __walkBudgetHit
+      ? `Deferred: the comment roster walk hit its ${Math.round(COMMENT_WALK_BUDGET_MS / 60000)}-min budget after ${attempts.length} attempt(s); the comment is still owed and will be retried.`
+      : (attempts.length
+        ? `Post published, but the first-comment link was not verified after ${attempts.length} profile attempt(s).`
+        : "Post published, but no approved fallback profile is assigned to this group for first-comment recovery."),
     validation: failedCommentRecoveryValidationFromAttempts(attempts),
     liveLog: [],
     state: readState(),
@@ -18216,6 +18519,18 @@ let __lastCommentResweepAt = 0;
 // approval / not yet visible) must NOT be re-cycled through profiles every 90s sweep — that was the overnight profile
 // churn (a stuck post burning profiles repeatedly). Skip it for ~20min, then retry (in case it went live/approved).
 const __commentRecoveryBackoff = new Map(); // postUrl -> last-attempt ms
+// CAPACITY DEFER (2026-07-26). MEASURED as the single largest latency term in the post->comment cycle.
+// `recoverFacebookCommentWithProfilesInner` already returns `deferredCapacity: true` with the explicit contract
+// "caller: do NOT treat as a failed attempt, do NOT escalate the backoff" -- but grep proved that field had ZERO
+// consumers anywhere in this file. So a comment refused purely because the box had no free browser slot (NO
+// browser opened, NOTHING attempted, NOTHING learned) was stamped exactly like a real failure and then waited the
+// full escalating backoff -- measured median 29.8 min to the next real attempt. That is the "125 x Posting
+// headroom reserved" line in the blocking-reason counts.
+// A bare delete would be wrong the other way: while the box stays saturated the post would be re-picked on every
+// ~3-min drain tick and re-refused, a retry storm. So a capacity defer clears the failure stamp and instead sets a
+// SHORT floor -- soon, but not instantly.
+const __capacityDeferAt = new Map(); // postUrl -> ms of the last pure-capacity refusal
+const CAPACITY_DEFER_FLOOR_MS = 75 * 1000; // ~1 slot-turnover; short enough to feel immediate, long enough to not storm a saturated box
 const COMMENT_RECOVERY_BACKOFF_MS = 4 * 60 * 1000; // operator 2026-06-28: re-check every ~4 min so EVERY post is commented within ~5-6 min of going PUBLIC (was 22 min). TRADE-OFF: a still-pending post is re-tried (and re-fires moderator approval) every ~4 min instead of ~22 min — more approval attempts on the thin 2-moderator pool. Accepted for fast commenting.
 // STUCK-SOFT-APPROVED RE-APPROVAL (2026-07-11, adversarially verified). A post SOFT-approved (approvalClicked but never
 // strong-verified) by the OLD miss-prone Approve code never actually became public, so re-commenting it forever is
@@ -18610,6 +18925,14 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         const __pending = __isProvablyPending(postUrl);
         const __effBackoffMs = (__pending && !__forcedSweep) ? Math.max(__backoffMs, PENDING_PUBLIC_BACKOFF_MS) : __backoffMs;
         if (Date.now() - __boAt < __effBackoffMs) { summary.stillMissing += 1; continue; } // tried recently + still uncommented -> defer (don't re-cycle profiles on a stuck/pending post)
+        // Pure-capacity refusal floor (see __capacityDeferAt): the previous pass opened no browser and learned
+        // nothing, so this post is NOT backed off -- but don't re-pick it within the same slot turnover either.
+        // Applies to FORCED sweeps too, deliberately. The always-on persistent drain runs with drain:true (i.e.
+        // __forcedSweep), so exempting it would let a capacity-deferred post be re-picked on every 3-min drain
+        // tick. 75s is far shorter than that tick, so a finish-drain still tries everything it owes -- it just
+        // cannot spin on a post the box has no slot for.
+        const __capAt = __capacityDeferAt.get(postUrl) || 0;
+        if (__capAt && Date.now() - __capAt < CAPACITY_DEFER_FLOOR_MS) { summary.stillMissing += 1; continue; }
         if (!__forcedSweep) __commentRecoveryBackoff.set(postUrl, Date.now()); // record this attempt (set BEFORE attempting so a timeout/crash still backs off) -- unchanged: still stamped at SELECTION time for normal sweeps, same as before
         if (__commentRecoveryBackoff.size > 3000) { const cut = Date.now() - 2 * COMMENT_RECOVERY_BACKOFF_MS; for (const [k, v] of __commentRecoveryBackoff) if (v < cut) __commentRecoveryBackoff.delete(k); } // bound memory
         // STUCK-SOFT ROUTING (2026-07-11): a post soft-approved but stuck pending (>=35min, >=3 profiles blocked, never
@@ -18680,7 +19003,27 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
               preloadedLedgerRows: rows, // PERF (adversarial review finding): avoid re-reading+re-parsing the whole (146MB+, growing) ledger file inside facebookCommentSoftSuccessFallbackEligible on every concurrently-dispatched candidate in this pass -- reuse the SAME `rows` snapshot this pass already loaded above.
             });
             if (res?.skipped) { summary.skippedInFlight = (summary.skippedInFlight || 0) + 1; } // DOUBLE-COMMENT GUARD: the per-post in-flight lock skipped this — ANOTHER attempt is actively committing the comment. NOT a failure: do not count it stillMissing and do NOT stamp the backoff (that 8-min poison would delay re-checking a post that ends up genuinely uncommented if the in-flight attempt fails). Left un-backed-off, the next sweep re-checks it immediately.
-            else if (res?.ok || latestDifferentProfileVerifiedCommentForPost(c.postUrl, c.publisherId)) summary.recommented += 1;
+            else if (res?.walkBudgetHit) {
+              // Real browser attempts were made and failed; only the ROSTER was cut short. Count it as a normal
+              // miss and KEEP the selection-time backoff stamp, so the escalating chronic backoff and the
+              // provably-pending floor both still apply. (Distinct from deferredCapacity below, which is a
+              // no-work refusal.) The post stays owed; the drain resumes it after the normal backoff.
+              summary.stillMissing += 1;
+              summary.walkBudgetDeferred = (summary.walkBudgetDeferred || 0) + 1;
+              if (c.__forcedSweep) __commentRecoveryBackoff.set(c.postUrl, Date.now());
+            }
+            else if (res?.deferredCapacity) {
+              // CAPACITY, NOT FAILURE (2026-07-26). Honour the contract the producer already documented. No browser
+              // was opened and no comment was submitted, so this cannot create a double-comment: the per-post
+              // in-flight lock, the in-memory verified-comment map, the ledger dedup index and the connector's own
+              // dup-check are all untouched. It also cannot abandon an owed comment -- the post stays owed and is
+              // simply retried sooner. Clear the selection-time stamp and apply the short floor instead.
+              summary.capacityDeferred = (summary.capacityDeferred || 0) + 1;
+              __commentRecoveryBackoff.delete(c.postUrl);
+              __capacityDeferAt.set(c.postUrl, Date.now());
+              if (__capacityDeferAt.size > 3000) { const cut = Date.now() - 10 * CAPACITY_DEFER_FLOOR_MS; for (const [k, v] of __capacityDeferAt) if (v < cut) __capacityDeferAt.delete(k); }
+            }
+            else if (res?.ok || latestDifferentProfileVerifiedCommentForPost(c.postUrl, c.publisherId)) { summary.recommented += 1; __capacityDeferAt.delete(c.postUrl); }
             else { summary.stillMissing += 1; if (c.__forcedSweep) __commentRecoveryBackoff.set(c.postUrl, Date.now()); } // forced sweep: stamp backoff only AFTER a real failure, so a clean attempt isn't poisoned by a race
           } catch (err) {
             if (c.__forcedSweep) __commentRecoveryBackoff.set(c.postUrl, Date.now()); // forced sweep: a thrown attempt also backs off (parity with the set-before path)
