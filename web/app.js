@@ -4616,16 +4616,35 @@ async function renderModeratorRecommendation() {
       box.className = "roleHint";
       return;
     }
+    // SUCCESS RATE FIRST. approvalDurationMinutes is elapsed-until-resolved, NOT moderator work time -- it
+    // includes every failed retry. Sizing a pool from it measures WASTE, not capacity, and would tell the
+    // operator to buy accounts that cannot help. Measured 2026-07-26: 2 of 17 approvals succeeded, and the
+    // slowest posts had already been tried by ALL configured moderators 7-11 times, every one failing with
+    // admin_approval_post_marker_not_verified. When approvals FAIL rather than QUEUE, more accounts add more
+    // failures, not more throughput. So: check the success rate before advising anything about pool size.
+    const okCount = pend.filter(function (d) { return d.approvedByModerator; }).length;
+    const okPct = pend.length ? Math.round(okCount * 100 / pend.length) : null;
     const perHour = pend.length / hours;
-    const avgMin = appr.length ? (appr.reduce(function (a, d) { return a + d.approvalDurationMinutes; }, 0) / appr.length) : 2.5;
-    const busy = (perHour * avgMin) / 60;          // moderators needed at 100% utilisation
-    const need = Math.max(1, Math.ceil(busy * 2)); // x2 headroom, never advise 0
+    if (okPct != null && okPct < 60 && pend.length >= 5) {
+      box.innerHTML = '<b>Do NOT add moderators.</b> Only <b>' + okCount + '/' + pend.length + '</b> ('
+        + okPct + '%) of moderated posts were actually approved — the approvals are <b>failing</b>, not queuing.'
+        + '<br><small>Adding accounts multiplies the failures instead of the throughput. The blocker is the post '
+        + 'not being found in the pending queue, not a shortage of moderators. You have <b>' + configured + '</b>, '
+        + 'which is enough for ' + perHour.toFixed(1) + ' moderated posts/h.</small>';
+      box.className = "roleHint warn";
+      return;
+    }
+    // Healthy success rate -> size the pool on REAL work time (median session ~2.5 min), x2 for bursts.
+    const avgMin = 2.5;
+    const busy = (perHour * avgMin) / 60;
+    const need = Math.max(1, Math.ceil(busy * 2));
     const enough = configured >= need;
     box.innerHTML = '<b>Recommended: ' + need + ' moderator' + (need > 1 ? 's' : '') + '</b> — you have <b>' + configured + '</b>. '
       + (enough ? '&#10003; Enough.' : '&#9888; Add ' + (need - configured) + '.')
       + '<br><small>' + modGroups.length + ' group' + (modGroups.length > 1 ? 's' : '') + ' need approval &middot; '
-      + perHour.toFixed(1) + ' posts/h go through moderation &middot; ' + avgMin.toFixed(1) + ' min per approval &middot; '
-      + 'that is ' + (busy * 100).toFixed(0) + '% of one moderator, doubled for bursts.</small>';
+      + perHour.toFixed(1) + ' posts/h moderated &middot; ~' + avgMin + ' min of real work per approval &middot; '
+      + 'that is ' + (busy * 100).toFixed(0) + '% of one moderator, doubled for bursts'
+      + (okPct != null ? ' &middot; ' + okPct + '% approved' : '') + '.</small>';
     box.className = "roleHint " + (enough ? "ok" : "warn");
   } catch (e) {
     box.textContent = "";
