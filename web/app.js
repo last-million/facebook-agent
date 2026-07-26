@@ -4581,7 +4581,59 @@ function prodRoleLabelFor(id) {
   const name = (p && (p.name || p.title)) || "";
   return name ? (id + " - " + name) : String(id);
 }
+// MODERATOR SIZING ADVICE (operator 2026-07-26: "how many moderators do I need?"). Computed from the LIVE run
+// report, never hardcoded: only groups actually flagged requiresAdminApproval generate approval work, and one
+// approval session costs a measurable amount of moderator time. Needed = (approval-posts/hour x session minutes)
+// / 60, then doubled for headroom (bursts, a logged-out account, retries). Shown next to the picker so the
+// number is visible exactly where the decision is made. Falls back to a plain explanation when there is no data.
+async function renderModeratorRecommendation() {
+  const box = document.getElementById("prodModeratorRecommendation");
+  if (!box) return;
+  try {
+    const st = (workflowState && workflowState.posting) ? workflowState : ((await api("/api/state").catch(() => null)) || {}).state;
+    const gad = (st && st.posting && st.posting.groupAssignmentData) || [];
+    const groups = Array.isArray(gad) ? gad : (function () { try { return JSON.parse(gad); } catch (e) { return []; } })();
+    const modGroups = groups.filter(function (g) { return g && g.requiresAdminApproval; });
+    const configured = String(((st && st.ixbrowser && st.ixbrowser.moderatorProfiles) || "")).split(/\r?\n/).filter(function (l) { return /^\s*\d/.test(l); }).length;
+
+    if (!modGroups.length) {
+      box.innerHTML = '<b>Recommended: 1 moderator</b> (spare only). No group currently requires approval — '
+        + 'posts publish directly, so moderators do almost nothing. You have <b>' + configured + '</b>.';
+      box.className = "roleHint ok";
+      return;
+    }
+    const rep = await api("/api/reports/runs").catch(function () { return null; });
+    const run = rep && rep.runs && rep.runs[0];
+    const det = (run && run.detail) || [];
+    const appr = det.filter(function (d) { return d.approvalDurationMinutes != null; });
+    const pend = det.filter(function (d) { return d.wasPendingApproval; });
+    const hours = Number(run && run.durationMin) > 0 ? (run.durationMin / 60) : 0;
+
+    if (!hours || !pend.length) {
+      box.innerHTML = '<b>' + modGroups.length + ' group' + (modGroups.length > 1 ? 's' : '') + ' need approval.</b> '
+        + 'Not enough data in the current run yet to size the pool — the number appears once posts have gone through moderation. '
+        + 'You have <b>' + configured + '</b> configured.';
+      box.className = "roleHint";
+      return;
+    }
+    const perHour = pend.length / hours;
+    const avgMin = appr.length ? (appr.reduce(function (a, d) { return a + d.approvalDurationMinutes; }, 0) / appr.length) : 2.5;
+    const busy = (perHour * avgMin) / 60;          // moderators needed at 100% utilisation
+    const need = Math.max(1, Math.ceil(busy * 2)); // x2 headroom, never advise 0
+    const enough = configured >= need;
+    box.innerHTML = '<b>Recommended: ' + need + ' moderator' + (need > 1 ? 's' : '') + '</b> — you have <b>' + configured + '</b>. '
+      + (enough ? '&#10003; Enough.' : '&#9888; Add ' + (need - configured) + '.')
+      + '<br><small>' + modGroups.length + ' group' + (modGroups.length > 1 ? 's' : '') + ' need approval &middot; '
+      + perHour.toFixed(1) + ' posts/h go through moderation &middot; ' + avgMin.toFixed(1) + ' min per approval &middot; '
+      + 'that is ' + (busy * 100).toFixed(0) + '% of one moderator, doubled for bursts.</small>';
+    box.className = "roleHint " + (enough ? "ok" : "warn");
+  } catch (e) {
+    box.textContent = "";
+  }
+}
+
 function renderProdRoleSelects() {
+  try { renderModeratorRecommendation(); } catch (e) {}
   const mod = $("prodModeratorProfileSelect");
   const exc = $("prodExcludedProfileSelect");
   const syl = $("prodSylProfileSelect");

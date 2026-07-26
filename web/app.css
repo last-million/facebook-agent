@@ -1129,3 +1129,9 @@ body[data-active-view="integrations"] .mainGrid .prodRoles.viewVisible { order: 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* Moderator sizing advice shown next to the role picker (2026-07-26) */
+.roleHint { margin: 0 0 8px; padding: 8px 10px; border-radius: var(--r-sm, 6px); border: 1px solid var(--line); background: var(--surface-2, rgba(255,255,255,.03)); font-size: 12.5px; line-height: 1.45; }
+.roleHint small { opacity: .7; display: block; margin-top: 3px; }
+.roleHint.ok { border-color: rgba(80,200,120,.45); }
+.roleHint.warn { border-color: rgba(240,180,60,.55); }
