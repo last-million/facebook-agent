@@ -3538,10 +3538,32 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
     await humanPause(4500, 8000);
     return result;
   }
+  // SAFETY BAILS ARE NOW TERMINAL (2026-07-26, found in adversarial review of a live incident-in-waiting).
+  // The containment climb above deliberately REFUSES to guess when the smallest container around our marker
+  // holds more than one Approve, or holds none. Those are positive determinations of "cannot click safely".
+  // But the check directly above only returns on SUCCESS, so both refusals used to FALL THROUGH into the
+  // looser locator search below -- which included page.locator('div') (every ANCESTOR div of the marker, i.e.
+  // whole-queue containers) and then clicked the FIRST Approve inside one. On a populated queue that first
+  // control belongs to the TOP post, which the live diagnostics prove is frequently a REAL MEMBER's post
+  // ("Approve post by Kay", "by Ross", "by Anita", ... seen across 781 sessions). In other words the
+  // 2026-07-11 anti-mass-approve guard was being silently undone by the code beneath it. It has not fired yet
+  // only because these sessions have been landing on the bare group feed, which renders no Approve controls
+  // at all -- pure luck, and any change that puts sessions back on the real queue would have triggered it.
+  // Refusing here loses nothing: the server simply records "not verified" and retries later, exactly as it
+  // already does for every other miss. Approving the WRONG post is irreversible; a retry is not.
+  if (directApprove.reason === 'ambiguous_multi_approve_not_fingerprint_scoped'
+      || directApprove.reason === 'no_perpost_approve_near_marker') {
+    result.reason = directApprove.reason;
+    await captureApprovalDiagnostic(page, matchKey).catch(() => {});
+    return result; // fail closed -- never fall through to a search that is not pinned to the marker's own row
+  }
   const roots = [
     page.locator('[role="article"]').filter({ hasText: matchKey }),
     page.locator('[data-pagelet]').filter({ hasText: matchKey }),
-    page.locator('div').filter({ hasText: matchKey }),
+    // NOTE: a bare page.locator('div') root was REMOVED here. It matched every ancestor div of the marker, and
+    // the loop below walks the OUTERMOST matches first, so it scoped to whole-queue containers rather than the
+    // post's own cell -- the exact path that could click another member's Approve. [role="article"] and
+    // [data-pagelet] stay: both are per-post containers, so a match is still pinned to one post.
   ];
   for (const root of roots) {
     const count = await root.count().catch(() => 0);
@@ -3550,10 +3572,18 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
       if (!(await scoped.isVisible({ timeout: 700 }).catch(() => false))) continue;
       await scoped.scrollIntoViewIfNeeded({ timeout: 3000 }).catch(() => {});
       // (a) DIRECT Approve button (older FB UI — keep as a fast path).
+      // BULK CONTROL EXCLUSION (2026-07-26): the real bulk button on this queue is labelled
+      // "Approve selected pending posts" -- it contains NO word like "all"/"todo"/"tous", so the 2026-07-25
+      // BULK_APPROVE_RE guard never matched it, and it was seen 86 times in 26h of live diagnostics. All three
+      // candidates below could select it: getByRole name-matching, the unanchored hasText, and especially the
+      // [aria-label*="Approve"] SUBSTRING match. Exclude the "selected" family explicitly, in every language
+      // the rest of this file already covers, so a per-post path can never trip a mass approval.
+      const notBulk = ':not([aria-label*="selected" i]):not([aria-label*="seleccionad" i]):not([aria-label*="sélectionn" i]):not([aria-label*="selezionat" i]):not([aria-label*="ausgewählt" i]):not([aria-label*="selecionad" i])';
+      const BULK_LABEL_RE = /selected pending|seleccionad|sélectionn|selezionat|ausgewählt|selecionad|المحدد|المختار/i;
       let clicked = await clickFirst(page, [
-        scoped.getByRole('button', { name: approveName }),
-        scoped.locator('button, [role="button"]').filter({ hasText: approveText }),
-        scoped.locator('[aria-label*="Approve" i], [aria-label*="Approuver" i], [aria-label*="Aprobar" i], [aria-label*="موافقة"], [aria-label*="قبول"]'),
+        scoped.getByRole('button', { name: approveName }).filter({ hasNotText: BULK_LABEL_RE }),
+        scoped.locator('button, [role="button"]').filter({ hasText: approveText }).filter({ hasNotText: BULK_LABEL_RE }),
+        scoped.locator('[aria-label*="Approve" i]' + notBulk + ', [aria-label*="Approuver" i]' + notBulk + ', [aria-label*="Aprobar" i]' + notBulk + ', [aria-label*="موافقة"]' + notBulk + ', [aria-label*="قبول"]' + notBulk),
       ], { timeout: 2500 });
       // (b) NEW admin queue: "Approve" is a standalone text button in the post's action bar, but it is often
       // a SIBLING of the article node (not a descendant) so the scoped locator above can miss it. Fall back
