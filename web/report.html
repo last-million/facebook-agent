@@ -183,6 +183,41 @@ function grpPill(g){
 }
 function rateBar(p){ var cls = p>=90?"":(p>=70?"warn":"bad"); return '<div class="bar '+cls+'"><i style="width:'+Math.max(2,Math.min(100,p))+'%"></i></div>'; }
 function statCard(k,v,x,cls){ return '<div class="stat '+(cls||"")+'"><div class="k">'+esc(k)+'</div><div class="v">'+v+'</div><div class="x">'+esc(x)+'</div></div>'; }
+// TOTAL ELAPSED, as a live stopwatch (operator request): "how much time from the start until now".
+// For the LIVE run this must TICK — the page only reloads every 30s, so a value baked in at render time
+// would sit frozen and look broken. The value element carries the two timestamps as data-attributes and a
+// 1s interval below rewrites just that text, so the counter runs smoothly without re-fetching anything.
+function fmtElapsed(ms){
+  if (ms == null || !isFinite(ms) || ms < 0) return "—";
+  var s = Math.floor(ms/1000);
+  var h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  var p2 = function(n){ return (n<10?"0":"")+n; };
+  return (h>0 ? h+"h "+p2(m)+"m "+p2(sec)+"s" : m+"m "+p2(sec)+"s");
+}
+function elapsedCard(r){
+  var fromMs = Date.parse(r.startedAt || 0);
+  if (!isFinite(fromMs)) return "";
+  // live run -> count to NOW (ticking); finished run -> freeze at its last post
+  var live = !!r.live;
+  var toIso = live ? "" : (r.endedAt || r.startedAt || "");
+  var nowMs = live ? Date.now() : Date.parse(toIso || 0);
+  var val = '<span class="elapsedTick" data-from="'+esc(r.startedAt)+'" data-to="'+esc(toIso)+'">'
+    + fmtElapsed(nowMs - fromMs) + '</span>';
+  return statCard(live ? "Durée (en cours)" : "Durée totale", val,
+    live ? "depuis le démarrage — compteur en direct" : "du 1er au dernier post", live ? "v" : "");
+}
+// one global ticker for every elapsed card currently on screen
+setInterval(function(){
+  var els = document.querySelectorAll(".elapsedTick");
+  for (var i=0;i<els.length;i++){
+    var el = els[i];
+    var from = Date.parse(el.getAttribute("data-from") || 0);
+    if (!isFinite(from)) continue;
+    var toAttr = el.getAttribute("data-to") || "";
+    if (toAttr) continue; // finished run: value is fixed, nothing to tick
+    el.textContent = fmtElapsed(Date.now() - from);
+  }
+}, 1000);
 
 function load(force){
   var u = "/api/reports/runs" + (force?"?force=1":"");
@@ -258,6 +293,7 @@ function runBody(r){
     approvalWaitCard = statCard("Approval wait", __avgWait+'<small> min avg</small>', __waitedMins.length+" post(s) waited, max "+__maxWait+" min", __avgWait>=15?"r":(__avgWait>=8?"a":"g"));
   }
   var html = '<div class="stats">'
+    + elapsedCard(r)
     + statCard("Posts published", r.posts, "over "+r.durationMin+" min", "")
     + statCard("Average post time", fmtMinSec(r.avgPostIntervalSec), "between posts going public (includes moderator-approval wait)", "v")
     + statCard("Unique products", (r.uniqueProducts||0), (r.productsInBoth||0)+" in both groups", (r.uniqueProducts? (r.productsInBoth>0?"g":"a") : ""))
