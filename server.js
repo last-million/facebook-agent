@@ -14962,6 +14962,18 @@ function facebookApprovalCountByProfile() {
   return { counts, lastApprovedAt };
 }
 
+// Per-moderator browser-session health, learned from real approval attempts. profileId -> {authAt, unauthAt}.
+// IN-MEMORY ON PURPOSE: it is an ordering hint, not a bench, so losing it on restart is harmless (the pool just
+// starts neutral again) and it can never leave a stale exclusion behind. Nothing here removes a profile from any
+// pool, so an operator Release needs no extra wiring -- there is no persisted state for it to clear.
+const __moderatorSessionHealth = new Map();
+function noteModeratorSessionHealth(profileId, authenticated) {
+  const pid = Number(profileId) || 0;
+  if (!pid || authenticated === null || typeof authenticated === "undefined") return; // undetermined -> learn nothing
+  const cur = __moderatorSessionHealth.get(pid) || { authAt: 0, unauthAt: 0 };
+  if (authenticated) cur.authAt = Date.now(); else cur.unauthAt = Date.now();
+  __moderatorSessionHealth.set(pid, cur);
+}
 async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState(), options = {}) {
   const excludedIds = new Set([options.excludeProfileId, options.publisherProfileId]
     .map((value) => Number(value || 0))
@@ -15045,9 +15057,27 @@ async function facebookAdminApprovalProfilesForGroup(groupUrl, state = readState
   // so the moderator that just approved sinks to the back -> approvals spread evenly across moderators, reducing
   // per-account suspension risk. A never-yet-successful moderator (lastAt 0) sorts to the very front, which is
   // correct (give it work). Ties fall through to configured order (stable sort).
+  // SESSION-HEALTH FIRST (2026-07-26, operator: "the system must work with what is available"). Measured:
+  // 66.8% of approve sessions ran on a browser profile with NO Facebook session and produced ZERO approvals,
+  // while the one profile that was logged in produced ALL of them. Least-used-first alone kept feeding work to
+  // provably-dead browsers because "least used" and "useless" look identical to a usage counter.
+  // This is ORDERING ONLY -- deliberately NOT an exclusion. An adversarial review proved that benching on this
+  // signal would have removed the ONLY working moderator for 22 hours over 14 days (its cookie reads as empty
+  // in ~4% of sessions even while authenticated), and with a 3-moderator pool that means approvals stop dead.
+  // Ordering cannot empty the pool by construction: every candidate is still tried, just in a smarter order.
+  // Fully self-healing and needs no operator action: one authenticated session moves a profile back to the
+  // front, one unauthenticated session sinks it, and the memory is in-process so a restart starts neutral.
+  const __authRank = (pid) => {
+    const st = __moderatorSessionHealth.get(Number(pid));
+    if (!st) return 1;                       // unknown -> middle: never punish a profile we have not observed
+    if (st.authAt && st.authAt >= st.unauthAt) return 0;  // most recently seen WITH a Facebook session -> first
+    return 2;                                // most recently seen WITHOUT one -> last, but still tried
+  };
   candidates.sort((a, b) => {
+    const ra = __authRank(a.profileId), rb = __authRank(b.profileId);
+    if (ra !== rb) return ra - rb;           // session health dominates
     const ca = __apprUsage.get(a.profileId) || 0, cb = __apprUsage.get(b.profileId) || 0;
-    if (ca !== cb) return ca - cb;
+    if (ca !== cb) return ca - cb;           // then the existing least-used fairness (unchanged)
     return (__apprLastAt.get(a.profileId) || 0) - (__apprLastAt.get(b.profileId) || 0);
   });
   const __out = candidates.slice(0, MAX_APPROVAL_MODERATOR_POOL);
@@ -15923,6 +15953,8 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
       // and let the rotation try the next moderator. (sessionAuthenticated === null means "could not determine",
       // which deliberately keeps today's behaviour rather than guessing.)
       const __sessionAuth = attempt.validation?.sessionAuthenticated;
+      // Feed the ordering memory so the next pool build tries the healthy browsers first (ordering only).
+      try { noteModeratorSessionHealth(attempt.profileId, __sessionAuth); } catch (_) {}
       if (markerMissingOnUrl && __sessionAuth === false) {
         try {
           logEvent("facebook_admin_approval_marker_miss_ignored_unauthenticated", {
