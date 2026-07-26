@@ -3898,6 +3898,10 @@ async function approvePendingPost(page, context, payload, gid, marker) {
   const attempts = [];
   const verified = [];
   let approvalResult = { clicked: false, confirmed: false, reason: 'not_attempted' };
+  // Whether THIS browser profile had a live Facebook session when we went to look at the queue.
+  // null = not determined. Declared at function scope so the final result can report it (see the
+  // approve_session_auth step below for why this matters).
+  let __sessionAuthenticated = null;
   // STEP 0 (critical): become the PERSONAL group-admin identity. Moderator profiles default to acting as
   // the posting Page, which cannot see/approve other members' pending posts (queue renders 0 Approve
   // buttons). Switching to the personal admin profile is what makes Approve/Decline appear. Idempotent.
@@ -3960,6 +3964,17 @@ async function approvePendingPost(page, context, payload, gid, marker) {
     }
   }
   if (!approvalResult.clicked) {
+    // SESSION-AUTHENTICATED SIGNAL (2026-07-26, measured: 66.8% of approve sessions ran on a browser profile with
+    // NO Facebook cookie). Facebook serves /groups/<gid>/pending_posts/ as a logged-out SHELL *without changing
+    // the URL*, so a blind scan of a login page looks exactly like a real "your post is not in the queue" answer.
+    // The server then trusted that answer and gave up on the post for EVERY remaining moderator -- 331 times in
+    // 24h -- including the one profile that actually works. Report the session state explicitly so the server can
+    // tell "I looked and it wasn't there" apart from "I never got to look".
+    try {
+      const __ids = await readFbIdentityCookies(page);
+      __sessionAuthenticated = Boolean(__ids && __ids.cUser);
+      console.log(JSON.stringify({ step: 'approve_session_auth', sessionAuthenticated: __sessionAuthenticated, cUser: (__ids && __ids.cUser) ? 'present' : '' }));
+    } catch (_) { __sessionAuthenticated = null; }
     const reviewSurface = await openGroupReviewSurface(page, groupUrl, marker, payload.publisherFacebookUserId || payload.facebookUserId, gid, Number(payload.__approveDeadlineAt) || 0);
     attempts.push({ target: groupUrl, ...reviewSurface });
     // Emit an explicit surface-reachability signal the server keys off of (separate from the
@@ -4032,6 +4047,10 @@ async function approvePendingPost(page, context, payload, gid, marker) {
     marker,
     postUrl: resolvedPostUrl,
     postPageUrl: resolvedPostUrl,
+    // See approve_session_auth above. false => this browser profile had NO Facebook session, so any
+    // "marker not found" from this session is a blind scan of a login shell and proves nothing about
+    // whether the post is really in the queue. null => could not determine; never treat as a negative.
+    sessionAuthenticated: (typeof __sessionAuthenticated === 'undefined') ? null : __sessionAuthenticated,
     bodyChecks: {
       markerVisible: checks.markerVisible || verified.some(item => item.hasMarker),
       ownControls: checks.ownControls,

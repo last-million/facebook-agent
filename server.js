@@ -15138,6 +15138,12 @@ function facebookAdminApprovalValidationFromLog(objects = [], postUrl = "") {
     noPendingPostForPublisher,
     approverLacksAdminRole,
     moderatorStuckForcedSwitch,
+    // Did this moderator's browser actually have a Facebook session when it looked at the queue?
+    // true / false / null (undetermined). Consumed by the blind-scan guard in the approval rotation:
+    // a "marker not found" from an unauthenticated session is not evidence the post is absent.
+    sessionAuthenticated: (resultStep && typeof resultStep.sessionAuthenticated !== "undefined")
+      ? resultStep.sessionAuthenticated
+      : null,
     ok: errors.length === 0,
     errors,
     warnings,
@@ -15907,6 +15913,25 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
       }
       const errs = Array.isArray(attempt.validation?.errors) ? attempt.validation.errors.map(e => String(e || '').toLowerCase()) : [];
       const markerMissingOnUrl = postUrl && errs.some(e => /admin_approval_post_marker_not_verified|admin_approval_page_unavailable|admin_approval_post_not_found_at_url/i.test(e));
+      // BLIND-SCAN GUARD (2026-07-26, measured). The break below rests on "the marker is not on this URL, so
+      // every OTHER moderator would see the same" -- which is only true if this moderator actually LOOKED.
+      // Facebook serves the pending-queue URL as a logged-out shell WITHOUT changing the URL, so a browser
+      // profile with no session scans a login page and reports an authoritative "not found". Measured over 24h:
+      // 66.8% of approve sessions ran with no Facebook cookie, and 331 times such a session went FIRST and made
+      // the whole post be abandoned for every remaining moderator -- including profile 16, the only one that
+      // actually approves anything. A session that never authenticated proves NOTHING; treat it as inconclusive
+      // and let the rotation try the next moderator. (sessionAuthenticated === null means "could not determine",
+      // which deliberately keeps today's behaviour rather than guessing.)
+      const __sessionAuth = attempt.validation?.sessionAuthenticated;
+      if (markerMissingOnUrl && __sessionAuth === false) {
+        try {
+          logEvent("facebook_admin_approval_marker_miss_ignored_unauthenticated", {
+            profileId: attempt.profileId, postUrl,
+            reason: "moderator_browser_had_no_facebook_session_so_the_scan_proves_nothing",
+          });
+        } catch (_) {}
+        continue; // try the next moderator instead of writing this post off
+      }
       if (markerMissingOnUrl) { urlMarkerMissing = true; break; }
     }
     if (urlMarkerMissing) {
