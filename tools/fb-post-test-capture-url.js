@@ -3676,6 +3676,68 @@ async function clickApproveForVisibleMarker(page, marker, publisherUserId = '', 
   return result;
 }
 
+// MODERATOR-RIGHTS PREFLIGHT (2026-07-26, operator: "at the start of prod he must open the moderators one by one
+// and verify they are really moderators in all the groups").
+// DELIBERATELY a separate, much lighter function than openGroupReviewSurface: it answers ONE question -- can this
+// account reach this group's pending queue -- and never scans, scrolls or clicks Approve. Keeping it off the live
+// approval path means a preflight change can never destabilise real approvals.
+// Verdict semantics, which the server depends on:
+//   hasRights: true   -> landed on /pending_posts|manage_post_queue|posts/pending  => really a moderator here
+//   hasRights: false  -> bounced to the group feed                                 => NOT a moderator here
+//   hasRights: null   -> could not tell (account blocked, login wall, nav failure)  => never treated as a verdict
+// The null case matters: a checkpointed account or a transient nav error must NEVER be reported as "not a
+// moderator", or the preflight would tell the operator to remove rights that are actually fine.
+async function probeGroupModeratorAccess(page, groupUrl, groupId = '') {
+  const rawBase = String(groupUrl || '').replace(/[?#].*$/, '').replace(/\/+$/, '');
+  let gid = String(groupId || '').replace(/\D+/g, '');
+  const out = { groupUrl, groupId: gid, hasRights: null, reason: '', landedUrl: '', accountBlocked: false };
+  const isAdminSurface = (u) => /\/(pending_posts|manage_post_queue|posts\/pending)/i.test(String(u || ''));
+  try {
+    // Resolve the NUMERIC id first: a vanity slug redirects the admin surface to the group feed, which would
+    // read as "not a moderator" on an account that genuinely is one (same trap the approve path documents).
+    if (!gid) {
+      await page.goto(rawBase, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+      await humanPause(2000, 3200);
+      if (await dismissForcedAccountSwitch(page)) await humanPause(1500, 2500);
+      gid = String(await resolveNumericGroupIdFromPage(page).catch(() => '') || '').replace(/\D+/g, '');
+      out.groupId = gid;
+    }
+    const snap = await facebookLoginSnapshot(page).catch(() => null);
+    if (snap && snap.accountBlocked) {
+      out.accountBlocked = true;
+      out.reason = snap.accountBlockReason || 'checkpoint_account_blocked';
+      out.landedUrl = String(snap.url || page.url() || '').slice(0, 200);
+      return out; // hasRights stays null: an unusable account is not evidence about group rights
+    }
+    if (snap && snap.loginRequired) { out.reason = 'login_required'; out.landedUrl = String(page.url() || '').slice(0, 200); return out; }
+    if (!gid) { out.reason = 'group_id_unresolved'; out.landedUrl = String(page.url() || '').slice(0, 200); return out; }
+    const base = `https://www.facebook.com/groups/${gid}`;
+    for (const target of [`${base}/pending_posts/`, `${base}/manage_post_queue`]) {
+      await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+      await humanPause(2500, 3800);
+      if (await dismissForcedAccountSwitch(page)) {
+        await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+        await humanPause(2500, 3500);
+      }
+      out.landedUrl = String(page.url() || '').slice(0, 200);
+      if (isAdminSurface(out.landedUrl)) { out.hasRights = true; out.reason = 'admin_surface_reached'; return out; }
+      const blocked = await facebookLoginSnapshot(page).catch(() => null);
+      if (blocked && blocked.accountBlocked) {
+        out.accountBlocked = true;
+        out.reason = blocked.accountBlockReason || 'checkpoint_account_blocked';
+        return out;
+      }
+    }
+    // Both admin surfaces bounced us away while the account is demonstrably logged in and the group resolved:
+    // that is the real "not a moderator of this group" signal.
+    out.hasRights = false;
+    out.reason = 'feed_redirect_not_moderator';
+  } catch (e) {
+    out.reason = 'probe_error:' + String((e && e.message) || e).slice(0, 120);
+  }
+  return out;
+}
+
 async function openGroupReviewSurface(page, groupUrl, marker, publisherUserId = '', groupId = '', deadlineAt = 0) {
   // deadlineAt (2026-07-13): epoch-ms self-deadline derived from the server's per-attempt kill budget. Stop
   // scanning/polling BEFORE the SIGKILL so this function's clean verdicts (marker_not_found / surface
@@ -4800,6 +4862,36 @@ async function main() {
     }
     catch (e) { console.log(JSON.stringify({ step: 'harvest_error', error: String((e && e.message) || e).slice(0, 300) })); }
     console.log(JSON.stringify({ step: 'harvest_result', count: harvested.length, items: harvested, lastFbid: harvestLastFbid }));
+    return; // the finally block closes the browser
+  }
+
+  if (payload.moderatorAudit) {
+    // PREFLIGHT MODE: one browser session per moderator, probing every approval-gated group in turn. One session
+    // for N groups (not N sessions) keeps the ixBrowser open-budget cost at exactly 1 per moderator.
+    const auditGroups = Array.isArray(payload.auditGroups) ? payload.auditGroups.slice(0, 40) : [];
+    const results = [];
+    let sessionAccountBlocked = false, sessionBlockReason = '';
+    for (const g of auditGroups) {
+      const r = await probeGroupModeratorAccess(page, String(g?.url || ''), String(g?.groupId || ''));
+      results.push(r);
+      console.log(JSON.stringify({ step: 'moderator_audit_group', profileId: payload.profileId, ...r }));
+      if (r.accountBlocked) {
+        // The moderator's own account is checkpointed/suspended: every remaining probe would return the same
+        // non-verdict, so stop and let the server park the account instead of burning the session.
+        sessionAccountBlocked = true;
+        sessionBlockReason = r.reason || 'checkpoint_account_blocked';
+        try { console.log(JSON.stringify({ step: 'facebook_account_blocked', mode: 'moderator_audit', accountBlocked: true, accountBlockReason: sessionBlockReason, url: r.landedUrl })); } catch (_) {}
+        break;
+      }
+      await humanPause(1200, 2200);
+    }
+    console.log(JSON.stringify({
+      step: 'moderator_audit_result',
+      profileId: payload.profileId,
+      accountBlocked: sessionAccountBlocked,
+      accountBlockReason: sessionBlockReason,
+      groups: results,
+    }, null, 2));
     return; // the finally block closes the browser
   }
 

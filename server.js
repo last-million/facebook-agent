@@ -2060,6 +2060,11 @@ function normalizeWorkflowState(state) {
       url: String(entry?.url || "").slice(0, 1000),
       sharePercent: clampNumber(entry?.sharePercent, 0, 100, 0),
       requiresAdminApproval: Boolean(entry?.requiresAdminApproval || entry?.requires_admin_approval || entry?.adminApproval || entry?.admin_approval),
+      // Set ONLY by the operator answering the moderator-preflight prompt with "continue without these groups"
+      // (and cleared automatically by a later passing preflight). This normalizer REBUILDS each entry from a
+      // whitelist, so the field must be listed here or it would be silently dropped on the next state write.
+      excludedFromRun: entry?.excludedFromRun === true,
+      excludedFromRunReason: String(entry?.excludedFromRunReason || "").slice(0, 200),
       profiles: Array.isArray(entry?.profiles)
         ? entry.profiles
           .slice(0, 500)
@@ -8471,7 +8476,13 @@ function postingSlots(state) {
   const __liveIds = cachedLiveIxProfileIdSet(); // DYNAMIC: live ixBrowser ids (sync cache, kept warm by the reconcile); null => fail open
   const postsPerProfile = clampNumber(state.rules.postsPerProfilePerDay, 1, 20, 5);
   const maxProfilesPerRun = clampNumber(state.ixbrowser?.maxProfilesPerRun, 1, 1000000, 100000);
-  const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
+  // OPERATOR-EXCLUDED GROUPS (2026-07-26): the moderator preflight can find an approval-gated group where NO
+  // moderator actually holds rights. Posting there would bury every post in a queue nobody can open, so the
+  // operator is offered "continue without these groups", which sets excludedFromRun on those entries. Filtering
+  // here -- the single chokepoint feeding both the slot builder and allGroupUrls -- excludes them from planning
+  // AND from fan-out. A later passing preflight clears the flag automatically (see applyModeratorPreflightResult).
+  const groups = (Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [])
+    .filter((g) => g && g.excludedFromRun !== true);
   // FRESH-FIRST coverage: order each group's profiles by least-posted-today then least-lifetime BEFORE
   // emitting slots, so the LOW slot indexes (which the plan fills first when products/scarce per-index
   // assets are limited) go to the freshest/rested profiles — not the raw groupAssignmentData order
@@ -14962,6 +14973,234 @@ function facebookApprovalCountByProfile() {
   return { counts, lastApprovedAt };
 }
 
+// MODERATOR READINESS GATE (2026-07-26, operator: "if 0 moderators available, prod should stop and say we need
+// at least 1"). Fully dynamic: it reads the CURRENT moderator list and the CURRENT parked lists every time, so
+// the operator can freely remove/add moderator accounts and this follows automatically with no config.
+// TWO DELIBERATE NUANCES, both there to avoid stopping a healthy production:
+//  1. It only matters when at least one configured group actually has requiresAdminApproval. With approval off
+//     everywhere (4 of 5 groups today), moderators are irrelevant and blocking a run would be plain wrong.
+//  2. "Usable" is judged from the DURABLE parked lists (suspended / disconnected / blocked moderators), NOT from
+//     the live browser-session signal. That signal reads empty in ~4% of sessions on a perfectly healthy profile,
+//     so gating a whole production run on it would halt everything on a transient cookie blip.
+function facebookApprovalReadiness(state = readState()) {
+  const groups = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
+  // Only groups that are actually POSTABLE can create approval demand: an entry with no assigned profiles is
+  // never planned (buildGroupSlots skips it), so counting it would let a stale row block production forever.
+  // Key-variant tolerant, same as isAdminApprovalEnabledForGroup.
+  const approvalGroups = groups.filter((g) => g
+    && Boolean(g.requiresAdminApproval || g.requires_admin_approval || g.adminApproval || g.admin_approval)
+    && Array.isArray(g.profiles) && g.profiles.length > 0);
+  const configured = [];
+  for (const line of recordLines(state?.ixbrowser?.moderatorProfiles)) {
+    const pid = Number(profileIdFromLabel(line) || 0);
+    if (pid) configured.push(pid);
+  }
+  const parked = new Set([
+    ...(Array.isArray(state?.posting?.suspendedProfiles) ? state.posting.suspendedProfiles : []),
+    ...(Array.isArray(state?.posting?.disconnectedProfiles) ? state.posting.disconnectedProfiles : []),
+    ...(Array.isArray(state?.posting?.erroredProfiles) ? state.posting.erroredProfiles : []),
+    ...(Array.isArray(state?.posting?.blockedModerators) ? state.posting.blockedModerators.filter((m) => m && m.parkedUntilRelease) : []),
+  ].map((e) => Number(e?.profileId || 0)).filter(Boolean));
+  const usable = configured.filter((pid) => !parked.has(pid));
+  // Recommended pool size: one moderator can realistically carry ~24 approval-gated posts/hour (measured ~2.5min
+  // of real work each). Size on the busiest configured group's share, x2 for bursts, floor 1 -- and recompute
+  // from live config so adding groups or changing volume moves the number by itself.
+  const perHourCap = 24;
+  const target = Number(state.operator?.autopilotMaxPostsPerRun) || 0;
+  const approvalShare = groups.length ? (approvalGroups.length / groups.length) : 0;
+  const estApprovalPostsPerHour = Math.max(1, Math.round((target ? Math.min(target, 300) : 100) * approvalShare / 8));
+  const recommended = approvalGroups.length ? Math.max(1, Math.min(4, Math.ceil((estApprovalPostsPerHour / perHourCap) * 2))) : 0;
+  return {
+    approvalGroupCount: approvalGroups.length,
+    approvalGroupNames: approvalGroups.map((g) => String(g?.url || "")),
+    configuredCount: configured.length,
+    usableCount: usable.length,
+    usableIds: usable,
+    parkedIds: configured.filter((pid) => parked.has(pid)),
+    recommended,
+    // The only condition that must ever stop or block a run.
+    blocking: approvalGroups.length > 0 && usable.length === 0,
+  };
+}
+// MODERATOR-RIGHTS PREFLIGHT (2026-07-26, operator: "at the start of prod he must open the moderators one by one
+// and verify they are really moderators in all the groups; if not, stop prod and show a popup").
+// Opens ONE browser session per moderator (not one per moderator x group) and probes every approval-gated group
+// from inside it, so the ixBrowser open-budget cost is exactly one open per moderator.
+// STRICTLY SEQUENTIAL: this runs at launch, when the box is otherwise idle, and serialising keeps it from
+// competing with anything for chrome/RAM -- the load spiral that historically destabilised this machine.
+let __moderatorPreflightInFlight = false;
+async function runModeratorPreflightAsync() {
+  if (__moderatorPreflightInFlight) return { ok: false, reason: "already_running" };
+  __moderatorPreflightInFlight = true;
+  try {
+    const state = readState();
+    const readiness = facebookApprovalReadiness(state);
+    if (!readiness.approvalGroupCount) {
+      // No group needs approval -> moderator rights are irrelevant. Passing here (rather than erroring) keeps the
+      // launch flow identical for the common all-pre-approved setup.
+      return { ok: true, skipped: true, reason: "no_approval_gated_group", checkedAt: new Date().toISOString(), groups: [], moderators: [], groupsWithoutModerator: [] };
+    }
+    if (!readiness.usableCount) {
+      return { ok: false, reason: "no_usable_moderator", checkedAt: new Date().toISOString(), readiness, groups: [], moderators: [], groupsWithoutModerator: readiness.approvalGroupNames };
+    }
+    const auditGroups = readiness.approvalGroupNames.map((url) => {
+      const slug = String(url || "").match(/\/groups\/([^/?#]+)/i);
+      const raw = slug ? slug[1] : "";
+      return { url, groupId: /^\d+$/.test(raw) ? raw : "" }; // vanity slug -> let the connector resolve it
+    });
+    // MEMORY (operator 2026-07-26: "he should remember those moderators ... but if a new group or moderator is
+    // added he should redo the analysis for the new ones"). Cache is keyed profileId:groupKey.
+    // ASYMMETRIC ON PURPOSE:
+    //  - a POSITIVE verdict is cached (14 days), so a stable setup opens ZERO browsers at launch;
+    //  - a NEGATIVE verdict is NEVER cached, because that is precisely the case the operator is about to fix on
+    //    Facebook -- caching it would keep blocking launches after the rights were already granted.
+    const cache = (state.posting?.moderatorRightsCache && typeof state.posting.moderatorRightsCache === "object") ? state.posting.moderatorRightsCache : {};
+    const CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+    const cacheKey = (pid, url) => `${pid}:${normalizedFacebookGroupKey(url)}`;
+    const cachedRight = (pid, url) => {
+      const hit = cache[cacheKey(pid, url)];
+      if (!hit || hit.hasRights !== true) return null;
+      const at = Date.parse(String(hit.at || "")) || 0;
+      if (!at || (Date.now() - at) > CACHE_TTL_MS) return null; // expired -> re-probe
+      return hit;
+    };
+    const moderators = [];
+    let __opened = 0, __fromCache = 0;
+    for (const profileId of readiness.usableIds) {
+      const label = (recordLines(state?.ixbrowser?.moderatorProfiles).find((l) => Number(profileIdFromLabel(l) || 0) === Number(profileId)) || String(profileId)).slice(0, 120);
+      const entry = { profileId, label, accountBlocked: false, error: "", groups: [] };
+      // Only probe the pairs we have no fresh positive for -- a brand-new group or a brand-new moderator is
+      // exactly what falls through here, which is the "redo the analysis for the new ones" the operator asked for.
+      const toProbe = [];
+      for (const g of auditGroups) {
+        const hit = cachedRight(profileId, g.url);
+        if (hit) {
+          entry.groups.push({ groupUrl: g.url, groupId: hit.groupId || g.groupId || "", hasRights: true, reason: "cached_" + String(hit.reason || "admin_surface_reached"), landedUrl: "", accountBlocked: false, fromCache: true });
+          __fromCache += 1;
+        } else {
+          toProbe.push(g);
+        }
+      }
+      if (!toProbe.length) { moderators.push(entry); continue; } // nothing new for this moderator -> no browser open at all
+      let release = () => {};
+      try {
+        release = acquireNormalIxProfileUse(profileId, "moderator_preflight");
+      } catch (err) {
+        entry.error = oneLineField((err && err.message) || String(err), 160);
+        moderators.push(entry);
+        continue;
+      }
+      try {
+        __opened += 1;
+        const timeoutMs = clampNumber(90000 + toProbe.length * 55000, 120000, 600000, 300000);
+        const scriptResult = await runLiveFacebookPostScript({
+          profileId,
+          moderatorAudit: true,
+          auditGroups: toProbe,
+          groupUrl: toProbe[0]?.url || "",
+        }, { timeoutMs });
+        const res = latestLiveLogStep(scriptResult.objects, "moderator_audit_result");
+        if (res) {
+          entry.accountBlocked = Boolean(res.accountBlocked);
+          entry.groups = Array.isArray(res.groups) ? res.groups : [];
+        } else {
+          // No result step = the session died/timed out. Recorded as an error, and deliberately NOT as
+          // "no rights": an inconclusive probe must never trigger the red popup (see hasRights === null).
+          entry.error = "no_audit_result";
+        }
+      } catch (err) {
+        entry.error = oneLineField((err && err.message) || String(err), 160);
+      } finally {
+        try { release(); } catch (_) {}
+      }
+      logEvent("moderator_preflight_profile_done", {
+        profileId,
+        accountBlocked: entry.accountBlocked,
+        error: entry.error,
+        withRights: entry.groups.filter((g) => g.hasRights === true).length,
+        without: entry.groups.filter((g) => g.hasRights === false).length,
+        unknown: entry.groups.filter((g) => g.hasRights !== true && g.hasRights !== false).length,
+      });
+      moderators.push(entry);
+    }
+    // Per-group verdict. A group PASSES as soon as ONE moderator can reach its queue -- approvals only ever
+    // need one. It FAILS only when at least one moderator gave a definite "not a moderator here" verdict and
+    // none gave a positive one; if every probe was inconclusive the group is 'unknown', never auto-blocked.
+    const groups = auditGroups.map(({ url }) => {
+      const per = moderators.map((m) => ({ profileId: m.profileId, label: m.label, ...(m.groups.find((g) => normalizedFacebookGroupKey(g.groupUrl) === normalizedFacebookGroupKey(url)) || { hasRights: null, reason: m.error || "not_probed" }) }));
+      const withRights = per.filter((p) => p.hasRights === true);
+      const denied = per.filter((p) => p.hasRights === false);
+      return {
+        url,
+        moderatorsWithRights: withRights.map((p) => p.profileId),
+        moderatorsWithoutRights: denied.map((p) => p.profileId),
+        status: withRights.length ? "ok" : (denied.length ? "no_moderator" : "unknown"),
+        detail: per,
+      };
+    });
+    const groupsWithoutModerator = groups.filter((g) => g.status === "no_moderator").map((g) => g.url);
+    const result = {
+      ok: groupsWithoutModerator.length === 0,
+      checkedAt: new Date().toISOString(),
+      groups,
+      moderators: moderators.map((m) => ({ profileId: m.profileId, label: m.label, accountBlocked: m.accountBlocked, error: m.error })),
+      groupsWithoutModerator,
+      recommended: readiness.recommended,
+      // Freshly-proven rights only (cache hits are already stored). Negatives are deliberately absent -- see
+      // the cache comment above for why a "no rights" verdict must never be remembered.
+      cacheWrites: moderators.flatMap((m) => (m.groups || [])
+        .filter((g) => g.hasRights === true && !g.fromCache)
+        .map((g) => ({ profileId: m.profileId, groupUrl: g.groupUrl, groupId: g.groupId || "", reason: g.reason || "admin_surface_reached" }))),
+    };
+    applyModeratorPreflightResult(result);
+    logEvent("moderator_preflight_done", {
+      ok: result.ok, groups: groups.length, failing: groupsWithoutModerator.length,
+      browsersOpened: __opened, pairsFromCache: __fromCache, pairsLearned: result.cacheWrites.length,
+    });
+    return result;
+  } finally {
+    __moderatorPreflightInFlight = false;
+  }
+}
+// Persist the verdict, and AUTO-CLEAR any excludedFromRun the operator set earlier for a group that now passes --
+// so restoring a moderator's rights on Facebook is enough to bring the group back, with no dashboard step.
+function applyModeratorPreflightResult(result) {
+  const state = readState();
+  state.posting = state.posting || {};
+  state.posting.moderatorPreflight = {
+    ok: Boolean(result.ok),
+    checkedAt: result.checkedAt,
+    groups: result.groups,
+    moderators: result.moderators,
+    groupsWithoutModerator: result.groupsWithoutModerator,
+    acknowledgedAt: "", // an operator decision on THIS verdict; a fresh preflight always re-asks
+  };
+  // Remember proven rights so a stable setup opens zero browsers next launch.
+  const cache = (state.posting.moderatorRightsCache && typeof state.posting.moderatorRightsCache === "object") ? state.posting.moderatorRightsCache : {};
+  const nowIso = new Date().toISOString();
+  for (const w of (Array.isArray(result.cacheWrites) ? result.cacheWrites : [])) {
+    cache[`${w.profileId}:${normalizedFacebookGroupKey(w.groupUrl)}`] = { hasRights: true, at: nowIso, groupId: w.groupId, reason: w.reason };
+  }
+  // Drop entries for moderators or groups that no longer exist in the config, so removing an account or a group
+  // cannot leave the cache growing forever (operator: "maybe I will remove those moderators and add new ones").
+  const liveModerators = new Set(recordLines(state?.ixbrowser?.moderatorProfiles).map((l) => Number(profileIdFromLabel(l) || 0)).filter(Boolean).map(String));
+  const liveGroups = new Set((Array.isArray(state.posting.groupAssignmentData) ? state.posting.groupAssignmentData : []).map((g) => normalizedFacebookGroupKey(g?.url)).filter(Boolean));
+  for (const k of Object.keys(cache)) {
+    const idx = k.indexOf(":");
+    const pid = k.slice(0, idx), gk = k.slice(idx + 1);
+    if (!liveModerators.has(pid) || !liveGroups.has(gk)) delete cache[k];
+  }
+  state.posting.moderatorRightsCache = cache;
+  const passing = new Set((result.groups || []).filter((g) => g.status === "ok").map((g) => normalizedFacebookGroupKey(g.url)));
+  for (const g of (Array.isArray(state.posting.groupAssignmentData) ? state.posting.groupAssignmentData : [])) {
+    if (g && g.excludedFromRun === true && passing.has(normalizedFacebookGroupKey(g.url))) {
+      g.excludedFromRun = false;
+      g.excludedFromRunReason = "";
+      logEvent("group_reincluded_after_preflight_pass", { group: String(g.url || "").slice(0, 200) });
+    }
+  }
+  writeState(state);
+}
 // Per-moderator browser-session health, learned from real approval attempts. profileId -> {authAt, unauthAt}.
 // IN-MEMORY ON PURPOSE: it is an ordering hint, not a bench, so losing it on restart is harmless (the pool just
 // starts neutral again) and it can never leave a stale exclusion behind. Nothing here removes a profile from any
@@ -25333,6 +25572,7 @@ const server = http.createServer(async (req, res) => {
     let __disarmTransition = false; // operator just turned a run OFF -> trigger a real STOP (kill in-flight work)
     let __armTransition = false; // operator just turned a run ON (false->true) -> kick an immediate tick so batch 1 fires NOW
     let __beforeOpForCacheBust = {}; // hoisted out of the try block below so the status-cache-bust check after writeState can see it
+    let __armReadiness = null; // moderator readiness snapshot, filled by the arm gate below (see facebookApprovalReadiness)
     // ARM = a fresh run: when the operator transitions autopilotEnabled false->true, reset the
     // per-run post counter so the hard limiter (autopilotMaxPostsPerRun) counts THIS run only.
     try {
@@ -25352,8 +25592,30 @@ const server = http.createServer(async (req, res) => {
         incoming.operator.autopilotEnabled = false;
         incoming.operator.armedForExternalActions = false;
         logEvent("arm_blocked_stop_cooldown", { sinceStopMs: Date.now() - __externalStopRequested });
+      } else if (!wasEnabled && nowEnabled && (__armReadiness = facebookApprovalReadiness(before)).blocking) {
+        // MODERATOR READINESS GATE at LAUNCH (2026-07-26, operator: "if launch prod and no moderator valid that
+        // work available then stop prod and show the popup in red"). An approval-gated group with zero usable
+        // moderators cannot ever publish: every post it makes goes pending and stays there. Refuse the arm loudly
+        // instead of running a production that silently buries everything it posts.
+        incoming.operator.autopilotEnabled = false;
+        incoming.operator.armedForExternalActions = false;
+        incoming.operator.lastArmBlocked = {
+          at: new Date().toISOString(),
+          reason: "no_usable_moderator",
+          configuredCount: __armReadiness.configuredCount,
+          parkedIds: __armReadiness.parkedIds,
+          approvalGroupCount: __armReadiness.approvalGroupCount,
+          recommended: __armReadiness.recommended,
+        };
+        logEvent("arm_blocked_no_usable_moderator", {
+          configured: __armReadiness.configuredCount,
+          parked: __armReadiness.parkedIds.join(","),
+          approvalGroups: __armReadiness.approvalGroupCount,
+          recommended: __armReadiness.recommended,
+        });
       } else if (!wasEnabled && nowEnabled) {
         __armTransition = true; // false->true arm: kick an immediate tick after writeState (below) so batch 1 doesn't wait ~120s
+        incoming.operator.lastArmBlocked = null; // a successful arm clears any previous red banner
         incoming.operator.autopilotPostsThisRun = 0; // fresh arm => count THIS run only
         // Freeze the run's TRUE original target for display (report.html livecard / Prod-tab "Run target"),
         // separate from autopilotMaxPostsPerRun which keeps getting shrunk to "remaining budget" on every
