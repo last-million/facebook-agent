@@ -268,8 +268,10 @@ function runCard(r,i){
       + '<span class="rmain"><span class="rdate">'+esc(fmtDate(r.startedAt))+'</span>'
       + (r.live?'<span class="rlive">● LIVE</span>':(i===0?'<span class="pill x">latest</span>':''))+'</span>'
       + '<span class="rposts">'+r.posts+' posts &middot; '+r.durationMin+'m'+(r.avgPostIntervalSec!=null?' &middot; ~'+fmtMinSec(r.avgPostIntervalSec)+'/post':'')+'</span>'
-      + '<span class="rrate '+(rate>=90?"ok":rate>=70?"slow":"no")+'">'+rate+'%<small> comm.</small></span>'
-      + (r.uncommented? '<span class="runc">'+r.uncommented+' without</span>':'')
+      + (r.commentsDisabled
+          ? '<span class="rrate"><small>comments off</small></span>'
+          : '<span class="rrate '+(rate>=90?"ok":rate>=70?"slow":"no")+'">'+rate+'%<small> comm.</small></span>')
+      + ((r.uncommented && !r.commentsDisabled)? '<span class="runc">'+r.uncommented+' without</span>':'')
       + ((r.pendingApproval&&r.pendingApproval.count)? '<span class="runc pending">'+r.pendingApproval.count+' pending</span>':'')
       + '<button class="rdel" title="Remove this run from the report" onclick="dismiss(event,\''+sa+'\',\''+ea+'\')">✕</button>'
     + '</summary>'
@@ -325,7 +327,9 @@ function runBody(r){
     + statCard("Average post time", fmtMinSec(r.avgPostIntervalSec), "between posts going public (includes moderator-approval wait)", "v")
     + statCard("Unique products", (r.uniqueProducts||0), (r.productsInBoth||0)+" in both groups", (r.uniqueProducts? (r.productsInBoth>0?"g":"a") : ""))
     + (r.contentFreshness ? statCard("Fresh harvested", r.contentFreshness.fresh, r.contentFreshness.reusedUnder24h+" reused ≤24h, "+r.contentFreshness.reusedUnder48h+" reused ≤48h"+(r.contentFreshness.reusedOver48h?", "+r.contentFreshness.reusedOver48h+" older (pre-fix)":""), (r.contentFreshness.reusedOver48h>0?"r":(r.contentFreshness.fresh>0?"g":"a"))) : "")
-    + statCard("Commented", r.commentRate+'<small>%</small>', r.commented+"/"+r.posts+" • "+r.uncommented+" without", r.commentRate>=90?"g":(r.commentRate>=70?"a":"r"))
+    + (r.commentsDisabled
+        ? statCard("Commented", "OFF", "comments disabled in Prod &middot; Step 1 &mdash; posts published without a first comment on purpose", "v")
+        : statCard("Commented", r.commentRate+'<small>%</small>', r.commented+"/"+r.posts+" • "+r.uncommented+" without", r.commentRate>=90?"g":(r.commentRate>=70?"a":"r")))
     + statCard("Average comment time", fmtGap(r.gap.avgSec), "from post recorded published to comment verified (approval wait not included)", (r.gap.avgSec>=240?"r":(r.gap.avgSec>=120?"a":"g")))
     + statCard("Median delay", fmtGap(r.gap.medianSec), "max "+fmtGap(r.gap.maxSec), "v")
     + approvalWaitCard
@@ -395,10 +399,12 @@ function runBody(r){
       var v=r.byGroup[g];
       var stuck = !v.posts && v.held>0;
       return '<div class="grp"><div class="gh"><span>'+grpPill(g)+'</span><span class="tag">'+v.posts+' posts</span></div>'
-        + (v.posts ? '<div class="row"><span>Commented</span><b>'+v.commented+'/'+v.posts+'</b></div>'
-          + '<div class="row"><span>Rate</span><b class="'+(v.commentRate>=90?"ok":v.commentRate>=70?"slow":"no")+'">'+v.commentRate+'%</b></div>'
-          + '<div class="row"><span>Median delay</span><b>'+fmtGap(v.gapMedianSec)+'</b></div>'
-          + rateBar(v.commentRate) : (stuck ? '<div class="row"><span class="no">⚠ No post — blocked</span></div>' : '<div class="row"><span style="opacity:.6">No post yet</span></div>'))
+        + (v.posts ? (v.commentsDisabled
+            ? '<div class="row"><span>Commented</span><b style="opacity:.7">off for this group</b></div>'
+            : '<div class="row"><span>Commented</span><b>'+v.commented+'/'+v.posts+'</b></div>'
+              + '<div class="row"><span>Rate</span><b class="'+(v.commentRate>=90?"ok":v.commentRate>=70?"slow":"no")+'">'+v.commentRate+'%</b></div>'
+              + '<div class="row"><span>Median delay</span><b>'+fmtGap(v.gapMedianSec)+'</b></div>'
+              + rateBar(v.commentRate)) : (stuck ? '<div class="row"><span class="no">⚠ No post — blocked</span></div>' : '<div class="row"><span style="opacity:.6">No post yet</span></div>'))
         + (v.held>0 ? '<div class="row"><span>Held (no free commenter)</span><b class="'+(stuck?"no":"slow")+'">'+v.held+'</b></div>' : '')
         + '</div>';
     }).join("");

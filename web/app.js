@@ -2856,6 +2856,10 @@ function initializeGroupAssignmentDraft() {
     return {
       url,
       sharePercent: Number(share) || 0,
+      // Per-group comment switch. Carried through the draft so re-rendering the matrix (which happens on
+      // every profile tick) cannot silently reset a group the operator switched off. Absent = ON, the same
+      // fail-safe the server uses.
+      commentsEnabled: previous.commentsEnabled !== false,
       profiles: Array.isArray(previous.profiles) ? previous.profiles.map(String).filter(isAllowedNormalIxBrowserProfileLabel) : [],
     };
   });
@@ -2872,9 +2876,14 @@ function collectGroupAssignmentData() {
     const profiles = Array.from(card.querySelectorAll("[data-assignment-profile]:checked"))
       .map((input) => input.value)
       .filter(isAllowedNormalIxBrowserProfileLabel);
+    const commentsBox = card.querySelector("[data-assignment-comments]");
     entries.push({
       url: draft.url,
       sharePercent: Number(card.querySelector("[data-assignment-share]")?.value || 0),
+      // ALWAYS emitted, never conditionally. The server honours an explicit value and inherits the on-disk
+      // one only when the field is absent -- so omitting it here would make "turn comments off for this
+      // group" un-undoable through the dashboard.
+      commentsEnabled: commentsBox ? commentsBox.checked : (draft.commentsEnabled !== false),
       profiles,
     });
   });
@@ -2919,6 +2928,13 @@ function renderGroupAssignmentBuilder() {
           </div>
         </div>
         <small><span data-selected-count>${entry.profiles.length}</span> of ${eligibleCount} eligible profile(s) selected</small>
+        <!-- PER-GROUP COMMENT SWITCH (operator 2026-07-28). Independent of the Step-1 master switch: OFF in
+             Step 1 silences every group, and a group may also opt out on its own. Saved with the rest of the
+             assignment matrix (markDirty -> the normal form auto-save). -->
+        <label class="switch line hasTooltip" style="margin-top:8px" data-tooltip="When off, this group still publishes (and is still approved if it needs moderation) but its posts get NO first comment — so no affiliate link goes out for this group.">
+          <input data-assignment-comments type="checkbox" ${entry.commentsEnabled !== false ? "checked" : ""}>
+          <span data-assignment-comments-label>${entry.commentsEnabled !== false ? "&#128172; Comment posts in this group" : "&#128683; No comment in this group"}</span>
+        </label>
       </div>
       <div class="profileChecklist">
         ${profiles.map((profile) => `
@@ -2950,7 +2966,7 @@ function syncGroupAssignmentOutput() {
   ];
   entries.forEach((entry, index) => {
     lines.push("");
-    lines.push(`GROUP ${index + 1} | share=${Number(entry.sharePercent) || 0}% | url=${entry.url}`);
+    lines.push(`GROUP ${index + 1} | share=${Number(entry.sharePercent) || 0}% | comments=${entry.commentsEnabled === false ? "OFF" : "on"} | url=${entry.url}`);
     if (entry.profiles.length) {
       entry.profiles.forEach((profile) => lines.push(`- ${profile}`));
     } else {
@@ -3705,6 +3721,7 @@ function chooseRandomOnePostAssignment() {
   groupAssignmentDraft = [{
     url: groupUrl,
     sharePercent: 100,
+    commentsEnabled: sameGroupEntry?.commentsEnabled !== false, // don't let the #test flow silently re-enable comments on a group the operator switched off
     profiles: orderedProfiles,
   }];
   renderGroupAssignmentBuilder();
@@ -5539,6 +5556,17 @@ $("groupAssignmentBuilder")?.addEventListener("click", (event) => {
 });
 
 $("groupAssignmentBuilder")?.addEventListener("change", (event) => {
+  // PER-GROUP COMMENT SWITCH. Handled before the profile-checkbox guard below, which would otherwise
+  // early-return and leave this checkbox purely decorative (ticked in the DOM, never collected, never saved).
+  if (event.target.matches("[data-assignment-comments]")) {
+    const on = event.target.checked;
+    const card = event.target.closest("[data-assignment-card]");
+    const label = card && card.querySelector("[data-assignment-comments-label]");
+    if (label) label.innerHTML = on ? "&#128172; Comment posts in this group" : "&#128683; No comment in this group";
+    syncGroupAssignmentOutput(); // re-collects the matrix, so the draft carries the new value
+    markDirty();
+    return;
+  }
   if (!event.target.matches("[data-assignment-profile]")) return;
   // EQUAL-SPLIT uniqueness: a profile may live in only ONE group — checking it here unchecks it
   // in every other group card.
@@ -6268,6 +6296,7 @@ function uxAttachIncompleteRunBanner() {
   async function renderProdTab() {
     try {
       populateProdRunMode((workflowState && workflowState.operator) || {}); // snappy + survives a failed status fetch
+      populateProdComments((workflowState && workflowState.operator) || {});
       const [statusRes, health, activity, reportsRes] = await Promise.all([
         api("/api/autopilot/status").catch(() => null),
         api("/api/prod/health").catch(() => null),
@@ -6404,6 +6433,30 @@ function uxAttachIncompleteRunBanner() {
     setIf("prodScheduleTimezone", op.scheduleTimezone || "");
     prodApplyRunModeVisibility();
   }
+  // ── Comments ON/OFF (Prod · Step 1) ───────────────────────────────────────────────────────────
+  // Writes operator.commentsEnabled straight through prodPatchState (the same path the drain toggle
+  // uses), so the choice applies to the very next post — no form save, no restart. prodCommentsTouched
+  // mirrors prodRunModeTouched: the 4s status poll must never re-check a radio the operator just moved.
+  let prodCommentsTouched = false;
+  function prodApplyCommentsHint(on) {
+    const hint = $("prodCommentsHint");
+    if (hint) {
+      hint.textContent = on
+        ? "ON — every post gets its first comment (the affiliate link), added by a different profile of the same group."
+        : "OFF — posts publish with NO first comment, so no affiliate link goes out. No commenter browser is opened and no comment recovery runs.";
+      hint.style.color = on ? "" : "#ffb3b3";
+    }
+    const sec = $("prodCommentsSection");
+    if (sec) sec.style.borderColor = on ? "" : "#8a3b3b";
+  }
+  function populateProdComments(op) {
+    if (prodCommentsTouched) return; // don't overwrite what the operator is actively setting
+    op = op || (workflowState && workflowState.operator) || {};
+    const on = op.commentsEnabled !== false; // anything but an explicit false = ON (matches facebookCommentsEnabled server-side)
+    const radio = document.querySelector('input[name="prodCommentsEnabled"][value="' + (on ? "on" : "off") + '"]');
+    if (radio) radio.checked = true;
+    prodApplyCommentsHint(on);
+  }
   function prodResult(msg) { const el = $("prodActionResult"); if (el) el.textContent = msg; }
   function prodOn(id, fn) { const el = $(id); if (el) el.addEventListener("click", async function () { try { await fn(); } catch (e) { prodResult("Error: " + ((e && e.message) || e)); } }); }
   function bindProd() {
@@ -6466,6 +6519,43 @@ function uxAttachIncompleteRunBanner() {
     const prodMaxEl = $("prodMaxPosts");
     if (prodMaxEl) prodMaxEl.addEventListener("input", function () { prodRunModeTouched = true; const n = parseInt(prodMaxEl.value, 10); if (workflowState && workflowState.operator && n > 0) workflowState.operator.autopilotMaxPostsPerRun = n; prodPersistRunModeSoon(); });
     ["prodStartTime", "prodStopTime", "prodScheduleTimezone"].forEach(function (id) { const el = $(id); if (el) el.addEventListener("input", function () { prodRunModeTouched = true; prodPersistRunModeSoon(); }); });
+    // COMMENTS ON/OFF — saved on the spot (no debounce): it's a single boolean, and it must be in force
+    // before the next post is dispatched. Turning it OFF asks for confirmation because it stops the
+    // affiliate link going out; turning it back ON needs none. Written via prodPatchState so it lands as
+    // an explicit operator PUT — the only write the server's operator-config guard lets change this flag.
+    document.querySelectorAll('input[name="prodCommentsEnabled"]').forEach(function (r) {
+      r.addEventListener("change", async function () {
+        if (!r.checked) return;
+        const on = r.value === "on";
+        if (!on && !window.confirm("Turn comments OFF?\n\nPosts will still publish, and groups that need moderation will still be approved — but NO first comment will be added, so the affiliate link never goes out.\n\nNo commenter browser is opened and no comment recovery runs while this is off. You can switch it back on at any time.")) {
+          const back = document.querySelector('input[name="prodCommentsEnabled"][value="on"]');
+          if (back) back.checked = true;
+          return;
+        }
+        prodCommentsTouched = true;
+        prodApplyCommentsHint(on);
+        if (workflowState && workflowState.operator) workflowState.operator.commentsEnabled = on;
+        prodResult(on ? "Enabling comments…" : "Disabling comments…");
+        try {
+          await prodPatchState({ operator: { commentsEnabled: on } });
+          prodResult(on
+            ? "✓ Comments ON — every post gets its first comment with the affiliate link."
+            : "✓ Comments OFF — the agent posts only; the comment step is skipped entirely.");
+        } catch (e) {
+          // REVERT ON FAILURE. The optimistic update above is what keeps the radio steady against the 4s
+          // poll, but if the PUT never landed the server is still on the OLD setting -- leaving the new one
+          // displayed would tell the operator comments are off while the agent keeps commenting (or the
+          // reverse). Put the radio, the hint and the cache back, and say so.
+          const prev = !on;
+          if (workflowState && workflowState.operator) workflowState.operator.commentsEnabled = prev;
+          const backEl = document.querySelector('input[name="prodCommentsEnabled"][value="' + (prev ? "on" : "off") + '"]');
+          if (backEl) backEl.checked = true;
+          prodApplyCommentsHint(prev);
+          prodCommentsTouched = false;
+          prodResult("Save failed — comments are still " + (prev ? "ON" : "OFF") + ". " + ((e && e.message) || e));
+        }
+      });
+    });
     // RUN CONTROLS — Start / Pause / Resume / Stop. Mirrored bars live in the control center + Step 1 + Step 3,
     // all driven by ONE delegated listener so every copy works and stays in sync. setProdCtlButtons (above
     // renderProdTab) shows the right buttons for the state everywhere at once.
@@ -6578,7 +6668,7 @@ function uxAttachIncompleteRunBanner() {
   function startProdPoll() { if (prodPollTimer) return; renderProdTab(); prodPollTimer = window.setInterval(function () { if (prodActive()) renderProdTab(); else { window.clearInterval(prodPollTimer); prodPollTimer = null; } }, 4000); }
   function initProd() {
     bindProd();
-    document.querySelectorAll("[data-view-target]").forEach(function (b) { b.addEventListener("click", function () { window.setTimeout(function () { if (prodActive()) { prodRunModeTouched = false; startProdPoll(); } }, 60); }); });
+    document.querySelectorAll("[data-view-target]").forEach(function (b) { b.addEventListener("click", function () { window.setTimeout(function () { if (prodActive()) { prodRunModeTouched = false; prodCommentsTouched = false; startProdPoll(); } }, 60); }); });
     if (prodActive()) startProdPoll();
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", initProd); else initProd();

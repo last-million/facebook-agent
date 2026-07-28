@@ -680,6 +680,17 @@
                 <span class="prodModeHint muted">Posts continuously while the clock is inside this window — no post-count limit.</span>
               </div>
             </div>
+            <!-- COMMENTS ON/OFF (operator 2026-07-28). Saves immediately to operator.commentsEnabled — no
+                 form save, no restart. ON is the default and the recommended setting: the affiliate link
+                 lives in the first comment, so OFF means posts publish with no link at all. -->
+            <div class="prodRunMode" id="prodCommentsSection" style="margin-bottom:12px">
+              <div class="prodModeRow">
+                <span class="prodModeTitle">&#128172; First comment</span>
+                <label class="prodModePick"><input type="radio" name="prodCommentsEnabled" value="on"><span>&#9989; Comment every post</span></label>
+                <label class="prodModePick"><input type="radio" name="prodCommentsEnabled" value="off"><span>&#128683; Post only &mdash; no comments</span></label>
+              </div>
+              <span class="prodModeHint muted" id="prodCommentsHint">The first comment carries the affiliate link. Leave this ON unless you specifically want link-free posts.</span>
+            </div>
             <div class="formGrid">
               <label class="hasTooltip" data-tooltip="Minimum minutes between two comments by the SAME profile. 5 is the anti-burn default.">&#128172; Minutes between comments (per profile)
                 <input id="commentCooldownMinutes" type="number" min="1" max="1440" step="1" placeholder="5"

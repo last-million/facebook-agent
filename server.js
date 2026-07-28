@@ -299,6 +299,67 @@ const FACEBOOK_COMMENT_RECOVERY_TIMEOUT_MS = 240000;
 // pending forever with 0 approval attempts.)
 const PENDING_POST_COMMENT_ERROR_RE = /comment_target_unavailable_or_pending|post_pending_or_unavailable|comment_target_not_ready|comment_target_pending|comment_target_unavailable/i;
 function isPendingPostCommentError(err) { return PENDING_POST_COMMENT_ERROR_RE.test(String(err || "")); }
+// ── COMMENTS ON/OFF — single source of truth for every comment path ──────────────────────────────
+// Operator switch in Prod > Step 1 (operator.commentsEnabled, default true). When OFF, the agent posts
+// and (where required) gets the post approved, but NEVER runs the comment step: no commenter browser is
+// opened, no comment is queued, and no recovery/drain pass chases an "owed" comment.
+//
+// FAILS SAFE TOWARD COMMENTING. Only an explicit `false` disables. A missing field (every state file
+// written before this feature existed), an unreadable/locked state file, or a throw inside readState all
+// return true -- because the affiliate link is IN the first comment, so silently NOT commenting is the
+// expensive failure, while silently commenting is merely the normal behaviour.
+//
+// Gated at four independent layers so no path can slip through:
+//   1. completeVerifiedFacebookPostWithComment  -- the post-publish comment stage (inline + backgrounded)
+//   2. addRequiredFirstCommentWithDifferentProfile -- the shared first-comment hub (all 5 call sites)
+//   3. resweepUncommentedFacebookPostsAsync     -- every recovery sweep (in-run, drain, stop-finish, manual)
+//   4. runFacebookCommentRecoveryAttempt / runFacebookCommentPinOnlyAttempt -- the ONLY two functions in
+//      this file that actually spawn a commenting browser session. Last line of defence.
+// Layer 4 alone makes "no browser ever opens to comment" true; 1-3 additionally stop the work being
+// queued, held, or retried, so a comments-off run behaves as if the comment step did not exist.
+function facebookCommentsEnabled(state) {
+  try {
+    const s = state || readState();
+    return s?.operator?.commentsEnabled !== false;
+  } catch (_) {
+    return true; // unreadable state -> keep commenting (never silently drop the money step)
+  }
+}
+// PER-GROUP override (2026-07-28, operator: "add also possibility to enable or disable comment step per
+// group"). groupAssignmentData[i].commentsEnabled, edited on that group's card in Prod > Step 3.
+//
+// Two-level AND: the Step-1 master switch wins when it is OFF (off means off everywhere), and a group may
+// additionally opt out on its own. Same fail-safe rule at BOTH levels -- only an explicit `false` disables,
+// so a group added before this feature existed, a group not present in groupAssignmentData at all, an
+// unresolvable URL, or a throw all keep commenting.
+//
+// MATCHED BY ALIAS, NOT BY STRING. The operator configures a group by its VANITY id
+// (.../groups/o38679876833911/) but Facebook returns permalinks under the NUMERIC id
+// (.../groups/1076334503593333/permalink/...), so actualGroupUrl and the configured url routinely differ
+// for the same group. A plain key compare would find no entry, fall through to "enabled", and silently
+// ignore the operator's OFF -- the exact vanity-vs-numeric trap this codebase has been bitten by before.
+// groupsMatchByAlias is the same resolver isAdminApprovalEnabledForGroup uses for the per-group approval
+// flag, with a plain-key fallback if it throws.
+//
+// Prefer this over facebookCommentsEnabled() at every call site that has a group URL in hand; the bare
+// version stays correct where there is no group context.
+function facebookCommentsEnabledForGroup(groupUrl, state) {
+  try {
+    const s = state || readState();
+    if (s?.operator?.commentsEnabled === false) return false; // master switch OFF -> off for every group
+    if (!normalizedFacebookGroupKey(groupUrl)) return true; // no/unparseable group -> master switch's answer (ON)
+    const rows = Array.isArray(s?.posting?.groupAssignmentData) ? s.posting.groupAssignmentData : [];
+    for (const entry of rows) {
+      let match = false;
+      try { match = groupsMatchByAlias(groupUrl, entry?.url); }
+      catch (_) { match = normalizedFacebookGroupKey(entry?.url) === normalizedFacebookGroupKey(groupUrl); }
+      if (match) return entry?.commentsEnabled !== false;
+    }
+    return true; // group not in the assignment matrix at all -> comment it (fail safe)
+  } catch (_) {
+    return true;
+  }
+}
 const HERMES_IMAGE_SELECTOR_TIMEOUT_MS = 120000;
 const TEST_HERMES_IMAGE_SELECTOR_TIMEOUT_MS = 90000;
 const REVIEW_IMAGE_CANDIDATE_COUNT = 5;
@@ -710,6 +771,14 @@ function defaultState() {
       // every stop/disarm path reaps it via closeStickyModeratorWindows. OFF by default so a deploy never changes
       // live behaviour until the operator opts in and watches one run.
       moderatorSessionEnabled: false,
+      // COMMENTS ON/OFF (2026-07-28, operator: Prod > Step 1 "add a visible section toggle to enable or
+      // disable comments -- if comment disabled he should not do the comment step"). ENABLED by default:
+      // the affiliate link lives in the first comment, so this is the revenue step and it must never turn
+      // itself off. Read ONLY through facebookCommentsEnabled(), which treats anything other than an
+      // explicit `false` as ON -- so a missing field, an unreadable state file, or a throw all fail SAFE
+      // (commenting continues). Listed in the operator-config clobber guard (~1455) so a background
+      // controlWrite holding a stale snapshot can never flip it in either direction.
+      commentsEnabled: true,
       autoRebalanceGroupsEnabled: false,      // 2026-07-07 (operator: "redispatch equally between groups" when
                                               // accounts fall out of service): auto-redispatch healthy profiles
                                               // across ALL currently-configured groups so each group's healthy
@@ -1452,7 +1521,11 @@ function writeState(state, opts = {}) {
   // on every background write so the duplicate-to-all-groups switch can't be silently flipped by a stale snapshot.
   if (!opts.allowOperatorConfig && existing.operator) {
     clean.operator = clean.operator || {};
-    for (const f of ["postToAllGroups", "keepOpenSessionEnabled"]) {
+    // commentsEnabled (Prod > Step 1 comments ON/OFF) is OPERATOR-CONFIG too: only the dashboard PUT may
+    // change it. Without this, a background controlWrite holding a pre-toggle snapshot could silently
+    // re-enable commenting the operator just switched off (or, worse, switch it off again after they turned
+    // it back on) -- the same stale-snapshot class as the lost STOP and the reverted reuseHours.
+    for (const f of ["postToAllGroups", "keepOpenSessionEnabled", "commentsEnabled"]) {
       if (existing.operator[f] !== undefined) clean.operator[f] = existing.operator[f];
     }
   }
@@ -1481,6 +1554,22 @@ function writeState(state, opts = {}) {
   ) {
     clean.posting.groupAssignmentData = existing.posting.groupAssignmentData;
     clean.posting.groupProfileAssignments = existing.posting.groupProfileAssignments;
+  }
+  // PER-GROUP commentsEnabled: inherit the on-disk value whenever the incoming entry does NOT state one.
+  // This is not optional bookkeeping -- normalizeWorkflowState (which runs AFTER this, ~2170) rebuilds every
+  // entry from a whitelist and defaults a MISSING commentsEnabled to true. So without this, any writer that
+  // rebuilds group entries without the field (server-side paths, an older dashboard tab, a partial API PUT)
+  // would silently switch a group's comments back ON. Same shape and same reasoning as the
+  // requiresAdminApproval inheritance below; kept as its own loop because that one `continue`s past the rest
+  // of its body. An EXPLICIT true or false from the caller is always honoured -- the switch stays two-way.
+  if (Array.isArray(clean.posting?.groupAssignmentData) && Array.isArray(existing.posting?.groupAssignmentData)) {
+    for (const newEntry of clean.posting.groupAssignmentData) {
+      if (!newEntry?.url) continue;
+      if (Object.prototype.hasOwnProperty.call(newEntry, "commentsEnabled")) continue; // caller stated it -> honour it
+      const k = normalizedFacebookGroupKey(newEntry.url);
+      const match = existing.posting.groupAssignmentData.find((e) => normalizedFacebookGroupKey(e?.url) === k);
+      if (match && match.commentsEnabled === false) newEntry.commentsEnabled = false;
+    }
   }
   if (Array.isArray(clean.posting?.groupAssignmentData) && Array.isArray(existing.posting?.groupAssignmentData)) {
     for (const newEntry of clean.posting.groupAssignmentData) {
@@ -2083,6 +2172,12 @@ function normalizeWorkflowState(state) {
       // whitelist, so the field must be listed here or it would be silently dropped on the next state write.
       excludedFromRun: entry?.excludedFromRun === true,
       excludedFromRunReason: String(entry?.excludedFromRunReason || "").slice(0, 200),
+      // PER-GROUP comment switch (Prod > Step 3 card). Must be listed here or this whitelist rebuild would
+      // drop it on the next state write. Normalized to an explicit boolean, defaulting to TRUE for any
+      // group that predates the feature -- so enabling this code changes no existing group's behaviour.
+      // Its protection against a partial write that OMITS the field lives in writeState (see the
+      // groupAssignmentData inheritance block), exactly like requiresAdminApproval.
+      commentsEnabled: entry?.commentsEnabled !== false,
       profiles: Array.isArray(entry?.profiles)
         ? entry.profiles
           .slice(0, 500)
@@ -16662,6 +16757,28 @@ async function runFacebookCommentRecoveryAttempt({ row, profileId, profileLabel,
   const cleanProfile = oneLineField(profileLabel || numericProfileId || "", 180);
   const closeResults = [];
   const state = readState();
+  // COMMENTS DISABLED (Prod > Step 1) — LAST-LINE guard. This function and runFacebookCommentPinOnlyAttempt
+  // are the only two places in this file that spawn a commenting browser session, so returning here makes
+  // "comments off => not one commenter window is ever opened" true regardless of which caller got through.
+  // Deliberately NOT ledger-appended: an operator who turned commenting off is not owed a failure row per
+  // post, and the ledger is the input to the owed/uncommented accounting the resweep reads.
+  if (!facebookCommentsEnabledForGroup(groupUrl, state)) {
+    return {
+      ok: false,
+      skipped: true,
+      commentsDisabled: true,
+      profileId: numericProfileId,
+      profile: cleanProfile,
+      validation: { ok: true, errors: [], warnings: ["comments_disabled_by_operator"], commentRequired: false, commentSubmitted: false, commentVerified: false },
+      closeResults,
+      message: "Comments are disabled for this group — no comment was attempted.",
+      liveLog: [],
+      liveLogFile: "",
+      payloadFile: "",
+      payloadDeleted: false,
+      script: path.relative(ROOT, liveFacebookPostingScriptPath()).replace(/\\/g, "/"),
+    };
+  }
   // MODERATORS ARE APPROVE-ONLY — universal last-line guard at the comment runtime choke point (mirrors the
   // POSTING guard). Even if a candidate source regresses, a moderator (41/42) can never be spawned to comment.
   if (isFacebookAdminApprovalProfileId(numericProfileId, state, groupUrl) || isFacebookAdminApprovalProfileLabel(cleanProfile, state, groupUrl)) {
@@ -17097,6 +17214,25 @@ async function runFacebookCommentPinOnlyAttempt({ row, profileId, profileLabel, 
   const cleanProfile = oneLineField(profileLabel || numericProfileId || "", 180);
   const closeResults = [];
   const state = readState();
+  // COMMENTS DISABLED (Prod > Step 1) — LAST-LINE guard, twin of the one in runFacebookCommentRecoveryAttempt.
+  // Pinning is part of the comment step; with commenting off there is nothing to pin.
+  if (!facebookCommentsEnabledForGroup(groupUrl, state)) {
+    return {
+      ok: false,
+      skipped: true,
+      commentsDisabled: true,
+      profileId: numericProfileId,
+      profile: cleanProfile,
+      validation: { ok: true, errors: [], warnings: ["comments_disabled_by_operator"], commentRequired: false, commentSubmitted: false, commentVerified: false, pinRequired: false, commentPinClicked: false, commentPinVerified: false },
+      closeResults,
+      message: "Comments are disabled for this group — no comment pin was attempted.",
+      liveLog: [],
+      liveLogFile: "",
+      payloadFile: "",
+      payloadDeleted: false,
+      script: path.relative(ROOT, liveFacebookPostingScriptPath()).replace(/\\/g, "/"),
+    };
+  }
   if (isDedicatedShopYourLikesIxProfile(numericProfileId) || isDedicatedShopYourLikesProfileLabel(cleanProfile)) {
     const validation = {
       ok: false,
@@ -18095,6 +18231,29 @@ function recentGroupPosterCommentCandidates(groupUrl, state = readState(), optio
 }
 
 async function addRequiredFirstCommentWithDifferentProfile(args) {
+  // COMMENTS DISABLED (Prod > Step 1) — shared hub gate, covering ALL callers of the first-comment step:
+  // the backgrounded fire, the queued fire, the inline await, the resweep's own re-comment, the
+  // already-published branch, and the manual /api recovery endpoint. Checked BEFORE the in-flight counter
+  // and the per-post lock are taken so this early return cannot leak either.
+  // ok:true, NOT false -- with commenting switched off nothing is owed, and the inline caller propagates
+  // this object's `ok` as the whole post's result (~19546); returning false there would report a landed,
+  // durably-recorded post as failed.
+  if (!facebookCommentsEnabledForGroup(args && args.groupUrl)) {
+    return {
+      ok: true,
+      posted: true,
+      skipped: true,
+      commentsDisabled: true,
+      postUrl: (args && args.postUrl) || "",
+      planId: args && args.row && args.row.planId,
+      sequence: args && args.row && args.row.sequence,
+      profileId: args && args.ready && args.ready.profileId,
+      attemptedGroups: [],
+      attemptedCommentProfiles: [],
+      closeResults: (args && args.closeResults) || [],
+      message: "Comments are disabled in Prod > Step 1 — post left without a first comment on purpose.",
+    };
+  }
   // Wrap the whole comment-completion body so a run-limit auto-disarm doesn't lock out the REQUIRED first
   // comment of an already-published post (see __postCompletionExternalActionInFlight). A real STOP still blocks.
   __postCompletionExternalActionInFlight += 1;
@@ -18695,6 +18854,12 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
       // trade-off (accepted): a post whose inline comment misses (e.g. pending-approval that goes public later) stays
       // uncommented — there is no recovery. Toggle commentDrainDisabled=false to restore recovery.
       if (state.operator?.commentDrainDisabled === true) return summary;
+      // COMMENTS DISABLED (Prod > Step 1): no recovery of any kind. Placed with commentDrainDisabled because
+      // it must silence the SAME set of sweeps -- the in-run heartbeat, the persistent drain, the cold-backlog
+      // pass, the stop/finish drain AND the manual "Resweep comments" button (options.force) -- so a
+      // comments-off run never opens a browser to chase a comment it was told not to make. Turning comments
+      // back ON restores recovery for anything still inside the window with no further action.
+      if (!facebookCommentsEnabled(state)) return summary;
       // Re-commenting is an EXTERNAL action — gate on the universal kill switch unless forced.
       // ignoreArmedGate = the operator FINISH/STOP comment-drain: run despite a fresh disarm, but WITHOUT force's
       // reach-back — it keeps the run-cutoff clamp below, so it only finishes the CURRENT run's comments and never
@@ -18917,6 +19082,12 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         if (!options.ignoreArmedGate && __externalStopRequested > resweepStartedAt) { logEvent("comment_resweep_aborted_by_stop", { checked: summary.checked }); break; } // operator hit STOP -> halt now (before dispatching anything new). EXCEPTION (operator 2026-06-20): the ignoreArmedGate FINISH-drains (stop-drain 8270 / run-end 9075) run to COMPLETION — a 2nd/stale/double STOP must NOT bump __externalStopRequested past this drain's resweepStartedAt and abandon the comments the run already owes (that left 20 uncommented forever). Posting+harvest are already hard-killed before the finish-drain starts, so this only lets the cheap comment-finish complete.
         const postUrl = ev.postUrl;
         if (!__isConfiguredGroup(ev.groupUrl || ev.actualGroupUrl)) { summary.skippedDeletedGroup = (summary.skippedDeletedGroup || 0) + 1; continue; } // 2026-07-12: post's group was removed from config -> never comment it again
+        // PER-GROUP comments OFF: the sweep spans posts from EVERY group, so the master-switch gate at the top
+        // of this function cannot express "group A still gets its comments, group B does not". Decided per
+        // candidate here, right beside the deleted-group skip, using the same field the post-publish path uses
+        // -- so a group the operator switched off is never re-opened by any drain, and its neighbours are
+        // completely unaffected. Uses the actual/recorded group url (alias-aware inside the helper).
+        if (!facebookCommentsEnabledForGroup(ev.actualGroupUrl || ev.groupUrl, state)) { summary.skippedCommentsDisabled = (summary.skippedCommentsDisabled || 0) + 1; continue; }
         // Bound by CANDIDATES SELECTED, not (as before) attempts made mid-loop -- equivalent now that dispatch
         // is concurrent: each selected candidate becomes exactly one real attempt below (barring the late
         // re-check race, same as before), so capping selection at maxToFix preserves the same per-pass budget.
@@ -19132,6 +19303,11 @@ async function completeVerifiedFacebookPostWithComment({
   approvalResult = null,
 }) {
   const actualGroupUrl = facebookGroupUrlFromPostUrl(postUrl) || groupUrl;
+  // COMMENTS DISABLED (Prod > Step 1) — resolved ONCE here so the whole comment stage of this post makes a
+  // single, consistent decision even if the operator flips the switch mid-post. Everything ABOVE the gate
+  // below still runs unchanged: the durable published-ledger row, the per-run counter bump, the publisher
+  // window close and its lock release. Only the comment stage is skipped.
+  const __commentsOff = !facebookCommentsEnabledForGroup(actualGroupUrl);
   recordPublishedFacebookPostUrl({
     postUrl,
     row,
@@ -19286,7 +19462,10 @@ async function completeVerifiedFacebookPostWithComment({
         logEvent("facebook_live_post_publisher_lock_released_for_different_profile_comment", { profileId: ready.profileId });
       }
     }
-    if (approvalResult?.ok) {
+    // `&& !__commentsOff`: this wait exists ONLY so a DIFFERENT profile can see the post in order to comment
+    // it. With commenting off there is no such profile and nothing to wait for, so paying 30s per approved
+    // post would be pure dead time on the tick.
+    if (approvalResult?.ok && !__commentsOff) {
       // After a moderator approves, FB needs time to flip the post from PENDING to publicly LIVE before a
       // DIFFERENT profile can see it to add the first comment. 45s was sometimes too short (the comment ran
       // while the post was still propagating and failed). 80s gives propagation room; the resweep is the backstop.
@@ -19294,6 +19473,47 @@ async function completeVerifiedFacebookPostWithComment({
       logEvent("facebook_live_post_waiting_for_fb_approval_propagation", { profileId: ready.profileId, waitMs: POST_APPROVAL_PROPAGATION_WAIT_MS_PRE });
       await sleep(POST_APPROVAL_PROPAGATION_WAIT_MS_PRE);
     }
+  }
+  // ── COMMENTS DISABLED (Prod > Step 1) — skip the entire comment stage ──────────────────────────
+  // Placed here, AFTER the publisher window is closed and its per-profile lock released (just above), and
+  // after the published ledger row + run-counter bump, so a comments-off post is durably recorded and
+  // leaves no browser or lock behind. Returning here bypasses, in one step: the different-profile comment,
+  // the backgrounded fire, the fast-fire queue, and the inline await -- i.e. the whole comment step, exactly
+  // as the operator asked ("if comment disabled he should not do comment step").
+  // ok:true because the post itself succeeded; the tick counts it, retires the product, and moves on. A
+  // false here would look like a failed post and could re-dispatch it = a duplicate live post.
+  if (__commentsOff) {
+    try { logEvent("facebook_post_comment_skipped_comments_disabled", { planId: row.planId, sequence: row.sequence, profileId: ready.profileId, groupUrl: actualGroupUrl, postUrl }); } catch (_) {}
+    return {
+      ok: true,
+      posted: true,
+      postUrl,
+      planId: row.planId,
+      sequence: row.sequence,
+      profileId: ready.profileId,
+      profile: row.profile || String(ready.profileId),
+      groupUrl: actualGroupUrl,
+      attemptedGroups,
+      closeResults,
+      postPayloadFile,
+      postPayloadDeleted,
+      postLiveLogFile,
+      postScript,
+      approvalResult: approvalResult ? {
+        ok: Boolean(approvalResult.ok),
+        approvalProfileId: approvalResult.approvalProfileId || approvalResult.profileId || "",
+        approvalProfile: approvalResult.approvalProfile || approvalResult.profile || "",
+        liveLogFile: approvalResult.liveLogFile || "",
+        attemptedApprovalProfiles: approvalResult.attemptedApprovalProfiles || [],
+      } : null,
+      postValidation: validation,
+      validation,
+      commentsDisabled: true,
+      message: `Post published by ${row.profile || ready.profileId} (URL: ${postUrl})${approvalResult?.ok ? ", admin approval verified" : ""}; comments are DISABLED in Prod > Step 1, so no first comment was added.`,
+      liveLog: compactLivePostLog(postLogObjects),
+      state: readState(),
+      registers: readRegisters(),
+    };
   }
   if (false && postUrl) { // same-profile comment path DISABLED — comment is made by a different random profile below
     const releaseKey = String(Number(ready.profileId));
@@ -19849,7 +20069,11 @@ async function runLiveFacebookPostFromPlan(body = {}) {
   // horizon), HOLD this post for the tick (no publish, product NOT retired, counter NOT bumped). It re-runs
   // next tick and publishes the moment a commenter frees up. Autopilot-only; skipped when a post already
   // exists (priorPublished just needs its comment) so it never blocks comment-recovery.
-  if (body.autopilot && !priorPublished?.postUrl) {
+  // `&& facebookCommentsEnabled(state)`: this gate HOLDS a post (does not publish it) when no commenter is
+  // free, so that no post ever goes live with a bare affiliate link and no first comment. With commenting
+  // switched off in Prod > Step 1 that reasoning inverts -- every post is deliberately comment-less -- and
+  // leaving the gate armed would stall the whole run on commenter availability that no longer matters.
+  if (body.autopilot && !priorPublished?.postUrl && facebookCommentsEnabledForGroup(ready.groupUrl, state)) {
     const __gate = anyCommenterFreeForPost(row, ready.groupUrl, ready.profileId, state);
     if (!__gate.free) {
       try { logEvent("post_held_no_free_commenter", { planId: row.planId, groupUrl: ready.groupUrl, candidates: __gate.candidates, soonestFreeSec: __gate.soonestFreeSec }); } catch (_) {}
@@ -19860,7 +20084,10 @@ async function runLiveFacebookPostFromPlan(body = {}) {
     const actualGroupUrl = priorPublished.actualGroupUrl || facebookGroupUrlFromPostUrl(priorPublished.postUrl) || priorPublished.groupUrl || ready.groupUrl;
     const commentText = String(row.commentTextPreview || row.link || "").trim();
     const priorDifferentComment = latestDifferentProfileVerifiedCommentForPost(priorPublished.postUrl, ready.profileId);
-    if (!priorDifferentComment && commentText) {
+    // ALREADY-PUBLISHED branch: normally we re-enter just to add the missing first comment. With commenting
+    // off there is nothing to add, so fall through to the duplicate_publish_prevented return below (which
+    // reports the existing post as ok) instead of spinning up a commenter.
+    if (!priorDifferentComment && commentText && facebookCommentsEnabledForGroup(actualGroupUrl, state)) {
       const closeResults = [];
       const commentResult = await addRequiredFirstCommentWithDifferentProfile({
         row,
@@ -25540,7 +25767,10 @@ function buildRunReports(force = false) {
     const contentFreshness = { fresh: 0, under24h: 0, under48h: 0, over48h: 0, unknown: 0 };
     for (const p of run.posts) {
       const g = __reportGroupName(p.groupUrl || p.actualGroupUrl || p.postUrl);
-      const gg = groups[g] || (groups[g] = { posts: 0, commented: 0, gaps: [] });
+      // `url` carries a real group URL from the first post of this bucket, purely so the per-group comment
+      // switch can be resolved below (__reportGroupName returns a display id, not a URL, and
+      // facebookCommentsEnabledForGroup needs something normalizedFacebookGroupKey can parse).
+      const gg = groups[g] || (groups[g] = { posts: 0, commented: 0, gaps: [], url: String(p.groupUrl || p.actualGroupUrl || p.postUrl || "") });
       gg.posts += 1;
       const c = commentByUrl.get(p.postUrl);
       let gapSec = null;
@@ -25603,7 +25833,7 @@ function buildRunReports(force = false) {
     const heldByGroup = {};
     for (const e of winHeld) { const g = __reportGroupName(e.groupUrl || ""); heldByGroup[g] = (heldByGroup[g] || 0) + 1; }
     const byGroup = {};
-    for (const [g, v] of Object.entries(groups)) byGroup[g] = { posts: v.posts, commented: v.commented, commentRate: __reportPct(v.commented, v.posts), gapMedianSec: __reportMedian(v.gaps), held: heldByGroup[g] || 0 };
+    for (const [g, v] of Object.entries(groups)) byGroup[g] = { posts: v.posts, commented: v.commented, commentRate: __reportPct(v.commented, v.posts), gapMedianSec: __reportMedian(v.gaps), held: heldByGroup[g] || 0, commentsDisabled: (idx === runsRaw.length - 1) && !facebookCommentsEnabledForGroup(v.url || "") };
     // ALL CONFIGURED GROUPS, NOT JUST ONES THAT LANDED A POST (2026-07-04 review fix): a group with zero posts
     // (e.g. every attempt is held for lack of a free commenter) used to be silently ABSENT from "Par groupe" --
     // looking like it doesn't exist rather than showing the operator exactly what's stuck. Scales to any number
@@ -25613,7 +25843,7 @@ function buildRunReports(force = false) {
     if (idx === runsRaw.length - 1) {
       for (const url of __configuredGroupUrls) {
         const g = __reportGroupName(url);
-        if (g && !byGroup[g]) byGroup[g] = { posts: 0, commented: 0, commentRate: 0, gapMedianSec: 0, held: heldByGroup[g] || 0 };
+        if (g && !byGroup[g]) byGroup[g] = { posts: 0, commented: 0, commentRate: 0, gapMedianSec: 0, held: heldByGroup[g] || 0, commentsDisabled: !facebookCommentsEnabledForGroup(url) };
       }
     }
     const winGov = gov.filter((e) => { const t = Date.parse(e.at || 0); return Number.isFinite(t) && t >= run.startT - 60000 && t <= run.lastT + 600000; });
@@ -25650,6 +25880,18 @@ function buildRunReports(force = false) {
       // aggregate -- this field is a summary count only, not itself read by the UI today.
       softApprovedPending: softApproved,
       commentRate: __reportPct(commented, run.posts.length),
+      // COMMENTS OFF (Prod > Step 1): tells report.html to render the "Commented" card as OFF instead of a
+      // red 0%, so a deliberately comment-less run doesn't read as a broken one. Reflects the CURRENT
+      // setting, so it is stamped only on the most recent run -- exactly like the configured-group roster
+      // injected above; a historical run predates the switch and must not be relabelled by it.
+      // The headline "Commented" card reads OFF when NOTHING in this run was supposed to be commented: either
+      // the Step-1 master switch is off, or every group that actually posted has its own switch off. A run
+      // where only SOME groups are off keeps the real percentage (it is genuinely partial), and the per-group
+      // cards in byGroup say which ones were deliberately silent.
+      commentsDisabled: (idx === runsRaw.length - 1) && (
+        !facebookCommentsEnabled()
+        || (Object.values(byGroup).some((v) => v.posts > 0) && Object.values(byGroup).every((v) => !v.posts || v.commentsDisabled))
+      ),
       byGroup,
       gap: gapStats,
       chromePeak: chromePeak || null,
