@@ -2364,6 +2364,13 @@ function collectState() {
     startTime: getValue("startTime"),
     stopTime: getValue("stopTime"),
   });
+  // NEVER let the main form's debounced autosave write commentsEnabled. It is spread in from the
+  // possibly-stale workflowState cache above, and this PUT carries allowOperatorConfig -- which is exactly
+  // the write the server's clobber guard steps aside for. So an unrelated edit in another tab, made from a
+  // snapshot taken before the operator flipped the switch, would silently flip it back. Deleting the key
+  // makes the field ABSENT from the payload, and writeState merges over existing, so the on-disk value
+  // stands. The Prod > Step 1 control (a targeted GET->PUT) stays the only writer.
+  delete state.operator.commentsEnabled;
   // Collect ONLY the rules still in use. The removed/dead fields (minutes-between-posts, account-move,
   // deal-signal, link-placement, pause-on-* etc.) are hidden in the DOM and NOT collected here — sending
   // their empty/default values would overwrite the saved config. writeState merges over existing, so any
@@ -6314,6 +6321,12 @@ function uxAttachIncompleteRunBanner() {
       const op = (st && st.operator) || {};
       const ix = (st && st.ixbrowser) || {};
       populateProdRunMode(op);
+      // Re-sync from the AUTHORITATIVE state fetched just above, not only from the workflowState cache used
+      // at the top of this function. Without this, a session whose cache never loaded (the initial refresh()
+      // failed) would keep rendering `{}`, and `{}.commentsEnabled !== false` is true -- so the panel would
+      // assert "Comment every post" while the server has comments OFF. Silently claiming the affiliate link
+      // is going out when it is not is the worst thing this control could do.
+      populateProdComments(op);
       const enabled = ap.enabled != null ? ap.enabled : op.autopilotEnabled;
       const dryRun = op.autopilotDryRun !== false;
       const live = Boolean(enabled) && !dryRun;
@@ -6527,7 +6540,7 @@ function uxAttachIncompleteRunBanner() {
       r.addEventListener("change", async function () {
         if (!r.checked) return;
         const on = r.value === "on";
-        if (!on && !window.confirm("Turn comments OFF?\n\nPosts will still publish, and groups that need moderation will still be approved — but NO first comment will be added, so the affiliate link never goes out.\n\nNo commenter browser is opened and no comment recovery runs while this is off. You can switch it back on at any time.")) {
+        if (!on && !window.confirm("Turn comments OFF?\n\nPosts will still publish, and groups that need moderation will still be approved — but NO first comment will be added, so the affiliate link never goes out.\n\nNo commenter browser is opened and no comment recovery runs while this is off.\n\nYou can switch it back on at any time. Posts published while it was off stay uncommented — turning it back on affects new posts only, so nothing is back-filled behind you.")) {
           const back = document.querySelector('input[name="prodCommentsEnabled"][value="on"]');
           if (back) back.checked = true;
           return;
@@ -6538,8 +6551,12 @@ function uxAttachIncompleteRunBanner() {
         prodResult(on ? "Enabling comments…" : "Disabling comments…");
         try {
           await prodPatchState({ operator: { commentsEnabled: on } });
+          // Released as soon as the write has LANDED, so the 4s poll goes back to showing the server's truth.
+          // (prodRunModeTouched stays latched because the operator owns those fields until they Start; this
+          // one is a single boolean that the server is authoritative for the moment it is saved.)
+          prodCommentsTouched = false;
           prodResult(on
-            ? "✓ Comments ON — every post gets its first comment with the affiliate link."
+            ? "✓ Comments ON — every post gets its first comment with the affiliate link. Posts published while it was off stay uncommented on purpose."
             : "✓ Comments OFF — the agent posts only; the comment step is skipped entirely.");
         } catch (e) {
           // REVERT ON FAILURE. The optimistic update above is what keeps the radio steady against the 4s

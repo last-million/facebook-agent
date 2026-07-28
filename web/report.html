@@ -328,7 +328,7 @@ function runBody(r){
     + statCard("Unique products", (r.uniqueProducts||0), (r.productsInBoth||0)+" in both groups", (r.uniqueProducts? (r.productsInBoth>0?"g":"a") : ""))
     + (r.contentFreshness ? statCard("Fresh harvested", r.contentFreshness.fresh, r.contentFreshness.reusedUnder24h+" reused ≤24h, "+r.contentFreshness.reusedUnder48h+" reused ≤48h"+(r.contentFreshness.reusedOver48h?", "+r.contentFreshness.reusedOver48h+" older (pre-fix)":""), (r.contentFreshness.reusedOver48h>0?"r":(r.contentFreshness.fresh>0?"g":"a"))) : "")
     + (r.commentsDisabled
-        ? statCard("Commented", "OFF", "comments disabled in Prod &middot; Step 1 &mdash; posts published without a first comment on purpose", "v")
+        ? statCard("Commented", "OFF", "comment step switched off — these posts were published without a first comment on purpose", "v")
         : statCard("Commented", r.commentRate+'<small>%</small>', r.commented+"/"+r.posts+" • "+r.uncommented+" without", r.commentRate>=90?"g":(r.commentRate>=70?"a":"r")))
     + statCard("Average comment time", fmtGap(r.gap.avgSec), "from post recorded published to comment verified (approval wait not included)", (r.gap.avgSec>=240?"r":(r.gap.avgSec>=120?"a":"g")))
     + statCard("Median delay", fmtGap(r.gap.medianSec), "max "+fmtGap(r.gap.maxSec), "v")
@@ -448,9 +448,15 @@ function runBody(r){
     }).join("");
     return h + '</tbody></table></div>';
   }
-  html += __breakdown("By group", "Group (weakest first)", __agg(det, function(d){ return d.group; }), 3);
-  html += __breakdown("By posting profile", "Publisher profile — on its published posts", __agg(det, function(d){ return d.profilePub; }, function(d){ return d.profilePubLabel || String(d.profilePub); }), 3);
-  html += __breakdown("By commenting profile", "Commenter profile — verified comments", __agg(det.filter(function(d){ return d.profileCom; }), function(d){ return d.profileCom; }, function(d){ return d.profileComLabel || String(d.profileCom); }), 3);
+  // These three tables rank by COMMENT rate and flag anything under 90% as red "weak". On a run where the
+  // comment step was deliberately switched off for every post, that paints every group and every profile red
+  // for doing exactly what they were told — and contradicts the "OFF" card rendered above. Nothing to rank,
+  // so nothing is shown. A PARTIAL run (only some groups off) still gets all three tables: its rate is real.
+  if (!r.commentsDisabled) {
+    html += __breakdown("By group", "Group (weakest first)", __agg(det, function(d){ return d.group; }), 3);
+    html += __breakdown("By posting profile", "Publisher profile — on its published posts", __agg(det, function(d){ return d.profilePub; }, function(d){ return d.profilePubLabel || String(d.profilePub); }), 3);
+    html += __breakdown("By commenting profile", "Commenter profile — verified comments", __agg(det.filter(function(d){ return d.profileCom; }), function(d){ return d.profileCom; }, function(d){ return d.profileComLabel || String(d.profileCom); }), 3);
+  }
 
   // BY PRODUCT — each harvested product, its number, how many times posted, in which groups, by which profiles
   var prods = r.products || [];
