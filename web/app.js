@@ -2310,7 +2310,16 @@ if (typeof window !== "undefined") window.unblockProfile = unblockProfile;
 function syncPreviewStateFromForm() {
   if (!workflowState) return;
   try {
+    // collectState() deliberately omits operator.commentsEnabled from its SAVE payload (see the delete
+    // there). Its result is ALSO reused as the in-memory read cache here, and the Prod > Step 1 radio
+    // renders from that cache — so the value has to be carried across, or the panel would read undefined,
+    // treat it as ON, and claim "Comment every post" while the server has comments OFF.
+    const __prevCommentsEnabled = workflowState.operator ? workflowState.operator.commentsEnabled : undefined;
     workflowState = collectState();
+    if (__prevCommentsEnabled !== undefined) {
+      workflowState.operator = workflowState.operator || {};
+      workflowState.operator.commentsEnabled = __prevCommentsEnabled;
+    }
     workflowRegisters = collectRegisters();
     $("activeProfileCount").textContent = `${countLines(workflowState.ixbrowser.activeProfiles)} active`;
     renderAnalytics();
@@ -2854,6 +2863,13 @@ function groupUrlsForAssignments() {
 function initializeGroupAssignmentDraft() {
   const existing = groupAssignmentDraft.length ? groupAssignmentDraft : (Array.isArray(workflowState?.posting?.groupAssignmentData) ? workflowState.posting.groupAssignmentData : []);
   const byUrl = new Map(existing.map((entry) => [String(entry.url || "").trim(), entry]));
+  // SAVED per-group settings, as a fallback for any group the current draft has no entry for. The #test
+  // single-post flow collapses groupAssignmentDraft to ONE group; the next render then rebuilds every OTHER
+  // group with `previous = {}`, which would resolve commentsEnabled to true and — because
+  // collectGroupAssignmentData always emits it explicitly — save that as a real "on", silently re-enabling
+  // comments on every group the operator had switched off.
+  const savedByUrl = new Map((Array.isArray(workflowState?.posting?.groupAssignmentData) ? workflowState.posting.groupAssignmentData : [])
+    .map((entry) => [String(entry?.url || "").trim(), entry]));
   const groups = groupUrlsForAssignments();
   const defaultShare = groups.length ? Math.floor(100 / groups.length) : 0;
   let remainder = groups.length ? 100 - (defaultShare * groups.length) : 0;
@@ -2864,9 +2880,12 @@ function initializeGroupAssignmentDraft() {
       url,
       sharePercent: Number(share) || 0,
       // Per-group comment switch. Carried through the draft so re-rendering the matrix (which happens on
-      // every profile tick) cannot silently reset a group the operator switched off. Absent = ON, the same
-      // fail-safe the server uses.
-      commentsEnabled: previous.commentsEnabled !== false,
+      // every profile tick) cannot silently reset a group the operator switched off; falls back to the SAVED
+      // value when this group is absent from the draft. Absent everywhere = ON, the same fail-safe the
+      // server uses.
+      commentsEnabled: (previous.commentsEnabled !== undefined
+        ? previous.commentsEnabled
+        : (savedByUrl.get(url) || {}).commentsEnabled) !== false,
       profiles: Array.isArray(previous.profiles) ? previous.profiles.map(String).filter(isAllowedNormalIxBrowserProfileLabel) : [],
     };
   });
@@ -6415,6 +6434,12 @@ function uxAttachIncompleteRunBanner() {
     if (patch.operator) Object.assign(st.operator, patch.operator);
     if (patch.ixbrowser) Object.assign(st.ixbrowser, patch.ixbrowser);
     if (patch.rules) Object.assign(st.rules, patch.rules);
+    // Every other caller of prodPatchState (Start / Stop / Pause / Go live / Disable / concurrency /
+    // run-mode) would otherwise re-assert commentsEnabled from the snapshot it just read — and this PUT
+    // carries allowOperatorConfig, the one write the server's clobber guard steps aside for. Drop the key
+    // unless THIS patch is the one setting it, so the field is absent and writeState keeps the on-disk
+    // value. Mirrors the same `delete` in collectState.
+    if (!(patch.operator && Object.prototype.hasOwnProperty.call(patch.operator, "commentsEnabled"))) delete st.operator.commentsEnabled;
     await api("/api/state", { method: "PUT", body: JSON.stringify({ state: st }) });
   }
   // ── Prod run mode: "stop after N posts" (count) OR "run between start & end time" (time) ─────

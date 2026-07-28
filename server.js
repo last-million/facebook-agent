@@ -349,13 +349,16 @@ function facebookCommentsEnabledForGroup(groupUrl, state) {
     if (s?.operator?.commentsEnabled === false) return false; // master switch OFF -> off for every group
     if (!normalizedFacebookGroupKey(groupUrl)) return true; // no/unparseable group -> master switch's answer (ON)
     const rows = Array.isArray(s?.posting?.groupAssignmentData) ? s.posting.groupAssignmentData : [];
+    // ANY matching entry that is off wins -- not just the first match. The same Facebook group can legitimately
+    // appear twice in the matrix (once under its vanity url, once under the numeric one); returning on the
+    // first match would make one of the two Step-3 checkboxes silently inert and let array order decide.
     for (const entry of rows) {
       let match = false;
       try { match = groupsMatchByAlias(groupUrl, entry?.url); }
       catch (_) { match = normalizedFacebookGroupKey(entry?.url) === normalizedFacebookGroupKey(groupUrl); }
-      if (match) return entry?.commentsEnabled !== false;
+      if (match && entry?.commentsEnabled === false) return false;
     }
-    return true; // group not in the assignment matrix at all -> comment it (fail safe)
+    return true; // no matching entry says off -> comment it (fail safe)
   } catch (_) {
     return true;
   }
@@ -1565,10 +1568,15 @@ function writeState(state, opts = {}) {
   if (Array.isArray(clean.posting?.groupAssignmentData) && Array.isArray(existing.posting?.groupAssignmentData)) {
     for (const newEntry of clean.posting.groupAssignmentData) {
       if (!newEntry?.url) continue;
-      if (Object.prototype.hasOwnProperty.call(newEntry, "commentsEnabled")) continue; // caller stated it -> honour it
+      // Only the operator's own dashboard PUT (allowOperatorConfig) may state this value. hasOwnProperty
+      // alone is NOT enough protection here: normalizeWorkflowState materializes commentsEnabled on EVERY
+      // group entry of every state it touches, so any background writer holding a stale full-state snapshot
+      // carries an explicit -- and possibly pre-flip -- value, which a bare hasOwnProperty check would
+      // dutifully honour. For every non-dashboard write the on-disk value simply wins.
+      if (opts.allowOperatorConfig && Object.prototype.hasOwnProperty.call(newEntry, "commentsEnabled")) continue;
       const k = normalizedFacebookGroupKey(newEntry.url);
       const match = existing.posting.groupAssignmentData.find((e) => normalizedFacebookGroupKey(e?.url) === k);
-      if (match && match.commentsEnabled === false) newEntry.commentsEnabled = false;
+      if (match && Object.prototype.hasOwnProperty.call(match, "commentsEnabled")) newEntry.commentsEnabled = match.commentsEnabled;
     }
   }
   if (Array.isArray(clean.posting?.groupAssignmentData) && Array.isArray(existing.posting?.groupAssignmentData)) {
@@ -1970,7 +1978,13 @@ function persistLiveTestResult(result = {}) {
   if (ok) {
     testRun.steps.post = { label: "Post", status: "done", detail: `Post + HD image verified in ${groupUrl || "Facebook group"}.` };
     testRun.steps.postUrl = { label: "Post URL", status: "done", detail: postUrl };
-    testRun.steps.comment = {
+    testRun.steps.comment = result.commentsDisabled ? {
+      // The comment step is switched off, so the run succeeded WITHOUT a comment. Saying "verified" here
+      // would report the money step as done when nothing was attempted.
+      label: "Comment",
+      status: "skipped",
+      detail: "Skipped — the comment step is switched off for this group.",
+    } : {
       label: "Comment",
       status: "done",
       detail: result.commentProfile
@@ -14298,7 +14312,12 @@ async function reconcilePendingPublishIntentsAsync(options = {}) {
               // DURABLE COMMENT-RECOVERY: stamp the payload here too — this kill-mid-post path lands a post WITHOUT going
               // through completeVerifiedFacebookPostWithComment, so without this the recovered post has no payload and is
               // permanently uncommentable once the plan is overwritten (the exact interrupted-run case the fix targets).
-              commentTextPreview: row.commentTextPreview || "", commentPostText: row.postText || "", commentLink: row.link || "", pinFirstComment: row.pinFirstComment !== false, harvested: Boolean(row.harvested), commentImagePath: row.image || row.imagePath || "", title: row.title || "", ogDescription: row.ogDescription || "", productKey: row.productKey || "" });
+              commentTextPreview: row.commentTextPreview || "", commentPostText: row.postText || "", commentLink: row.link || "", pinFirstComment: row.pinFirstComment !== false, harvested: Boolean(row.harvested), commentImagePath: row.image || row.imagePath || "", title: row.title || "", ogDescription: row.ogDescription || "", productKey: row.productKey || "",
+              // Same comments-off stamp completeVerifiedFacebookPostWithComment writes. This path lands a post
+              // WITHOUT going through that function, so without it a post recovered from a kill-mid-post while
+              // the comment step was switched off would be missing the stamp and get retro-commented the moment
+              // comments were switched back on.
+              commentsDisabledAtPublish: !facebookCommentsEnabledForGroup(actualGroupUrl, reconState) || !facebookCommentsEnabledForGroup(groupUrl, reconState) });
             // COUNT it toward the run if it belongs to the CURRENT run (parity with the live counter bump), so a
             // recovered landed post doesn't make a "stop at N" run over-publish by 1.
             try {
@@ -19059,6 +19078,25 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         const m = __pendingFailByUrl.get(u); if (!m || m.size < clampNumber(state.operator?.commentCorroborationMinProfiles, 2, 20, 3)) return false;
         const t = [...m.values()]; return Math.max(...t) - Math.min(...t) >= clampNumber(state.operator?.commentCorroborationMinSpreadMinutes, 0, 720, 30) * 60000;
       };
+      // COMMENTS-OFF variant of __isStuckSoft. The corroborated predicates above both require
+      // __pendingFailByUrl, which is built ONLY from comment_recovery_finished failure rows -- and with the
+      // comment lane closed no such row is ever written. So in comments-off mode they can never fire, and a
+      // post the moderator approved but Facebook never made public would be buried forever: invisible on
+      // Facebook, product retired, run counter bumped, nothing anywhere to push it public again.
+      //
+      // With no comment probe available, the soft_clicked stamp IS the evidence -- it means precisely
+      // "a moderator clicked Approve and FB never confirmed the post live". Deliberately narrow: ONLY
+      // soft_clicked rows, never plain "published"/not_applicable (that would sweep in every normal post),
+      // and still subject to the same SOFT_STUCK_MIN_AGE_MS, the same MAX_SOFT_STUCK_REAPPROVALS per url and
+      // the same MAX_REAPPROVALS_PER_PASS per pass as the normal lane. Worst case is a wasted moderator
+      // visit on a post that was already public -- which this file documents as a no-op, and with comments
+      // off there is no owed comment for it to defer.
+      const __isStuckSoftNoComments = (ev, url) => {
+        if (ev.event !== "published_after_admin_approval" || ev.approvalVerification !== "soft_clicked") return false;
+        if (Date.now() - (Date.parse(ev.at || "") || 0) < SOFT_STUCK_MIN_AGE_MS) return false;
+        let u = ""; try { u = sanitizeFacebookPostUrl(url); } catch { return false; }
+        return !__okUrls.has(u) && !__confirmedPublicUrls.has(u);
+      };
       const __orderedPending = [...publishedByPlan.values()].sort((a, b) => {
         const fa = __failCountFor(a.postUrl), fb = __failCountFor(b.postUrl);
         if (fa !== fb) return fa - fb;
@@ -19122,22 +19160,30 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         if (!options.ignoreArmedGate && __externalStopRequested > resweepStartedAt) { logEvent("comment_resweep_aborted_by_stop", { checked: summary.checked }); break; } // operator hit STOP -> halt now (before dispatching anything new). EXCEPTION (operator 2026-06-20): the ignoreArmedGate FINISH-drains (stop-drain 8270 / run-end 9075) run to COMPLETION — a 2nd/stale/double STOP must NOT bump __externalStopRequested past this drain's resweepStartedAt and abandon the comments the run already owes (that left 20 uncommented forever). Posting+harvest are already hard-killed before the finish-drain starts, so this only lets the cheap comment-finish complete.
         const postUrl = ev.postUrl;
         if (!__isConfiguredGroup(ev.groupUrl || ev.actualGroupUrl)) { summary.skippedDeletedGroup = (summary.skippedDeletedGroup || 0) + 1; continue; } // 2026-07-12: post's group was removed from config -> never comment it again
-        // COMMENTS OFF for this candidate. Computed here but deliberately NOT acted on with `continue`: the
-        // post must still be allowed to reach the stuck-soft RE-APPROVAL routing further down (~19195), which
-        // is about getting the POST public and has nothing to do with its comment. It is consumed at the
-        // routing branch instead, where it blocks only the comment lane.
-        //
-        // Three independent reasons a candidate's comment lane is closed:
+        // COMMENTS OFF for this candidate. Three independent reasons the comment lane is closed:
         //   1. the Step-1 master switch is off (whole box),
-        //   2. this post's group has its own switch off (alias-aware, vanity<->numeric),
+        //   2. this post's group has its own switch off,
         //   3. the post was PUBLISHED while comments were off (durably stamped on its published ledger row).
         // (3) is what stops re-enabling comments from retro-commenting an entire off-window at once: those
         // posts were deliberately published without a link, and back-filling them hours later would be both a
         // surprise money-comment and a burst of browser opens. The explicit manual "Resweep comments" button
         // (options.force) bypasses (3) on purpose, so the operator still has a deliberate way to back-fill.
+        //
+        // BOTH urls are asked, and OFF wins -- exactly as completeVerifiedFacebookPostWithComment does. The
+        // configured (vanity) url and the resolved (numeric permalink) url are BOTH on this ledger row, and
+        // asking only the numeric one would fail open on every group configured by vanity id whose alias has
+        // not been learned yet.
         const __cOff = __commentsMasterOff
-          || !facebookCommentsEnabledForGroup(ev.actualGroupUrl || ev.groupUrl, state)
+          || !facebookCommentsEnabledForGroup(ev.actualGroupUrl, state)
+          || !facebookCommentsEnabledForGroup(ev.groupUrl, state)
           || (ev.commentsDisabledAtPublish === true && !options.force);
+        // Comment lane closed AND not a re-approval candidate -> skip NOW, before the expensive per-row work
+        // below (postingPlanRowForRecord + the durable-payload rebuild). Without this cheap exit the
+        // `__candidates.length >= maxToFix` break can never fire in comments-off mode -- __cOff posts are
+        // counted, never pushed -- so every published row in the window would pay full reconstruction on
+        // every pass of the always-on drain. A post that IS stuck-soft falls through on purpose: it still
+        // needs its shot at re-approval below, which is about the POST, not its comment.
+        if (__cOff && !__isStuckSoftNoComments(ev, postUrl)) { summary.skippedCommentsDisabled = (summary.skippedCommentsDisabled || 0) + 1; continue; }
         // Bound by CANDIDATES SELECTED, not (as before) attempts made mid-loop -- equivalent now that dispatch
         // is concurrent: each selected candidate becomes exactly one real attempt below (barring the late
         // re-check race, same as before), so capping selection at maxToFix preserves the same per-pass budget.
@@ -19227,11 +19273,11 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
         // stop-finish drain we NEVER re-approve -- we always COMMENT, so an ex-pending-now-public post the run owes
         // is commented before disarm (re-approving a public post is a no-op that would defer its owed comment).
         if (!__forcedSweep
-            && (__isStuckSoft(ev, postUrl) || (__pending && isAdminApprovalEnabledForGroup(ev.groupUrl || ev.actualGroupUrl, state)))
+            && (__isStuckSoft(ev, postUrl) || (__cOff && __isStuckSoftNoComments(ev, postUrl)) || (__pending && isAdminApprovalEnabledForGroup(ev.groupUrl || ev.actualGroupUrl, state)))
             && (__reapprovalAttemptsByUrl.get(sanitizeFacebookPostUrl(postUrl)) || 0) < MAX_SOFT_STUCK_REAPPROVALS)
           __reapprovalCandidates.push({ ev, row, postUrl, publisherId });
         else if (__cOff)
-          summary.skippedCommentsDisabled = (summary.skippedCommentsDisabled || 0) + 1; // comments off for this post -> no comment attempt, but it kept its shot at re-approval above
+          summary.skippedCommentsDisabled = (summary.skippedCommentsDisabled || 0) + 1; // comments off and its re-approval shot is spent/not applicable -> nothing owed
         else
           __candidates.push({ ev, row, postUrl, publisherId, __forcedSweep });
       }
@@ -19307,6 +19353,14 @@ async function resweepUncommentedFacebookPostsAsync(options = {}) {
               __capacityDeferAt.set(c.postUrl, Date.now());
               if (__capacityDeferAt.size > 3000) { const cut = Date.now() - 10 * CAPACITY_DEFER_FLOOR_MS; for (const [k, v] of __capacityDeferAt) if (v < cut) __capacityDeferAt.delete(k); }
             }
+            else if (res?.commentsDisabled) {
+              // The switch was flipped OFF between this candidate's selection and its dispatch. Nothing was
+              // owed and no browser opened, so this is not a miss: without its own branch it would fall into
+              // the terminal `else` below and be recorded as a real comment FAILURE, stamping an escalating
+              // chronic backoff on a post that was merely switched off.
+              summary.skippedCommentsDisabled = (summary.skippedCommentsDisabled || 0) + 1;
+              __commentRecoveryBackoff.delete(c.postUrl);
+            }
             else if (res?.ok || latestDifferentProfileVerifiedCommentForPost(c.postUrl, c.publisherId)) { summary.recommented += 1; __capacityDeferAt.delete(c.postUrl); }
             else { summary.stillMissing += 1; if (c.__forcedSweep) __commentRecoveryBackoff.set(c.postUrl, Date.now()); } // forced sweep: stamp backoff only AFTER a real failure, so a clean attempt isn't poisoned by a race
           } catch (err) {
@@ -19365,7 +19419,8 @@ async function completeVerifiedFacebookPostWithComment({
   // aliases it already knows -- and the post-pacing gate upstream asked the same question using the
   // configured url. Asking both, and treating either "off" as off, makes the two gates agree by
   // construction instead of by luck.
-  const __commentsOff = !facebookCommentsEnabledForGroup(actualGroupUrl) || !facebookCommentsEnabledForGroup(groupUrl);
+  const __cwcState = readState(); // read ONCE and share: both lookups below would otherwise each pay their own merge-cache clone, per post, inside the post-publish critical section
+  const __commentsOff = !facebookCommentsEnabledForGroup(actualGroupUrl, __cwcState) || !facebookCommentsEnabledForGroup(groupUrl, __cwcState);
   recordPublishedFacebookPostUrl({
     postUrl,
     row,
@@ -25838,10 +25893,7 @@ function buildRunReports(force = false) {
     const contentFreshness = { fresh: 0, under24h: 0, under48h: 0, over48h: 0, unknown: 0 };
     for (const p of run.posts) {
       const g = __reportGroupName(p.groupUrl || p.actualGroupUrl || p.postUrl);
-      // `url` carries a real group URL from the first post of this bucket, purely so the per-group comment
-      // switch can be resolved below (__reportGroupName returns a display id, not a URL, and
-      // facebookCommentsEnabledForGroup needs something normalizedFacebookGroupKey can parse).
-      const gg = groups[g] || (groups[g] = { posts: 0, commented: 0, gaps: [], url: String(p.groupUrl || p.actualGroupUrl || p.postUrl || ""), offPosts: 0 });
+      const gg = groups[g] || (groups[g] = { posts: 0, commented: 0, gaps: [], offPosts: 0 });
       if (p.commentsDisabledAtPublish === true) gg.offPosts += 1; // HISTORICAL, from the post's own published row
       gg.posts += 1;
       const c = commentByUrl.get(p.postUrl);
