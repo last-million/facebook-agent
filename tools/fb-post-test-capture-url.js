@@ -45,21 +45,30 @@ function normalizeTextLoose(value) {
     .toLowerCase();
 }
 
-// MINIMUM NORMALIZED MARKER LENGTH = 8 (was 10 here / 12 at the in-page match sites, lowered 2026-08-01).
-// 8 is the exact normalized length of the per-post fingerprint "#fb<6hex>" -> "fb1a2b3c", which is the
-// marker the server now sends for harvested rows (see livePostPayloadForRow: the marker is the fingerprint
-// alone, so it stays a verbatim substring of the caption whether or not the marketing hashtags were posted).
-// This is NOT a new, looser threshold: the moderator-approval gate (clickApproveForVisibleMarker) has run
-// `cleanMarker.length >= 8` against exactly this key in production for months. The RAW includes() tier above
-// still runs FIRST at every site; only the normalized fallback tier moved, and only far enough to keep
-// working for a contiguous hex token. Do not lower it below 8 -- shorter keys match promiscuously.
+// NORMALIZED-MARKER FLOORS, and why they differ by site (2026-08-01).
+// The server now sends "#fb<6hex>" as the marker for harvested rows (see livePostPayloadForRow). It
+// normalizes to exactly 8 chars, so the in-page normalized fallback tiers — which required >= 12 — would
+// have gone permanently dead for the entire production path, leaving those sites on raw includes() alone.
+// They were therefore changed to `(cleanMarker.length >= 12 || /^fb[0-9a-f]{6}$/.test(cleanMarker))`:
+// admit the fingerprint EXPLICITLY by shape, and leave every other marker on its original 12-char floor.
+// A blanket ">= 8" was the first attempt and was wrong — it would also have loosened matching for short
+// web-row title phrases ("Ring Light" -> 10 chars), widening a class this change has no business touching.
+//
+// THIS SITE KEEPS ITS 10-CHAR FLOOR — deliberately NOT lowered at all.
+// The in-page gates match against RENDERED text (one post card, a queue screen), where the normalized tier
+// exists to absorb whitespace/accent reflow and an 8-char key is safe. markerTextMatches is different: its
+// only caller feeds it RAW multi-hundred-KB GraphQL/JSON response bodies, where a normalized 8-character
+// hex needle like "fb1a2b3c" can occur by chance inside any hex or base64 run and produce a false
+// "marker seen" capture. The server now sends "#fb<6hex>" as the marker for harvested rows, and the RAW
+// includes() tier immediately above already matches it verbatim in those bodies -- the normalized tier buys
+// nothing for a contiguous token with no accents and no spaces. So the floor stays where it was.
 function markerTextMatches(haystack, marker) {
   const rawHaystack = String(haystack || '');
   const rawMarker = String(marker || '');
   if (!rawMarker) return false;
   if (rawHaystack.includes(rawMarker)) return true;
   const cleanMarker = normalizeTextLoose(rawMarker);
-  if (cleanMarker.length < 8) return false;
+  if (cleanMarker.length < 10) return false;
   const cleanHaystack = normalizeTextLoose(rawHaystack);
   if (cleanHaystack.includes(cleanMarker)) return true;
   const zdf = (rawMarker.match(/\bZDF-[A-Z0-9]{6,16}\b/i) || [])[0];
@@ -1328,7 +1337,7 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
         if (!needles || !needles.length) return { found: false };
         const visible = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none'; };
         const norm = (s) => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\p{L}\p{N}]+/gu, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-        const markerMatch = (value) => { if (marker && String(value || '').includes(marker)) return true; const cm = norm(marker); return cm.length >= 8 && norm(value).includes(cm); };
+        const markerMatch = (value) => { if (marker && String(value || '').includes(marker)) return true; const cm = norm(marker); return (cm.length >= 12 || /^fb[0-9a-f]{6}$/.test(cm)) && norm(value).includes(cm); };
         // FB renders each COMMENT as its own [role="article"] with a comment aria-label (multilingual), and renders
         // RELATED/SUGGESTED posts (their own articles + comments) BELOW the target on a group permalink. The affiliate
         // link is PRODUCT-stable (every repost reuses the byte-identical shortlink), so we must scan ONLY the target
@@ -1401,7 +1410,7 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
         .trim()
         .toLowerCase();
       const cleanMarker = normalize(marker);
-      return cleanMarker.length >= 8 && normalize(value).includes(cleanMarker);
+      return (cleanMarker.length >= 12 || /^fb[0-9a-f]{6}$/.test(cleanMarker)) && normalize(value).includes(cleanMarker);
     };
     const markerArticles = [...document.querySelectorAll('[role="article"]')]
       .filter((el) => visible(el) && marker && (matches(el.innerText || '') || matches(el.textContent || '')));
@@ -1493,7 +1502,7 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
       if (!marker) return false;
       if (String(value || '').includes(marker)) return true;
       const cleanMarker = normalize(marker);
-      return cleanMarker.length >= 8 && normalize(value).includes(cleanMarker);
+      return (cleanMarker.length >= 12 || /^fb[0-9a-f]{6}$/.test(cleanMarker)) && normalize(value).includes(cleanMarker);
     };
     const visible = (el) => {
       const rect = el.getBoundingClientRect();
@@ -1589,7 +1598,7 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
         .trim()
         .toLowerCase();
       const cleanMarker = normalize(marker);
-      return cleanMarker.length >= 8 && normalize(value).includes(cleanMarker);
+      return (cleanMarker.length >= 12 || /^fb[0-9a-f]{6}$/.test(cleanMarker)) && normalize(value).includes(cleanMarker);
     };
     const articleRoots = [...document.querySelectorAll('[role="article"]')]
       .filter((el) => visible(el) && marker && matches(el.innerText || ''));
@@ -1648,7 +1657,7 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
           .trim()
           .toLowerCase();
         const cleanMarker = normalize(marker);
-        return cleanMarker.length >= 8 && normalize(value).includes(cleanMarker);
+        return (cleanMarker.length >= 12 || /^fb[0-9a-f]{6}$/.test(cleanMarker)) && normalize(value).includes(cleanMarker);
       };
       if (!marker || !matches(bodyText)) return { clicked: false, reason: 'target_marker_not_visible_for_permalink_comment_fallback' };
       const visible = (el) => {
@@ -1990,7 +1999,7 @@ async function submitCommentOnVisiblePost(page, marker, commentText, expectedPos
           .trim()
           .toLowerCase();
         const cleanMarker = normalize(marker);
-        return cleanMarker.length >= 8 && normalize(value).includes(cleanMarker);
+        return (cleanMarker.length >= 12 || /^fb[0-9a-f]{6}$/.test(cleanMarker)) && normalize(value).includes(cleanMarker);
       };
       const roots = [...document.querySelectorAll('[role="article"], div')].filter((el) => marker && matches(el.innerText || ''));
       const preferredRoot = roots.find((el) => el.matches?.('[role="article"]')) || roots[roots.length - 1] || document.body;
@@ -2343,7 +2352,7 @@ async function commentTargetPreflight(page, postUrl, marker) {
         .trim()
         .toLowerCase();
       const cleanMarker = normalize(marker);
-      return cleanMarker.length >= 8 && normalize(value).includes(cleanMarker);
+      return (cleanMarker.length >= 12 || /^fb[0-9a-f]{6}$/.test(cleanMarker)) && normalize(value).includes(cleanMarker);
     };
     // PENDING/UNAVAILABLE detection — multilingual (these profiles run FB in ES/AR; EN-only let a localized pending
     // post pass preflight and try to comment on a not-yet-approved post). Covers EN/FR/ES/PT/DE + Arabic.
@@ -2492,17 +2501,18 @@ async function extractMarkerScopedPostUrls(page, gid, marker) {
     const markerNodes = [...document.querySelectorAll('[role="article"], div, span')]
       .filter(el => visible(el) && marker && (el.innerText || '').includes(marker));
     const roots = [];
-    // CLIMB DEPTH 8 -> 12 (2026-08-01). markerNodes is the set of elements whose innerText CONTAINS the
-    // marker, and we climb from each to find the post card that owns the permalink href. With the marker now
-    // being a single short "#fb<hex>" token rather than a whole tag line, the DEEPEST element containing it
-    // is the hashtag's own anchor/span -- one to two levels BELOW the caption container that used to be the
-    // deepest match -- so a fixed 8-level climb could top out short of the post card. Raising the cap only
-    // ADDS candidate roots; it can never remove one, and every candidate URL still has to pass
-    // candidateHasStrongPermalinkMarker (exactPermalink AND a marker hit), so a wider root set cannot admit
-    // a wrong post.
+    // CLIMB DEPTH DELIBERATELY LEFT AT 8 (2026-08-01). It was briefly raised to 12 on the theory that a
+    // short "#fb<hex>" marker matches a DEEPER node than a full tag line did, so the climb might stop short
+    // of the post card. That theory was wrong twice over. First, markerNodes is every element whose
+    // innerText CONTAINS the marker -- and innerText includes descendants -- so the post card is ALREADY in
+    // markerNodes itself; the climb is only belt-and-braces. Second, and worse: `preferred` below takes
+    // .slice(-8) of `roots`, and roots is pushed deepest-first, so a deeper climb does not add roots, it
+    // REPLACES the eight deepest (post-card-scoped) ones with broader feed-level containers -- which
+    // preferred.reverse() then scans FIRST, letting a neighbouring post's permalink be collected ahead of
+    // ours. Raising this number is a wrong-post-capture risk, not a robustness win.
     for (const node of markerNodes.slice(-12)) {
       let current = node;
-      for (let depth = 0; current && depth < 12; depth += 1, current = current.parentElement) {
+      for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
         if (!visible(current)) continue;
         if (current.matches?.('[role="article"], [role="dialog"], div')) roots.push(current);
       }
@@ -2619,7 +2629,7 @@ async function extractVisibleGroupUserCandidates(page, gid, marker, source = 'pa
       if (!marker) return false;
       if (String(value || '').includes(marker)) return true;
       const cleanMarker = normalize(marker);
-      return cleanMarker.length >= 8 && normalize(value).includes(cleanMarker);
+      return (cleanMarker.length >= 12 || /^fb[0-9a-f]{6}$/.test(cleanMarker)) && normalize(value).includes(cleanMarker);
     };
     const visible = (el) => {
       const rect = el.getBoundingClientRect();
@@ -2836,7 +2846,7 @@ async function verifyCandidate(context, url, marker) {
           .trim()
           .toLowerCase();
         const cleanMarker = normalize(marker);
-        return cleanMarker.length >= 8 && normalize(value).includes(cleanMarker);
+        return (cleanMarker.length >= 12 || /^fb[0-9a-f]{6}$/.test(cleanMarker)) && normalize(value).includes(cleanMarker);
       };
       const visible = (el) => {
         const rect = el.getBoundingClientRect();
@@ -3023,7 +3033,7 @@ async function bodyMarkerChecks(page, marker) {
       const sv = String(value || '');
       if (sv.includes(marker)) return true;
       const cleanMarker = normalize(marker);
-      return cleanMarker.length >= 8 && normalize(sv).includes(cleanMarker);
+      return (cleanMarker.length >= 12 || /^fb[0-9a-f]{6}$/.test(cleanMarker)) && normalize(sv).includes(cleanMarker);
     };
     return {
       markerVisible: matchesLoose(text),
@@ -4182,10 +4192,18 @@ async function approvePendingPost(page, context, payload, gid, marker) {
       // product-word tag line. payload.searchHint carries that richer text purely for navigation; acceptance
       // is still gated on the marker/fingerprint by collectVerifiedUrls below, so a wrong or stale hint can
       // only ever waste one page load -- it can never cause a wrong post to be accepted.
-      const searchTarget = `${groupUrl.replace(/[?#].*$/, '').replace(/\/+$/, '')}/search/?q=${encodeURIComponent(payload.searchHint || marker)}`;
-      await page.goto(searchTarget, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
-      await humanPause(4000, 7000);
-      attempts.push({ target: searchTarget, ...(await collectVerifiedUrls('group_search_after_approval')) });
+      const __base = groupUrl.replace(/[?#].*$/, '').replace(/\/+$/, '');
+      // BOTH queries, hint FIRST and marker LAST, deduped. The hint carries the product words (the strong
+      // query for a post published WITH its tag line); the marker is the bare #fb<hex>. Trying both means a
+      // hint that turns out to be useless can never leave us worse off than querying the marker alone, and
+      // a post published with hashtags OFF — whose hint IS the fingerprint — simply collapses to one query.
+      for (const __q of [...new Set([payload.searchHint, marker].filter(Boolean))]) {
+        const searchTarget = `${__base}/search/?q=${encodeURIComponent(__q)}`;
+        await page.goto(searchTarget, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {});
+        await humanPause(4000, 7000);
+        attempts.push({ target: searchTarget, ...(await collectVerifiedUrls('group_search_after_approval')) });
+        if (verified.length) break; // resolved — don't burn a second page load
+      }
     }
   }
   if (postUrl) {

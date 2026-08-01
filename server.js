@@ -14049,9 +14049,13 @@ function livePostPayloadForRow(row, groupUrl, imagePath, profileId, options = {}
   const marker = titleTags
     ? oneLineField(fbFingerprintOk ? fbFingerprintTag : titleTags.join(" "), 280)
     : oneLineField(phrase, 200);
-  // INVARIANT: the marker must be a verbatim substring of what we are about to publish, or nothing can find
-  // this post again. Log-only (never throw) — the publish is worth more than the diagnostic — but this is
-  // the check that would have caught the whole drift class at its source.
+  // INVARIANT TRIPWIRE: the marker must be a verbatim substring of what we are about to publish, or nothing
+  // can ever find this post again. As the code stands this cannot fire — marker and signatureLine are built
+  // from the same two consts a few lines apart, and all four {harvested, web} x {on, off} combinations were
+  // verified to hold — so this is not load-bearing today. It exists because those two expressions are the
+  // exact pair a future edit is most likely to change independently, and the failure would otherwise be
+  // silent and only visible hours later as "post not found". Log-only, never throws: a publish in progress
+  // is worth more than a diagnostic.
   if (marker && !postText.includes(marker)) {
     try { logEvent("post_marker_not_in_post_text", { planId: row.planId, sequence: row.sequence, harvested: Boolean(titleTags), omitMarketingHashtags, marker: oneLineField(marker, 80) }); } catch (_) {}
   }
@@ -14059,10 +14063,13 @@ function livePostPayloadForRow(row, groupUrl, imagePath, profileId, options = {}
     profileId,
     groupUrl,
     marker,
-    // NAVIGATION-ONLY hint for the connector's group /search/?q= legs. The marker is now a bare hex token,
-    // which is a poor search QUERY even though it is an excellent match KEY; this keeps the product words
-    // available for finding the post, while acceptance stays gated on the marker. Never used for matching.
-    searchHint: oneLineField(titleTags ? titleTags.join(" ") : phrase, 280),
+    // NAVIGATION-ONLY hint for the connector's group /search/?q= legs. The marker is a bare hex token —
+    // an excellent match KEY but a poor search QUERY — so this carries the richest text available instead.
+    // It is derived from signatureLine, i.e. from what was ACTUALLY appended to the post: searching for the
+    // product tag line on a post published WITHOUT it would query text that exists nowhere, which is worse
+    // than a weak query (the findOnly leg's "not found" is what lets the reconciler release a product claim
+    // and re-publish). Acceptance always stays gated on `marker`; a hint can only cost one page load.
+    searchHint: oneLineField(titleTags ? signatureLine : phrase, 280),
     trackingRef,
     facebookUserId: oneLineField(row.facebookUserId || row.facebook_user_id || row.publisherFacebookUserId || row.publisher_facebook_user_id || "", 64).replace(/\D+/g, ""),
     postText,
@@ -16038,6 +16045,11 @@ async function runFacebookAdminApprovalAttempt({ row, profileId, profileLabel, g
     groupUrl,
     postUrl,
     marker: markerPayload.marker,
+    // Carried explicitly because this payload is hand-built rather than spread from markerPayload. Without
+    // it the connector's post-approval group-search fallback would fall back to `marker` — now a bare hex
+    // token — and silently lose the product-word query it has always used, on the DEFAULT comments-on path.
+    // Navigation only; approval acceptance is gated on the fingerprint, never on this.
+    searchHint: markerPayload.searchHint || "",
     approveOnly: true,
     imagePath: "",
     postText: "",
