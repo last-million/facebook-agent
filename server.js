@@ -13997,16 +13997,72 @@ function livePostPayloadForRow(row, groupUrl, imagePath, profileId, options = {}
   const sigTags = titleTags
     ? titleTags.join(" ")
     : (() => { const sigT1 = POST_SIG_TAGS[sigHash[2] % POST_SIG_TAGS.length]; let sigT2 = POST_SIG_TAGS[sigHash[3] % POST_SIG_TAGS.length]; if (sigT2 === sigT1) sigT2 = POST_SIG_TAGS[(sigHash[3] + 1) % POST_SIG_TAGS.length]; return `${sigT1} ${sigT2}`; })();
+  // The per-post fingerprint, taken as the LAST element rather than regex-searched: harvestedHashtags pushes
+  // "#fb"+fp last and unconditionally, AFTER the product words. A first-match regex over the joined line
+  // could latch onto a scraped product word that happens to start with "fb"+hex — the decoy hazard the
+  // connector documents at its own extraction site (it uses .pop() for the same reason). Validated against
+  // the exact format so a future change to harvestedHashtags can only make this fall back, never go wrong.
+  const fbFingerprintTag = titleTags ? String(titleTags[titleTags.length - 1] || "") : "";
+  const fbFingerprintOk = /^#fb[0-9a-f]{6}$/i.test(fbFingerprintTag);
+  // ── MARKETING HASHTAGS OFF (2026-08-01, operator: "if we disable comments he should not put or generate
+  // the hashtags in posts") ──────────────────────────────────────────────────────────────────────────────
+  // The affiliate link lives in the first comment, so with the comment step switched off those product
+  // hashtags advertise nothing — they are pure noise on the account. Dropped from the POSTED TEXT here.
+  //
+  // WHAT DOES NOT GO: the single trailing #fb<hex> fingerprint. It is not marketing, it is the post's
+  // IDENTITY — the only thing that lets a moderator find and Approve THIS post rather than another of ours
+  // or, far worse, a real member's post sitting in the same queue. Removing it does not just weaken
+  // approval, it disables it outright: batchApproveAllPublisherPosts refuses to click without one
+  // ("if (!fp) continue"), and countOwnFingerprints uses it as the queue-scroll boundary. Both read it out
+  // of the POST TEXT, not the payload. So a comments-off post ends with exactly one short incidental token.
+  //
+  // Read as an OPTION, never from state: this function must stay a pure function of (row, options) — see
+  // the marker note directly below for why that is not a style preference.
+  const omitMarketingHashtags = options.omitMarketingHashtags === true;
   // harvested (Option B): signature = JUST the unique tags (no emoji/title header). Web: emoji + phrase + tags.
-  const signatureLine = titleTags ? sigTags : `${sigE1} ${phrase} ${sigE2} ${sigTags}`;
+  // Comments off — harvested: the fingerprint alone. Web: keep emojis + phrase (the phrase IS the web
+  // marker, so it must stay verbatim), drop only the two rotating promo tags.
+  const signatureLine = titleTags
+    ? ((omitMarketingHashtags && fbFingerprintOk) ? fbFingerprintTag : sigTags)
+    : (omitMarketingHashtags ? `${sigE1} ${phrase} ${sigE2}` : `${sigE1} ${phrase} ${sigE2} ${sigTags}`);
   const postText = basePostText ? `${basePostText}\n\n${signatureLine}` : signatureLine;
-  // marker = the unique tags (incl the #fb fingerprint) for harvested — posted VERBATIM, located by exact
-  // match; the fingerprint guarantees a unique permalink even for same-title / same-body products. Web: phrase.
-  const marker = titleTags ? oneLineField(titleTags.join(" "), 280) : oneLineField(phrase, 200);
+  // ── MARKER = THE FINGERPRINT ALONE (harvested), AND IT MUST NOT DEPEND ON ANY SETTING ──────────────────
+  // The marker is how every later pass re-finds this exact post: the moderator approval click, the
+  // submitted-URL recovery scan, the kill-mid-post reconciler, the commenter's permalink proof. It is NEVER
+  // persisted anywhere — the ledger row stores the marker's INPUTS, not the marker — so each of those passes
+  // RE-DERIVES it from this function, minutes or hours later. That makes one property non-negotiable: the
+  // marker must be a pure function of the row, identical every time it is recomputed.
+  //
+  // So it is deliberately NOT switched by omitMarketingHashtags. If it were, a post published while
+  // comments were off (text = "...#fb1a2b3c") and re-derived after the operator switched comments back on
+  // would yield the full tag line — a string that was never published. The reconciler would scan, cleanly
+  // find nothing, treat that as "the post never landed", release the product claim, and publish the SAME
+  // product to the SAME group a second time. A live duplicate post, from a setting flip alone.
+  //
+  // The fingerprint alone is the right choice, not a compromise: it is what makes the marker unique per post
+  // INSTANCE (a product legitimately reposted weeks later gets a different one), it is a verbatim substring
+  // of the caption whether or not the marketing tags were posted, and the approval path already reduced the
+  // full tag line to exactly this token before matching — so on the path guarding the wrong-post invariant
+  // this is a literal no-op. Being short also makes it immune to the "See more" reflow that can break an
+  // includes() on a 200-char tag line, and it can no longer be truncated by the length cap below.
+  // Falls back to today's full tag line if the fingerprint is ever missing/malformed. Web: phrase, unchanged.
+  const marker = titleTags
+    ? oneLineField(fbFingerprintOk ? fbFingerprintTag : titleTags.join(" "), 280)
+    : oneLineField(phrase, 200);
+  // INVARIANT: the marker must be a verbatim substring of what we are about to publish, or nothing can find
+  // this post again. Log-only (never throw) — the publish is worth more than the diagnostic — but this is
+  // the check that would have caught the whole drift class at its source.
+  if (marker && !postText.includes(marker)) {
+    try { logEvent("post_marker_not_in_post_text", { planId: row.planId, sequence: row.sequence, harvested: Boolean(titleTags), omitMarketingHashtags, marker: oneLineField(marker, 80) }); } catch (_) {}
+  }
   return {
     profileId,
     groupUrl,
     marker,
+    // NAVIGATION-ONLY hint for the connector's group /search/?q= legs. The marker is now a bare hex token,
+    // which is a poor search QUERY even though it is an excellent match KEY; this keeps the product words
+    // available for finding the post, while acceptance stays gated on the marker. Never used for matching.
+    searchHint: oneLineField(titleTags ? titleTags.join(" ") : phrase, 280),
     trackingRef,
     facebookUserId: oneLineField(row.facebookUserId || row.facebook_user_id || row.publisherFacebookUserId || row.publisher_facebook_user_id || "", 64).replace(/\D+/g, ""),
     postText,
@@ -20383,7 +20439,12 @@ async function runLiveFacebookPostFromPlan(body = {}) {
     attemptedGroups.push(groupUrl);
     // Publisher POSTS ONLY — never comments in its own session. The first comment is always
   // made afterwards by a DIFFERENT, random profile with group access (realism requirement).
-  const payload = livePostPayloadForRow(row, groupUrl, ready.imagePath, ready.profileId, { includeComment: false });
+  // THE ONLY CALL WHOSE postText IS ACTUALLY TYPED INTO FACEBOOK, so it is the only one that decides the
+  // marketing hashtags. Every other caller (approval marker payload, submitted-URL recovery, comment/pin
+  // recovery) passes nothing and inherits the default — they only ever READ the marker, never retype the
+  // caption, and the marker is identical either way by construction.
+  const __hashtagsOff = !facebookCommentsEnabledForGroup(groupUrl, state);
+  const payload = livePostPayloadForRow(row, groupUrl, ready.imagePath, ready.profileId, { includeComment: false, omitMarketingHashtags: __hashtagsOff });
     // KEEP-OPEN: reuse this profile's already-open CDP session (0 extra ix opens) if alive + under the post/age caps.
     const __ko = keepOpenEnabled();
     let __sess = __ko ? __keepOpenSession.get(ready.profileId) : null;
