@@ -6339,6 +6339,26 @@ function uxAttachIncompleteRunBanner() {
       if (!st) { const r = await api("/api/state").catch(() => null); st = r ? (r.state || r) : {}; }
       const op = (st && st.operator) || {};
       const ix = (st && st.ixbrowser) || {};
+      // GROUP COVERAGE ALERT — shown only for groups that are STILL configured, so a stale entry for a group
+      // the operator has since removed can never raise a false alarm.
+      try {
+        const __gcb = $("groupCoverageBanner");
+        if (__gcb) {
+          const __cfg = (st && st.posting && Array.isArray(st.posting.groupAssignmentData)) ? st.posting.groupAssignmentData : [];
+          const __cfgKeys = __cfg.map(function (g) { return String((g && g.url) || "").trim().toLowerCase().replace(/[?#].*$/, "").replace(/\/+$/, ""); }).filter(Boolean);
+          const __missing = (Array.isArray(op.groupsWithoutEligibleProfiles) ? op.groupsWithoutEligibleProfiles : [])
+            .filter(function (m) { return m && m.group && __cfgKeys.indexOf(String(m.group).toLowerCase()) !== -1; });
+          if (__missing.length) {
+            const __names = __missing.map(function (m) { return String(m.group).replace(/.*groups\//, "").replace(/\/.*/, ""); });
+            $("groupCoverageText").textContent = __names.length === 1
+              ? ("Group " + __names[0] + " has no usable profile left, so this run is not posting to it at all.")
+              : (__names.length + " groups have no usable profile left and are getting nothing: " + __names.join(", ") + ".");
+            __gcb.style.display = "";
+          } else {
+            __gcb.style.display = "none";
+          }
+        }
+      } catch (_e) { /* observability only — never break the Prod tab render */ }
       populateProdRunMode(op);
       // Re-sync from the AUTHORITATIVE state fetched just above, not only from the workflowState cache used
       // at the top of this function. Without this, a session whose cache never loaded (the initial refresh()

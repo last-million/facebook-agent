@@ -782,6 +782,15 @@ function defaultState() {
       // (commenting continues). Listed in the operator-config clobber guard (~1455) so a background
       // controlWrite holding a stale snapshot can never flip it in either direction.
       commentsEnabled: true,
+      // CROSS-GROUP POSTING FALLBACK (2026-08-02, operator: "why sometimes in prod he doesn't post in all
+      // groups"). false = a profile only ever posts to the group the operator ticked for it in Step 3. If it
+      // cannot post there, its slot is skipped and another profile of THAT group serves it.
+      // true = the legacy behaviour: re-point the slot at a different group at plan time, and retry a failed
+      // post into up to 20 other groups at publish time. Both halves read this one flag.
+      // Measured before flipping it: 26% of all "cannot_post_in_group" failures were on groups the profile
+      // was never assigned to -- failures the fallback created for itself, while draining posts away from
+      // the group that was already short. See postingSlots and fallbackGroupUrlsForSlot.
+      groupFallbackEnabled: false,
       autoRebalanceGroupsEnabled: false,      // 2026-07-07 (operator: "redispatch equally between groups" when
                                               // accounts fall out of service): auto-redispatch healthy profiles
                                               // across ALL currently-configured groups so each group's healthy
@@ -1528,7 +1537,7 @@ function writeState(state, opts = {}) {
     // change it. Without this, a background controlWrite holding a pre-toggle snapshot could silently
     // re-enable commenting the operator just switched off (or, worse, switch it off again after they turned
     // it back on) -- the same stale-snapshot class as the lost STOP and the reverted reuseHours.
-    for (const f of ["postToAllGroups", "keepOpenSessionEnabled", "commentsEnabled"]) {
+    for (const f of ["postToAllGroups", "keepOpenSessionEnabled", "commentsEnabled", "groupFallbackEnabled"]) {
       if (existing.operator[f] !== undefined) clean.operator[f] = existing.operator[f];
     }
   }
@@ -8737,6 +8746,24 @@ function postingSlots(state) {
         if (isProfileBlockedForPosting(label, state, groupUrl)) continue;
         let effectiveGroupUrl = groupUrl;
         if (isProfileGroupBlockedForPosting(label, groupUrl, state)) {
+          // CROSS-GROUP MIGRATION — OFF BY DEFAULT since 2026-08-02 (operator: "why sometimes in prod he
+          // doesn't post in all groups"). This branch used to silently re-point a blocked profile's slot at a
+          // DIFFERENT group. It cannot help the group that just lost the slot; all it does is convert
+          // "group X gets one fewer post" into "group Y gets one more" — and always the SAME group Y, because
+          // allGroupUrls.find() returns the first non-blocked entry in a fixed order. That is a systematic
+          // drift of capacity away from whichever group is struggling, which is exactly the symptom.
+          //
+          // Worse, it sends the profile to a group the operator never ticked for it in Step 3, where the
+          // account is often not even a member. Measured over the last three days of audit logs: of 1,306
+          // "cannot_post_in_group" reports, 341 (26%) were on a group the profile was NOT assigned to —
+          // failures this branch created for itself, each one a wasted Facebook attempt AND a new
+          // cannot_post_in_group record that then blocks that pair too.
+          //
+          // Skipping instead costs nothing: the round-robin above emits a slot for this SAME group for every
+          // other profile assigned to it, so the group is still served — by an account that can actually post
+          // there. If a group has NO usable profile left, that is a real problem the operator must see, and
+          // posting_group_no_eligible_profiles already raises it.
+          if (state.operator?.groupFallbackEnabled !== true) continue;
           effectiveGroupUrl = allGroupUrls.find((candidateGroupUrl) => {
             if (normalizedFacebookGroupKey(candidateGroupUrl) === normalizedFacebookGroupKey(groupUrl)) return false;
             return !isProfileGroupBlockedForPosting(label, candidateGroupUrl, state);
@@ -9061,7 +9088,13 @@ function stripPriorRepeatedBlacklistLines(value, profileId) {
 
 // In-memory throttle for the "configured group has 0 eligible profiles" fan-out alert (preparePostingPlan): the
 // loud event/flag is emitted ONLY when the missing-group set CHANGES, never on every plan build. Resets on restart.
-let __noEligibleGroupAlertKeys = "";
+// SENTINEL, NOT "" (2026-08-02): the throttle compares against the joined key list, and the healthy state IS the
+// empty string. Seeding it with "" therefore meant that after a restart with nothing missing, __nowKeys === the
+// seed, the write was skipped, and state.operator.groupsWithoutEligibleProfiles kept whatever it held from before
+// -- forever. Live proof: it still named a group the operator had removed from the config two weeks earlier, long
+// after the real answer became "none". A value no real key list can equal (null) forces the first plan build after
+// every boot to write the truth, which matters now that the dashboard shows this flag to the operator.
+let __noEligibleGroupAlertKeys = null;
 
 // A profile whose ONLY failure was first-comment verification (the POST actually published) gets a SHORT
 // graduated cooldown — long enough for the tick to move on to fresh profiles, but NOT the full 24h sticky
@@ -9164,6 +9197,16 @@ function isProfileGroupBlockedForPosting(label, groupUrl, state) {
 }
 
 function fallbackGroupUrlsForSlot(slot, state) {
+  // THE POST-TIME HALF of the same cross-group fallback, and the more damaging of the two. These urls are
+  // stamped onto the plan row, and runLiveFacebookPostFromPlan builds its publish loop as
+  //   [ready.groupUrl, ...row.fallbackGroupUrls]
+  // so a post that fails on its assigned group is retried into up to 20 OTHER groups until one accepts it.
+  // The post then lands somewhere the operator never planned it, while the group it was meant for gets
+  // nothing — the plan-time migration's twin, and the reason a group can quietly end a run at zero.
+  // Returning an empty list leaves that loop with exactly the assigned group, which is the operator's
+  // Step-3 intent. Gated by the same single flag so both halves move together and can be rolled back
+  // together. (Fan-out rows already ship fallbackGroupUrls: [] — this aligns the primary row with them.)
+  if (state?.operator?.groupFallbackEnabled !== true) return [];
   const urls = [];
   const seen = new Set();
   const add = (value) => {

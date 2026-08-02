@@ -771,6 +771,16 @@
                   </div>
                 </div>
               </div>
+              <!-- GROUP COVERAGE ALERT (2026-08-02). A profile now only ever posts to the group it is ticked
+                   for in Step 3 — it is never bounced into another group. That is what the operator asked for,
+                   but it means a group whose whole assigned pool is benched/logged-out now genuinely receives
+                   NOTHING instead of quietly having its posts absorbed by a neighbour. The server already
+                   detected that (operator.groupsWithoutEligibleProfiles) but nothing ever displayed it. -->
+              <div id="groupCoverageBanner" style="display:none; border:1px solid #8a3b3b; border-radius:10px; background:linear-gradient(180deg, rgba(138,59,59,.16), transparent); padding:12px 14px; margin-bottom:14px;">
+                <h2 style="margin:0;">&#9888;&#65039; A group is getting no posts</h2>
+                <p id="groupCoverageText" style="margin:4px 0 0;"></p>
+                <p style="margin:6px 0 0; opacity:.75; font-size:.9em">Every profile assigned to this group is currently benched, logged out or blocked, so nothing can post there. Release or fix its profiles in the Profiles tab, or tick more profiles for it in Step&nbsp;3.</p>
+              </div>
               <div id="prodHeadline" class="prodHeadline">Loading production status…</div>
               <div id="prodStatusGrid" class="prodStatusGrid"></div>
               <div id="prodParallelInfo" style="margin:8px 0;padding:7px 12px;border:1px solid #2a3344;border-radius:9px;background:#141a24;font-size:.9em;">&#9889; <b>Parallel posting:</b> <b id="ccCapPosting">&ndash;</b> profiles at once &middot; <b>harvest:</b> <b id="ccCapHarvest">&ndash;</b>/group <span id="ccCapMeta" style="opacity:.65"></span> <span style="opacity:.6">&mdash; auto, machine-synced (every 24&nbsp;h)</span></div>
