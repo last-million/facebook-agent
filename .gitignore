@@ -44,3 +44,6 @@ isolate-*.log
 /server-stdout.log
 /server-stderr.log
 /test2-err.log
+
+# installer transcript written by deployment/bootstrap.ps1 (machine-specific)
+deployment/install-log.txt

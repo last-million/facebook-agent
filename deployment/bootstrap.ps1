@@ -97,10 +97,21 @@ if (-not $Target) {
   }
 }
 
+# TRANSCRIPT. If a console window ever closes before it can be read - a wrong
+# double-click, a machine policy killing the shell, an installer that reboots -
+# there has to be something left behind to look at. Best-effort only: a copy on
+# read-only media (a USB stick mounted read-only) must not stop the install, so
+# it falls back to TEMP and then gives up silently.
+$script:LogPath = ''
+foreach ($cand in @((Join-Path $PSScriptRoot 'install-log.txt'), (Join-Path $env:TEMP 'fb-agent-install-log.txt'))) {
+  try { Start-Transcript -Path $cand -Force -ErrorAction Stop | Out-Null; $script:LogPath = $cand; break } catch {}
+}
+
 Say "=============================================================="
 if ($CheckOnly) { Say " Facebook Agent - bootstrap (CHECK ONLY, installs nothing)" }
 else            { Say " Facebook Agent - bootstrap" }
 Say " Target: $Target"
+if ($script:LogPath) { Say " Log:    $script:LogPath" }
 if ($RunningInPlace) { Say " Mode:   installing IN PLACE (the copy you ran this from)" }
 Say "=============================================================="
 
@@ -398,6 +409,9 @@ foreach ($m in $manual) { Say ("   " + $i + ") " + $m); $i++ }
 Say ""
 Say " Then start it:   run-facebook-agent.bat     (opens http://127.0.0.1:9317)"
 Say ""
+
+if ($script:LogPath) { Say " A full log of this run was saved to:"; Say ("   " + $script:LogPath); Say "" }
+try { Stop-Transcript | Out-Null } catch {}
 
 if ($CheckOnly -and $script:Missing.Count -gt 0) { exit 2 }
 exit 0
