@@ -88,7 +88,12 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-echo  Elevated window opened. You can close this one.
+echo  ================================================================
+echo   A SECOND WINDOW has just opened - that is where the install
+echo   runs. It may be BEHIND this one, so check your taskbar.
+echo.
+echo   Watch THAT window. This one is finished and does nothing more.
+echo  ================================================================
 echo.
 pause
 exit /b 0

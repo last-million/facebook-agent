@@ -31,6 +31,8 @@ param(
   # Report what WOULD be installed and exit non-zero if anything is missing.
   # Used to validate this script on a working machine without touching it.
   [switch]$CheckOnly,
+  # Finish without starting the dashboard / opening the browser.
+  [switch]$NoStart,
   # Where the agent lives. Default is worked out at runtime just below, because
   # the right answer depends on how you got the files. Pass -Target to override.
   [string]$Target = '',
@@ -406,8 +408,61 @@ Say ""
 Say " Manual steps (cannot be automated - they need your accounts):"
 $i = 1
 foreach ($m in $manual) { Say ("   " + $i + ") " + $m); $i++ }
+
+# --- 10. Start the dashboard ---------------------------------------------------
+# The point of running an installer is to end up looking at the thing. Printing a
+# URL on line 40 of a wall of text is not that - the operator reported finishing a
+# run and never seeing an address at all. So: start the server, wait until it
+# genuinely answers, open the browser, and print the URL where it cannot be missed.
+# Starting the SERVER is not starting a posting run: a run is armed separately from
+# the dashboard, so nothing here touches Facebook.
+$dashUrl = 'http://127.0.0.1:9317/'
+$serverUp = $false
+if (-not $CheckOnly -and -not $NoStart -and $script:Missing.Count -eq 0) {
+  Step 10 "Starting the dashboard"
+  $owner = $null
+  try { $owner = (Get-NetTCPConnection -LocalPort 9317 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess } catch {}
+  if ($owner) {
+    OK "already running (pid $owner)"
+    $serverUp = $true
+  } elseif (-not (Test-Path (Join-Path $Target 'server.js'))) {
+    Warn "server.js not found - skipping"
+  } else {
+    # Timestamped logs, matching tools\fb-watchdog.ps1: PowerShell's redirection
+    # truncates rather than appends, so fixed names would destroy the previous
+    # crash's output on every start.
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $outLog = Join-Path $dataDir ("server-stdout-" + $stamp + ".log")
+    $errLog = Join-Path $dataDir ("server-stderr-" + $stamp + ".log")
+    try {
+      Start-Process -FilePath 'node.exe' -ArgumentList 'server.js' -WorkingDirectory $Target `
+                    -WindowStyle Hidden -RedirectStandardOutput $outLog -RedirectStandardError $errLog | Out-Null
+      Info "launched, waiting for it to answer..."
+      for ($i = 0; $i -lt 40; $i++) {
+        Start-Sleep -Seconds 1
+        try {
+          if ((Invoke-WebRequest -Uri $dashUrl -UseBasicParsing -TimeoutSec 2).StatusCode -eq 200) { $serverUp = $true; break }
+        } catch {}
+      }
+      if ($serverUp) { OK "dashboard is up" }
+      else { Warn "did not answer within 40s - check $errLog" }
+    } catch { Fail ("could not start node: " + $_.Exception.Message) }
+  }
+  if ($serverUp) { try { Start-Process $dashUrl | Out-Null; Info "opened it in your browser" } catch {} }
+}
+
 Say ""
-Say " Then start it:   run-facebook-agent.bat     (opens http://127.0.0.1:9317)"
+Say "  +----------------------------------------------------------+"
+if ($serverUp) {
+  Write-Host "  |   THE DASHBOARD IS RUNNING - OPEN THIS ADDRESS:           |" -ForegroundColor Green
+  Say       "  |                                                          |"
+  Write-Host "  |       http://127.0.0.1:9317                              |" -ForegroundColor Green
+} else {
+  Write-Host "  |   TO START IT:  double-click  run-facebook-agent.bat      |" -ForegroundColor Yellow
+  Say       "  |                                                          |"
+  Write-Host "  |   THEN OPEN:    http://127.0.0.1:9317                     |" -ForegroundColor Yellow
+}
+Say "  +----------------------------------------------------------+"
 Say ""
 
 if ($script:LogPath) { Say " A full log of this run was saved to:"; Say ("   " + $script:LogPath); Say "" }
