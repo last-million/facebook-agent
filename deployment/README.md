@@ -13,21 +13,43 @@ and to keep the GitHub repo continuously in sync with the live machine.
 
 ## Deploy on a brand-new machine
 
-You do **not** need to pre-install anything except the ability to download the repo.
+Both ways of getting the files are supported, and the installer works out which one
+you used. You do **not** need to pre-install anything.
 
-**Windows**
+### A. You have the folder already (ZIP download, or a copy on a USB stick)
+
+This is the flow to use when the repo is **private** — download the ZIP once, carry it
+on a USB stick, and run it on any machine. **No Git needed, nothing is cloned.**
+
+```cmd
+:: Windows - extract anywhere (any folder name, any drive), then:
+<extracted folder>\deployment\deploy.bat
+```
+```bash
+# Linux / macOS
+bash <extracted folder>/deployment/deploy.sh
+```
+
+The installer installs **in place**, into the folder you ran it from. It prints
+`Mode: installing IN PLACE` so you can see it picked up your copy.
+
+> Running from a USB stick works, but copy the folder to the local disk before running
+> production — the watchdog keeps restarting the server, and that path disappears the
+> moment you unplug the drive. The installer warns you if it sees a removable drive.
+
+### B. You want it to download the project for you (public repo)
+
 ```cmd
 git clone https://github.com/last-million/facebook-agent.git "%USERPROFILE%\Desktop\facbeook agent"
 "%USERPROFILE%\Desktop\facbeook agent\deployment\deploy.bat"
 ```
-(No Git yet? Download the repo ZIP from GitHub, extract it, and run `deployment\deploy.bat` —
-it installs Git for you.)
-
-**Linux / macOS**
 ```bash
 git clone https://github.com/last-million/facebook-agent.git ~/facebook-agent
 bash ~/facebook-agent/deployment/deploy.sh
 ```
+
+You can also run `bootstrap.ps1` on its own with no project next to it; it falls back to
+cloning into `%USERPROFILE%\Desktop\facbeook agent` and installs Git first if needed.
 
 Both installers:
 - **skip whatever is already installed** — safe to re-run as often as you like;

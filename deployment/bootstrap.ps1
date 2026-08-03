@@ -170,15 +170,16 @@ if (Have-Cmd node) {
 # Needed to clone/update the repo. (The repo also vendors a portable git under
 # .tooling\mingit for the auto-sync task, but you need a real git to get the repo
 # in the first place.)
-Step 2 "Git for Windows (optional)"
-# Git is NOT required to run the agent. It is needed only to CLONE a fresh copy --
-# and in the normal flow (ZIP download, or a copy carried on a USB stick because
-# the repo is private) the files are already here, so there is nothing to clone.
-# Treat it as optional: install it when we can, never fail the run over it.
+# Git is only ever needed to CLONE. Which of the two supported flows you are in
+# decides whether that makes it optional or mandatory:
+#   ZIP / USB copy  - the files are already here, nothing to clone -> OPTIONAL
+#   clone from git  - there is no copy yet, so it must be installed -> REQUIRED
 # The repo may also vendor a portable git at .tooling\mingit for the auto-sync
-# task; that is not in a GitHub ZIP (untracked), so its absence is normal too.
+# task; that is untracked, so a GitHub ZIP legitimately has none either.
 $vendoredGit = Join-Path $Target '.tooling\mingit\cmd\git.exe'
 $repoPresent = Test-Path (Join-Path $Target 'server.js')
+if ($repoPresent -or $RunningInPlace) { Step 2 "Git for Windows (optional here - the project files are already present)" }
+else                                  { Step 2 "Git for Windows (required - needed to download the project)" }
 if (Have-Cmd git) {
   OK (& git --version)
 } elseif (Test-Path $vendoredGit) {
@@ -187,7 +188,7 @@ if (Have-Cmd git) {
   OK "not installed - and not needed: the project files are already here"
   Info "install Git only if you want 'git pull' updates or the auto-sync task"
 } elseif ($CheckOnly) {
-  Need "Git" "needed here only because there is no copy of the project to install from"
+  Need "Git" "required in THIS flow: there is no copy of the project here to install from"
 } else {
   $exe = $null
   try {
