@@ -293,7 +293,17 @@ if ($hermesOk) {
   # must resolve to root's HOME regardless of which UNIX user Ubuntu created.
   # sed strips CR first: a Windows-line-ending checkout otherwise makes bash die
   # with an unreadable "\r: command not found".
-  $cmd = "sed -i 's/\r`$//' '$shWsl' 2>/dev/null; bash '$shWsl'"
+  # Work on a COPY in /tmp rather than sed -i on the checkout: the file may have
+  # CRLF endings (bash then dies with an unreadable "\r: command not found"), but
+  # rewriting it in place would dirty the git working tree on the user's machine.
+  # FB_REPO_DIR tells the copy where the real repo is, since it can no longer
+  # infer that from its own location.
+  # FB_HERMES_ONLY=1: deploy.sh is a FULL installer when run on its own (it will
+  # install Node and the npm deps for a Linux host). Here the dashboard runs on
+  # the WINDOWS Node, so a second Node inside WSL would be pure waste - this flag
+  # makes it do the Hermes half only.
+  $repoWsl = (Clean-Wsl (& wsl.exe wslpath -a "$Target" 2>&1)).Trim()
+  $cmd = "sed 's/\r`$//' '$shWsl' > /tmp/fb-deploy.sh && FB_HERMES_ONLY=1 FB_REPO_DIR='$repoWsl' bash /tmp/fb-deploy.sh"
   & wsl.exe -u root bash -lc $cmd
   $rc = $LASTEXITCODE
   $probe2 = Clean-Wsl (& wsl.exe -u root bash -lc "test -x /root/.local/bin/hermes && echo HERMES_OK || echo HERMES_MISSING" 2>&1)
