@@ -283,6 +283,28 @@ $wdScript = Join-Path $Target 'tools\fb-watchdog.ps1'
 $existing = Get-ScheduledTask -TaskName 'FacebookAgentWatchdog' -ErrorAction SilentlyContinue
 if ($existing) {
   OK ("FacebookAgentWatchdog already registered (" + $existing.State + ")")
+  # A SECOND COPY ON THE SAME MACHINE is easy to create by accident - unzip to
+  # Downloads, run deploy.bat there, and now two folders both call themselves the
+  # agent. They do NOT share anything: state, the ledger, secrets and logs all live
+  # under each copy's own data\ directory, and only ONE of them can hold port 9317.
+  # The watchdog points at exactly one of them, so say plainly which, rather than
+  # letting someone configure the copy that is not the one actually running.
+  try {
+    $wdArg = ($existing.Actions | Select-Object -First 1).Arguments
+    $m = [regex]::Match([string]$wdArg, '-File\s+"([^"]+)"')
+    if ($m.Success) {
+      $wdOwner = Split-Path (Split-Path $m.Groups[1].Value -Parent) -Parent
+      if ($wdOwner -and ($wdOwner.TrimEnd('\') -ne $Target.TrimEnd('\'))) {
+        Say ""
+        Warn "ANOTHER COPY of the agent is already installed on this machine:"
+        Info ("   running copy : " + $wdOwner)
+        Info ("   this copy    : " + $Target)
+        Info "They share nothing - separate state, ledger, secrets and logs, and only"
+        Info "one can use port 9317. The watchdog keeps starting the RUNNING copy."
+        Info "Configure that one, or delete it first if you meant to replace it."
+      }
+    }
+  } catch {}
 } elseif ($CheckOnly) {
   Need "FacebookAgentWatchdog scheduled task" "registered by this script"
 } elseif (-not (Test-Path $wdScript)) {
@@ -304,27 +326,69 @@ if ($existing) {
 # --- 7. WSL + Ubuntu ----------------------------------------------------------
 # Hermes (the image-review LLM CLI the dashboard shells out to) runs in Linux.
 Step 7 "WSL + Ubuntu"
+# DETECT BY EXECUTION, NOT BY PARSING TEXT.
+# This used to decide from `wsl --status` matching the words "Default Distribution".
+# That is fragile twice over: the text is LOCALIZED, and wsl.exe emits UTF-16, which
+# decodes differently depending on the console code page of whatever shell launched
+# us. It duly misfired on a live machine whose WSL was perfectly healthy - and the
+# consequence was not a wrong message, it was running `wsl --install` against an
+# already-working installation. Never risk that again: the only question that
+# actually matters is "can I run a command inside WSL", so ask exactly that.
 $wslOk = $false
+$wslDistros = @()
 if (Have-Cmd wsl) {
-  $status = Clean-Wsl (& wsl.exe --status 2>&1)
-  if ($status -match 'Default\s*Distribution') {
-    $wslOk = $true
-    $line = ($status -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 1)
-    OK $line.Trim()
-  }
+  $probe = Clean-Wsl (& wsl.exe -e sh -c "echo WSL_READY" 2>&1)
+  if ($probe -match 'WSL_READY') { $wslOk = $true }
+  $wslDistros = @((Clean-Wsl (& wsl.exe -l -q 2>&1)) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
-if (-not $wslOk) {
+if ($wslOk) {
+  if ($wslDistros.Count) { OK ("working - distro(s): " + ($wslDistros -join ', ')) } else { OK "working" }
+} elseif (-not (Have-Cmd wsl)) {
+  # wsl.exe genuinely absent -> a real install is warranted.
   if ($CheckOnly) {
     Need "WSL + a Linux distro" "wsl --install -d Ubuntu   (then REBOOT and re-run)"
   } else {
-    Warn "WSL not ready - installing (a REBOOT will be required)"
+    Warn "WSL is not installed - installing it now (a REBOOT will be required)"
     & wsl.exe --install -d Ubuntu
+    $rc = $LASTEXITCODE
     Say ""
-    Warn "=================================================================="
-    Warn " REBOOT NOW, then run deploy.bat again to finish Hermes."
-    Warn " (Ubuntu asks you to create a UNIX user on its first launch.)"
-    Warn "=================================================================="
-    exit 0
+    if ($rc -eq 0) {
+      Warn "=================================================================="
+      Warn " REBOOT NOW, then run deploy.bat again to finish Hermes."
+      Warn " (Ubuntu asks you to create a UNIX user on its first launch.)"
+      Warn "=================================================================="
+    } else {
+      # Do NOT tell someone to reboot when the install actually failed - rebooting
+      # will not fix a component-store error and they will just run it again.
+      Fail ("wsl --install failed (exit " + $rc + ") - see the message above")
+      Info "Common causes: Windows needs updates, virtualization is off in the BIOS,"
+      Info "or the machine is a VM without nested virtualization enabled."
+      Info "Everything else is installed; only the Hermes half needs WSL."
+      $script:Missing += 'WSL'
+    }
+    if ($rc -eq 0) { exit 0 }
+  }
+} else {
+  # wsl.exe exists but nothing runs. Either no distro is registered, or the install
+  # is broken. Adding a distro is safe; "repairing" one is not, so we never try.
+  if ($wslDistros.Count) {
+    Fail ("WSL is installed (distro(s): " + ($wslDistros -join ', ') + ") but commands do not run")
+    Info "Try 'wsl --shutdown' then 'wsl -e echo ok' in a terminal, or reboot."
+    Info "Not touching it automatically - a working install must not be reinstalled."
+    $script:Missing += 'WSL (present but not responding)'
+  } elseif ($CheckOnly) {
+    Need "a WSL Linux distro" "wsl --install -d Ubuntu"
+  } else {
+    Warn "WSL is present but has no distro - installing Ubuntu"
+    & wsl.exe --install -d Ubuntu
+    $rc = $LASTEXITCODE
+    if ($rc -ne 0) { Fail ("distro install failed (exit " + $rc + ")"); $script:Missing += 'WSL distro' }
+    else {
+      Say ""
+      Warn " Ubuntu installed. If it asks for a UNIX user, create one, then run"
+      Warn " deploy.bat again to finish Hermes."
+      exit 0
+    }
   }
 }
 
