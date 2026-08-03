@@ -532,13 +532,32 @@ Say       "  +----------------------------------------------------------+"
 # 127.0.0.1 is LOOPBACK. server.js binds HOST = "127.0.0.1" deliberately, so the
 # dashboard is not reachable from any other computer - typing this address on a
 # different PC can only ever fail, and that has already confused someone once.
-# It is bound that way on purpose: the page itself carries the API token (the HTML
-# is served with __DASHBOARD_TOKEN__ substituted in), so anyone who can load it has
-# full control of every Facebook account and every stored key. Remote access should
-# be RDP or an SSH tunnel to this machine - not opening the port.
+#
+# So report what THIS machine actually is: its name and its real IPv4 addresses.
+# That turns "why doesn't the URL work" into a concrete, checkable statement, and
+# tells anyone who wants remote access exactly which address they would be asking
+# for. Detected live rather than assumed, so it is correct on any machine.
 Say ""
-Say "  127.0.0.1 means THIS computer. From another PC that address cannot work -"
-Say "  connect to this machine (RDP / console) and open it there."
+Say "  127.0.0.1 means THIS computer, so that address only works while you are"
+Say "  sitting on it (console or RDP). This machine is:"
+Say ""
+Say ("    name : " + $env:COMPUTERNAME)
+try {
+  $addrs = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+             Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' -and $_.IPAddress -ne '0.0.0.0' } |
+             Select-Object -ExpandProperty IPAddress -Unique)
+  if ($addrs.Count) {
+    foreach ($a in $addrs) { Say ("    IPv4 : " + $a) }
+    Say ""
+    Say "  Those addresses do NOT serve the dashboard today - it is bound to loopback"
+    Say "  ON PURPOSE. The page carries the API token inside it, so anyone who could"
+    Say "  load it would control every Facebook account and every saved key. Opening"
+    Say "  the port without adding a real login would hand that to the whole network."
+    Say "  Use RDP for now; ask if you want proper remote access added."
+  } else {
+    Say "    IPv4 : (none detected)"
+  }
+} catch {}
 Say ""
 
 if ($script:LogPath) { Say " A full log of this run was saved to:"; Say ("   " + $script:LogPath); Say "" }
