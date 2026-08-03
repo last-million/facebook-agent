@@ -520,13 +520,25 @@ Say "  +----------------------------------------------------------+"
 if ($serverUp) {
   Write-Host "  |   THE DASHBOARD IS RUNNING - OPEN THIS ADDRESS:           |" -ForegroundColor Green
   Say       "  |                                                          |"
-  Write-Host "  |       http://127.0.0.1:9317                              |" -ForegroundColor Green
+  Write-Host "  |       http://127.0.0.1:9317                               |" -ForegroundColor Green
 } else {
   Write-Host "  |   TO START IT:  double-click  run-facebook-agent.bat      |" -ForegroundColor Yellow
   Say       "  |                                                          |"
   Write-Host "  |   THEN OPEN:    http://127.0.0.1:9317                     |" -ForegroundColor Yellow
 }
-Say "  +----------------------------------------------------------+"
+Say       "  |                                                          |"
+Write-Host "  |   ON THIS MACHINE ONLY (" -NoNewline; Write-Host ($env:COMPUTERNAME.PadRight(24)) -NoNewline -ForegroundColor White; Write-Host ")        |"
+Say       "  +----------------------------------------------------------+"
+# 127.0.0.1 is LOOPBACK. server.js binds HOST = "127.0.0.1" deliberately, so the
+# dashboard is not reachable from any other computer - typing this address on a
+# different PC can only ever fail, and that has already confused someone once.
+# It is bound that way on purpose: the page itself carries the API token (the HTML
+# is served with __DASHBOARD_TOKEN__ substituted in), so anyone who can load it has
+# full control of every Facebook account and every stored key. Remote access should
+# be RDP or an SSH tunnel to this machine - not opening the port.
+Say ""
+Say "  127.0.0.1 means THIS computer. From another PC that address cannot work -"
+Say "  connect to this machine (RDP / console) and open it there."
 Say ""
 
 if ($script:LogPath) { Say " A full log of this run was saved to:"; Say ("   " + $script:LogPath); Say "" }
