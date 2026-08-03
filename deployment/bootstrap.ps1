@@ -482,7 +482,17 @@ foreach ($m in $manual) { Say ("   " + $i + ") " + $m); $i++ }
 # the dashboard, so nothing here touches Facebook.
 $dashUrl = 'http://127.0.0.1:9317/'
 $serverUp = $false
-if (-not $CheckOnly -and -not $NoStart -and $script:Missing.Count -eq 0) {
+# GATE ON WHAT THE DASHBOARD ACTUALLY NEEDS, not on a clean bill of health. Node,
+# the project files and node_modules are what make `node server.js` run. WSL and
+# Hermes are NOT: they only power the image-review step, so a machine where WSL
+# refused to install still posts, comments and serves the dashboard perfectly well.
+# Gating on $Missing being empty meant one failed optional component left the user
+# with no dashboard at all and no idea why - which is exactly what happened on a
+# fresh RDP box whose `wsl --install` died on a component-store error.
+$canRunDashboard = (Have-Cmd node) -and
+                   (Test-Path (Join-Path $Target 'server.js')) -and
+                   (Test-Path (Join-Path $Target 'node_modules\playwright-core'))
+if (-not $CheckOnly -and -not $NoStart -and $canRunDashboard) {
   Step 10 "Starting the dashboard"
   $owner = $null
   try { $owner = (Get-NetTCPConnection -LocalPort 9317 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess } catch {}
@@ -509,8 +519,34 @@ if (-not $CheckOnly -and -not $NoStart -and $script:Missing.Count -eq 0) {
         } catch {}
       }
       if ($serverUp) { OK "dashboard is up" }
-      else { Warn "did not answer within 40s - check $errLog" }
-    } catch { Fail ("could not start node: " + $_.Exception.Message) }
+      else {
+        # SHOW THE REASON, do not post a file path and walk away. On a fresh machine
+        # this is the single most likely thing to go wrong, and "check this log" just
+        # moves the problem to someone who is already stuck. Node's own error is
+        # almost always self-explanatory (a missing module, a port in use, a bad
+        # path), so print it here.
+        Fail "the dashboard did not answer within 40s"
+        $died = $true
+        try { $died = -not (Get-Process -Name node -ErrorAction SilentlyContinue) } catch {}
+        if ($died) { Info "the node process is no longer running - it exited on startup" }
+        foreach ($lg in @($errLog, $outLog)) {
+          try {
+            if ((Test-Path $lg) -and ((Get-Item $lg).Length -gt 0)) {
+              Say ""
+              Info ("---- " + (Split-Path $lg -Leaf) + " (last 15 lines) ----")
+              Get-Content $lg -Tail 15 -ErrorAction SilentlyContinue | ForEach-Object { Say ("      " + $_) }
+            }
+          } catch {}
+        }
+        Say ""
+        Info "Common causes on a fresh machine:"
+        Info "  - port 9317 already in use by something else"
+        Info "  - npm install did not finish (delete node_modules and re-run this)"
+        Info "  - the ZIP was extracted only partially (web\ or tools\ missing)"
+        Info ("To see it live, run this in the folder:  node server.js")
+        $script:Missing += 'dashboard did not start'
+      }
+    } catch { Fail ("could not start node: " + $_.Exception.Message); $script:Missing += 'dashboard did not start' }
   }
   if ($serverUp) { try { Start-Process $dashUrl | Out-Null; Info "opened it in your browser" } catch {} }
 }
