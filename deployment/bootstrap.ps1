@@ -31,9 +31,9 @@ param(
   # Report what WOULD be installed and exit non-zero if anything is missing.
   # Used to validate this script on a working machine without touching it.
   [switch]$CheckOnly,
-  # Where the agent lives. Kept identical to the historical path (note the
-  # long-standing "facbeook" spelling - it is load-bearing for existing installs).
-  [string]$Target = (Join-Path $env:USERPROFILE 'Desktop\facbeook agent'),
+  # Where the agent lives. Default is worked out at runtime just below, because
+  # the right answer depends on how you got the files. Pass -Target to override.
+  [string]$Target = '',
   [string]$RepoUrl = 'https://github.com/last-million/facebook-agent.git'
 )
 
@@ -74,11 +74,59 @@ function Need ($what, $how) {
   if ($how) { Info $how }
 }
 
+# --- Where is the agent? ------------------------------------------------------
+# INSTALL IN PLACE. The normal way this is used is: download the project (ZIP from
+# GitHub, or a copy on a USB stick, because the repo may be PRIVATE), drop the
+# folder on the machine, and run deploy.bat out of it. So the target is simply the
+# folder this script lives in -- deployment\bootstrap.ps1 -> its parent.
+#
+# That matters for more than tidiness: a hardcoded "Desktop\facbeook agent" default
+# made the installer ignore the very files the user had just unpacked and try to
+# git-clone a second copy somewhere else. It also means the folder can be named
+# anything (a GitHub ZIP unpacks as "facebook-agent-main") and can sit on any drive.
+$RunningInPlace = $false
+if (-not $Target) {
+  $selfRepo = Split-Path $PSScriptRoot -Parent
+  if (Test-Path (Join-Path $selfRepo 'server.js')) {
+    $Target = $selfRepo
+    $RunningInPlace = $true
+  } else {
+    # Not inside a copy of the project (someone ran bootstrap.ps1 on its own):
+    # fall back to the historical location and clone into it.
+    $Target = Join-Path $env:USERPROFILE 'Desktop\facbeook agent'
+  }
+}
+
 Say "=============================================================="
 if ($CheckOnly) { Say " Facebook Agent - bootstrap (CHECK ONLY, installs nothing)" }
 else            { Say " Facebook Agent - bootstrap" }
 Say " Target: $Target"
+if ($RunningInPlace) { Say " Mode:   installing IN PLACE (the copy you ran this from)" }
 Say "=============================================================="
+
+# Files that arrived in a downloaded ZIP carry the Mark of the Web, which makes
+# PowerShell refuse to run them on some machines. deploy.bat already passes
+# -ExecutionPolicy Bypass, but clearing the mark stops any other prompt as well.
+if ($RunningInPlace -and -not $CheckOnly) {
+  try {
+    Get-ChildItem -Path $Target -Recurse -Include *.ps1,*.bat,*.cmd,*.sh -ErrorAction SilentlyContinue |
+      Unblock-File -ErrorAction SilentlyContinue
+  } catch {}
+}
+
+# Running production off a USB stick works right up until the stick is removed --
+# and this installs a watchdog that will keep trying to restart the server from a
+# path that no longer exists. Say so plainly; do not block, it is the user's call.
+try {
+  $driveLetter = ($Target.Substring(0,2))
+  $drv = Get-CimInstance Win32_LogicalDisk -Filter ("DeviceID='" + $driveLetter + "'") -ErrorAction SilentlyContinue
+  if ($drv -and $drv.DriveType -eq 2) {
+    Say ""
+    Warn "This folder is on a REMOVABLE drive ($driveLetter)."
+    Info "Copy it to the local disk before running production - the watchdog and"
+    Info "the run will break the moment the drive is unplugged."
+  }
+} catch {}
 
 # --- 0. Administrator ---------------------------------------------------------
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -122,20 +170,24 @@ if (Have-Cmd node) {
 # Needed to clone/update the repo. (The repo also vendors a portable git under
 # .tooling\mingit for the auto-sync task, but you need a real git to get the repo
 # in the first place.)
-Step 2 "Git for Windows"
-# The repo vendors a portable git at .tooling\mingit (used by the auto-sync task),
-# so a machine can be perfectly healthy with no system-wide git. Only the CLONE
-# needs a real one - if the checkout already exists, the vendored copy is enough
-# and reporting "Git is missing" would be a false alarm.
+Step 2 "Git for Windows (optional)"
+# Git is NOT required to run the agent. It is needed only to CLONE a fresh copy --
+# and in the normal flow (ZIP download, or a copy carried on a USB stick because
+# the repo is private) the files are already here, so there is nothing to clone.
+# Treat it as optional: install it when we can, never fail the run over it.
+# The repo may also vendor a portable git at .tooling\mingit for the auto-sync
+# task; that is not in a GitHub ZIP (untracked), so its absence is normal too.
 $vendoredGit = Join-Path $Target '.tooling\mingit\cmd\git.exe'
 $repoPresent = Test-Path (Join-Path $Target 'server.js')
 if (Have-Cmd git) {
   OK (& git --version)
-} elseif ($repoPresent -and (Test-Path $vendoredGit)) {
-  OK ("no system git, but the repo is present and vendors one: " + ((& $vendoredGit --version) -join ''))
-  Info "a system-wide git is only needed to clone a fresh copy"
+} elseif (Test-Path $vendoredGit) {
+  OK ("no system git; the project vendors one: " + ((& $vendoredGit --version) -join ''))
+} elseif ($repoPresent) {
+  OK "not installed - and not needed: the project files are already here"
+  Info "install Git only if you want 'git pull' updates or the auto-sync task"
 } elseif ($CheckOnly) {
-  Need "Git" "https://git-scm.com/download/win"
+  Need "Git" "needed here only because there is no copy of the project to install from"
 } else {
   $exe = $null
   try {
@@ -160,8 +212,10 @@ if (Have-Cmd git) {
 }
 
 # --- 3. The repo --------------------------------------------------------------
-Step 3 "Repository"
-if (Test-Path (Join-Path $Target 'server.js')) {
+Step 3 "Project files"
+if ($RunningInPlace) {
+  OK "using the copy you ran this from (no download needed)"
+} elseif (Test-Path (Join-Path $Target 'server.js')) {
   OK "already present at $Target"
 } elseif ($CheckOnly) {
   Need "repo checkout" "git clone $RepoUrl into $Target"
