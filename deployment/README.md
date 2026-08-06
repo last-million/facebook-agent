@@ -9,6 +9,7 @@ and to keep the GitHub repo continuously in sync with the live machine.
 | `deploy.bat` | Windows | **Start here on Windows.** Self-elevates and runs `bootstrap.ps1`. |
 | `bootstrap.ps1` | Windows | The real installer: Node.js, Git, repo, npm deps, data dir, keep-alive watchdog, WSL+Ubuntu, then Hermes inside WSL. |
 | `deploy.sh` | Linux / WSL / macOS | **Start here on Linux.** Base packages, uv, Node.js, npm deps, Hermes, `~/.hermes/.env`, data dir. |
+| `reapply-hermes-customizations.sh` | Linux / WSL | Re-applies our Hermes customizations (`SOUL.md`, config, custom tools, source patches) after a Hermes update wipes them. Idempotent; `deploy.sh` runs it automatically on every deploy. |
 | `auto-sync.ps1` | Windows | Refreshes `claude-memory/` from the live memory, commits changed tracked files, pushes to GitHub. |
 
 ## Deploy on a brand-new machine
@@ -72,6 +73,32 @@ On a bare Windows box WSL needs **one reboot**. The script tells you, then you r
   Node, so a second Node inside WSL would be waste).
 - **ixBrowser has no Linux build.** A pure-Linux host can run the dashboard and Hermes,
   but the posting/commenting side needs ixBrowser reachable over its Local API.
+
+## Hermes customizations (survive updates)
+`hermes-config/` carries everything we changed on top of stock Hermes, so a fresh
+deploy — or a Hermes update — never loses it:
+
+| What | Where it lands | Notes |
+|------|----------------|-------|
+| `SOUL.md` | `~/.hermes/SOUL.md` | agent persona |
+| `skills_prompt_snapshot.json` | `~/.hermes/.skills_prompt_snapshot.json` | skills prompt cache (auto-sync refreshes the repo copy from WSL every cycle) |
+| `config.yaml` | `~/.hermes/config.yaml` | our model order/providers. **api_key fields are empty** — keys live in `~/.hermes/.env`, never here. Copied only when missing; `--force-config` overwrites. |
+| `custom/facebook-agent/*` | `~/.hermes/custom/facebook-agent/` | humanize-browser prompt + pointer tools |
+| `tools/*.py` | `hermes-agent/tools/` | pointer primitives registered inside Hermes |
+| `patches/*.patch` | applied onto the `hermes-agent` checkout | websocket heartbeat/host fixes + SessionsPage tweak |
+
+After any **manual** Hermes update, re-apply by hand (deploy does it for you):
+```bash
+bash deployment/reapply-hermes-customizations.sh
+```
+If a Hermes update changes the same upstream lines, the patch refuses to apply and
+the script says so. Re-apply the intent by hand in `~/.hermes/hermes-agent`, then
+regenerate the patch:
+```bash
+git -C ~/.hermes/hermes-agent diff > hermes-config/patches/hermes-local-fixes.patch
+```
+The pipx install is **editable**, so patched Python files are live immediately — no
+reinstall. A patch that touches `web/` needs the Hermes web UI rebuilt if you use it.
 
 ## Auto-sync (keep GitHub up to date automatically)
 `auto-sync.ps1` commits + pushes changes to `workflow-state.json`, `.hermes/` plans,

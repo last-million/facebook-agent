@@ -26,8 +26,14 @@ data/*
 # ── Operator config + agent memory: machine-specific, contains group IDs + tokens. ──
 # LOCAL only (the repo is code + deployment only). Settings persist across restarts.
 claude-memory/
-hermes-config/
 .hermes/
+
+# hermes-config/ is TRACKED on purpose (2026-08-06): it carries our Hermes
+# customizations (SOUL.md, skills snapshot, config.yaml with EMPTY api_key fields,
+# source patches, custom tools) so deployment can restore them after a Hermes
+# update/reinstall wipes them. Verified secret-free - API keys live only in
+# ~/.hermes/.env on each machine, never in this folder. Keep it that way.
+hermes-config/.env
 
 # local git config (created when HOME pointed at repo during setup)
 .gitconfig

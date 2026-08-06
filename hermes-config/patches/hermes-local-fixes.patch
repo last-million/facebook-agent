@@ -1,0 +1,174 @@
+diff --git a/hermes_cli/web_server.py b/hermes_cli/web_server.py
+index bdb24554f..b0042e350 100644
+--- a/hermes_cli/web_server.py
++++ b/hermes_cli/web_server.py
+@@ -3168,9 +3168,17 @@ def _ws_client_is_allowed(ws: "WebSocket") -> bool:
+     """
+     if _is_public_bind():
+         return True
++    bound_host = getattr(app.state, "bound_host", "")
++    host_header = ws.headers.get("host", "")
++    if bound_host and _is_accepted_host(host_header, bound_host):
++        return True
+     client_host = ws.client.host if ws.client else ""
+     if not client_host:
+         return True
++    sidecar_host = getattr(app.state, "sidecar_host", "")
++    bind_host = getattr(app.state, "bind_host", "")
++    if client_host in {sidecar_host, bind_host}:
++        return True
+     return client_host in _LOOPBACK_HOSTS
+ 
+ # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
+@@ -3227,7 +3235,7 @@ def _resolve_chat_argv(
+ 
+ def _build_sidecar_url(channel: str) -> Optional[str]:
+     """ws:// URL the PTY child should publish events to, or None when unbound."""
+-    host = getattr(app.state, "bound_host", None)
++    host = getattr(app.state, "sidecar_host", None) or getattr(app.state, "bound_host", None)
+     port = getattr(app.state, "bound_port", None)
+ 
+     if not host or not port:
+@@ -3470,9 +3478,21 @@ async def events_ws(ws: WebSocket) -> None:
+     try:
+         while True:
+             # Subscribers don't speak — the receive() just blocks until
+-            # disconnect so the connection stays open as long as the
+-            # browser holds it.
+-            await ws.receive_text()
++            # disconnect so the connection stays open as long as the browser
++            # holds it. Send a lightweight heartbeat on idle so localhost
++            # port proxies do not reap the event feed.
++            try:
++                await asyncio.wait_for(ws.receive_text(), timeout=15.0)
++            except asyncio.TimeoutError:
++                await ws.send_text(
++                    json.dumps(
++                        {
++                            "jsonrpc": "2.0",
++                            "method": "event",
++                            "params": {"type": "heartbeat", "payload": {}},
++                        }
++                    )
++                )
+     except WebSocketDisconnect:
+         pass
+     finally:
+@@ -4400,6 +4420,8 @@ def start_server(
+     # bound_port is also stashed so /api/pty can build the back-WS URL the
+     # PTY child uses to publish events to the dashboard sidebar.
+     app.state.bound_host = host
++    app.state.bind_host = host
++    app.state.sidecar_host = host
+     app.state.bound_port = port
+ 
+     if open_browser:
+diff --git a/tui_gateway/ws.py b/tui_gateway/ws.py
+index a5879ef3a..38d618f13 100644
+--- a/tui_gateway/ws.py
++++ b/tui_gateway/ws.py
+@@ -133,9 +133,20 @@ async def handle_ws(ws: Any) -> None:
+     try:
+         while True:
+             try:
+-                raw = await ws.receive_text()
++                raw = await asyncio.wait_for(ws.receive_text(), timeout=15.0)
+             except _WebSocketDisconnect:
+                 break
++            except asyncio.TimeoutError:
++                ok = await transport.write_async(
++                    {
++                        "jsonrpc": "2.0",
++                        "method": "event",
++                        "params": {"type": "heartbeat", "payload": {}},
++                    }
++                )
++                if not ok:
++                    break
++                continue
+ 
+             line = raw.strip()
+             if not line:
+diff --git a/web/src/pages/SessionsPage.tsx b/web/src/pages/SessionsPage.tsx
+index dd2ad6b23..4ad17a679 100644
+--- a/web/src/pages/SessionsPage.tsx
++++ b/web/src/pages/SessionsPage.tsx
+@@ -430,6 +430,7 @@ export default function SessionsPage() {
+   const { setAfterTitle, setEnd } = usePageHeader();
+   const { activeAction, actionStatus, dismissLog } = useSystemActions();
+   const resumeInChatEnabled = isDashboardEmbeddedChatEnabled();
++  const navigate = useNavigate();
+ 
+   useLayoutEffect(() => {
+     if (loading) {
+@@ -443,29 +444,42 @@ export default function SessionsPage() {
+       </Badge>,
+     );
+     setEnd(
+-      <div className="relative w-full min-w-0 sm:max-w-xs">
+-        {searching ? (
+-          <Spinner className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[0.875rem] text-primary" />
+-        ) : (
+-          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+-        )}
+-        <Input
+-          placeholder={t.sessions.searchPlaceholder}
+-          value={search}
+-          onChange={(e) => setSearch(e.target.value)}
+-          className="h-8 pr-7 pl-8 text-xs"
+-        />
+-        {search && (
++      <div className="flex w-full min-w-0 items-center gap-2 sm:max-w-md">
++        {resumeInChatEnabled && (
+           <Button
+-            ghost
+-            size="xs"
+-            className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+-            onClick={() => setSearch("")}
+-            aria-label={t.common.clear}
++            size="sm"
++            className="shrink-0"
++            onClick={() => navigate("/chat")}
++            aria-label="Chat with Hermes"
+           >
+-            <X />
++            <MessageSquare className="mr-1.5 h-3.5 w-3.5" />
++            <span className="hidden sm:inline">Chat with Hermes</span>
+           </Button>
+         )}
++        <div className="relative min-w-0 flex-1">
++          {searching ? (
++            <Spinner className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[0.875rem] text-primary" />
++          ) : (
++            <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
++          )}
++          <Input
++            placeholder={t.sessions.searchPlaceholder}
++            value={search}
++            onChange={(e) => setSearch(e.target.value)}
++            className="h-8 pr-7 pl-8 text-xs"
++          />
++          {search && (
++            <Button
++              ghost
++              size="xs"
++              className="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
++              onClick={() => setSearch("")}
++              aria-label={t.common.clear}
++            >
++              <X />
++            </Button>
++          )}
++        </div>
+       </div>,
+     );
+     return () => {
+@@ -478,6 +492,8 @@ export default function SessionsPage() {
+     searching,
+     setAfterTitle,
+     setEnd,
++    navigate,
++    resumeInChatEnabled,
+     t.common.clear,
+     t.sessions.searchPlaceholder,
+     total,

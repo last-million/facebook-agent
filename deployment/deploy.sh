@@ -195,6 +195,21 @@ else
   if [ -x "$HERMES_BIN" ]; then ok "installed"; else fail "Hermes did not land at $HERMES_BIN"; MISSING="$MISSING Hermes"; fi
 fi
 
+# --- 5b. our Hermes customizations --------------------------------------------
+# A Hermes update/reinstall wipes the local changes this project depends on
+# (SOUL.md, config, custom tools, source patches) - put them back every deploy.
+if [ "$CHECK_ONLY" != "1" ] && [ -f "$REPO_DIR/deployment/reapply-hermes-customizations.sh" ]; then
+  step 5b "Our Hermes customizations (SOUL.md, config, tools, patches)"
+  # Run a CRLF-stripped copy: this repo is often cloned on Windows, where the
+  # checkout may carry CRLF endings that break bash. FB_REPO_DIR/HERMES_DIR keep
+  # the copy pointed at the real repo and the real Hermes checkout.
+  REAPPLY_TMP="$(mktemp)"
+  sed 's/\r$//' "$REPO_DIR/deployment/reapply-hermes-customizations.sh" > "$REAPPLY_TMP"
+  FB_REPO_DIR="$REPO_DIR" HERMES_DIR="$HERMES_DIR" bash "$REAPPLY_TMP" \
+    || warn "customization re-apply reported problems (see above)"
+  rm -f "$REAPPLY_TMP"
+fi
+
 # --- 6. Hermes brain + env ----------------------------------------------------
 step 6 "Hermes config (SOUL.md, skills, .env)"
 if [ "$CHECK_ONLY" = "1" ]; then
