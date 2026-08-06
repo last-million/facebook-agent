@@ -374,13 +374,21 @@ if (Have-Cmd wsl) {
 }
 if ($wslOk) {
   if ($wslDistros.Count) { OK ("working - distro(s): " + ($wslDistros -join ', ')) } else { OK "working" }
+  # server.js runs every job with -d Ubuntu-24.04 - that exact distro must exist,
+  # even on a machine whose WSL was already healthy with some other distro.
+  if (-not $CheckOnly -and ($wslDistros -notcontains 'Ubuntu-24.04')) {
+    Info "adding the Ubuntu-24.04 distro (the one the agent runs jobs in)"
+    & wsl.exe --install -d Ubuntu-24.04 --no-launch 2>&1 | Out-Null
+    & wsl.exe --set-default Ubuntu-24.04 2>&1 | Out-Null
+    & wsl.exe --shutdown 2>&1 | Out-Null
+  }
 } elseif (-not (Have-Cmd wsl)) {
   # wsl.exe genuinely absent -> a real install is warranted.
   if ($CheckOnly) {
     Need "WSL + a Linux distro" "wsl --install -d Ubuntu   (then REBOOT and re-run)"
   } else {
     Warn "WSL is not installed - installing it now (a REBOOT will be required)"
-    & wsl.exe --install -d Ubuntu
+    & wsl.exe --install -d Ubuntu-24.04
     $rc = $LASTEXITCODE
     Say ""
     if ($rc -eq 0) {
@@ -400,25 +408,50 @@ if ($wslOk) {
     if ($rc -eq 0) { exit 0 }
   }
 } else {
-  # wsl.exe exists but nothing runs. Either no distro is registered, or the install
-  # is broken. Adding a distro is safe; "repairing" one is not, so we never try.
-  if ($wslDistros.Count) {
-    Fail ("WSL is installed (distro(s): " + ($wslDistros -join ', ') + ") but commands do not run")
-    Info "Try 'wsl --shutdown' then 'wsl -e echo ok' in a terminal, or reboot."
-    Info "Not touching it automatically - a working install must not be reinstalled."
-    $script:Missing += 'WSL (present but not responding)'
-  } elseif ($CheckOnly) {
-    Need "a WSL Linux distro" "wsl --install -d Ubuntu"
+  # wsl.exe exists but commands do not run. AUTOMATIC REPAIR LADDER (2026-08-06,
+  # operator: "the deployment files should do it") - every step is a safe,
+  # standard WSL operation, and we re-probe by EXECUTION after each one. The old
+  # behavior stopped here and printed manual terminal steps instead.
+  if ($CheckOnly) {
+    Need "working WSL" "automatic repair runs on a real install (wsl --update, shutdown, distro)"
   } else {
-    Warn "WSL is present but has no distro - installing Ubuntu"
-    & wsl.exe --install -d Ubuntu
-    $rc = $LASTEXITCODE
-    if ($rc -ne 0) { Fail ("distro install failed (exit " + $rc + ")"); $script:Missing += 'WSL distro' }
-    else {
-      Say ""
-      Warn " Ubuntu installed. If it asks for a UNIX user, create one, then run"
-      Warn " deploy.bat again to finish Hermes."
-      exit 0
+    Warn "WSL is present but not answering - attempting automatic repair"
+    Info "step 1/3: wsl --shutdown (resets a hung WSL service/VM)"
+    & wsl.exe --shutdown 2>&1 | Out-Null
+    Start-Sleep -Seconds 2
+    if ((Clean-Wsl (& wsl.exe -e sh -c "echo WSL_READY" 2>&1)) -match 'WSL_READY') { $wslOk = $true }
+    if (-not $wslOk) {
+      Info "step 2/3: wsl --update (repairs the WSL engine itself - the old INBOX build does not understand -e)"
+      & wsl.exe --update 2>&1 | Out-Null
+      if ($LASTEXITCODE -ne 0) { & wsl.exe --update --web-download 2>&1 | Out-Null }
+      & wsl.exe --shutdown 2>&1 | Out-Null
+      Start-Sleep -Seconds 2
+      if ((Clean-Wsl (& wsl.exe -e sh -c "echo WSL_READY" 2>&1)) -match 'WSL_READY') { $wslOk = $true }
+    }
+    if (-not $wslOk) {
+      Info "step 3/3: install the Ubuntu-24.04 distro (the one server.js runs jobs in)"
+      & wsl.exe --install -d Ubuntu-24.04 --no-launch 2>&1 | Out-Null
+      & wsl.exe --set-default Ubuntu-24.04 2>&1 | Out-Null
+      & wsl.exe --shutdown 2>&1 | Out-Null
+      Start-Sleep -Seconds 2
+      if ((Clean-Wsl (& wsl.exe -e sh -c "echo WSL_READY" 2>&1)) -match 'WSL_READY') { $wslOk = $true }
+    }
+    if ($wslOk) {
+      OK "WSL repaired and answering"
+      $wslDistros = @((Clean-Wsl (& wsl.exe -l -q 2>&1)) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+      if ($wslDistros -notcontains 'Ubuntu-24.04') {
+        Info "adding the Ubuntu-24.04 distro (the one the agent runs jobs in)"
+        & wsl.exe --install -d Ubuntu-24.04 --no-launch 2>&1 | Out-Null
+        & wsl.exe --set-default Ubuntu-24.04 2>&1 | Out-Null
+        & wsl.exe --shutdown 2>&1 | Out-Null
+      }
+    } else {
+      # The one thing automation cannot do for you: a kernel/feature change only
+      # takes effect after a reboot. Say it loudly and offer to do it (see the
+      # end of this script).
+      Fail "WSL still not answering after automatic repair - one REBOOT is required"
+      $script:Missing += 'WSL (needs one reboot)'
+      $script:NeedsReboot = $true
     }
   }
 }
@@ -648,6 +681,20 @@ Say ""
 
 if ($script:LogPath) { Say " A full log of this run was saved to:"; Say ("   " + $script:LogPath); Say "" }
 try { Stop-Transcript | Out-Null } catch {}
+
+# WSL repair/first-install only takes effect after a reboot. Offer to do it -
+# after the reboot the operator just runs deploy.bat again and it picks up here.
+if ($script:NeedsReboot -and -not $CheckOnly) {
+  Say ""
+  Warn "Automatic repair is done, but WSL only starts working after ONE reboot."
+  $answer = Read-Host "Reboot NOW? [Y/n]"
+  if ($answer -notmatch '^[Nn]') {
+    Warn "Rebooting in 15 seconds. After login: run deploy.bat again to finish."
+    & shutdown.exe /r /t 15 | Out-Null
+  } else {
+    Warn "OK - reboot when you can, then run deploy.bat again to finish."
+  }
+}
 
 if ($CheckOnly -and $script:Missing.Count -gt 0) { exit 2 }
 exit 0
