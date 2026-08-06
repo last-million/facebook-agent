@@ -23643,6 +23643,7 @@ const HERMES_OAUTH_PROVIDERS = {
   "google-gemini-cli": { label: "Google account (Gemini)", note: "Free tier via Google sign-in." },
 };
 let hermesStatusCache = { at: 0, data: null };
+let hermesVersionCache = { at: 0, value: "" };   // 10-min TTL: --version via WSL is slow and barely changes
 const hermesOauthFlows = new Map();
 
 function maskApiKey(key) {
@@ -23709,9 +23710,14 @@ async function buildHermesStatus(force = false) {
     } catch { /* WSL itself is down */ }
   }
   if (status.hermesInstalled) {
-    try {
-      status.hermesVersion = (await wslExec([HERMES_BIN, "--version"], 20000)).split("\n")[0].trim();
-    } catch { /* version is cosmetic */ }
+    if (hermesVersionCache.value && Date.now() - hermesVersionCache.at < 600000) {
+      status.hermesVersion = hermesVersionCache.value;
+    } else {
+      try {
+        status.hermesVersion = (await wslExec([HERMES_BIN, "--version"], 20000)).split("\n")[0].trim();
+        if (status.hermesVersion) hermesVersionCache = { at: Date.now(), value: status.hermesVersion };
+      } catch { /* version is cosmetic */ }
+    }
     try {
       const envRaw = await hermesReadEnvRaw();
       status.envKeys = readHermesEnvKeys(envRaw).map(({ key, ...pub }) => pub);

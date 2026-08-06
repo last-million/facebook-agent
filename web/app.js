@@ -6946,9 +6946,9 @@ function uxAttachIncompleteRunBanner() {
     const label = el("hermesKeyLabel").value.trim();
     const result = el("hermesKeyResult");
     if (!apiKey) { result.textContent = "Paste a key first."; return; }
-    result.textContent = "Saving\u2026";
+    result.textContent = "Saving\u2026 (the first save after a cold start can take up to a minute - WSL wakes up)";
     try {
-      const data = await api("/api/hermes/keys", { method: "POST", body: JSON.stringify({ provider, apiKey, label }), timeoutMs: 60000 });
+      const data = await api("/api/hermes/keys", { method: "POST", body: JSON.stringify({ provider, apiKey, label }), timeoutMs: 120000 });
       hermesStatus = data.hermes || hermesStatus;
       el("hermesKeyValue").value = "";
       result.textContent = data.poolAdded
@@ -6965,7 +6965,7 @@ function uxAttachIncompleteRunBanner() {
     const result = el("hermesKeyResult");
     result.textContent = apiKey ? "Testing the pasted key\u2026" : "Testing the saved key\u2026";
     try {
-      const data = await api("/api/hermes/keys/test", { method: "POST", body: JSON.stringify({ provider, apiKey }), timeoutMs: 30000 });
+      const data = await api("/api/hermes/keys/test", { method: "POST", body: JSON.stringify({ provider, apiKey }), timeoutMs: 45000 });
       result.textContent = (data.ok ? "\u2713 " : "\u2717 ") + (data.detail || "");
     } catch (err) { result.textContent = err.message; }
   }
