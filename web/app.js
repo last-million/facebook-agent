@@ -6838,3 +6838,187 @@ function uxAttachIncompleteRunBanner() {
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", setup); else setup();
 })();
 
+
+// --- Hermes agent setup (WSL + LLM connection) --------------------------------
+// Status banner + setup modal for the Hermes brain: is it installed, and does
+// it have a working LLM credential? Intentionally separate from the main 3s
+// refresh() poll: the status endpoint probes WSL and can take a few seconds on
+// a cold check, which must never stall the main dashboard refresh.
+(() => {
+  const HERMES_POLL_MS = 20000;
+  let hermesStatus = null;
+  let hermesOauthFlowId = null;
+  let hermesOauthTimer = null;
+
+  const el = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  async function refreshHermesStatus(force = false) {
+    try {
+      const data = await api(`/api/hermes/status${force ? "?refresh=1" : ""}`, { timeoutMs: 45000 });
+      hermesStatus = data.hermes || null;
+    } catch {
+      hermesStatus = null;
+    }
+    renderHermesStatus();
+  }
+
+  function hermesStatusLine() {
+    if (!hermesStatus) return "";
+    if (!hermesStatus.wslReachable) return "WSL (Ubuntu-24.04) is not reachable - the agent cannot run any jobs.";
+    if (!hermesStatus.hermesInstalled) return "Hermes agent is not installed in WSL - run deployment\\deploy.bat (Windows) or deployment/deploy.sh.";
+    if (!hermesStatus.llmConnected) return "Hermes is installed, but no LLM is connected - add an API key or sign in below.";
+    return "";
+  }
+
+  function renderHermesStatus() {
+    const banner = el("hermesSetupBanner");
+    const problem = hermesStatusLine();
+    if (banner) {
+      banner.style.display = problem ? "" : "none";
+      const txt = el("hermesSetupBannerText");
+      if (txt && problem) txt.textContent = problem;
+    }
+    const checks = el("hermesStatusChecks");
+    if (checks) {
+      if (!hermesStatus) {
+        checks.innerHTML = '<p class="muted">Checking&hellip;</p>';
+      } else {
+        const version = hermesStatus.hermesVersion ? ` - ${esc(hermesStatus.hermesVersion)}` : "";
+        const rows = [
+          ["WSL (Ubuntu-24.04)", hermesStatus.wslReachable],
+          [`Hermes agent${version}`, hermesStatus.hermesInstalled],
+          ["LLM connected", hermesStatus.llmConnected],
+        ];
+        checks.innerHTML = rows.map(([label, ok]) =>
+          `<div style="display:flex;gap:8px;align-items:center;margin:3px 0;"><span style="color:${ok ? "#4caf50" : "#e57373"};font-weight:700;">${ok ? "\u2713" : "\u2717"}</span><span>${label}</span></div>`
+        ).join("");
+      }
+    }
+    renderHermesCredList();
+  }
+
+  function renderHermesCredList() {
+    const list = el("hermesCredList");
+    if (!list) return;
+    if (!hermesStatus) { list.innerHTML = ""; return; }
+    const rows = [];
+    for (const k of hermesStatus.envKeys || []) {
+      rows.push({ provider: k.provider, label: `${k.label} (${k.envVar})`, masked: k.masked, source: "env", target: "" });
+    }
+    for (const p of hermesStatus.pool || []) {
+      const statusTag = p.status ? ` [${p.status}]` : "";
+      rows.push({ provider: p.provider, label: `${p.provider} - ${p.label || p.id || "credential"}${statusTag}`, masked: p.masked, source: p.source || "pool", target: p.id || p.label });
+    }
+    if (!rows.length) {
+      list.innerHTML = '<p class="muted">No credentials saved yet.</p>';
+      return;
+    }
+    list.innerHTML = rows.map((r, i) =>
+      `<div style="display:flex;gap:10px;align-items:center;margin:4px 0;flex-wrap:wrap;"><span style="flex:1;min-width:220px;">${esc(r.label)} <span class="muted">${esc(r.masked || "")}</span></span><button type="button" data-hermes-remove="${i}" style="opacity:.8;">Remove</button></div>`
+    ).join("");
+    list.querySelectorAll("[data-hermes-remove]").forEach((btn) => {
+      btn.addEventListener("click", () => removeHermesCred(rows[Number(btn.getAttribute("data-hermes-remove"))]));
+    });
+  }
+
+  async function removeHermesCred(row) {
+    if (!row) return;
+    if (!window.confirm(`Remove ${row.label}?`)) return;
+    try {
+      const data = await api("/api/hermes/keys/remove", { method: "POST", body: JSON.stringify({ provider: row.provider, source: row.source, target: row.target }) });
+      hermesStatus = data.hermes || hermesStatus;
+      showToast("Credential removed.");
+    } catch (err) { showToast(err.message); }
+    renderHermesStatus();
+  }
+
+  async function saveHermesKey() {
+    const provider = el("hermesKeyProvider").value;
+    const apiKey = el("hermesKeyValue").value.trim();
+    const label = el("hermesKeyLabel").value.trim();
+    const result = el("hermesKeyResult");
+    if (!apiKey) { result.textContent = "Paste a key first."; return; }
+    result.textContent = "Saving\u2026";
+    try {
+      const data = await api("/api/hermes/keys", { method: "POST", body: JSON.stringify({ provider, apiKey, label }), timeoutMs: 60000 });
+      hermesStatus = data.hermes || hermesStatus;
+      el("hermesKeyValue").value = "";
+      result.textContent = data.poolAdded
+        ? "Saved - added to the rotation pool."
+        : "Saved to the Hermes env file (the rotation pool was not available for this provider).";
+      showToast("API key saved.");
+    } catch (err) { result.textContent = err.message; }
+    renderHermesStatus();
+  }
+
+  async function testHermesKey() {
+    const provider = el("hermesKeyProvider").value;
+    const apiKey = el("hermesKeyValue").value.trim();
+    const result = el("hermesKeyResult");
+    result.textContent = apiKey ? "Testing the pasted key\u2026" : "Testing the saved key\u2026";
+    try {
+      const data = await api("/api/hermes/keys/test", { method: "POST", body: JSON.stringify({ provider, apiKey }), timeoutMs: 30000 });
+      result.textContent = (data.ok ? "\u2713 " : "\u2717 ") + (data.detail || "");
+    } catch (err) { result.textContent = err.message; }
+  }
+
+  async function startHermesOauth(provider) {
+    try {
+      const data = await api("/api/hermes/oauth/start", { method: "POST", body: JSON.stringify({ provider }) });
+      hermesOauthFlowId = data.flowId;
+      el("hermesOauthBox").style.display = "";
+      el("hermesOauthUrl").textContent = "starting\u2026";
+      el("hermesOauthUrl").removeAttribute("href");
+      el("hermesOauthCode").textContent = "";
+      el("hermesOauthStatus").textContent = "Starting the sign-in flow\u2026";
+      window.clearInterval(hermesOauthTimer);
+      hermesOauthTimer = window.setInterval(pollHermesOauth, 2000);
+    } catch (err) { showToast(err.message); }
+  }
+
+  async function pollHermesOauth() {
+    if (!hermesOauthFlowId) { window.clearInterval(hermesOauthTimer); return; }
+    let flow;
+    try {
+      flow = await api(`/api/hermes/oauth/${hermesOauthFlowId}`);
+    } catch {
+      window.clearInterval(hermesOauthTimer);
+      return;
+    }
+    if (flow.url) {
+      const a = el("hermesOauthUrl");
+      a.textContent = flow.url;
+      a.href = flow.url;
+    }
+    if (flow.userCode) el("hermesOauthCode").textContent = flow.userCode;
+    if (flow.done) {
+      window.clearInterval(hermesOauthTimer);
+      el("hermesOauthStatus").textContent = flow.ok
+        ? "\u2713 Connected - the credential is in the rotation pool."
+        : "\u2717 Sign-in failed or was cancelled.";
+      if (flow.ok) refreshHermesStatus(true);
+    }
+  }
+
+  function setHermesSetupOpen(open) {
+    const modal = el("hermesSetupModal");
+    if (!modal) return;
+    modal.hidden = !open;
+    if (open) refreshHermesStatus(true);
+  }
+
+  function initHermesSetup() {
+    el("hermesSetupOpenBtn")?.addEventListener("click", () => setHermesSetupOpen(true));
+    el("hermesSetupClose")?.addEventListener("click", () => setHermesSetupOpen(false));
+    el("hermesSetupModal")?.addEventListener("click", (event) => { if (event.target === el("hermesSetupModal")) setHermesSetupOpen(false); });
+    el("hermesKeySaveBtn")?.addEventListener("click", saveHermesKey);
+    el("hermesKeyTestBtn")?.addEventListener("click", testHermesKey);
+    el("hermesOauthGoogleBtn")?.addEventListener("click", () => startHermesOauth("google-gemini-cli"));
+    el("hermesOauthCodexBtn")?.addEventListener("click", () => startHermesOauth("openai-codex"));
+    refreshHermesStatus();
+    window.setInterval(refreshHermesStatus, HERMES_POLL_MS);
+  }
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", initHermesSetup); else initHermesSetup();
+})();

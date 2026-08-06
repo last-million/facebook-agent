@@ -1505,6 +1505,56 @@
       </section>
     </main>
     <button id="setupWizardLauncher" class="setupLauncher hasTooltip" type="button" aria-label="Open setup wizard" data-tooltip="Open setup wizard">?</button>
+    <section id="hermesSetupModal" class="wizardOverlay" role="dialog" aria-modal="true" aria-labelledby="hermesSetupTitle" hidden>
+      <div class="wizardShell">
+        <header class="wizardHeader">
+          <div>
+            <span class="wizardKicker">Agent setup</span>
+            <h2 id="hermesSetupTitle">Hermes agent &amp; LLM connection</h2>
+            <p id="hermesSetupSubtitle">Every job the Facebook agent runs goes through Hermes (inside WSL). Hermes must be installed and connected to at least one LLM &mdash; with an API key or an account sign-in.</p>
+          </div>
+          <button id="hermesSetupClose" class="ghostButton wizardClose" type="button" aria-label="Close Hermes setup">X</button>
+        </header>
+        <div class="wizardBody">
+          <div class="wizardContent" style="grid-column:1/-1; max-width:860px;">
+            <h3>Status</h3>
+            <div id="hermesStatusChecks" class="wizardChecks"></div>
+
+            <h3 style="margin-top:18px;">Add an API key</h3>
+            <p class="muted">Free options: <b>OpenRouter</b> (has free models) or a free <b>Google AI Studio</b> key. Tip: add <b>more than one key or provider</b> &mdash; Hermes keeps a pool and rotates automatically when one is exhausted.</p>
+            <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+              <select id="hermesKeyProvider">
+                <option value="openrouter">OpenRouter (free models available)</option>
+                <option value="gemini">Google Gemini &mdash; AI Studio key (free)</option>
+                <option value="openai">OpenAI</option>
+                <option value="anthropic">Anthropic</option>
+              </select>
+              <input id="hermesKeyValue" type="password" placeholder="Paste API key" autocomplete="off" style="min-width:280px;">
+              <input id="hermesKeyLabel" type="text" placeholder="Label (optional, e.g. free-key-1)" style="max-width:200px;">
+              <button id="hermesKeySaveBtn" class="primary" type="button">Save key</button>
+              <button id="hermesKeyTestBtn" type="button">Test key</button>
+            </div>
+            <p id="hermesKeyResult" class="muted" style="margin:6px 0 0;"></p>
+
+            <h3 style="margin-top:18px;">Saved credentials</h3>
+            <div id="hermesCredList" class="wizardChecks"></div>
+
+            <h3 style="margin-top:18px;">Or connect with an account (OAuth)</h3>
+            <p class="muted">Google/Gemini sign-in has a <b>free tier</b>. ChatGPT sign-in needs a paid ChatGPT plan.</p>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <button id="hermesOauthGoogleBtn" type="button">Connect Google (Gemini &mdash; free)</button>
+              <button id="hermesOauthCodexBtn" type="button">Connect ChatGPT account</button>
+            </div>
+            <div id="hermesOauthBox" style="display:none; margin-top:10px; border:1px solid #2a3344; border-radius:9px; padding:10px 12px; background:#141a24;">
+              <p style="margin:0;">1. Open this link: <a id="hermesOauthUrl" href="#" target="_blank" rel="noopener" style="color:#5fb6ff;"></a></p>
+              <p style="margin:6px 0 0;">2. Enter this code: <code id="hermesOauthCode" style="font-size:1.15em; font-weight:700;"></code></p>
+              <p id="hermesOauthStatus" class="muted" style="margin:6px 0 0;">Waiting for sign-in to finish&hellip;</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section id="setupWizard" class="wizardOverlay" role="dialog" aria-modal="true" aria-labelledby="setupWizardTitle" hidden>
       <div class="wizardShell">
         <header class="wizardHeader">

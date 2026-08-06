@@ -23613,7 +23613,7 @@ const HERMES_KEY_PROVIDERS = {
     label: "OpenRouter",
     envVar: "OPENROUTER_API_KEY",
     hermesProvider: "openrouter",
-    testUrl: "https://openrouter.ai/api/v1/models",
+    testUrl: "https://openrouter.ai/api/v1/auth/key",
     testHeaders: (key) => ({ Authorization: `Bearer ${key}` }),
   },
   openai: {
@@ -23787,18 +23787,27 @@ async function hermesTestApiKey(body) {
   const provider = String(body && body.provider || "");
   const spec = HERMES_KEY_PROVIDERS[provider];
   if (!spec) throw hermesBadRequest(`Unknown provider "${provider}".`);
+  const envRaw = await hermesReadEnvRaw();
   let key = String(body && body.apiKey || "").trim();
   if (!key) {
-    const found = readHermesEnvKeys(await hermesReadEnvRaw()).find((entry) => entry.provider === provider);
+    const found = readHermesEnvKeys(envRaw).find((entry) => entry.provider === provider);
     key = found ? found.key : "";
   }
   if (!key) return { ok: false, detail: `No key given and no saved ${spec.label} key was found.` };
-  const url = spec.testQueryKey ? `${spec.testUrl}?key=${encodeURIComponent(key)}` : spec.testUrl;
+  // An OpenAI-compatible key may live behind a custom base URL (this box points
+  // OPENAI_BASE_URL at Nous Research). Test where the key is actually used.
+  let baseUrl = spec.testUrl;
+  let customBase = false;
+  if (provider === "openai") {
+    const base = envRaw.match(/^OPENAI_BASE_URL=(\S+)$/m);
+    if (base && base[1]) { baseUrl = `${base[1].replace(/\/+$/, "")}/models`; customBase = true; }
+  }
+  const url = spec.testQueryKey ? `${baseUrl}?key=${encodeURIComponent(key)}` : baseUrl;
   const headers = spec.testHeaders ? spec.testHeaders(key) : {};
   try {
     await fetchJson(url, { headers, timeoutMs: 15000 });
     logEvent("hermes_key_tested", { provider, ok: true });
-    return { ok: true, detail: `${spec.label} accepted the key.` };
+    return { ok: true, detail: `${spec.label} accepted the key${customBase ? " (via its custom base URL)" : ""}.` };
   } catch (err) {
     const rejected = err.remoteStatus === 401 || err.remoteStatus === 403;
     const detail = rejected
