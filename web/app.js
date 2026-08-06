@@ -6872,6 +6872,13 @@ function uxAttachIncompleteRunBanner() {
   }
 
   function renderHermesStatus() {
+    const dot = el("hermesSetupDot");
+    if (dot) {
+      dot.style.background = !hermesStatus
+        ? "#9aa4b2"
+        : (hermesStatus.hermesInstalled && hermesStatus.llmConnected ? "#4caf50" : "#e57373");
+      dot.title = hermesStatusLine() || "Hermes is installed and an LLM is connected.";
+    }
     const banner = el("hermesSetupBanner");
     const problem = hermesStatusLine();
     if (banner) {
@@ -7009,6 +7016,7 @@ function uxAttachIncompleteRunBanner() {
   }
 
   function initHermesSetup() {
+    el("hermesSetupTopBtn")?.addEventListener("click", () => setHermesSetupOpen(true));
     el("hermesSetupOpenBtn")?.addEventListener("click", () => setHermesSetupOpen(true));
     el("hermesSetupClose")?.addEventListener("click", () => setHermesSetupOpen(false));
     el("hermesSetupModal")?.addEventListener("click", (event) => { if (event.target === el("hermesSetupModal")) setHermesSetupOpen(false); });
