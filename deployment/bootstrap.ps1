@@ -240,6 +240,29 @@ if ($RunningInPlace) {
   if ($LASTEXITCODE -ne 0) { Fail "git clone failed"; exit 1 }
   OK "cloned"
 }
+# Re-running the installer must ALSO mean "get the newest code" - otherwise the
+# dashboard keeps serving whatever was downloaded the first time (the 2026-08-06
+# stale-server 404s came from exactly that: new files never pulled, old process
+# never restarted). Fast-forward only: if local commits ever diverge from GitHub
+# we warn and keep going instead of silently merging or destroying anything.
+# ZIP copies have no .git, so for those the update path is a fresh ZIP - say so.
+if ($CheckOnly) {
+  # nothing to report: code freshness is not a prerequisite check
+} elseif ((Test-Path (Join-Path $Target '.git')) -and (Have-Cmd git)) {
+  Push-Location $Target
+  try {
+    $pullOut = & git pull --ff-only 2>&1 | Out-String
+    if ($LASTEXITCODE -eq 0) {
+      if ($pullOut -match 'Already up to date') { OK "code already up to date with GitHub" }
+      else { OK "pulled the newest code from GitHub" }
+    } else {
+      Warn "git pull did not apply cleanly - keeping the local code as-is"
+      Info "local commits diverged from GitHub; run 'git pull' by hand to see why"
+    }
+  } finally { Pop-Location }
+} else {
+  Info "ZIP copy (no git folder) - to update the code later, download a fresh ZIP and re-run this installer over it"
+}
 
 # --- 4. npm dependencies ------------------------------------------------------
 # Only cheerio + playwright-core. playwright-core deliberately ships NO browsers:
@@ -248,9 +271,17 @@ if ($RunningInPlace) {
 Step 4 "npm dependencies"
 $hasPw = Test-Path (Join-Path $Target 'node_modules\playwright-core')
 $hasCh = Test-Path (Join-Path $Target 'node_modules\cheerio')
+# A git pull can bring a NEWER package.json - "already installed" must mean
+# "installed for the CURRENT package.json", not "some node_modules exists".
+$depsStale = $false
+try {
+  $pkgTime = (Get-Item (Join-Path $Target 'package.json') -ErrorAction Stop).LastWriteTime
+  $nmTime = (Get-Item (Join-Path $Target 'node_modules') -ErrorAction Stop).LastWriteTime
+  if ($pkgTime -gt $nmTime) { $depsStale = $true }
+} catch {}
 if (-not (Test-Path (Join-Path $Target 'package.json'))) {
   Warn "no package.json yet (repo step did not complete) - skipping"
-} elseif ($hasPw -and $hasCh) {
+} elseif ($hasPw -and $hasCh -and -not $depsStale) {
   OK "already installed (cheerio + playwright-core)"
 } elseif ($CheckOnly) {
   Need "node_modules" "npm install (in $Target)"
@@ -497,9 +528,27 @@ if (-not $CheckOnly -and -not $NoStart -and $canRunDashboard) {
   $owner = $null
   try { $owner = (Get-NetTCPConnection -LocalPort 9317 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess } catch {}
   if ($owner) {
-    OK "already running (pid $owner)"
-    $serverUp = $true
-  } elseif (-not (Test-Path (Join-Path $Target 'server.js'))) {
+    # A server started BEFORE the files on disk changed is serving OLD code - the
+    # 2026-08-06 incident: the browser had the new app.js, the running node process
+    # did not have the new routes, and this branch used to just say "already
+    # running" and walk away. Compare timestamps and restart it onto current code.
+    $restart = $true
+    try {
+      $procStart = (Get-Process -Id $owner -ErrorAction Stop).StartTime
+      $codeTime = (Get-Item (Join-Path $Target 'server.js')).LastWriteTime
+      if ($codeTime -le $procStart) { $restart = $false }
+    } catch { $restart = $true }   # cannot tell -> restart to be safe
+    if ($restart) {
+      Info "running server (pid $owner) predates the files on disk - restarting it onto the current code"
+      try { Stop-Process -Id $owner -Force -ErrorAction Stop; Start-Sleep -Seconds 2 } catch {}
+      $owner = $null
+    } else {
+      OK "already running the current code (pid $owner)"
+      $serverUp = $true
+    }
+  }
+  if (-not $owner -and -not $serverUp) {
+    if (-not (Test-Path (Join-Path $Target 'server.js'))) {
     Warn "server.js not found - skipping"
   } else {
     # Timestamped logs, matching tools\fb-watchdog.ps1: PowerShell's redirection
@@ -547,6 +596,7 @@ if (-not $CheckOnly -and -not $NoStart -and $canRunDashboard) {
         $script:Missing += 'dashboard did not start'
       }
     } catch { Fail ("could not start node: " + $_.Exception.Message); $script:Missing += 'dashboard did not start' }
+  }
   }
   if ($serverUp) { try { Start-Process $dashUrl | Out-Null; Info "opened it in your browser" } catch {} }
 }

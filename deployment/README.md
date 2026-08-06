@@ -54,6 +54,11 @@ cloning into `%USERPROFILE%\Desktop\facbeook agent` and installs Git first if ne
 
 Both installers:
 - **skip whatever is already installed** — safe to re-run as often as you like;
+- **update the code on every re-run**: on a git clone they `git pull --ff-only`
+  first (deploy.sh even re-execs itself so the rest of the run uses the new
+  code), and if the dashboard is running code older than the files on disk they
+  **restart it onto the current code** automatically. ZIP copies have no git —
+  re-download the ZIP and re-run the installer over the folder instead;
 - **report before they change anything** with `deploy.bat /check` or `deploy.sh --check`,
   which installs nothing and exits non-zero if something is missing;
 - **end with the list of manual steps** that genuinely cannot be scripted (ixBrowser +

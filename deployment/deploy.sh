@@ -64,6 +64,28 @@ echo " Repo:   $REPO_DIR"
 [ "$HERMES_ONLY" = "1" ] && echo " Mode:   Hermes only (called from the Windows installer)"
 echo "=============================================================="
 
+# --- self-update ---------------------------------------------------------------
+# A re-run must also mean "newest code" (the 2026-08-06 lesson: new files plus
+# an old running process = 404s everywhere). Pull fast-forward only; if HEAD
+# moved, re-exec this script from the fresh checkout, because bash would
+# otherwise keep executing the old bytes mid-file. Skipped for --check, and
+# guarded against re-exec loops via FB_DEPLOY_REPULLED.
+if [ "$CHECK_ONLY" != "1" ] && [ "${FB_DEPLOY_REPULLED:-0}" != "1" ] && [ -d "$REPO_DIR/.git" ] && have git; then
+  BEFORE="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo none)"
+  if git -C "$REPO_DIR" pull --ff-only >/dev/null 2>&1; then
+    AFTER="$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo none)"
+    if [ "$BEFORE" != "$AFTER" ]; then
+      ok "pulled new code from GitHub - restarting this script on it"
+      SELF="$REPO_DIR/deployment/deploy.sh"
+      [ -f "$SELF" ] || SELF="$0"
+      FB_DEPLOY_REPULLED=1 FB_REPO_DIR="$REPO_DIR" exec bash "$SELF" "$@"
+    fi
+    ok "code already up to date with GitHub"
+  else
+    warn "git pull did not apply cleanly - keeping local code as-is"
+  fi
+fi
+
 # --- platform -----------------------------------------------------------------
 OS="$(uname -s 2>/dev/null || echo unknown)"
 IS_WSL=0
@@ -233,6 +255,50 @@ if [ "$HERMES_ONLY" != "1" ]; then
   else mkdir -p "$REPO_DIR/data" && ok "created"; fi
 fi
 
+# --- 8. dashboard: start / restart onto the current code ------------------------
+# A dashboard started BEFORE the files changed serves OLD code (the 2026-08-06
+# 404 lesson). Stale -> restart it. Not running -> start it. Hermes-only mode
+# skips this: there the dashboard lives on the WINDOWS side, and bootstrap.ps1
+# runs the same restart logic there.
+if [ "$HERMES_ONLY" != "1" ]; then
+  step 8 "Dashboard (start / restart onto current code)"
+  if [ "$CHECK_ONLY" = "1" ]; then
+    : # reporting-only run - the summary below says how to start it by hand
+  elif ! have node || [ ! -f "$REPO_DIR/server.js" ]; then
+    warn "node or server.js missing - cannot start the dashboard"
+  else
+    DPID=""
+    if have ss; then DPID="$(ss -ltnp 2>/dev/null | grep ':9317' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"; fi
+    [ -z "$DPID" ] && have lsof && DPID="$(lsof -ti tcp:9317 -s tcp:LISTEN 2>/dev/null | head -1)"
+    RESTART=0
+    if [ -n "$DPID" ]; then
+      ELAPSED="$(ps -o etimes= -p "$DPID" 2>/dev/null | tr -d ' ')"
+      MTIME="$(stat -c %Y "$REPO_DIR/server.js" 2>/dev/null || stat -f %m "$REPO_DIR/server.js" 2>/dev/null || echo 0)"
+      FILE_AGE=$(( $(date +%s) - MTIME ))
+      # server.js changed AFTER the process started -> it is serving old code
+      if [ -z "$ELAPSED" ] || [ "$FILE_AGE" -lt "${ELAPSED:-0}" ]; then RESTART=1; fi
+    fi
+    if [ -n "$DPID" ] && [ "$RESTART" = "1" ]; then
+      info "running server (pid $DPID) predates the files on disk - restarting it"
+      kill "$DPID" 2>/dev/null; sleep 2; kill -9 "$DPID" 2>/dev/null
+      DPID=""
+    fi
+    if [ -n "$DPID" ]; then
+      ok "already running the current code (pid $DPID)"
+    else
+      mkdir -p "$REPO_DIR/data"
+      ( cd "$REPO_DIR" && nohup node server.js >> data/dashboard-server.log 2>&1 & )
+      UP=0
+      for _ in $(seq 1 30); do
+        curl -sf -o /dev/null --max-time 2 http://127.0.0.1:9317/ && { UP=1; break; }
+        sleep 1
+      done
+      if [ "$UP" = "1" ]; then ok "dashboard is up: http://127.0.0.1:9317"
+      else fail "dashboard did not answer within 30s"; MISSING="$MISSING dashboard"; fi
+    fi
+  fi
+fi
+
 # --- summary ------------------------------------------------------------------
 echo ""
 echo "=============================================================="
@@ -259,7 +325,8 @@ if [ "$HERMES_ONLY" != "1" ]; then
     echo "       side needs ixBrowser reachable over its Local API."
   fi
   echo ""
-  echo " Then start it:   node server.js      (dashboard on http://127.0.0.1:9317)"
+  echo " Dashboard:     http://127.0.0.1:9317  (started or restarted above when possible;"
+  echo "                otherwise start it by hand:  node server.js)"
 fi
 echo ""
 
