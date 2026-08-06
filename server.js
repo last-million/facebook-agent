@@ -23597,6 +23597,252 @@ async function fetchJson(url, options = {}) {
   }
 }
 
+// --- Hermes (WSL) setup status + credential management -------------------------
+// The dashboard's window into the Hermes agent that actually runs the jobs
+// (runJob shells out to it). Status is built from FAST file checks only
+// (test -x / cat) -- never by launching an agent run, those can hang 75s+
+// on this box. Key tests call the provider APIs directly from Node via
+// fetchJson. Keys are added to ~/.hermes/.env (the proven path this project's
+// Hermes config reads) AND to Hermes' native credential pool (auth add), which
+// is what gives multi-key rotation. Full keys NEVER leave these endpoints.
+const HERMES_WSL_DISTRO = "Ubuntu-24.04";
+const HERMES_ENV_FILE = "/root/.hermes/.env";
+const HERMES_AUTH_FILE = "/root/.hermes/auth.json";
+const HERMES_KEY_PROVIDERS = {
+  openrouter: {
+    label: "OpenRouter",
+    envVar: "OPENROUTER_API_KEY",
+    hermesProvider: "openrouter",
+    testUrl: "https://openrouter.ai/api/v1/models",
+    testHeaders: (key) => ({ Authorization: `Bearer ${key}` }),
+  },
+  openai: {
+    label: "OpenAI",
+    envVar: "OPENAI_API_KEY",
+    hermesProvider: "openai",
+    testUrl: "https://api.openai.com/v1/models",
+    testHeaders: (key) => ({ Authorization: `Bearer ${key}` }),
+  },
+  gemini: {
+    label: "Google Gemini (AI Studio key)",
+    envVar: "GEMINI_API_KEY",
+    hermesProvider: "google-gemini-cli",
+    testUrl: "https://generativelanguage.googleapis.com/v1beta/models",
+    testQueryKey: true,
+  },
+  anthropic: {
+    label: "Anthropic",
+    envVar: "ANTHROPIC_API_KEY",
+    hermesProvider: "anthropic",
+    testUrl: "https://api.anthropic.com/v1/models",
+    testHeaders: (key) => ({ "x-api-key": key, "anthropic-version": "2023-06-01" }),
+  },
+};
+const HERMES_OAUTH_PROVIDERS = {
+  "openai-codex": { label: "ChatGPT account (OpenAI Codex)", note: "Needs a paid ChatGPT plan." },
+  "google-gemini-cli": { label: "Google account (Gemini)", note: "Free tier via Google sign-in." },
+};
+let hermesStatusCache = { at: 0, data: null };
+const hermesOauthFlows = new Map();
+
+function maskApiKey(key) {
+  const s = String(key || "").trim();
+  if (!s) return "";
+  if (s.length <= 8) return "****";
+  return `${s.slice(0, 3)}...${s.slice(-4)}`;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+async function wslExec(args, timeoutMs = 8000) {
+  const { stdout } = await execFileAsync("wsl.exe", ["-d", HERMES_WSL_DISTRO, "--", ...args], {
+    timeout: timeoutMs,
+    windowsHide: true,
+    maxBuffer: 1024 * 1024,
+  });
+  return String(stdout || "");
+}
+
+function hermesBadRequest(message) {
+  const err = new Error(message);
+  err.statusCode = 400;
+  err.publicError = "hermes_bad_request";
+  return err;
+}
+
+function readHermesEnvKeys(envRaw) {
+  const keys = [];
+  for (const [provider, spec] of Object.entries(HERMES_KEY_PROVIDERS)) {
+    const match = String(envRaw).match(new RegExp(`^${spec.envVar}=(.+)$`, "m"));
+    const value = match ? match[1].trim() : "";
+    if (value) keys.push({ provider, label: spec.label, envVar: spec.envVar, masked: maskApiKey(value), key: value });
+  }
+  return keys;
+}
+
+async function hermesReadEnvRaw() {
+  try { return await wslExec(["cat", HERMES_ENV_FILE], 6000); } catch { return ""; }
+}
+
+async function buildHermesStatus(force = false) {
+  if (!force && hermesStatusCache.data && Date.now() - hermesStatusCache.at < 30000) return hermesStatusCache.data;
+  const status = {
+    wslReachable: false,
+    hermesInstalled: false,
+    hermesVersion: "",
+    activeProvider: "",
+    envKeys: [],
+    pool: [],
+    llmConnected: false,
+    checkedAt: new Date().toISOString(),
+  };
+  try {
+    await wslExec(["test", "-x", HERMES_BIN], 6000);
+    status.wslReachable = true;
+    status.hermesInstalled = true;
+  } catch {
+    try {
+      await wslExec(["true"], 6000);
+      status.wslReachable = true;
+    } catch { /* WSL itself is down */ }
+  }
+  if (status.hermesInstalled) {
+    try {
+      status.hermesVersion = (await wslExec([HERMES_BIN, "--version"], 20000)).split("\n")[0].trim();
+    } catch { /* version is cosmetic */ }
+    try {
+      const envRaw = await hermesReadEnvRaw();
+      status.envKeys = readHermesEnvKeys(envRaw).map(({ key, ...pub }) => pub);
+    } catch { /* no readable .env */ }
+    try {
+      const auth = JSON.parse(await wslExec(["cat", HERMES_AUTH_FILE], 6000));
+      status.activeProvider = String(auth.active_provider || "");
+      const pool = auth.credential_pool && typeof auth.credential_pool === "object" ? auth.credential_pool : {};
+      for (const [provider, entries] of Object.entries(pool)) {
+        for (const entry of entries || []) {
+          status.pool.push({
+            provider,
+            id: String(entry.id || ""),
+            label: String(entry.label || ""),
+            source: String(entry.source || entry.auth_type || "unknown"),
+            masked: maskApiKey(entry.access_token),
+            status: String(entry.last_status || ""),
+          });
+        }
+      }
+    } catch { /* no auth.json yet */ }
+  }
+  status.llmConnected = status.envKeys.length > 0 || status.pool.length > 0;
+  hermesStatusCache = { at: Date.now(), data: status };
+  return status;
+}
+
+async function hermesAddApiKey(body) {
+  const provider = String(body && body.provider || "");
+  const spec = HERMES_KEY_PROVIDERS[provider];
+  if (!spec) throw hermesBadRequest(`Unknown provider "${provider}". Use one of: ${Object.keys(HERMES_KEY_PROVIDERS).join(", ")}.`);
+  const key = String(body && body.apiKey || "").trim();
+  if (key.length < 8 || /\s/.test(key)) throw hermesBadRequest("That does not look like an API key (too short, or it contains spaces).");
+  // 1) ~/.hermes/.env -- the proven path this project's Hermes config reads.
+  const envRaw = await hermesReadEnvRaw();
+  if (!new RegExp(`^${spec.envVar}=.+$`, "m").test(envRaw)) {
+    await wslExec(["/bin/bash", "-c", `printf '%s=%s\n' ${shellQuote(spec.envVar)} ${shellQuote(key)} >> ${shellQuote(HERMES_ENV_FILE)}`], 8000);
+  }
+  // 2) Hermes' native credential pool = multi-key rotation. Best-effort: the
+  // env var alone already makes the key usable even if the pool add fails.
+  let poolAdded = false;
+  try {
+    const args = [HERMES_BIN, "auth", "add", spec.hermesProvider, "--type", "api-key", "--api-key", key];
+    const label = String(body && body.label || "").trim().slice(0, 60);
+    if (label) args.push("--label", label);
+    await wslExec(args, 45000);
+    poolAdded = true;
+  } catch { /* env var is enough; pool add is a bonus */ }
+  logEvent("hermes_key_added", { provider, poolAdded });
+  return { poolAdded, hermes: await buildHermesStatus(true) };
+}
+
+async function hermesRemoveCredential(body) {
+  const provider = String(body && body.provider || "");
+  const spec = HERMES_KEY_PROVIDERS[provider];
+  const source = String(body && body.source || "");
+  const target = String(body && body.target || "").trim();
+  if (spec && source.startsWith("env")) {
+    // env-backed credential: strip the VAR=... line from ~/.hermes/.env
+    // (envVar comes from the fixed whitelist above, so no injection risk).
+    await wslExec(["/bin/bash", "-c", `sed -i '/^${spec.envVar}=/d' ${shellQuote(HERMES_ENV_FILE)}`], 8000);
+    logEvent("hermes_env_key_removed", { provider });
+    return { hermes: await buildHermesStatus(true) };
+  }
+  const hermesProvider = spec ? spec.hermesProvider : provider;
+  if (!hermesProvider || !target) throw hermesBadRequest("provider and target are required.");
+  await wslExec([HERMES_BIN, "auth", "remove", hermesProvider, target], 30000);
+  logEvent("hermes_key_removed", { provider: hermesProvider });
+  return { hermes: await buildHermesStatus(true) };
+}
+
+async function hermesTestApiKey(body) {
+  const provider = String(body && body.provider || "");
+  const spec = HERMES_KEY_PROVIDERS[provider];
+  if (!spec) throw hermesBadRequest(`Unknown provider "${provider}".`);
+  let key = String(body && body.apiKey || "").trim();
+  if (!key) {
+    const found = readHermesEnvKeys(await hermesReadEnvRaw()).find((entry) => entry.provider === provider);
+    key = found ? found.key : "";
+  }
+  if (!key) return { ok: false, detail: `No key given and no saved ${spec.label} key was found.` };
+  const url = spec.testQueryKey ? `${spec.testUrl}?key=${encodeURIComponent(key)}` : spec.testUrl;
+  const headers = spec.testHeaders ? spec.testHeaders(key) : {};
+  try {
+    await fetchJson(url, { headers, timeoutMs: 15000 });
+    logEvent("hermes_key_tested", { provider, ok: true });
+    return { ok: true, detail: `${spec.label} accepted the key.` };
+  } catch (err) {
+    const rejected = err.remoteStatus === 401 || err.remoteStatus === 403;
+    const detail = rejected
+      ? `${spec.label} rejected this key (HTTP ${err.remoteStatus}).`
+      : `Could not reach ${spec.label}: ${err.message}`;
+    logEvent("hermes_key_tested", { provider, ok: false });
+    return { ok: false, detail };
+  }
+}
+
+function startHermesOauth(provider) {
+  const spec = HERMES_OAUTH_PROVIDERS[String(provider || "")];
+  if (!spec) throw hermesBadRequest(`OAuth is not supported for "${provider}". Use one of: ${Object.keys(HERMES_OAUTH_PROVIDERS).join(", ")}.`);
+  const id = crypto.randomUUID();
+  const child = spawn("wsl.exe", ["-d", HERMES_WSL_DISTRO, "--", HERMES_BIN, "auth", "add", provider, "--type", "oauth", "--no-browser"], { windowsHide: true });
+  const flow = { id, provider, output: "", done: false, exitCode: null, startedAt: Date.now(), child };
+  child.stdout.on("data", (chunk) => { flow.output = (flow.output + chunk.toString()).slice(-8000); });
+  child.stderr.on("data", (chunk) => { flow.output = (flow.output + chunk.toString()).slice(-8000); });
+  child.on("error", (err) => { flow.done = true; flow.exitCode = -1; flow.output += `\nspawn error: ${err.message}`; });
+  child.on("exit", (code) => { flow.done = true; flow.exitCode = code; hermesStatusCache.at = 0; });
+  const killer = setTimeout(() => { if (!flow.done) child.kill("SIGTERM"); }, 15 * 60 * 1000);
+  if (typeof killer.unref === "function") killer.unref();
+  hermesOauthFlows.set(id, flow);
+  logEvent("hermes_oauth_started", { provider });
+  return { flowId: id, provider, label: spec.label, note: spec.note };
+}
+
+function readHermesOauthFlow(id) {
+  const flow = hermesOauthFlows.get(String(id || ""));
+  if (!flow) return null;
+  const urlMatch = flow.output.match(/https?:\/\/[^\s)"']+/);
+  const codeMatch = flow.output.match(/(?:code|Code)[:\s]+([A-Z0-9][A-Z0-9-]{3,})\b/) || flow.output.match(/\b[A-Z0-9]{4}-[A-Z0-9]{4}\b/);
+  const result = {
+    provider: flow.provider,
+    url: urlMatch ? urlMatch[0] : "",
+    userCode: codeMatch ? (codeMatch[1] || codeMatch[0]) : "",
+    done: flow.done,
+    ok: flow.done ? flow.exitCode === 0 : null,
+    outputTail: flow.output.slice(-600),
+  };
+  if (flow.done) hermesOauthFlows.delete(flow.id);
+  return result;
+}
+
 async function webshareRequest(pathname) {
   const secrets = readSecrets();
   if (!secrets.webshare.apiKey) throw serviceConfigError("Webshare API key is missing. Add it in Integrations API Keys, then save.", "webshare_missing_api_key");
@@ -26427,6 +26673,35 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "GET" && url.pathname === "/api/integrations/health") {
     return json(res, 200, buildIntegrationHealth());
+  }
+  if (req.method === "GET" && url.pathname === "/api/hermes/status") {
+    const hermes = await buildHermesStatus(url.searchParams.get("refresh") === "1");
+    return json(res, 200, { hermes });
+  }
+  if (req.method === "POST" && url.pathname === "/api/hermes/keys") {
+    const body = await readJson(req);
+    const result = await hermesAddApiKey(body);
+    return json(res, 200, { ok: true, ...result });
+  }
+  if (req.method === "POST" && url.pathname === "/api/hermes/keys/remove") {
+    const body = await readJson(req);
+    const result = await hermesRemoveCredential(body);
+    return json(res, 200, { ok: true, ...result });
+  }
+  if (req.method === "POST" && url.pathname === "/api/hermes/keys/test") {
+    const body = await readJson(req);
+    const result = await hermesTestApiKey(body);
+    return json(res, 200, result);
+  }
+  if (req.method === "POST" && url.pathname === "/api/hermes/oauth/start") {
+    const body = await readJson(req);
+    const flow = startHermesOauth(body && body.provider);
+    return json(res, 200, flow);
+  }
+  if (req.method === "GET" && url.pathname.startsWith("/api/hermes/oauth/")) {
+    const flow = readHermesOauthFlow(url.pathname.split("/").pop());
+    if (!flow) return json(res, 404, { error: "unknown_flow", message: "OAuth flow not found or already finished." });
+    return json(res, 200, flow);
   }
   if (req.method === "GET" && url.pathname === "/api/content-sources/harvested") {
     const st = readState();
