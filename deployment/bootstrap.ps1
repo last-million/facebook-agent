@@ -63,6 +63,23 @@ function Refresh-Path {
 # -match against it silently fails unless they are stripped first.
 function Clean-Wsl ($s) { return (($s | Out-String) -replace "`0", '') }
 
+# Native commands that write to stderr become TERMINATING errors under
+# $ErrorActionPreference='Stop' the moment their streams are merged (2>&1) -
+# that is what killed the 2026-08-06 repair run mid-ladder ("wsl.exe: The
+# parameter is incorrect" then exit 1). These two helpers never throw:
+# streams are discarded, not merged, and everything is wrapped in try/catch.
+function Invoke-Quiet {
+  param([string]$Exe, [string[]]$Args)
+  try { & $Exe @Args *> $null } catch {}
+  return $LASTEXITCODE
+}
+function Test-WslReady {
+  try {
+    $probe = Clean-Wsl (& wsl.exe -e sh -c "echo WSL_READY" 2>$null)
+    return ($probe -match 'WSL_READY')
+  } catch { return $false }
+}
+
 function Download-File ($url, $outFile) {
   Info "downloading $url"
   # TLS 1.2 must be forced on older Server images or every vendor download fails.
@@ -273,11 +290,15 @@ $hasPw = Test-Path (Join-Path $Target 'node_modules\playwright-core')
 $hasCh = Test-Path (Join-Path $Target 'node_modules\cheerio')
 # A git pull can bring a NEWER package.json - "already installed" must mean
 # "installed for the CURRENT package.json", not "some node_modules exists".
+# Measure against node_modules\.package-lock.json (npm writes it LAST, at the
+# end of an install) and allow a 5-minute skew: same-install timestamps differ
+# by seconds, a real "pulled a newer package.json" gap is hours or days.
 $depsStale = $false
 try {
   $pkgTime = (Get-Item (Join-Path $Target 'package.json') -ErrorAction Stop).LastWriteTime
-  $nmTime = (Get-Item (Join-Path $Target 'node_modules') -ErrorAction Stop).LastWriteTime
-  if ($pkgTime -gt $nmTime) { $depsStale = $true }
+  $lockMarker = Join-Path $Target 'node_modules\.package-lock.json'
+  $nmTime = if (Test-Path $lockMarker) { (Get-Item $lockMarker).LastWriteTime } else { (Get-Item (Join-Path $Target 'node_modules') -ErrorAction Stop).LastWriteTime }
+  if (($pkgTime - $nmTime) -gt [TimeSpan]::FromMinutes(5)) { $depsStale = $true }
 } catch {}
 if (-not (Test-Path (Join-Path $Target 'package.json'))) {
   Warn "no package.json yet (repo step did not complete) - skipping"
@@ -368,9 +389,8 @@ Step 7 "WSL + Ubuntu"
 $wslOk = $false
 $wslDistros = @()
 if (Have-Cmd wsl) {
-  $probe = Clean-Wsl (& wsl.exe -e sh -c "echo WSL_READY" 2>&1)
-  if ($probe -match 'WSL_READY') { $wslOk = $true }
-  $wslDistros = @((Clean-Wsl (& wsl.exe -l -q 2>&1)) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+  $wslOk = Test-WslReady
+  $wslDistros = @((Clean-Wsl (& wsl.exe -l -q 2>$null)) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
 if ($wslOk) {
   if ($wslDistros.Count) { OK ("working - distro(s): " + ($wslDistros -join ', ')) } else { OK "working" }
@@ -378,9 +398,9 @@ if ($wslOk) {
   # even on a machine whose WSL was already healthy with some other distro.
   if (-not $CheckOnly -and ($wslDistros -notcontains 'Ubuntu-24.04')) {
     Info "adding the Ubuntu-24.04 distro (the one the agent runs jobs in)"
-    & wsl.exe --install -d Ubuntu-24.04 --no-launch 2>&1 | Out-Null
-    & wsl.exe --set-default Ubuntu-24.04 2>&1 | Out-Null
-    & wsl.exe --shutdown 2>&1 | Out-Null
+    Invoke-Quiet wsl.exe @('--install','-d','Ubuntu-24.04','--no-launch') | Out-Null
+    Invoke-Quiet wsl.exe @('--set-default','Ubuntu-24.04') | Out-Null
+    Invoke-Quiet wsl.exe @('--shutdown') | Out-Null
   }
 } elseif (-not (Have-Cmd wsl)) {
   # wsl.exe genuinely absent -> a real install is warranted.
@@ -416,34 +436,46 @@ if ($wslOk) {
     Need "working WSL" "automatic repair runs on a real install (wsl --update, shutdown, distro)"
   } else {
     Warn "WSL is present but not answering - attempting automatic repair"
-    Info "step 1/3: wsl --shutdown (resets a hung WSL service/VM)"
-    & wsl.exe --shutdown 2>&1 | Out-Null
+    Info "step 1/4: wsl --shutdown (resets a hung WSL service/VM)"
+    Invoke-Quiet wsl.exe @('--shutdown') | Out-Null
     Start-Sleep -Seconds 2
-    if ((Clean-Wsl (& wsl.exe -e sh -c "echo WSL_READY" 2>&1)) -match 'WSL_READY') { $wslOk = $true }
+    if (Test-WslReady) { $wslOk = $true }
     if (-not $wslOk) {
-      Info "step 2/3: wsl --update (repairs the WSL engine itself - the old INBOX build does not understand -e)"
-      & wsl.exe --update 2>&1 | Out-Null
-      if ($LASTEXITCODE -ne 0) { & wsl.exe --update --web-download 2>&1 | Out-Null }
-      & wsl.exe --shutdown 2>&1 | Out-Null
+      Info "step 2/4: wsl --update (repairs the WSL engine itself - the old INBOX build does not understand -e)"
+      if ((Invoke-Quiet wsl.exe @('--update')) -ne 0) { Invoke-Quiet wsl.exe @('--update','--web-download') | Out-Null }
+      Invoke-Quiet wsl.exe @('--shutdown') | Out-Null
       Start-Sleep -Seconds 2
-      if ((Clean-Wsl (& wsl.exe -e sh -c "echo WSL_READY" 2>&1)) -match 'WSL_READY') { $wslOk = $true }
+      if (Test-WslReady) { $wslOk = $true }
     }
     if (-not $wslOk) {
-      Info "step 3/3: install the Ubuntu-24.04 distro (the one server.js runs jobs in)"
-      & wsl.exe --install -d Ubuntu-24.04 --no-launch 2>&1 | Out-Null
-      & wsl.exe --set-default Ubuntu-24.04 2>&1 | Out-Null
-      & wsl.exe --shutdown 2>&1 | Out-Null
+      # "The parameter is incorrect" here means this wsl.exe does not know an
+      # argument (older builds lack --no-launch) - so try every sane combo, and
+      # both distro names, before giving up. Invoke-Quiet cannot abort the run.
+      Info "step 3/4: install a Linux distro (Ubuntu-24.04 is the one server.js runs jobs in)"
+      $installed = $false
+      foreach ($distro in @('Ubuntu-24.04', 'Ubuntu')) {
+        if ((Invoke-Quiet wsl.exe @('--install','-d',$distro,'--no-launch')) -eq 0) { $installed = $true; break }
+        if ((Invoke-Quiet wsl.exe @('--install','-d',$distro)) -eq 0) { $installed = $true; break }
+      }
+      if (-not $installed) { Info "distro install did not go through - will retry after the reboot" }
+      Invoke-Quiet wsl.exe @('--set-default','Ubuntu-24.04') | Out-Null
+      Invoke-Quiet wsl.exe @('--shutdown') | Out-Null
       Start-Sleep -Seconds 2
-      if ((Clean-Wsl (& wsl.exe -e sh -c "echo WSL_READY" 2>&1)) -match 'WSL_READY') { $wslOk = $true }
+      if (Test-WslReady) { $wslOk = $true }
+    }
+    if (-not $wslOk) {
+      Info "step 4/4: enable the Windows features WSL needs (they take effect after a reboot)"
+      Invoke-Quiet dism.exe @('/online','/enable-feature','/featurename:Microsoft-Windows-Subsystem-Linux','/all','/norestart') | Out-Null
+      Invoke-Quiet dism.exe @('/online','/enable-feature','/featurename:VirtualMachinePlatform','/all','/norestart') | Out-Null
     }
     if ($wslOk) {
       OK "WSL repaired and answering"
-      $wslDistros = @((Clean-Wsl (& wsl.exe -l -q 2>&1)) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+      $wslDistros = @((Clean-Wsl (& wsl.exe -l -q 2>$null)) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
       if ($wslDistros -notcontains 'Ubuntu-24.04') {
         Info "adding the Ubuntu-24.04 distro (the one the agent runs jobs in)"
-        & wsl.exe --install -d Ubuntu-24.04 --no-launch 2>&1 | Out-Null
-        & wsl.exe --set-default Ubuntu-24.04 2>&1 | Out-Null
-        & wsl.exe --shutdown 2>&1 | Out-Null
+        Invoke-Quiet wsl.exe @('--install','-d','Ubuntu-24.04','--no-launch') | Out-Null
+        Invoke-Quiet wsl.exe @('--set-default','Ubuntu-24.04') | Out-Null
+        Invoke-Quiet wsl.exe @('--shutdown') | Out-Null
       }
     } else {
       # The one thing automation cannot do for you: a kernel/feature change only
