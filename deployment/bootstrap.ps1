@@ -548,11 +548,11 @@ if ($hermesOk) {
 # --- 9. What a human still has to do ------------------------------------------
 # These genuinely cannot be scripted - they need a person, a browser, credentials.
 $manual = @(
+  'Connect an LLM: open the dashboard - the "Agent LLM" button (top right) opens the setup popup for API keys or OAuth sign-in. (Manual fallback: edit ~/.hermes/.env inside WSL.)',
   'ixBrowser desktop app: install from https://www.ixbrowser.com, sign in, enable its Local API.',
   'ixBrowser profiles: log into each Facebook account you post/comment with.',
-  'Dashboard > Integrations: enter OpenAI / OpenRouter keys and Webshare proxy credentials.',
+  'Dashboard > Integrations: Webshare proxy credentials.',
   'Dashboard > Prod > Step 3: tick which profiles serve which group.',
-  'Inside WSL, edit ~/.hermes/.env and add your OpenRouter/OpenAI keys.',
   '(optional) Log ChatGPT into a persistent Edge profile for HD image upgrades.'
 )
 
