@@ -726,12 +726,18 @@ if ($script:NeedsReboot -and -not $CheckOnly) {
     Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'FacebookAgentBootstrap' -Value $resumeCmd -ErrorAction Stop
     Info "auto-resume registered - after the reboot this installer continues BY ITSELF at login"
   } catch { Warn "could not register auto-resume - just run deploy.bat again after the reboot" }
-  $answer = Read-Host "Reboot NOW? [Y/n]"
-  if ($answer -notmatch '^[Nn]') {
-    Warn "Rebooting in 15 seconds. After login the installer continues by itself."
-    & shutdown.exe /r /t 15 | Out-Null
+  if (-not [Environment]::UserInteractive) {
+    # Remote/automated run (e.g. WMI): Read-Host would hang a session-0 console
+    # forever. The caller drives the reboot instead.
+    Warn "non-interactive session - skipping the prompt; reboot this machine, then re-run."
   } else {
-    Warn "OK - reboot when you can; the installer will continue by itself at next login."
+    $answer = Read-Host "Reboot NOW? [Y/n]"
+    if ($answer -notmatch '^[Nn]') {
+      Warn "Rebooting in 15 seconds. After login the installer continues by itself."
+      & shutdown.exe /r /t 15 | Out-Null
+    } else {
+      Warn "OK - reboot when you can; the installer will continue by itself at next login."
+    }
   }
 }
 
