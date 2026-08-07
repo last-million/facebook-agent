@@ -715,16 +715,23 @@ if ($script:LogPath) { Say " A full log of this run was saved to:"; Say ("   " +
 try { Stop-Transcript | Out-Null } catch {}
 
 # WSL repair/first-install only takes effect after a reboot. Offer to do it -
-# after the reboot the operator just runs deploy.bat again and it picks up here.
+# and register a RunOnce entry first, so after the reboot this installer
+# continues BY ITSELF at login and finishes Hermes without the operator
+# lifting a finger.
 if ($script:NeedsReboot -and -not $CheckOnly) {
   Say ""
   Warn "Automatic repair is done, but WSL only starts working after ONE reboot."
+  try {
+    $resumeCmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '" -Target "' + $Target + '"'
+    Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce' -Name 'FacebookAgentBootstrap' -Value $resumeCmd -ErrorAction Stop
+    Info "auto-resume registered - after the reboot this installer continues BY ITSELF at login"
+  } catch { Warn "could not register auto-resume - just run deploy.bat again after the reboot" }
   $answer = Read-Host "Reboot NOW? [Y/n]"
   if ($answer -notmatch '^[Nn]') {
-    Warn "Rebooting in 15 seconds. After login: run deploy.bat again to finish."
+    Warn "Rebooting in 15 seconds. After login the installer continues by itself."
     & shutdown.exe /r /t 15 | Out-Null
   } else {
-    Warn "OK - reboot when you can, then run deploy.bat again to finish."
+    Warn "OK - reboot when you can; the installer will continue by itself at next login."
   }
 }
 
