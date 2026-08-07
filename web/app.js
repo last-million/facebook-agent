@@ -6887,6 +6887,18 @@ function uxAttachIncompleteRunBanner() {
       if (txt && problem) txt.textContent = problem;
     }
     const checks = el("hermesStatusChecks");
+    const hermesNotReady = !!(hermesStatus && (!hermesStatus.wslReachable || !hermesStatus.hermesInstalled));
+    for (const id of ["hermesKeySaveBtn", "hermesKeyTestBtn", "hermesOauthGoogleBtn", "hermesOauthCodexBtn"]) {
+      const btn = el(id);
+      if (btn) btn.disabled = hermesNotReady;
+    }
+    const wnote = el("hermesWslNote");
+    if (wnote) {
+      wnote.style.display = hermesNotReady ? "" : "none";
+      if (hermesNotReady) {
+        wnote.textContent = "WSL/Hermes is not ready on this machine yet (see the status above). Run deployment\\deploy.bat - it repairs WSL automatically - and come back here once the status is green. Keys have nowhere to be saved until then.";
+      }
+    }
     if (checks) {
       if (!hermesStatus) {
         checks.innerHTML = '<p class="muted">Checking&hellip;</p>';

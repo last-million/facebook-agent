@@ -23658,12 +23658,34 @@ function shellQuote(value) {
 }
 
 async function wslExec(args, timeoutMs = 8000) {
-  const { stdout } = await execFileAsync("wsl.exe", ["-d", HERMES_WSL_DISTRO, "--", ...args], {
-    timeout: timeoutMs,
-    windowsHide: true,
-    maxBuffer: 1024 * 1024,
-  });
-  return String(stdout || "");
+  // NEVER leak the command line into an error: args can carry an API key, and
+  // execFile errors quote the full command text (a key reached the dashboard
+  // UI this way on 2026-08-06). Build a fresh, args-free error instead.
+  try {
+    const { stdout } = await execFileAsync("wsl.exe", ["-d", HERMES_WSL_DISTRO, "--", ...args], {
+      timeout: timeoutMs,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    });
+    return String(stdout || "");
+  } catch (err) {
+    const detail = String(err && err.stderr || "").trim().split("\n").slice(-2).join(" ").slice(0, 200);
+    const safe = new Error(`WSL command failed${err && err.code != null ? ` (exit ${err.code})` : ""}${detail ? `: ${detail}` : ""}`);
+    safe.statusCode = 503;
+    safe.publicError = "wsl_command_failed";
+    throw safe;
+  }
+}
+
+async function assertHermesWslReady() {
+  // Credentials live inside WSL. While WSL is down, say so plainly instead of
+  // throwing a raw wsl.exe failure at the operator.
+  try { await wslExec(["true"], 6000); } catch {
+    const err = new Error("WSL is not running on this machine yet, so Hermes credentials cannot be changed. Run deployment\\deploy.bat first (it repairs WSL automatically), then try again.");
+    err.statusCode = 503;
+    err.publicError = "wsl_not_ready";
+    throw err;
+  }
 }
 
 function hermesBadRequest(message) {
@@ -23751,6 +23773,7 @@ async function hermesAddApiKey(body) {
   if (!spec) throw hermesBadRequest(`Unknown provider "${provider}". Use one of: ${Object.keys(HERMES_KEY_PROVIDERS).join(", ")}.`);
   const key = String(body && body.apiKey || "").trim();
   if (key.length < 8 || /\s/.test(key)) throw hermesBadRequest("That does not look like an API key (too short, or it contains spaces).");
+  await assertHermesWslReady();
   // 1) ~/.hermes/.env -- the proven path this project's Hermes config reads.
   const envRaw = await hermesReadEnvRaw();
   if (!new RegExp(`^${spec.envVar}=.+$`, "m").test(envRaw)) {
@@ -23771,6 +23794,7 @@ async function hermesAddApiKey(body) {
 }
 
 async function hermesRemoveCredential(body) {
+  await assertHermesWslReady();
   const provider = String(body && body.provider || "");
   const spec = HERMES_KEY_PROVIDERS[provider];
   const source = String(body && body.source || "");
@@ -23824,9 +23848,10 @@ async function hermesTestApiKey(body) {
   }
 }
 
-function startHermesOauth(provider) {
+async function startHermesOauth(provider) {
   const spec = HERMES_OAUTH_PROVIDERS[String(provider || "")];
   if (!spec) throw hermesBadRequest(`OAuth is not supported for "${provider}". Use one of: ${Object.keys(HERMES_OAUTH_PROVIDERS).join(", ")}.`);
+  await assertHermesWslReady();
   const id = crypto.randomUUID();
   const child = spawn("wsl.exe", ["-d", HERMES_WSL_DISTRO, "--", HERMES_BIN, "auth", "add", provider, "--type", "oauth", "--no-browser"], { windowsHide: true });
   const flow = { id, provider, output: "", done: false, exitCode: null, startedAt: Date.now(), child };
@@ -26710,7 +26735,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (req.method === "POST" && url.pathname === "/api/hermes/oauth/start") {
     const body = await readJson(req);
-    const flow = startHermesOauth(body && body.provider);
+    const flow = await startHermesOauth(body && body.provider);
     return json(res, 200, flow);
   }
   if (req.method === "GET" && url.pathname.startsWith("/api/hermes/oauth/")) {
