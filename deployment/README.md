@@ -78,6 +78,12 @@ On a bare Windows box WSL needs **one reboot**. The script tells you, then you r
   Node, so a second Node inside WSL would be waste).
 - **ixBrowser has no Linux build.** A pure-Linux host can run the dashboard and Hermes,
   but the posting/commenting side needs ixBrowser reachable over its Local API.
+- **No-WSL machines get a native Hermes.** If WSL genuinely cannot be enabled
+  (e.g. Server 2022 Evaluation media, whose component store lacks the WSL payload —
+  DISM 0x80073701 through every repair path), the installer falls back to installing
+  Python 3.12 + an editable hermes-agent at `C:\hermes-agent` (pinned to the proven
+  commit) and your customizations land in `%USERPROFILE%\.hermes`. `server.js`
+  auto-detects the runtime (`wsl` vs `native`) and runs jobs through whichever exists.
 
 ## Hermes customizations (survive updates)
 `hermes-config/` carries everything we changed on top of stock Hermes, so a fresh

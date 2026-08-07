@@ -6865,7 +6865,7 @@ function uxAttachIncompleteRunBanner() {
 
   function hermesStatusLine() {
     if (!hermesStatus) return "";
-    if (!hermesStatus.wslReachable) return "WSL (Ubuntu-24.04) is not reachable - the agent cannot run any jobs.";
+    if (!hermesStatus.wslReachable) return "No working Hermes runtime on this machine (neither WSL nor a native install) - run deployment\\deploy.bat.";
     if (!hermesStatus.hermesInstalled) return "Hermes agent is not installed in WSL - run deployment\\deploy.bat (Windows) or deployment/deploy.sh.";
     if (!hermesStatus.llmConnected) return "Hermes is installed, but no LLM is connected - add an API key or sign in below.";
     return "";
@@ -6904,8 +6904,9 @@ function uxAttachIncompleteRunBanner() {
         checks.innerHTML = '<p class="muted">Checking&hellip;</p>';
       } else {
         const version = hermesStatus.hermesVersion ? ` - ${esc(hermesStatus.hermesVersion)}` : "";
+        const platformLabel = hermesStatus.runtime === "native" ? "Native Windows runtime" : "WSL (Ubuntu-24.04)";
         const rows = [
-          ["WSL (Ubuntu-24.04)", hermesStatus.wslReachable],
+          [platformLabel, hermesStatus.wslReachable],
           [`Hermes agent${version}`, hermesStatus.hermesInstalled],
           ["LLM connected", hermesStatus.llmConnected],
         ];

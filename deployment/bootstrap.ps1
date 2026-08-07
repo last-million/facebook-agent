@@ -491,16 +491,85 @@ if ($wslOk) {
 # --- 8. Hermes agent (inside WSL) ---------------------------------------------
 # server.js calls it at exactly /root/.local/bin/hermes (see HERMES_BIN), so that
 # is what we verify - being on some other PATH is not good enough.
-Step 8 "Hermes agent (WSL)"
+Step 8 "Hermes agent (WSL or native)"
 $hermesOk = $false
+$nativeHermes = $false
+$nativeHermesExe = "$env:ProgramFiles\Python312\Scripts\hermes.exe"
 if ($wslOk) {
   $probe = Clean-Wsl (& wsl.exe -u root bash -lc "test -x /root/.local/bin/hermes && echo HERMES_OK || echo HERMES_MISSING" 2>&1)
   $hermesOk = ($probe -match 'HERMES_OK')
 }
-if ($hermesOk) {
+if (-not $hermesOk -and (Test-Path $nativeHermesExe)) { $hermesOk = $true; $nativeHermes = $true }
+if ($hermesOk -and $wslOk -and -not $nativeHermes) {
   OK "/root/.local/bin/hermes present (where server.js expects it)"
+} elseif ($hermesOk -and $nativeHermes) {
+  OK "native Windows Hermes present ($nativeHermesExe)"
 } elseif (-not $wslOk) {
-  Warn "skipped - WSL not ready"
+  # NATIVE FALLBACK (2026-08-06): some machines CANNOT enable WSL at all - e.g.
+  # Server 2022 Evaluation media lacks the WSL payload in its component store
+  # (DISM 0x80073701 through every repair path, even from ISO source). Hermes
+  # runs fine on native Windows Python, so install that way instead of failing.
+  if ($CheckOnly) {
+    Need "Hermes agent (native Windows fallback)" "Python 3.12 + editable hermes-agent install (this script does it)"
+  } else {
+    Warn "no working WSL - installing Hermes NATIVELY on Windows instead"
+    $hermesPin = '3034eee38ec516109566c00975be4d0276747c34'   # same build the proven machine runs
+    $pyExe = "$env:ProgramFiles\Python312\python.exe"
+    if (-not (Test-Path $pyExe)) {
+      Info "downloading Python 3.12"
+      try {
+        Download-File 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe' "$env:TEMP\python-3.12.10-amd64.exe"
+        $proc = Start-Process "$env:TEMP\python-3.12.10-amd64.exe" -ArgumentList '/quiet','InstallAllUsers=1','PrependPath=1','Include_pip=1' -Wait -PassThru
+        if ($proc.ExitCode -ne 0) { Warn "python installer exit $($proc.ExitCode)" }
+      } catch { Warn ("python download/install failed: " + $_.Exception.Message) }
+    }
+    if (Test-Path $pyExe) { OK "Python 3.12 present" }
+    $hermesDir = 'C:\hermes-agent'
+    if ((Test-Path $pyExe) -and -not (Test-Path (Join-Path $hermesDir 'pyproject.toml'))) {
+      Info "downloading hermes-agent (pinned to the proven commit)"
+      try {
+        Download-File "https://github.com/NousResearch/hermes-agent/archive/$hermesPin.zip" "$env:TEMP\hermes-agent.zip"
+        if (Test-Path "$env:TEMP\hermes-agent-x") { Remove-Item "$env:TEMP\hermes-agent-x" -Recurse -Force }
+        Expand-Archive "$env:TEMP\hermes-agent.zip" "$env:TEMP\hermes-agent-x" -Force
+        $inner = Get-ChildItem "$env:TEMP\hermes-agent-x" -Directory | Select-Object -First 1
+        Move-Item $inner.FullName $hermesDir
+      } catch { Warn ("hermes-agent download failed: " + $_.Exception.Message) }
+    }
+    if ((Test-Path $pyExe) -and (Test-Path (Join-Path $hermesDir 'pyproject.toml'))) {
+      Info "editable install of hermes-agent (a few minutes)"
+      & $pyExe -m pip install --quiet -e $hermesDir 2>$null | Out-Null
+      if (Test-Path $nativeHermesExe) {
+        OK "native Hermes installed"
+        $nativeHermes = $true; $hermesOk = $true
+        # Our customizations: config files + pointer tools. The source .patch
+        # needs git to apply; without it we skip - it only tunes the Hermes web
+        # UI, nothing the Facebook jobs depend on.
+        $hHome = Join-Path $env:USERPROFILE '.hermes'
+        $cfgDir = Join-Path $Target 'hermes-config'
+        New-Item -ItemType Directory -Force -Path $hHome | Out-Null
+        if (Test-Path (Join-Path $cfgDir 'SOUL.md')) { Copy-Item (Join-Path $cfgDir 'SOUL.md') (Join-Path $hHome 'SOUL.md') -Force }
+        if (Test-Path (Join-Path $cfgDir 'skills_prompt_snapshot.json')) { Copy-Item (Join-Path $cfgDir 'skills_prompt_snapshot.json') (Join-Path $hHome '.skills_prompt_snapshot.json') -Force }
+        if ((Test-Path (Join-Path $cfgDir 'config.yaml')) -and -not (Test-Path (Join-Path $hHome 'config.yaml'))) { Copy-Item (Join-Path $cfgDir 'config.yaml') (Join-Path $hHome 'config.yaml') -Force }
+        if (Test-Path (Join-Path $cfgDir 'custom')) {
+          $customDst = Join-Path $hHome 'custom'
+          New-Item -ItemType Directory -Force -Path $customDst | Out-Null
+          Copy-Item (Join-Path $cfgDir 'custom\*') $customDst -Recurse -Force
+        }
+        if (Test-Path (Join-Path $cfgDir 'tools')) { Copy-Item (Join-Path $cfgDir 'tools\*.py') (Join-Path $hermesDir 'tools') -Force }
+        $envFile = Join-Path $hHome '.env'
+        if (-not (Test-Path $envFile)) {
+          Set-Content $envFile "# Hermes env - your own keys. Add them via the dashboard 'Agent LLM' popup.`nOPENROUTER_API_KEY=`nOPENAI_API_KEY=" -Encoding utf8
+        }
+        OK "Hermes config in place ($hHome)"
+      } else {
+        Fail "native Hermes install did not produce hermes.exe"
+        $script:Missing += 'Hermes (native)'
+      }
+    } elseif (Test-Path $pyExe) {
+      Fail "hermes-agent source missing at $hermesDir"
+      $script:Missing += 'Hermes (native source)'
+    }
+  }
 } elseif ($CheckOnly) {
   Need "Hermes agent" "installed by this script via deployment/deploy.sh"
 } else {

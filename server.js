@@ -4,7 +4,7 @@ const fs = require("fs");
 const net = require("net");
 const os = require("os");
 const path = require("path");
-const { spawn, execFile } = require("child_process");
+const { spawn, execFile, spawnSync } = require("child_process");
 const { promisify } = require("util");
 const tls = require("tls");
 const cheerio = require("cheerio");
@@ -23597,17 +23597,21 @@ async function fetchJson(url, options = {}) {
   }
 }
 
-// --- Hermes (WSL) setup status + credential management -------------------------
-// The dashboard's window into the Hermes agent that actually runs the jobs
-// (runJob shells out to it). Status is built from FAST file checks only
-// (test -x / cat) -- never by launching an agent run, those can hang 75s+
-// on this box. Key tests call the provider APIs directly from Node via
-// fetchJson. Keys are added to ~/.hermes/.env (the proven path this project's
-// Hermes config reads) AND to Hermes' native credential pool (auth add), which
-// is what gives multi-key rotation. Full keys NEVER leave these endpoints.
+// --- Hermes setup status + credential management ------------------------------
+// The dashboard's window into the Hermes agent that actually runs the jobs.
+// TWO RUNTIMES, auto-detected (2026-08-06):
+//   "wsl"    - classic path: /root/.local/bin/hermes inside WSL Ubuntu-24.04
+//   "native" - hermes.exe on Windows Python (for machines whose WSL cannot be
+//              enabled - e.g. Server 2022 Eval media lacking the WSL payload)
+// Status is built from FAST file checks only - never by launching an agent run
+// (those can hang 75s+). Key tests call the provider APIs directly from Node.
+// Full keys NEVER leave these endpoints (an execFile error once leaked one -
+// errors are now built args-free).
 const HERMES_WSL_DISTRO = "Ubuntu-24.04";
-const HERMES_ENV_FILE = "/root/.hermes/.env";
-const HERMES_AUTH_FILE = "/root/.hermes/auth.json";
+const HERMES_BIN_NATIVE = process.env.FB_HERMES_NATIVE_BIN || "C:\\Program Files\\Python312\\Scripts\\hermes.exe";
+const HERMES_HOME_NATIVE = path.join(os.homedir(), ".hermes");
+const HERMES_WSL_ENV = "/root/.hermes/.env";
+const HERMES_WSL_AUTH = "/root/.hermes/auth.json";
 const HERMES_KEY_PROVIDERS = {
   openrouter: {
     label: "OpenRouter",
@@ -23643,8 +23647,20 @@ const HERMES_OAUTH_PROVIDERS = {
   "google-gemini-cli": { label: "Google account (Gemini)", note: "Free tier via Google sign-in." },
 };
 let hermesStatusCache = { at: 0, data: null };
-let hermesVersionCache = { at: 0, value: "" };   // 10-min TTL: --version via WSL is slow and barely changes
+let hermesVersionCache = { at: 0, value: "" };   // 10-min TTL: --version is slow and barely changes
 const hermesOauthFlows = new Map();
+
+// "wsl" | "native" | "none" - computed at load, re-checked by status builds.
+let HERMES_RUNTIME = "none";
+function detectHermesRuntimeSync() {
+  try {
+    const r = spawnSync("wsl.exe", ["-d", HERMES_WSL_DISTRO, "--", "test", "-x", HERMES_BIN], { timeout: 8000, windowsHide: true });
+    if (r && r.status === 0) { HERMES_RUNTIME = "wsl"; return HERMES_RUNTIME; }
+  } catch { /* wsl absent or broken */ }
+  HERMES_RUNTIME = fs.existsSync(HERMES_BIN_NATIVE) ? "native" : "none";
+  return HERMES_RUNTIME;
+}
+detectHermesRuntimeSync();
 
 function maskApiKey(key) {
   const s = String(key || "").trim();
@@ -23657,10 +23673,16 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
+function hermesFail(prefix, err) {
+  // NEVER leak the command line into an error: args can carry an API key.
+  const detail = String(err && err.stderr || "").trim().split("\n").slice(-2).join(" ").slice(0, 200);
+  const safe = new Error(`${prefix}${err && err.code != null ? ` (exit ${err.code})` : ""}${detail ? `: ${detail}` : ""}`);
+  safe.statusCode = 503;
+  safe.publicError = "hermes_runtime_failed";
+  return safe;
+}
+
 async function wslExec(args, timeoutMs = 8000) {
-  // NEVER leak the command line into an error: args can carry an API key, and
-  // execFile errors quote the full command text (a key reached the dashboard
-  // UI this way on 2026-08-06). Build a fresh, args-free error instead.
   try {
     const { stdout } = await execFileAsync("wsl.exe", ["-d", HERMES_WSL_DISTRO, "--", ...args], {
       timeout: timeoutMs,
@@ -23669,23 +23691,52 @@ async function wslExec(args, timeoutMs = 8000) {
     });
     return String(stdout || "");
   } catch (err) {
-    const detail = String(err && err.stderr || "").trim().split("\n").slice(-2).join(" ").slice(0, 200);
-    const safe = new Error(`WSL command failed${err && err.code != null ? ` (exit ${err.code})` : ""}${detail ? `: ${detail}` : ""}`);
-    safe.statusCode = 503;
-    safe.publicError = "wsl_command_failed";
-    throw safe;
+    throw hermesFail("WSL command failed", err);
   }
 }
 
-async function assertHermesWslReady() {
-  // Credentials live inside WSL. While WSL is down, say so plainly instead of
-  // throwing a raw wsl.exe failure at the operator.
-  try { await wslExec(["true"], 6000); } catch {
-    const err = new Error("WSL is not running on this machine yet, so Hermes credentials cannot be changed. Run deployment\\deploy.bat first (it repairs WSL automatically), then try again.");
-    err.statusCode = 503;
-    err.publicError = "wsl_not_ready";
-    throw err;
+async function hermesCli(args, timeoutMs = 30000) {
+  if (HERMES_RUNTIME === "native") {
+    try {
+      const { stdout } = await execFileAsync(HERMES_BIN_NATIVE, args, { timeout: timeoutMs, windowsHide: true, maxBuffer: 1024 * 1024 });
+      return String(stdout || "");
+    } catch (err) {
+      throw hermesFail("Hermes command failed", err);
+    }
   }
+  return wslExec([HERMES_BIN, ...args], timeoutMs);
+}
+
+async function hermesReadTextFile(wslPath, nativePath) {
+  if (HERMES_RUNTIME === "native") {
+    try { return fs.readFileSync(nativePath, "utf8"); } catch { return ""; }
+  }
+  try { return await wslExec(["cat", wslPath], 6000); } catch { return ""; }
+}
+
+async function hermesReadEnvRaw() {
+  return hermesReadTextFile(HERMES_WSL_ENV, path.join(HERMES_HOME_NATIVE, ".env"));
+}
+
+async function hermesAppendEnv(varName, value) {
+  if (HERMES_RUNTIME === "native") {
+    fs.mkdirSync(HERMES_HOME_NATIVE, { recursive: true });
+    fs.appendFileSync(path.join(HERMES_HOME_NATIVE, ".env"), `${varName}=${value}\n`, "utf8");
+    return;
+  }
+  await wslExec(["/bin/bash", "-c", `printf '%s=%s\n' ${shellQuote(varName)} ${shellQuote(value)} >> ${shellQuote(HERMES_WSL_ENV)}`], 8000);
+}
+
+async function hermesRemoveEnv(varName) {
+  // varName comes from the fixed provider whitelist - safe for the sed pattern.
+  if (HERMES_RUNTIME === "native") {
+    const p = path.join(HERMES_HOME_NATIVE, ".env");
+    let lines = [];
+    try { lines = fs.readFileSync(p, "utf8").split(/\r?\n/); } catch { return; }
+    fs.writeFileSync(p, lines.filter((l) => !l.startsWith(`${varName}=`)).join("\n"), "utf8");
+    return;
+  }
+  await wslExec(["/bin/bash", "-c", `sed -i '/^${varName}=/d' ${shellQuote(HERMES_WSL_ENV)}`], 8000);
 }
 
 function hermesBadRequest(message) {
@@ -23705,15 +23756,23 @@ function readHermesEnvKeys(envRaw) {
   return keys;
 }
 
-async function hermesReadEnvRaw() {
-  try { return await wslExec(["cat", HERMES_ENV_FILE], 6000); } catch { return ""; }
+async function assertHermesReady() {
+  // Credentials live with the Hermes runtime. While there is none, say so
+  // plainly instead of throwing a raw spawn failure at the operator.
+  if (detectHermesRuntimeSync() !== "none") return;
+  const err = new Error("No Hermes runtime on this machine yet (neither WSL nor a native install). Run deployment\\deploy.bat first - it sets one up automatically - then try again.");
+  err.statusCode = 503;
+  err.publicError = "hermes_not_ready";
+  throw err;
 }
 
 async function buildHermesStatus(force = false) {
   if (!force && hermesStatusCache.data && Date.now() - hermesStatusCache.at < 30000) return hermesStatusCache.data;
+  detectHermesRuntimeSync();
   const status = {
-    wslReachable: false,
-    hermesInstalled: false,
+    runtime: HERMES_RUNTIME,
+    wslReachable: HERMES_RUNTIME !== "none",
+    hermesInstalled: HERMES_RUNTIME !== "none",
     hermesVersion: "",
     activeProvider: "",
     envKeys: [],
@@ -23721,31 +23780,20 @@ async function buildHermesStatus(force = false) {
     llmConnected: false,
     checkedAt: new Date().toISOString(),
   };
-  try {
-    await wslExec(["test", "-x", HERMES_BIN], 6000);
-    status.wslReachable = true;
-    status.hermesInstalled = true;
-  } catch {
-    try {
-      await wslExec(["true"], 6000);
-      status.wslReachable = true;
-    } catch { /* WSL itself is down */ }
-  }
-  if (status.hermesInstalled) {
+  if (HERMES_RUNTIME !== "none") {
     if (hermesVersionCache.value && Date.now() - hermesVersionCache.at < 600000) {
       status.hermesVersion = hermesVersionCache.value;
     } else {
       try {
-        status.hermesVersion = (await wslExec([HERMES_BIN, "--version"], 20000)).split("\n")[0].trim();
+        status.hermesVersion = (await hermesCli(["--version"], 20000)).split("\n")[0].trim();
         if (status.hermesVersion) hermesVersionCache = { at: Date.now(), value: status.hermesVersion };
       } catch { /* version is cosmetic */ }
     }
     try {
-      const envRaw = await hermesReadEnvRaw();
-      status.envKeys = readHermesEnvKeys(envRaw).map(({ key, ...pub }) => pub);
+      status.envKeys = readHermesEnvKeys(await hermesReadEnvRaw()).map(({ key, ...pub }) => pub);
     } catch { /* no readable .env */ }
     try {
-      const auth = JSON.parse(await wslExec(["cat", HERMES_AUTH_FILE], 6000));
+      const auth = JSON.parse(await hermesReadTextFile(HERMES_WSL_AUTH, path.join(HERMES_HOME_NATIVE, "auth.json")));
       status.activeProvider = String(auth.active_provider || "");
       const pool = auth.credential_pool && typeof auth.credential_pool === "object" ? auth.credential_pool : {};
       for (const [provider, entries] of Object.entries(pool)) {
@@ -23773,42 +23821,40 @@ async function hermesAddApiKey(body) {
   if (!spec) throw hermesBadRequest(`Unknown provider "${provider}". Use one of: ${Object.keys(HERMES_KEY_PROVIDERS).join(", ")}.`);
   const key = String(body && body.apiKey || "").trim();
   if (key.length < 8 || /\s/.test(key)) throw hermesBadRequest("That does not look like an API key (too short, or it contains spaces).");
-  await assertHermesWslReady();
-  // 1) ~/.hermes/.env -- the proven path this project's Hermes config reads.
+  await assertHermesReady();
+  // 1) the Hermes env file - the proven path this project's Hermes config reads.
   const envRaw = await hermesReadEnvRaw();
   if (!new RegExp(`^${spec.envVar}=.+$`, "m").test(envRaw)) {
-    await wslExec(["/bin/bash", "-c", `printf '%s=%s\n' ${shellQuote(spec.envVar)} ${shellQuote(key)} >> ${shellQuote(HERMES_ENV_FILE)}`], 8000);
+    await hermesAppendEnv(spec.envVar, key);
   }
   // 2) Hermes' native credential pool = multi-key rotation. Best-effort: the
   // env var alone already makes the key usable even if the pool add fails.
   let poolAdded = false;
   try {
-    const args = [HERMES_BIN, "auth", "add", spec.hermesProvider, "--type", "api-key", "--api-key", key];
+    const args = ["auth", "add", spec.hermesProvider, "--type", "api-key", "--api-key", key];
     const label = String(body && body.label || "").trim().slice(0, 60);
     if (label) args.push("--label", label);
-    await wslExec(args, 45000);
+    await hermesCli(args, 45000);
     poolAdded = true;
   } catch { /* env var is enough; pool add is a bonus */ }
-  logEvent("hermes_key_added", { provider, poolAdded });
+  logEvent("hermes_key_added", { provider, poolAdded, runtime: HERMES_RUNTIME });
   return { poolAdded, hermes: await buildHermesStatus(true) };
 }
 
 async function hermesRemoveCredential(body) {
-  await assertHermesWslReady();
+  await assertHermesReady();
   const provider = String(body && body.provider || "");
   const spec = HERMES_KEY_PROVIDERS[provider];
   const source = String(body && body.source || "");
   const target = String(body && body.target || "").trim();
   if (spec && source.startsWith("env")) {
-    // env-backed credential: strip the VAR=... line from ~/.hermes/.env
-    // (envVar comes from the fixed whitelist above, so no injection risk).
-    await wslExec(["/bin/bash", "-c", `sed -i '/^${spec.envVar}=/d' ${shellQuote(HERMES_ENV_FILE)}`], 8000);
+    await hermesRemoveEnv(spec.envVar);
     logEvent("hermes_env_key_removed", { provider });
     return { hermes: await buildHermesStatus(true) };
   }
   const hermesProvider = spec ? spec.hermesProvider : provider;
   if (!hermesProvider || !target) throw hermesBadRequest("provider and target are required.");
-  await wslExec([HERMES_BIN, "auth", "remove", hermesProvider, target], 30000);
+  await hermesCli(["auth", "remove", hermesProvider, target], 30000);
   logEvent("hermes_key_removed", { provider: hermesProvider });
   return { hermes: await buildHermesStatus(true) };
 }
@@ -23824,8 +23870,8 @@ async function hermesTestApiKey(body) {
     key = found ? found.key : "";
   }
   if (!key) return { ok: false, detail: `No key given and no saved ${spec.label} key was found.` };
-  // An OpenAI-compatible key may live behind a custom base URL (this box points
-  // OPENAI_BASE_URL at Nous Research). Test where the key is actually used.
+  // An OpenAI-compatible key may live behind a custom base URL (the first box
+  // points OPENAI_BASE_URL at Nous Research). Test where the key is used.
   let baseUrl = spec.testUrl;
   let customBase = false;
   if (provider === "openai") {
@@ -23851,9 +23897,11 @@ async function hermesTestApiKey(body) {
 async function startHermesOauth(provider) {
   const spec = HERMES_OAUTH_PROVIDERS[String(provider || "")];
   if (!spec) throw hermesBadRequest(`OAuth is not supported for "${provider}". Use one of: ${Object.keys(HERMES_OAUTH_PROVIDERS).join(", ")}.`);
-  await assertHermesWslReady();
+  await assertHermesReady();
   const id = crypto.randomUUID();
-  const child = spawn("wsl.exe", ["-d", HERMES_WSL_DISTRO, "--", HERMES_BIN, "auth", "add", provider, "--type", "oauth", "--no-browser"], { windowsHide: true });
+  const child = HERMES_RUNTIME === "native"
+    ? spawn(HERMES_BIN_NATIVE, ["auth", "add", provider, "--type", "oauth", "--no-browser"], { windowsHide: true })
+    : spawn("wsl.exe", ["-d", HERMES_WSL_DISTRO, "--", HERMES_BIN, "auth", "add", provider, "--type", "oauth", "--no-browser"], { windowsHide: true });
   const flow = { id, provider, output: "", done: false, exitCode: null, startedAt: Date.now(), child };
   child.stdout.on("data", (chunk) => { flow.output = (flow.output + chunk.toString()).slice(-8000); });
   child.stderr.on("data", (chunk) => { flow.output = (flow.output + chunk.toString()).slice(-8000); });
@@ -23862,7 +23910,7 @@ async function startHermesOauth(provider) {
   const killer = setTimeout(() => { if (!flow.done) child.kill("SIGTERM"); }, 15 * 60 * 1000);
   if (typeof killer.unref === "function") killer.unref();
   hermesOauthFlows.set(id, flow);
-  logEvent("hermes_oauth_started", { provider });
+  logEvent("hermes_oauth_started", { provider, runtime: HERMES_RUNTIME });
   return { flowId: id, provider, label: spec.label, note: spec.note };
 }
 
@@ -25502,10 +25550,10 @@ function runJob(job) {
   });
   logEvent("job_started", { jobId: job.id, title: job.title });
 
-  const child = spawn("wsl.exe", args, {
-    cwd: ROOT,
-    windowsHide: true,
-  });
+  // Native runtime (no working WSL on this machine): run hermes.exe directly.
+  const child = HERMES_RUNTIME === "native"
+    ? spawn(HERMES_BIN_NATIVE, ["-z", prompt], { cwd: ROOT, windowsHide: true })
+    : spawn("wsl.exe", args, { cwd: ROOT, windowsHide: true });
 
   const runtimeTimer = setTimeout(() => {
     updateJob(job.id, {
