@@ -392,7 +392,15 @@ if (Have-Cmd wsl) {
   $wslOk = Test-WslReady
   $wslDistros = @((Clean-Wsl (& wsl.exe -l -q 2>$null)) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 }
-if ($wslOk) {
+# A machine with a NATIVE Windows Hermes (step 8's fallback, for machines whose
+# Windows cannot run WSL - e.g. Server Evaluation media without the WSL payload)
+# does not need WSL at all: server.js auto-detects the native runtime. Do NOT
+# run the repair ladder or ask for a reboot there - a reboot cannot fix a
+# missing component-store payload, so the "reboot required" nag would loop forever.
+$nativeHermesExe = "$env:ProgramFiles\Python312\Scripts\hermes.exe"
+if (Test-Path $nativeHermesExe) {
+  OK "native Windows Hermes present - WSL not required on this machine"
+} elseif ($wslOk) {
   if ($wslDistros.Count) { OK ("working - distro(s): " + ($wslDistros -join ', ')) } else { OK "working" }
   # server.js runs every job with -d Ubuntu-24.04 - that exact distro must exist,
   # even on a machine whose WSL was already healthy with some other distro.
