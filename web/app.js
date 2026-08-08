@@ -1640,6 +1640,8 @@ function renderState(state) {
   setValue("contentSourcesEnabled", state.posting.contentSources?.enabled);
   setValue("contentSourcesExclusive", state.posting.contentSources?.exclusive);
   setValue("contentSourcesAllowNoLink", state.posting.contentSources?.harvestAllowNoLink);
+  setValue("contentSourcesNoLinkGroups", state.posting.contentSources?.noLinkGroupsText);
+  setValue("contentSourcesPostingGroupSources", state.posting.contentSources?.postingGroupSourcesText);
   setValue("contentSourcesReserveAuto", state.posting.contentSources?.reserveAuto !== false);
   setValue("contentSourcesReserveTarget", state.posting.contentSources?.reserveTarget);
   setValue("contentSourcesReserveRefillAt", state.posting.contentSources?.reserveRefillAt);
@@ -2415,6 +2417,8 @@ function collectState() {
       enabled: getValue("contentSourcesEnabled") === true,
       exclusive: getValue("contentSourcesExclusive") === true,
       harvestAllowNoLink: getValue("contentSourcesAllowNoLink") === true,
+      noLinkGroupsText: getValue("contentSourcesNoLinkGroups"),
+      postingGroupSourcesText: getValue("contentSourcesPostingGroupSources"),
       reserveAuto: getValue("contentSourcesReserveAuto") !== false,
       reserveTarget: Number(getValue("contentSourcesReserveTarget")) || 20,
       reserveRefillAt: Number(getValue("contentSourcesReserveRefillAt")) || 10,

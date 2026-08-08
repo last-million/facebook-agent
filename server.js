@@ -2227,7 +2227,11 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.overnightReserveTarget = clampNumber(state.posting.contentSources.overnightReserveTarget, state.posting.contentSources.reserveTarget, 5000, Math.max(state.posting.contentSources.reserveTarget, 200)); // OVERNIGHT: stock up to this many for the whole next day
   const __hpgCap = Math.min(6, machineParallelCap(state)); // never above the machine auto-cap (same source as the runtime harvest clamp; state passed -> no readState recursion)
   state.posting.contentSources.harvestProfilesPerGroup = clampNumber(state.posting.contentSources.harvestProfilesPerGroup, 1, __hpgCap, Math.min(3, __hpgCap)); // # member profiles to harvest each group with IN PARALLEL (spreads load)
-  state.posting.contentSources.harvestAllowNoLink = state.posting.contentSources.harvestAllowNoLink === true; // Step-2 option: also harvest posts that have a real product PHOTO but no product/affiliate URL in the comments (posted comment = lead/CTA text, no link)
+  state.posting.contentSources.harvestAllowNoLink = state.posting.contentSources.harvestAllowNoLink === true;
+  if (typeof state.posting.contentSources.noLinkGroupsText !== "string") state.posting.contentSources.noLinkGroupsText = "";
+  state.posting.contentSources.noLinkGroupsText = state.posting.contentSources.noLinkGroupsText.slice(0, 20000);
+  if (typeof state.posting.contentSources.postingGroupSourcesText !== "string") state.posting.contentSources.postingGroupSourcesText = "";
+  state.posting.contentSources.postingGroupSourcesText = state.posting.contentSources.postingGroupSourcesText.slice(0, 20000); // Step-2 option: also harvest posts that have a real product PHOTO but no product/affiliate URL in the comments (posted comment = lead/CTA text, no link)
   if (typeof state.posting.contentSources.postCta !== "string") state.posting.contentSources.postCta = ""; // optional CTA line ABOVE the emoji+title+tags signature (blank = clean deal post)
   else state.posting.contentSources.postCta = state.posting.contentSources.postCta.slice(0, 300);
   // RE-USE ROTATION knobs (dynamic): a posted harvested product becomes eligible again after reuseHours (so
@@ -9892,6 +9896,41 @@ let __assetBufferFillInFlight = null;
 // the buffer hits target or no eligible products remain. Single-flight; safe to
 // fire-and-forget after discovery or after a post publishes. Applies equally to
 // prod and test (both consume the same ready buffer).
+// PER-SOURCE-GROUP no-link harvest (operator 2026-08-08): the global harvestAllowNoLink switch OR a
+// per-group list ("noLinkGroupsText", one source URL per line) - so one source group can be harvested
+// with-links-only while another also takes photo-only posts.
+function harvestAllowNoLinkForGroup(groupUrl, state = readState()) {
+  const cs = state.posting?.contentSources || {};
+  if (cs.harvestAllowNoLink === true) return true;
+  const key = normalizedFacebookGroupKey(groupUrl);
+  if (!key) return false;
+  const list = String(cs.noLinkGroupsText || "").split(/\r?\n/).map((l) => normalizedFacebookGroupKey(l)).filter(Boolean);
+  return list.includes(key);
+}
+
+// PER-POSTING-GROUP SOURCE PINNING (operator 2026-08-08): "in Step 3, for each group select which source
+// group(s) its products come from". Syntax in postingGroupSourcesText, one mapping per line:
+//   <posting group URL> <= <source group URL 1>, <source group URL 2>
+// A mapped posting group draws ONLY products harvested from its mapped source group(s). Unmapped = whole pool.
+function parsePostingGroupSources(text) {
+  const map = new Map();
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const t = String(line || "").trim();
+    if (!t || t.startsWith("#")) continue;
+    const parts = t.split("<=");
+    if (parts.length !== 2) continue;
+    const pg = normalizedFacebookGroupKey(parts[0]);
+    const srcs = parts[1].split(",").map((x) => normalizedFacebookGroupKey(x)).filter(Boolean);
+    if (pg && srcs.length) map.set(pg, new Set(srcs));
+  }
+  return map;
+}
+function allowedSourceKeysForPostingGroup(groupUrl, state = readState()) {
+  const map = parsePostingGroupSources(state.posting?.contentSources?.postingGroupSourcesText);
+  if (!map.size) return null;
+  return map.get(normalizedFacebookGroupKey(groupUrl)) || null;
+}
+
 // ===== CONTENT-SOURCE HARVEST (default OFF) =====================================================
 // Spawn the connector in READ-ONLY harvestOnly mode for ONE group/profile; return its parsed items[].
 async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {}) {
@@ -9899,7 +9938,7 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
   const payloadDir = path.join(DATA_DIR, "harvest-requests");
   fs.mkdirSync(payloadDir, { recursive: true });
   const payloadPath = path.join(payloadDir, `harvest-${Date.now()}-${crypto.randomBytes(5).toString("hex")}.json`);
-  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4), harvestSeenIds: (opts.seenIds || []).slice(0, 2000), harvestProfileIndex: Number(opts.profileIndex || 0), harvestProfileCount: Number(opts.profileCount || 1), harvestResumeFbid: String(opts.resumeFromFbid || ""), harvestMaxAgeDays: clampNumber(opts.maxAgeDays, 1, 30, 2), harvestClaimsDir: String(opts.claimsDir || ""), harvestAllowNoLink: state.posting?.contentSources?.harvestAllowNoLink === true }));
+  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4), harvestSeenIds: (opts.seenIds || []).slice(0, 2000), harvestProfileIndex: Number(opts.profileIndex || 0), harvestProfileCount: Number(opts.profileCount || 1), harvestResumeFbid: String(opts.resumeFromFbid || ""), harvestMaxAgeDays: clampNumber(opts.maxAgeDays, 1, 30, 2), harvestClaimsDir: String(opts.claimsDir || ""), harvestAllowNoLink: harvestAllowNoLinkForGroup(groupUrl, readState()) }));
   try {
     const { stdout } = await execFileAsync("node", [scriptPath, payloadPath], { cwd: ROOT, windowsHide: true, timeout: 6 * 60 * 1000, maxBuffer: 24 * 1024 * 1024 });
     const objs = parseJsonLogObjects(stdout);
@@ -12047,10 +12086,34 @@ function preparePostingPlan(options = {}) {
     }
     return fallback; // the slot's own profile is the only one assigned to this group -> it IS a member, use it
   };
+  // Per-posting-group source pinning: mapped groups only draw products harvested from their mapped source
+  // group(s) (harvested products only - web-pool products are never pinned). Fallback to the global pool with
+  // a log event when the mapped sources have nothing ready, so a mapping can never stall a run.
+  const __usedPlanProductIdx = new Set();
+  const __planCursorByGroup = new Map();
+  const pickProductForSlot = (slot, index) => {
+    const allowed = allowedSourceKeysForPostingGroup(slot && slot.groupUrl, state);
+    if (!allowed) return planProducts[index];
+    const cursorKey = normalizedFacebookGroupKey(slot && slot.groupUrl);
+    const start = __planCursorByGroup.get(cursorKey) || 0;
+    for (let n = 0; n < planProducts.length; n += 1) {
+      const pi = (start + n) % planProducts.length;
+      if (__usedPlanProductIdx.has(pi)) continue;
+      const cand = planProducts[pi];
+      const rec = String(cand && cand.key || "").startsWith("harvested:") ? harvestedRecordForKey(cand.key, state) : null;
+      if (!rec) continue;
+      if (!allowed.has(normalizedFacebookGroupKey(rec.sourceGroupUrl || ""))) continue;
+      __usedPlanProductIdx.add(pi);
+      __planCursorByGroup.set(cursorKey, (pi + 1) % planProducts.length);
+      return cand;
+    }
+    try { logEvent("plan_source_pin_fallback", { groupUrl: slot && slot.groupUrl, note: "no ready product from the mapped source group(s); using the global pool" }); } catch (_) {}
+    return planProducts[index];
+  };
   for (let index = 0; index < limit; index += 1) {
     const slot = slots[index];
     const concurrency = concurrencyBatchForSlot(slot, state);
-    const product = planProducts[index];
+    const product = pickProductForSlot(slot, index);
     const originalProductIndex = Math.max(0, products.findIndex((candidate) => candidate.key === product.key));
     // HARVESTED products carry their OWN text + image + link (the first-comment url) — bypass the rotation
     // post-text, the review-image channel, and ShopYourLikes link-gen.
