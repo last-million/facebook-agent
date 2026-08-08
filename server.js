@@ -1582,9 +1582,15 @@ function writeState(state, opts = {}) {
       // group entry of every state it touches, so any background writer holding a stale full-state snapshot
       // carries an explicit -- and possibly pre-flip -- value, which a bare hasOwnProperty check would
       // dutifully honour. For every non-dashboard write the on-disk value simply wins.
-      if (opts.allowOperatorConfig && Object.prototype.hasOwnProperty.call(newEntry, "commentsEnabled")) continue;
       const k = normalizedFacebookGroupKey(newEntry.url);
       const match = existing.posting.groupAssignmentData.find((e) => normalizedFacebookGroupKey(e?.url) === k);
+      // sourceGroups gets the identical treatment: only the dashboard PUT may state it, every other write
+      // inherits what is on disk. Without this the whitelist rebuild above (which defaults a missing value
+      // to []) would silently un-pin every group on the next background write.
+      if (!(opts.allowOperatorConfig && Object.prototype.hasOwnProperty.call(newEntry, "sourceGroups"))) {
+        if (match && Array.isArray(match.sourceGroups)) newEntry.sourceGroups = match.sourceGroups.slice();
+      }
+      if (opts.allowOperatorConfig && Object.prototype.hasOwnProperty.call(newEntry, "commentsEnabled")) continue;
       if (match && Object.prototype.hasOwnProperty.call(match, "commentsEnabled")) newEntry.commentsEnabled = match.commentsEnabled;
     }
   }
@@ -2201,6 +2207,13 @@ function normalizeWorkflowState(state) {
       // Its protection against a partial write that OMITS the field lives in writeState (see the
       // groupAssignmentData inheritance block), exactly like requiresAdminApproval.
       commentsEnabled: entry?.commentsEnabled !== false,
+      // PER-GROUP HARVEST SOURCES (Prod > Step 3 card, 2026-08-08). Which source group(s) this posting
+      // group draws its copied products from. EMPTY = every source, which is the historical behaviour, so
+      // an existing install is unaffected until the operator ticks something. Same whitelist rule as
+      // above: a field not listed here is silently dropped on the next state write.
+      sourceGroups: Array.isArray(entry?.sourceGroups)
+        ? entry.sourceGroups.slice(0, 50).map((u) => String(u || "").slice(0, 1000)).filter(Boolean)
+        : [],
       profiles: Array.isArray(entry?.profiles)
         ? entry.profiles
           .slice(0, 500)
@@ -9925,10 +9938,37 @@ function parsePostingGroupSources(text) {
   }
   return map;
 }
+// TWO WAYS TO SET THIS, and the Step-3 tick boxes win.
+// The operator's own words: "in step 3 for each group select from which group harvested to post in the
+// group". So the per-group picker on the Step-3 card (groupAssignmentData[i].sourceGroups) is the primary
+// source of truth. The Step-2 text mapping stays as a fallback so anything already configured that way
+// keeps working, and so a mapping can still be written by hand or by script.
+// EMPTY / ABSENT anywhere = no pin = draw from every source, which is the historical behaviour.
 function allowedSourceKeysForPostingGroup(groupUrl, state = readState()) {
+  const key = normalizedFacebookGroupKey(groupUrl);
+  if (!key) return null;
+  try {
+    const rows = Array.isArray(state.posting?.groupAssignmentData) ? state.posting.groupAssignmentData : [];
+    for (const entry of rows) {
+      // Alias-aware, not string equality: the same group is written as a vanity id (o38679876833911) in one
+      // place and a numeric id (1076334503593333) in another, and a plain key compare silently misses that
+      // pairing -- the pin would just never apply. Falls back to the plain compare if the alias helper throws.
+      let match = false;
+      try { match = groupsMatchByAlias(groupUrl, entry?.url); }
+      catch (_) { match = normalizedFacebookGroupKey(entry?.url) === key; }
+      if (!match) continue;
+      const picked = Array.isArray(entry?.sourceGroups)
+        ? entry.sourceGroups.map((u) => normalizedFacebookGroupKey(u)).filter(Boolean)
+        : [];
+      // Only a NON-EMPTY selection pins anything. An empty list means "all sources", so it must fall
+      // through to the text mapping rather than pinning this group to nothing and starving it.
+      if (picked.length) return new Set(picked);
+      break;
+    }
+  } catch (_) {}
   const map = parsePostingGroupSources(state.posting?.contentSources?.postingGroupSourcesText);
   if (!map.size) return null;
-  return map.get(normalizedFacebookGroupKey(groupUrl)) || null;
+  return map.get(key) || null;
 }
 
 // ===== CONTENT-SOURCE HARVEST (default OFF) =====================================================

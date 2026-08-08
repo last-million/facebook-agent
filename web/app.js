@@ -2892,9 +2892,63 @@ function initializeGroupAssignmentDraft() {
       commentsEnabled: (previous.commentsEnabled !== undefined
         ? previous.commentsEnabled
         : (savedByUrl.get(url) || {}).commentsEnabled) !== false,
+      // Which source group(s) this posting group copies from. Same draft-then-saved fallback as the comment
+      // switch, for the same reason: the matrix re-renders on every profile tick, and losing the value here
+      // would silently un-pin a group the operator had scoped.
+      sourceGroups: (Array.isArray(previous.sourceGroups)
+        ? previous.sourceGroups
+        : (Array.isArray((savedByUrl.get(url) || {}).sourceGroups) ? savedByUrl.get(url).sourceGroups : [])
+      ).map(String).filter(Boolean),
       profiles: Array.isArray(previous.profiles) ? previous.profiles.map(String).filter(isAllowedNormalIxBrowserProfileLabel) : [],
     };
   });
+}
+
+// PER-GROUP HARVEST SOURCE PICKER (operator 2026-08-08: "in step 3 for each group select from which group
+// harvested to post in the group"). Lists the source groups configured in Step 2 as tick boxes on each
+// posting group's card. None ticked = draw from every source, which is the default and what every existing
+// install already does. The list is built from the live Step-2 value, so adding or removing a source group
+// updates every card on the next render - nothing here is hardcoded.
+function sourceGroupUrlsForAssignments() {
+  const raw = (typeof getValue === "function" ? getValue("contentSourceGroupsText") : "")
+    || (workflowState && workflowState.posting && workflowState.posting.contentSources && workflowState.posting.contentSources.groupsText)
+    || "";
+  const out = [];
+  const seen = new Set();
+  String(raw).split(/\r?\n/).forEach((line) => {
+    // Step 2 allows an optional "| profileId" pin after the URL - strip it.
+    const url = String(line || "").split("|")[0].trim();
+    if (!url || url.startsWith("#")) return;
+    const key = url.toLowerCase().replace(/[?#].*$/, "").replace(/\/+$/, "");
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push(url);
+  });
+  return out;
+}
+function shortGroupLabel(url) {
+  const m = String(url || "").match(/groups\/([^/?#]+)/i);
+  return m ? m[1] : String(url || "").slice(0, 40);
+}
+function sourceGroupPickerHtml(entry) {
+  const sources = sourceGroupUrlsForAssignments();
+  if (!sources.length) return ""; // no source groups configured yet -> nothing to choose between
+  const norm = (u) => String(u || "").trim().toLowerCase().replace(/[?#].*$/, "").replace(/\/+$/, "");
+  const picked = new Set((Array.isArray(entry.sourceGroups) ? entry.sourceGroups : []).map(norm));
+  const all = picked.size === 0;
+  return `
+        <div class="assignmentSources" style="margin-top:8px">
+          <small><b>&#128230; Copy products from</b> <span data-assignment-source-summary style="opacity:.75">${all ? "all sources" : (picked.size + " selected")}</span></small>
+          <div style="display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:4px">
+            ${sources.map((u) => `
+              <label class="profileCheck" style="margin:0" title="${escapeHtml(u)}">
+                <input data-assignment-source type="checkbox" value="${escapeHtml(u)}" ${picked.has(norm(u)) ? "checked" : ""}>
+                <span>${escapeHtml(shortGroupLabel(u))}</span>
+              </label>
+            `).join("")}
+          </div>
+          <small style="opacity:.65">Tick none = use every source group. Tick one or more = this group prefers products copied from those. If none of them has a ready product, the run still posts from the full pool (logged as plan_source_pin_fallback) rather than skipping the group.</small>
+        </div>`;
 }
 
 function collectGroupAssignmentData() {
@@ -2916,6 +2970,13 @@ function collectGroupAssignmentData() {
       // one only when the field is absent -- so omitting it here would make "turn comments off for this
       // group" un-undoable through the dashboard.
       commentsEnabled: commentsBox ? commentsBox.checked : (draft.commentsEnabled !== false),
+      // Ticked source groups for this posting group. NONE ticked = [] = draw from every source, which is
+      // both the default and the historical behaviour. Read from the DOM only when the picker is actually
+      // rendered; otherwise carried through from the draft, so collecting on a page that never drew the
+      // picker cannot wipe a saved selection.
+      sourceGroups: card.querySelector("[data-assignment-source]")
+        ? Array.from(card.querySelectorAll("[data-assignment-source]:checked")).map((i) => i.value)
+        : (Array.isArray(draft.sourceGroups) ? draft.sourceGroups : []),
       profiles,
     });
   });
@@ -2967,6 +3028,7 @@ function renderGroupAssignmentBuilder() {
           <input data-assignment-comments type="checkbox" ${entry.commentsEnabled !== false ? "checked" : ""}>
           <span data-assignment-comments-label>${entry.commentsEnabled !== false ? "&#128172; Comment posts in this group" : "&#128683; No comment in this group"}</span>
         </label>
+        ${sourceGroupPickerHtml(entry)}
       </div>
       <div class="profileChecklist">
         ${profiles.map((profile) => `
@@ -5588,8 +5650,18 @@ $("groupAssignmentBuilder")?.addEventListener("click", (event) => {
 });
 
 $("groupAssignmentBuilder")?.addEventListener("change", (event) => {
-  // PER-GROUP COMMENT SWITCH. Handled before the profile-checkbox guard below, which would otherwise
-  // early-return and leave this checkbox purely decorative (ticked in the DOM, never collected, never saved).
+  // PER-GROUP HARVEST SOURCE. Handled before the profile-checkbox guard below, which would otherwise
+  // early-return and leave these boxes purely decorative (ticked in the DOM, never collected, never saved).
+  if (event.target.matches("[data-assignment-source]")) {
+    const card = event.target.closest("[data-assignment-card]");
+    const n = card ? card.querySelectorAll("[data-assignment-source]:checked").length : 0;
+    const sum = card && card.querySelector("[data-assignment-source-summary]");
+    if (sum) sum.textContent = n === 0 ? "all sources" : (n + " selected");
+    syncGroupAssignmentOutput();
+    markDirty();
+    return;
+  }
+  // PER-GROUP COMMENT SWITCH. Same reason as the source picker above.
   if (event.target.matches("[data-assignment-comments]")) {
     const on = event.target.checked;
     const card = event.target.closest("[data-assignment-card]");
