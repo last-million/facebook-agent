@@ -16843,6 +16843,12 @@ async function approvePendingFacebookPostWithAdminProfilesImpl({ row, ready, gro
         try { logEvent("facebook_admin_approval_zero_work_attempt_not_counted", { profileId: attempt.profileId, realAttempts: __realAttemptCount(), totalAttempts: attempts.length, maxAttempts: MAX_ADMIN_APPROVAL_ATTEMPTS }); } catch (_) {}
       }
       if (attemptErrored && !attempt.validation?.noPendingPostForPublisher) {
+        // SKIP-ON-ISSUE (2026-08-08): a moderator that errors (busy, connector, session, not_found, etc.)
+        // gets a temporary cooldown in blockedModerators so the rotation skips it next cycle. Without this,
+        // a single broken moderator (e.g. profile 112 with ixBrowser "Process not found") is retried forever
+        // because there is no fallback moderator assigned, wasting sessions and keeping pending approvals stuck.
+        const blockReason = Array.isArray(attempt.validation?.errors) ? attempt.validation.errors.join(" / ") : (attempt.error || "unknown approval error");
+        try { markModeratorBlocked(attempt.profileId, attempt.profile, "approval error - skipping cooldown: " + String(blockReason).slice(0, 160)); } catch (_) {}
         logEvent("facebook_admin_approval_profile_errored_trying_next", { profileId: attempt.profileId, errors: attempt.validation?.errors || ["unknown"] });
         continue;
       }
