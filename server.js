@@ -3303,6 +3303,42 @@ function isFacebookAccountError(message) {
   return /content isn.?t available|this content isn.?t avail|isn.?t available right now|owner only shared|changed who can see|it.?s been deleted|this page isn.?t available|confirm your identity|publish as this page|checkpoint\/(?:disabled|appeal|blocked)|temporarily (blocked|restricted|unavailable)|account (restricted|disabled|locked|review)|verify your (account|identity)|we limit how often|suspicious (activity|login)|community standards|your account has been|action blocked|you can.?t use this feature/i.test(String(message || ""));
 }
 
+// FB removed this profile's posts as SPAM and now shows the enforcement dialog over the composer
+// (tools/fb-post-test-capture-url.js detects it and throws the underscored code). Account-level
+// enforcement: the profile must be PARKED, never soft-streak retried  before this existed a flagged
+// profile burned 221 blind composer retries in a single day (2026-08-08), each one deepening the
+// account's spam standing.
+function isFacebookSpamViolationError(message) {
+  return /facebook_spam_violation_dialog/i.test(String(message || ""));
+}
+
+// SPAM-VIOLATION CIRCUIT BREAKER: FB spam sweeps flag MANY profiles at once (live 2026-08-08: 41/41
+// composer failures were the same spam dialog; 0 posts landed for hours while the run banner showed
+// "in progress" for 22h). When enough DISTINCT profiles hit the dialog inside a rolling window, stop
+// the autopilot exactly like the operator's Stop button  live.armed flips false, the run banner
+// closes, and the accounts get their cooldown instead of a slow-motion ban.
+const __spamViolationHits = new Map(); // profileId -> epoch ms
+const SPAM_VIOLATION_WINDOW_MS = 2 * 60 * 60 * 1000;
+const SPAM_VIOLATION_AUTOSTOP_PROFILES = 5;
+function noteSpamViolationOutcome(oc) {
+  const pid = Number(oc && oc.profileId || 0);
+  if (pid) __spamViolationHits.set(pid, Date.now());
+  const cutoff = Date.now() - SPAM_VIOLATION_WINDOW_MS;
+  for (const [id, at] of __spamViolationHits) if (at < cutoff) __spamViolationHits.delete(id);
+  if (__spamViolationHits.size < SPAM_VIOLATION_AUTOSTOP_PROFILES) return;
+  const state = readState();
+  if (!state.operator?.armedForExternalActions && !state.operator?.autopilotEnabled) { __spamViolationHits.clear(); return; } // already stopped
+  state.operator = Object.assign({}, state.operator || {}, {
+    armedForExternalActions: false,
+    autopilotEnabled: false,
+    commentDrainPaused: true,
+    autopilotStoppedReason: "auto-stopped: " + __spamViolationHits.size + " profiles hit Facebook spam-violation dialogs within 2h. Cool the accounts down 24-72h, release the parked profiles in the Prod tab, then re-arm.",
+  });
+  writeState(state);
+  logEvent("autopilot_auto_stopped_spam_violations", { profiles: [...__spamViolationHits.keys()], windowHours: 2 });
+  __spamViolationHits.clear();
+}
+
 function appendJsonlAbsoluteFile(filePath, row) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const line = `${JSON.stringify(row)}\n`;
@@ -11566,7 +11602,8 @@ async function autopilotTickAsync(options = {}) {
     // re-logs them in and releases them from the Prod-tab "Disconnected profiles" section.
     for (const oc of decision.outcomes || []) {
       if (!oc || oc.ok) continue;
-      if (isFacebookSuspendedError(oc.error)) markProfileSuspended(oc.profileId, oc.profile, oc.error); // SUSPENDED / disabled / banned (most severe)
+      if (isFacebookSpamViolationError(oc.error)) { markProfileErrored(oc.profileId, oc.profile, "Facebook removed this account's posts as spam (violation dialog) - cooled down; release after review"); noteSpamViolationOutcome(oc); }
+      else if (isFacebookSuspendedError(oc.error)) markProfileSuspended(oc.profileId, oc.profile, oc.error); // SUSPENDED / disabled / banned (most severe)
       else if (isFacebookNotLoggedInError(oc.error)) markProfileDisconnected(oc.profileId, oc.profile, oc.error); // not logged in
       else if (isFacebookAccountError(oc.error)) markProfileErrored(oc.profileId, oc.profile, oc.error); // account/access error ("content isn't available", identity, checkpoint...)
     }

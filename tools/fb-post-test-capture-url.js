@@ -563,6 +563,29 @@ async function dismissFacebookInterstitials(page) {
   return { clicked: clickedAny };
 }
 
+// Best-effort dismissal of FB's spam/violation enforcement dialog (the one whose dialogText reports
+// removed-as-spam posts). Escape first (cheap, harmless), then click an enabled dismiss-ish button inside
+// the topmost dialog. Returning false is fine — the caller still throws the distinct error; the dismiss is
+// only so the NEXT human/session view of the profile isn't stuck behind the overlay.
+async function dismissViolationDialog(page) {
+  try { await page.keyboard.press('Escape'); } catch (_) {}
+  await humanPause(400, 800);
+  return page.evaluate(() => {
+    const dialogs = [...document.querySelectorAll('div[role="dialog"]')];
+    const dlg = dialogs[dialogs.length - 1];
+    if (!dlg) return false;
+    const DISMISS_RE = /^(close|fermer|ok|okay|done|terminé|got it|j.?ai compris|d.?accord|cerrar|entendido|fechar)$/i;
+    const btns = [...dlg.querySelectorAll('[role="button"], button')];
+    for (const b of btns) {
+      const label = String(b.getAttribute('aria-label') || b.textContent || '').trim();
+      if (label && DISMISS_RE.test(label) && b.getAttribute('aria-disabled') !== 'true' && !b.disabled) { b.click(); return true; }
+    }
+    const x = dlg.querySelector('[aria-label="Close"], [aria-label="Fermer"], [aria-label="Cerrar"], [aria-label="Fechar"]');
+    if (x) { x.click(); return true; }
+    return false;
+  }).catch(() => false);
+}
+
 async function openComposerWithRecovery(page, groupUrl) {
   let result = await openComposer(page);
   if (result.opened || !shouldRetryComposerOpen(result)) return result;
@@ -5427,6 +5450,19 @@ async function main() {
     const netErr = (netProbe.match(/ERR_[A-Z_]+/) || [])[0] || '';
     if (/^chrome-error:\/\//i.test(String(d.url || '')) || /ERR_TUNNEL_CONNECTION_FAILED|ERR_PROXY|ERR_SOCKS|ERR_TIMED_OUT|ERR_CONNECTION_(?:RESET|CLOSED|REFUSED|FAILED)|ERR_NAME_NOT_RESOLVED|ERR_INTERNET_DISCONNECTED|ERR_ADDRESS_UNREACHABLE|this site can.?t be reached|took too long to respond/i.test(netProbe)) {
       throw new Error(`facebook_proxy_unreachable${netErr ? ': ' + netErr : ''}`);
+    }
+    // SPAM/VIOLATION ENFORCEMENT DIALOG (2026-08-08, live incident): when FB starts removing a profile's
+    // posts as spam it overlays an enforcement dialog ("We removed your content... Spam" / FR "Nous avons
+    // supprimé... Spam / Publication supprimée") that COVERS the composer. Filed as a generic 'could not
+    // open composer' it only soft-streaks, so the profile was retried blindly ALL DAY (one burned 221
+    // attempts while every retry deepened the account's spam standing). Detect it, best-effort dismiss it,
+    // and throw a DISTINCT error so the server parks the profile + circuit-breaks the run instead.
+    const spamDialogProbe = String(d.dialogText || '');
+    const spamProbe = `${d.title || ''} ${d.dialogText || ''}`;
+    if (/\bspam\b/i.test(spamDialogProbe) || /we removed (?:your|some)|your (?:post|content|message)s? (?:was|were) removed|post removed|you(?:'re| are|’re) temporarily blocked|nous avons supprim|publication supprim|ce qui s.est pass|eliminamos (?:tu|su)|publicaci.n eliminada|removemos (?:sua|seu)|publica..o removida/i.test(spamProbe)) {
+      const dismissed = await dismissViolationDialog(page).catch(() => false);
+      console.log(JSON.stringify({ step: 'spam_violation_dialog_detected', dismissed, dialogSnippet: String(d.dialogText || '').slice(0, 160) }));
+      throw new Error('facebook_spam_violation_dialog');
     }
     const btns = Array.isArray(d.buttons) ? d.buttons : [];
     const probe = `${d.title || ''} ${d.dialogText || ''} ${btns.map((b) => String(b && b.label || '').toLowerCase()).join(' | ')}`.toLowerCase();
