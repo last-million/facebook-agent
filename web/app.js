@@ -1639,6 +1639,7 @@ function renderState(state) {
   setValue("facebookProfileStatus", state.posting.facebookProfileStatus);
   setValue("contentSourcesEnabled", state.posting.contentSources?.enabled);
   setValue("contentSourcesExclusive", state.posting.contentSources?.exclusive);
+  setValue("contentSourcesAllowNoLink", state.posting.contentSources?.harvestAllowNoLink);
   setValue("contentSourcesReserveAuto", state.posting.contentSources?.reserveAuto !== false);
   setValue("contentSourcesReserveTarget", state.posting.contentSources?.reserveTarget);
   setValue("contentSourcesReserveRefillAt", state.posting.contentSources?.reserveRefillAt);
@@ -2413,6 +2414,7 @@ function collectState() {
     contentSources: {
       enabled: getValue("contentSourcesEnabled") === true,
       exclusive: getValue("contentSourcesExclusive") === true,
+      harvestAllowNoLink: getValue("contentSourcesAllowNoLink") === true,
       reserveAuto: getValue("contentSourcesReserveAuto") !== false,
       reserveTarget: Number(getValue("contentSourcesReserveTarget")) || 20,
       reserveRefillAt: Number(getValue("contentSourcesReserveRefillAt")) || 10,

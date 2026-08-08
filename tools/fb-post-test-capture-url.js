@@ -4316,7 +4316,7 @@ async function harvestExtractPhoto(page, ctx) {
     });
     await page.waitForTimeout(700);
   } catch (_) {}
-  const data = await page.evaluate(() => {
+  const data = await page.evaluate((allowNoLink) => {
     const clean = (s) => String(s || '').replace(/\s+/g, ' ').trim(); // \s+ collapse keeps emojis intact
     const isUrl = (s) => /^https?:\/\//i.test(s.trim()) || /^www\./i.test(s.trim());
     const isChrome = (s) => /^(Like|Comment|Share|Reply|See more|See less|All reactions|Active|Write a comment|See translation|Most relevant|Top fan|Author|Follow|Send|Share to|Sponsored|·)\b/i.test(s) || /^\d+\s*(comment|share|reaction|like)/i.test(s);
@@ -4419,8 +4419,14 @@ async function harvestExtractPhoto(page, ctx) {
         if (txt.length >= 2 && txt.length <= 800 && !isChrome(txt) && !isUrl(txt) && !META_RE.test(txt.slice(0, 140))) commentLead = txt;
       }
     }
-    return { text, image, link, commentLead, ogTitle, ogDesc, candCount: cands.length };
-  });
+    // NO-LINK HARVEST (operator 2026-08-08, Step-2 option "also harvest posts without a product link"):
+    // a post with a real product PHOTO but no affiliate/product URL in the comments is still harvestable
+    // when the operator enabled it. Synthesize a UNIQUE per-post key (the photo permalink) purely as the
+    // dedup/identity key — the server sees noLink:true and never puts this URL in the posted comment.
+    let noLink = false;
+    if (!link && allowNoLink === true && curFbid) { link = 'https://www.facebook.com/photo/?fbid=' + curFbid; noLink = true; }
+    return { text, image, link, noLink, commentLead, ogTitle, ogDesc, candCount: cands.length };
+  }, ctx.allowNoLink === true);
   const dkey = (data.link || '').split(/[?#]/)[0];
   if (!data.link || !dkey || seenLinks.has(dkey)) return null; // PRODUCTS only: no first-comment product link => skip (recipes/news never enter the buffer)
   seenLinks.add(dkey);
@@ -4460,7 +4466,7 @@ async function harvestExtractPhoto(page, ctx) {
   let productOgTitle = '', productOgDescription = '';
   // EVERY harvested product gets the OG attempt (operator: tags must ALWAYS come from the link's og title) —
   // the old cap of 4/round left ~all records with an empty ogTitle. The budget guard still prevents overruns.
-  if (data.link && ogState.n < 60 && (!ctx.budgetEnd || Date.now() < ctx.budgetEnd - 25000)) {
+  if (data.link && !data.noLink && ogState.n < 60 && (!ctx.budgetEnd || Date.now() < ctx.budgetEnd - 25000)) {
     ogState.n++;
     let p2 = null;
     try {
@@ -4698,7 +4704,7 @@ async function harvestGroupFeed(page, count, opts = {}) {
       } else {
         tooOldStreak = 0;
         try {
-          const rec = await harvestExtractPhoto(page, { href: `https://www.facebook.com/photo/?fbid=${curFbid}&set=g.${groupId}`, postId: curFbid, seenLinks, ogState, claimsDir: opts.claimsDir, profileId: opts.profileId, budgetEnd });
+          const rec = await harvestExtractPhoto(page, { href: `https://www.facebook.com/photo/?fbid=${curFbid}&set=g.${groupId}`, postId: curFbid, seenLinks, ogState, claimsDir: opts.claimsDir, profileId: opts.profileId, budgetEnd, allowNoLink: opts.allowNoLink === true });
           if (rec) { out.push(rec); console.log(JSON.stringify({ step: 'harvest_item', n: out.length, fbid: curFbid, textLen: (rec.text || '').length, textPreview: (rec.text || '').slice(0, 90), imageSaved: !!rec.imageLocalPath, link: rec.link })); }
           else { console.log(JSON.stringify({ step: 'harvest_walk_skip', fbid: curFbid, reason: 'no_product_link_or_dup' })); }
         } catch (e) { console.log(JSON.stringify({ step: 'harvest_walk_item_error', fbid: curFbid, error: String((e && e.message) || e).slice(0, 140) })); }

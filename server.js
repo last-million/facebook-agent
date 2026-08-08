@@ -2227,6 +2227,7 @@ function normalizeWorkflowState(state) {
   state.posting.contentSources.overnightReserveTarget = clampNumber(state.posting.contentSources.overnightReserveTarget, state.posting.contentSources.reserveTarget, 5000, Math.max(state.posting.contentSources.reserveTarget, 200)); // OVERNIGHT: stock up to this many for the whole next day
   const __hpgCap = Math.min(6, machineParallelCap(state)); // never above the machine auto-cap (same source as the runtime harvest clamp; state passed -> no readState recursion)
   state.posting.contentSources.harvestProfilesPerGroup = clampNumber(state.posting.contentSources.harvestProfilesPerGroup, 1, __hpgCap, Math.min(3, __hpgCap)); // # member profiles to harvest each group with IN PARALLEL (spreads load)
+  state.posting.contentSources.harvestAllowNoLink = state.posting.contentSources.harvestAllowNoLink === true; // Step-2 option: also harvest posts that have a real product PHOTO but no product/affiliate URL in the comments (posted comment = lead/CTA text, no link)
   if (typeof state.posting.contentSources.postCta !== "string") state.posting.contentSources.postCta = ""; // optional CTA line ABOVE the emoji+title+tags signature (blank = clean deal post)
   else state.posting.contentSources.postCta = state.posting.contentSources.postCta.slice(0, 300);
   // RE-USE ROTATION knobs (dynamic): a posted harvested product becomes eligible again after reuseHours (so
@@ -2853,6 +2854,7 @@ function appendHarvestedProduct(record, state = readState()) {
     imageLocalPath: String(record.imageLocalPath || ""),
     sourceGroupUrl: String(record.sourceGroupUrl || ""),
     postId: String(record.postId || ""),
+    noLink: record.noLink === true, // harvested WITHOUT a product URL (operator option): firstCommentUrl is a synthetic per-post key, never posted
     // real product name/description from the link's og: tags, fetched IN the harvest browser
     ogTitle: String(record.ogTitle || "").slice(0, 200),
     ogDescription: String(record.ogDescription || "").slice(0, 500),
@@ -2942,7 +2944,7 @@ async function backfillHarvestedOpenGraphAsync(maxPerRound = 5) {
   if (__ogBackfillInFlight) return { skipped: "in_flight" };
   __ogBackfillInFlight = true;
   try {
-    const recs = readHarvestedProducts().filter((r) => r && r.firstCommentUrl && !r.ogTriedAt).slice(0, maxPerRound);
+    const recs = readHarvestedProducts().filter((r) => r && r.firstCommentUrl && !r.noLink && !r.ogTriedAt).slice(0, maxPerRound);
     let enriched = 0;
     for (const rec of recs) {
       const og = await fetchOpenGraphForHarvestedLink(rec.firstCommentUrl);
@@ -9897,7 +9899,7 @@ async function runHarvestConnector(groupUrl, profileId, harvestCount, opts = {})
   const payloadDir = path.join(DATA_DIR, "harvest-requests");
   fs.mkdirSync(payloadDir, { recursive: true });
   const payloadPath = path.join(payloadDir, `harvest-${Date.now()}-${crypto.randomBytes(5).toString("hex")}.json`);
-  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4), harvestSeenIds: (opts.seenIds || []).slice(0, 2000), harvestProfileIndex: Number(opts.profileIndex || 0), harvestProfileCount: Number(opts.profileCount || 1), harvestResumeFbid: String(opts.resumeFromFbid || ""), harvestMaxAgeDays: clampNumber(opts.maxAgeDays, 1, 30, 2), harvestClaimsDir: String(opts.claimsDir || "") }));
+  fs.writeFileSync(payloadPath, JSON.stringify({ harvestOnly: true, groupUrl, profileId: Number(profileId), harvestCount: clampNumber(harvestCount, 1, 20, 4), harvestSeenIds: (opts.seenIds || []).slice(0, 2000), harvestProfileIndex: Number(opts.profileIndex || 0), harvestProfileCount: Number(opts.profileCount || 1), harvestResumeFbid: String(opts.resumeFromFbid || ""), harvestMaxAgeDays: clampNumber(opts.maxAgeDays, 1, 30, 2), harvestClaimsDir: String(opts.claimsDir || ""), harvestAllowNoLink: state.posting?.contentSources?.harvestAllowNoLink === true }));
   try {
     const { stdout } = await execFileAsync("node", [scriptPath, payloadPath], { cwd: ROOT, windowsHide: true, timeout: 6 * 60 * 1000, maxBuffer: 24 * 1024 * 1024 });
     const objs = parseJsonLogObjects(stdout);
@@ -10409,7 +10411,7 @@ async function harvestContentSourcesAsync(options = {}) {
               } else { skippedSeen++; }
               continue;
             }
-            let persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, firstCommentText: it.commentLead, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId, ogTitle: it.ogTitle, ogDescription: it.ogDescription }, readState());
+            let persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, firstCommentText: it.commentLead, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId, noLink: it.noLink === true, ogTitle: it.ogTitle, ogDescription: it.ogDescription }, readState());
             if (!persisted) {
               // SWARM FIX #7: the URL is NOT in the active store (existing was falsy) yet the append was rejected -> it
               // is in the PERMANENT seen-ledger because the age-sweep already pruned its record. The connector only
@@ -10418,7 +10420,7 @@ async function harvestContentSourcesAsync(options = {}) {
               // ledger key, append fresh. STILL-ACTIVE products are protected by the `existing` check above, so this
               // only re-admits genuinely pruned-then-relisted URLs (which get a fresh harvestedAt, no immediate re-prune).
               try { forgetHarvestKey(url, readState()); } catch (_) {}
-              persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, firstCommentText: it.commentLead, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId, ogTitle: it.ogTitle, ogDescription: it.ogDescription }, readState());
+              persisted = appendHarvestedProduct({ firstCommentUrl: url, text: it.text, firstCommentText: it.commentLead, imageLocalPath: rel, sourceGroupUrl: pair.groupUrl, postId: it.postId, noLink: it.noLink === true, ogTitle: it.ogTitle, ogDescription: it.ogDescription }, readState());
               if (persisted) reusedOld++;
             }
             if (persisted) { existingByUrl.set(url, { firstCommentUrl: url, posted: "" }); harvestedNew++; }
@@ -12080,7 +12082,9 @@ function preparePostingPlan(options = {}) {
     const __harvUrl = harvestedRec ? String(harvestedRec.firstCommentUrl || "").trim() : "";
     const __harvLead = harvestedRec ? String(harvestedRec.firstCommentText || "").trim() : ""; // source comment lead ONLY — not the caption
     const commentText = harvestedRec
-      ? (__harvLead ? `${__harvLead} ${__harvUrl}`.trim() : __harvUrl)
+      ? (harvestedRec.noLink === true
+          ? (__harvLead || postCta || commentLeadIn || "").trim() // harvested WITHOUT a product URL: the comment is text-only, NEVER the synthetic per-post key
+          : (__harvLead ? `${__harvLead} ${__harvUrl}`.trim() : __harvUrl))
       : String(state.posting.commentTemplate || "{lead_in} {link}")
           .replace("{lead_in}", commentLeadIn)
           .replace("{link}", linkForPreview)
