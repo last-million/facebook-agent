@@ -22593,17 +22593,23 @@ function autoBlacklistProfileIfNeeded(opts = {}) {
     const persisted = recentProfileBlockingFailureCount(pid, state);
     const total = Math.max(streak, persisted + 1); // +1 = the current failure
     if (!hard) {
-      // OPERATOR (2026-07-19): stop auto-blacklisting profiles for repeated TRANSIENT posting failures
-      // (composer/timeout/proxy-type issues). These could get stuck for a long time under a case-
-      // sensitivity bug in the age-expiry check (fixed the same day), and the operator wants them to
-      // just keep retrying instead of ever being benched for this. Genuine FB account suspensions (the
-      // hard branch below) are a real, unfixable-by-restarting block and are unaffected by this.
-      // Still apply a short in-memory-only cooldown (see PROFILE_SOFT_FAILURE_COOLDOWN_MS above) so a
-      // just-failed profile isn't immediately re-picked first and thrown straight back at a possibly
-      // stressed box -- this is pacing, not blacklisting: no bench line, nothing persisted, self-clears.
+      // SOFT-FAILURE PACING + ANOMALY MONITORING (2026-08-08): transient errors (composer/timeout/proxy/
+      // group-render-unavailable) used to NEVER bench, so broken profiles were retried forever (one profile
+      // burned 200+ group-render failures in a day). Now they get the short in-memory cooldown AND a counter.
+      // Once the failure count crosses the operator-tunable threshold, the profile is auto-blacklisted into
+      // the Prod-tab "Profiles having issue" section, just like a hard block, and stays there until the admin
+      // releases it. The threshold defaults to 10 total failures so flaky blips still self-heal, but chronic
+      // failures are parked instead of deepening account health damage.
       __profileSoftCooldownUntil[pid] = Date.now() + PROFILE_SOFT_FAILURE_COOLDOWN_MS;
-      try { logEvent("profile_soft_failure_not_blacklisted", { profileId: pid, profile, streak, persisted, total, source: opts.source || "", lastError: oneLineField(errorText, 160) }); } catch (_) {}
-      return;
+      const __threshold = clampNumber(state.operator?.autoBlacklistTransientFailureThreshold, 3, 50, 10);
+      if (total < __threshold) {
+        try { logEvent("profile_soft_failure_not_blacklisted", { profileId: pid, profile, streak, persisted, total, threshold: __threshold, source: opts.source || "", lastError: oneLineField(errorText, 160) }); } catch (_) {}
+        if (total >= Math.max(3, Math.floor(__threshold / 2))) {
+          try { logEvent("profile_failure_anomaly", { profileId: pid, profile, streak, persisted, total, threshold: __threshold, note: "approaching auto-blacklist threshold", source: opts.source || "", lastError: oneLineField(errorText, 160) }); } catch (_) {}
+        }
+        return;
+      }
+      // FALL THROUGH to the shared auto-blacklist write below: chronic soft failure -> persistent park.
     }
     const fields = { component: "facebook_review", issue: "account_hard_blocked", status: "cannot_post_in_any_group", action: "quarantined", reason: "auto_blacklist_account_blocked_or_restricted", source: opts.source || "auto_blacklist", auto_blocked: "1" };
     const line = buildProfileRecordLine(record, fields);
