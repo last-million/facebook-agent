@@ -11,6 +11,7 @@ and to keep the GitHub repo continuously in sync with the live machine.
 | `deploy.sh` | Linux / WSL / macOS | **Start here on Linux.** Base packages, uv, Node.js, npm deps, Hermes, `~/.hermes/.env`, data dir. |
 | `reapply-hermes-customizations.sh` | Linux / WSL | Re-applies our Hermes customizations (`SOUL.md`, config, custom tools, source patches) after a Hermes update wipes them. Idempotent; `deploy.sh` runs it automatically on every deploy. |
 | `auto-sync.ps1` | Windows | Refreshes `claude-memory/` from the live memory, commits changed tracked files, pushes to GitHub. |
+| `health.ps1` | Windows | **Read-only status check.** Prints server-up, watchdog state, whether autopilot is armed, every posting group with its profiles / comments / harvest sources, and today's ledger tallies. Writes nothing — safe to run mid-run on production. |
 
 ## Deploy on a brand-new machine
 
@@ -84,6 +85,19 @@ On a bare Windows box WSL needs **one reboot**. The script tells you, then you r
   Python 3.12 + an editable hermes-agent at `C:\hermes-agent` (pinned to the proven
   commit) and your customizations land in `%USERPROFILE%\.hermes`. `server.js`
   auto-detects the runtime (`wsl` vs `native`) and runs jobs through whichever exists.
+
+## Monitor a running machine
+One read-only command shows the live state of any deployed box — server up, watchdog,
+whether autopilot is armed, every posting group with its profiles / comments / harvest
+sources, and today's posted/commented tallies. It writes nothing, so it is safe to run
+mid-run on production:
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File deployment\health.ps1
+```
+Runs on Windows PowerShell 5.1 (the server's own runtime). It finds the repo whether it
+was run in place or installed at the default Desktop / Downloads location. Handy for a
+second machine you administer over SMB/RDP: run it there to confirm the agent is up and
+posting without opening the dashboard.
 
 ## Hermes customizations (survive updates)
 `hermes-config/` carries everything we changed on top of stock Hermes, so a fresh
